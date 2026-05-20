@@ -1,0 +1,50 @@
+use_default_settings: true
+
+server:
+  bind_address: "0.0.0.0:8888"
+  secret_key: "${SEARXNG_SECRET_KEY}"
+  # Disable rate limiting — internal homelab use only
+  limiter: false
+  image_proxy: false
+
+search:
+  # Disable safe search for homelab admin use
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: bv
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+
+  # Google disabled — rate-limits quickly on residential IPs
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 30.0
+
+ui:
+  # Keep UI but don't expose externally — internal only
+  default_locale: ""
+  query_in_title: false
+  infinite_scroll: false
+  default_theme: simple

@@ -1,0 +1,164 @@
+# HomePilot Vault — Zero-Secrets Architecture
+
+## Overview
+
+HomePilot v2 uses a **zero-secrets deployment model**: the `.env` file contains **no HomePilot secrets**. All sensitive values (API tokens, encryption keys, shared secrets) are stored in an age-encrypted vault and resolved at runtime.
+
+## Architecture
+
+```
+Secret resolution order:
+  env var → vault → file → auto-generate
+
+  HP_SECRET_KEY=          → vault("secret-key") → auto-generate & persist
+  HP_ADMIN_SECRET=         → vault("admin-secret") → ConfigError (production)
+  PVE_API_TOKEN=           → vault("pve-token") → unavailable
+  JUMPSERVER_AUTH_TOKEN=   → vault("jumpserver-token") → unavailable
+  HP_EVENTS_WEBHOOK_SECRET=→ vault("webhook-secret") → unavailable
+```
+
+The `.env` file only contains **non-secret configuration**: ports, URLs, feature flags, and service discovery addresses.
+
+## Auto-Generated Vault Passphrase
+
+When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the system automatically generates a strong passphrase and persists it to:
+
+```
+{data_dir}/.vault_passphrase   (mode 0o600)
+```
+
+- Generated using `secrets.token_urlsafe(32)` (256 bits of entropy)
+- File permissions are set to `0o600` (owner read/write only)
+- On subsequent starts, the persisted passphrase is loaded automatically
+- If the file cannot be written (e.g., read-only filesystem), the passphrase is ephemeral and will change on restart
+
+### Code Reference
+
+```python
+# src/homepilot/config.py — Settings._auto_generate_passphrase()
+
+def _auto_generate_passphrase(self, secrets_mod, logger):
+    passphrase_path = Path(self.data_dir) / ".vault_passphrase"
+    if passphrase_path.exists():
+        passphrase = passphrase_path.read_text().strip()
+        if passphrase:
+            logger.info("Vault passphrase loaded from %s", passphrase_path)
+            return passphrase
+    passphrase = secrets_mod.token_urlsafe(32)
+    passphrase_path.parent.mkdir(parents=True, exist_ok=True)
+    passphrase_path.write_text(passphrase)
+    passphrase_path.chmod(0o600)
+    logger.info("No HP_VAULT_PASSPHRASE — auto-generated and saved to %s", passphrase_path)
+    return passphrase
+```
+
+## _try_vault_secret — Multi-Key Extraction
+
+The `_try_vault_secret` method attempts to resolve a secret from the vault with **progressive key fallback**:
+
+```python
+# src/homepilot/config.py — Settings._try_vault_secret()
+
+def _try_vault_secret(self, name: str) -> str:
+    # 1. Open vault with resolved passphrase
+    # 2. Get secret dict (e.g., {"token": "pve_token_value"})
+    # 3. Try keys in order: "value" → "secret" → "key" → "token"
+    # 4. Fall back to first value in dict if none of the above match
+    # 5. Return "" if vault unavailable or secret not found
+```
+
+This accommodates different vault secret formats:
+
+| Vault Key | Common Value Keys | Example |
+|-----------|------------------|---------|
+| `secret-key` | `value`, `secret` | `{"value": "abc123..."}` |
+| `admin-secret` | `value`, `secret` | `{"secret": "xyz789..."}` |
+| `pve-token` | `token`, `key` | `{"token": "admin@pam!tokenid=uuid"}` |
+| `jumpserver-token` | `value` | `{"value": "token_hex..."}` |
+| `webhook-secret` | `value`, `secret` | `{"value": "webhook_hex..."}` |
+
+## Secret Lifecycle
+
+### 1. Environment Variable (highest priority)
+
+If the env var is set, it's used directly. No vault lookup.
+
+```bash
+HP_SECRET_KEY=abc123  # Used directly
+```
+
+### 2. Vault (recommended for production)
+
+If the env var is empty, `_try_vault_secret` attempts to load from the encrypted vault:
+
+```bash
+# Set a secret in the vault
+docker compose exec -it backend hp vault set pve-token
+# Enter JSON: {"token": "admin@pam!tokenid=uuid"}
+```
+
+### 3. Auto-Generate (fallback, development only)
+
+If neither env var nor vault has the secret, some keys are auto-generated:
+
+- `secret_key` → persisted to `{data_dir}/.secret_key` (0o600)
+- `vault_passphrase` → persisted to `{data_dir}/.vault_passphrase` (0o600)
+
+**Production safeguards**: If `HP_ENV=production` and `HP_SECRET_KEY` is not set (and not in vault), HomePilot refuses to start with a `ConfigError`.
+
+## Deployment: Zero-Secrets .env
+
+A production `.env` contains **no HomePilot secrets**:
+
+```env
+# Non-secret configuration only
+HP_DAEMON_PORT=8000
+HP_PROXMOX_HOST=pve.example.local
+HP_PROXMOX_VERIFY_SSL=false
+HP_JUMP_ENABLED=true
+HP_AUTO_APPLY_ENABLED=true
+HP_INVENTORY_INTERVAL_SECONDS=300
+HP_RATE_LIMIT=60
+HP_CORS_ORIGINS=*
+HP_EMBEDDING_SERVICE_URL=http://llm-embed:8081/v1/embeddings
+HP_EMBEDDING_MODEL=bge-m3
+
+# All secrets are in the vault — no HP_SECRET_KEY, HP_ADMIN_SECRET, etc.
+```
+
+The vault holds 5 secrets:
+
+| Vault Key | Purpose | Value Format |
+|-----------|---------|-------------|
+| `secret-key` | API token signing key | `{"value": "random_hex_64"}` |
+| `admin-secret` | Admin authentication | `{"secret": "random_hex_32"}` |
+| `webhook-secret` | Event webhook verification | `{"value": "random_hex_32"}` |
+| `jumpserver-token` | SSH relay auth | `{"value": "random_hex_48"}` |
+| `pve-token` | Proxmox VE API access | `{"token": "user@realm!tokenid=uuid"}` |
+
+## Bootstrap (First Deployment)
+
+```bash
+# 1. Start the stack — passphrase auto-generates
+docker compose up -d
+
+# 2. Set vault secrets
+docker compose exec -it backend hp vault set secret-key
+docker compose exec -it backend hp vault set admin-secret
+docker compose exec -it backend hp vault set webhook-secret
+docker compose exec -it backend hp vault set jumpserver-token
+docker compose exec -it backend hp vault set pve-token
+
+# 3. Create API token
+docker compose exec backend hp token create
+
+# 4. Restart to load vault secrets into config
+docker compose restart backend
+```
+
+## Security Considerations
+
+- Passphrase file (`{data_dir}/.vault_passphrase`) is mode `0o600` — only the HomePilot process can read it
+- Vault data is encrypted with age (X25519 + ChaCha20-Poly1305)
+- Auto-generated secrets are ephemeral if the passphrase file cannot be persisted (read-only filesystem)
+- In production (`HP_ENV=production`), `HP_SECRET_KEY` must be explicitly set or stored in vault — auto-generation is forbidden

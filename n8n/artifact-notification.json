@@ -1,0 +1,752 @@
+{
+  "name": "HomePilot Artifact Notifications",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "homepilot-artifacts",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "hp-artifact-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftExpression": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "signature-check",
+              "left": "={{ $headers['x-webhook-signature'] }}",
+              "right": "={{ $env.HP_WEBHOOK_SECRET ? (function(){const crypto=require('crypto');return crypto.createHmac('sha256',$env.HP_WEBHOOK_SECRET).update($body).digest('hex')})() : '' }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "validate-signature",
+      "name": "Validate X-Webhook-Signature",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: 'invalid webhook signature' }) }}",
+        "options": {
+          "statusCode": 403
+        }
+      },
+      "id": "reject-unauthorized",
+      "name": "Reject Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [680, 200]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_proposed"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_approved"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_rejected"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_applied"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_failed"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_superseded"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_revoked"
+            },
+            {
+              "operation": "equals",
+              "value1": "={{ $json.body.event }}",
+              "value2": "artifact_drifted"
+            }
+          ]
+        },
+        "fallbackOutput": {
+          "operation": "routeToOutput"
+        }
+      },
+      "id": "route-by-event",
+      "name": "Route by Event Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "content": "=🏠 **Artifact Proposed**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nTarget: {{ $json.body.target.kind }} / {{ $json.body.target.node }}:{{ $json.body.target.vmid }}\nStatus: `{{ $json.body.status }}`\nMutating: {{ $json.body.mutating }}\nTimestamp: {{ $json.body.timestamp }}\nSource: {{ $json.body.source.agent ?? 'unknown' }}"
+      },
+      "id": "format-proposed",
+      "name": "Format Proposed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, -280]
+    },
+    {
+      "parameters": {
+        "content": "=✅ **Artifact Approved**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nApproved by: {{ $json.body.approved_by?.user ?? 'unknown' }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-approved",
+      "name": "Format Approved",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, -140]
+    },
+    {
+      "parameters": {
+        "content": "=🚫 **Artifact Rejected**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nRejected by: {{ $json.body.rejected_by?.user ?? 'unknown' }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-rejected",
+      "name": "Format Rejected",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 0]
+    },
+    {
+      "parameters": {
+        "content": "=🚀 **Artifact Applied**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nTarget: {{ $json.body.target.kind }} / {{ $json.body.target.node }}:{{ $json.body.target.vmid }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-applied",
+      "name": "Format Applied",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 140]
+    },
+    {
+      "parameters": {
+        "content": "=❌ **Artifact Failed**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-failed",
+      "name": "Format Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 280]
+    },
+    {
+      "parameters": {
+        "content": "=🔄 **Artifact Superseded**\n\nID: `{{ $json.body.id }}`\nSuperseded by: `{{ $json.body.superseded_by }}`\nKind: `{{ $json.body.kind }}`\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-superseded",
+      "name": "Format Superseded",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "content": "=🔒 **Artifact Revoked**\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nRevoked by: {{ $json.body.revoked_by?.user ?? 'unknown' }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-revoked",
+      "name": "Format Revoked",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 560]
+    },
+    {
+      "parameters": {
+        "content": "=⚠️ **Artifact Drifted** (future-proofing: no lifecycle hook yet)\n\nID: `{{ $json.body.id }}`\nKind: `{{ $json.body.kind }}`\nIntent: {{ $json.body.intent }}\nDrift summary: {{ $json.body.drift_summary ?? 'see audit log' }}\nTimestamp: {{ $json.body.timestamp }}"
+      },
+      "id": "format-drifted",
+      "name": "Format Drifted (future-proofing)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 700]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-proposed",
+      "name": "Notify Matrix (Proposed)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, -280]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-approved",
+      "name": "Notify Matrix (Approved)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, -140]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-rejected",
+      "name": "Notify Matrix (Rejected)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 0]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-applied",
+      "name": "Notify Matrix (Applied)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 140]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-failed",
+      "name": "Notify Matrix (Failed)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-superseded",
+      "name": "Notify Matrix (Superseded)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-revoked",
+      "name": "Notify Matrix (Revoked)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 560]
+    },
+    {
+      "parameters": {
+        "roomId": "={{ $env.MATRIX_ROOM_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-matrix-drifted",
+      "name": "Notify Matrix (Drifted)",
+      "type": "n8n-nodes-base.matrix",
+      "typeVersion": 1,
+      "position": [1340, 700]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-proposed",
+      "name": "Notify Telegram (Proposed)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, -280]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-approved",
+      "name": "Notify Telegram (Approved)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, -140]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-rejected",
+      "name": "Notify Telegram (Rejected)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 0]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-applied",
+      "name": "Notify Telegram (Applied)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 140]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-failed",
+      "name": "Notify Telegram (Failed)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 280]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-superseded",
+      "name": "Notify Telegram (Superseded)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 420]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-revoked",
+      "name": "Notify Telegram (Revoked)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 560]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.content }}"
+      },
+      "id": "notify-telegram-drifted",
+      "name": "Notify Telegram (Drifted)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 700]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', event: $json.body.event }) }}",
+        "options": {}
+      },
+      "id": "respond-ok",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate X-Webhook-Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate X-Webhook-Signature": {
+      "main": [
+        [
+          {
+            "node": "Reject Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route by Event Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Event Type": {
+      "main": [
+        [
+          {
+            "node": "Format Proposed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Approved",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Applied",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Failed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Superseded",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Revoked",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Drifted (future-proofing)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Proposed": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Proposed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Approved": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Approved)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Rejected": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Rejected)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Applied": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Applied)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Failed": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Failed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Superseded": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Superseded)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Revoked": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Revoked)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Drifted (future-proofing)": {
+      "main": [
+        [
+          {
+            "node": "Notify Matrix (Drifted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Proposed)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Proposed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Approved)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Approved)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Rejected)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Rejected)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Applied)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Applied)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Failed)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Failed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Superseded)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Superseded)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Revoked)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Revoked)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Matrix (Drifted)": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram (Drifted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Proposed)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Approved)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Rejected)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Applied)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Failed)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Superseded)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Revoked)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Telegram (Drifted)": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "homepilot"
+    },
+    {
+      "name": "artifact-notifications"
+    }
+  ]
+}

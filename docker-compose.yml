@@ -1,0 +1,217 @@
+services:
+  # ═══════════════════════════════════════════════════════════════════════
+  #  HomePilot v2 — backend + jumpserver
+  # ═══════════════════════════════════════════════════════════════════════
+  backend:
+    container_name: homepilot
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.2.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${HP_DAEMON_PORT:-8000}:8000"
+    volumes:
+      - ./data/hp:/home/homepilot/.hp
+    env_file:
+      - .env
+    depends_on:
+      jumpserver:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - homepilot
+
+  jumpserver:
+    container_name: jumpserver
+    build:
+      context: ./jumpserver
+      dockerfile: Dockerfile
+    ports:
+      - "${JUMPSERVER_PORT:-50051}:50051"
+    volumes:
+      - ./data/jumpserver/ssh:/root/.ssh
+      - ./data/jumpserver/logs:/var/log/jumpserver
+    environment:
+      JUMPSERVER_AUTH_TOKEN: ${JUMPSERVER_AUTH_TOKEN}
+      JUMPSERVER_AUTH_TOKEN_FILE: ${JUMPSERVER_AUTH_TOKEN_FILE:-}
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: "50051"
+      SSH_KEY_PATH: /root/.ssh/id_ed25519
+      JUMPSERVER_LOG_DIR: /var/log/jumpserver
+      JUMPSERVER_KNOWN_HOSTS_FILE: ${JUMPSERVER_KNOWN_HOSTS_FILE:-/etc/ssh/ssh_known_hosts}
+      PVE_NODE_NAMES: ${PVE_NODE_NAMES:-}
+      JUMPSERVER_TLS: ${JUMPSERVER_TLS:-false}
+      JUMPSERVER_TLS_CERT: ${JUMPSERVER_TLS_CERT:-}
+      JUMPSERVER_TLS_KEY: ${JUMPSERVER_TLS_KEY:-}
+      JUMPSERVER_TLS_CA: ${JUMPSERVER_TLS_CA:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost',50051)); s.close()\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - homepilot
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  Agent services — LLM, embeddings, n8n, search, calendar, voice
+  # ═══════════════════════════════════════════════════════════════════════
+
+  llm:
+    container_name: llm
+    profiles: ["gpu"]
+    image: ghcr.io/ggerganov/llama.cpp:server-cuda
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      LLAMA_ARG_MODEL: /models/${GGUF_MODEL_FILENAME:-Qwen3-14B-Q8_0.gguf}
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_GPU_LAYERS: "99"
+      LLAMA_ARG_CTX_SIZE: ${LLAMA_ARG_CTX_SIZE:-32768}
+      LLAMA_ARG_PARALLEL: ${LLAMA_ARG_PARALLEL:-4}
+    volumes:
+      - ./agent/models:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  llm-embed:
+    container_name: llm-embed
+    profiles: ["gpu"]
+    image: ghcr.io/ggerganov/llama.cpp:server
+    ports:
+      - "8081:8081"
+    environment:
+      LLAMA_ARG_MODEL: /models/bge-m3.gguf
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8081"
+      NVIDIA_VISIBLE_DEVICES: "1"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./agent/data/llm-embed-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  llm-embed-cpu:
+    container_name: llm-embed-cpu
+    profiles: ["cpu"]
+    image: ghcr.io/ggerganov/llama.cpp:server
+    ports:
+      - "8081:8081"
+    environment:
+      LLAMA_ARG_MODEL: /models/bge-m3.gguf
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8081"
+    volumes:
+      - ./agent/data/llm-embed-models:/models
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  n8n:
+    container_name: n8n
+    image: n8nio/n8n:latest
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${TZ:-Etc/UTC}
+      N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD_FILE: /run/secrets/n8n_basic_auth_password
+      HP_MCP_URL: http://backend:8000/mcp
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
+      MATRIX_ROOM_ID: ${MATRIX_ROOM_ID:-}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+    volumes:
+      - ./agent/data/n8n:/home/node/.n8n
+    secrets:
+      - n8n_encryption_key
+      - n8n_basic_auth_password
+    ports:
+      - "5678:5678"
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    volumes:
+      - ./agent/searxng:/etc/searxng:ro
+    environment:
+      SEARXNG_SECRET_KEY: ${SEARXNG_SECRET_KEY}
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  radicale:
+    container_name: radicale
+    image: tomsquest/docker-radicale:latest
+    volumes:
+      - ./agent/radicale/config:/config/config:ro
+      - ./agent/data/radicale:/data
+      - ./agent/radicale/htpasswd:/data/htpasswd
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  whisper:
+    container_name: whisper
+    image: fedirz/faster-whisper-server:latest-cpu
+    ports:
+      - "8082:8000"
+    environment:
+      - WHISPER__MODEL=base
+      - WHISPER__COMPUTE_TYPE=int8
+      - WHISPER__DEVICE=cpu
+    volumes:
+      - ./agent/data/whisper:/root/.config/faster-whisper-server
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  piper:
+    container_name: piper
+    image: rhasspy/wyoming-piper:latest
+    ports:
+      - "8083:10200"
+    command: ["--voice", "en_US-lessac-medium", "--length-scale", "1.0", "--noise-scale", "0.667", "--noise-w", "0.333", "--data-dir", "/voices"]
+    volumes:
+      - ./agent/data/piper:/voices
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+networks:
+  homepilot:
+    driver: bridge
+
+secrets:
+  n8n_encryption_key:
+    file: ./secrets/n8n_encryption_key.txt
+  n8n_basic_auth_password:
+    file: ./secrets/n8n_basic_auth_password.txt
