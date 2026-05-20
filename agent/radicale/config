@@ -1,0 +1,19 @@
+[server]
+hosts = 0.0.0.0:5232
+max_connections = 20
+max_content_length = 100000000
+timeout = 30
+
+[auth]
+type = htpasswd
+htpasswd_filename = /data/htpasswd
+htpasswd_encryption = bcrypt
+# Single user — homelab admin. Create htpasswd with:
+#   docker run --rm -it tomsquest/docker-radicale htpasswd -Bc /data/htpasswd admin
+# Or: htpasswd -Bc radicale/data/htpasswd admin
+
+[storage]
+filesystem_folder = /data/collections
+
+[logging]
+level = info
