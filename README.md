@@ -218,6 +218,29 @@ HomePilot emits SSE events for artifact lifecycle changes (proposed, approved, a
 
 All state transitions write an append-only audit log stored in SQLite. Use `hp status` or the API to query it.
 
+## Production Deployment
+
+For production, HomePilot v2 runs behind an nginx reverse proxy with:
+- **HTTPS termination** on the proxy host (TLSv1.2/1.3, HSTS, 80→443 redirect)
+- **PostgreSQL** on a dedicated database host (not SQLite)
+- **Embeddings** via Ollama API (`HP_EMBEDDING_SERVICE_URL` + `HP_EMBEDDING_MODEL`)
+- **Monitoring** via Zabbix agent2 with Docker plugin
+
+Key production env vars:
+
+| Variable | Description |
+|----------|-------------|
+| `HP_SECRET_KEY` | Random hex string (required) |
+| `HP_PROXMOX_HOST` | PVE hostname |
+| `HP_EMBEDDING_SERVICE_URL` | Ollama embedding endpoint |
+| `HP_EMBEDDING_MODEL` | Embedding model name (e.g. `nomic-embed-text`) |
+| `HP_VAULT_PASSPHRASE_FILE` | Docker secret path for vault passphrase |
+| `HP_JUMP_ENABLED` | Enable SSH jumpserver relay |
+| `HP_ARTIFACTS_REMOTE` | Git remote for artifact backup |
+| `HP_TRUSTED_PROXIES` | Trusted reverse proxy IPs |
+
+See [`docs/deployment.md`](docs/deployment.md) for step-by-step setup.
+
 ## Architecture
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — deployment topology, artifact lifecycle, MCP tools reference
@@ -227,6 +250,20 @@ All state transitions write an append-only audit log stored in SQLite. Use `hp s
 - [`docs/deployment.md`](docs/deployment.md) — step-by-step Docker deployment
 
 > Historical planning and design docs are in [`docs/archive/`](docs/archive/) — do not use for reference.
+
+## Screenshots
+
+| Login | Artifacts | Inventory |
+|------|-----------|-----------|
+| ![Login](docs/images/hp-v2-login.png) | ![Artifacts](docs/images/hp-v2-artifacts.png) | ![Inventory](docs/images/hp-v2-inventory.png) |
+
+| Drift Detection | Knowledge Base | Journal |
+|----------------|----------------|---------|
+| ![Drift](docs/images/hp-v2-drift.png) | ![KB](docs/images/hp-v2-kb.png) | ![Journal](docs/images/hp-v2-journal.png) |
+
+| Settings | Tokens | Health | Review |
+|----------|--------|--------|--------|
+| ![Settings](docs/images/hp-v2-settings.png) | ![Tokens](docs/images/hp-v2-tokens.png) | ![Health](docs/images/hp-v2-health.png) | ![Review](docs/images/hp-v2-review.png) |
 
 ## License
 
