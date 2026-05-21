@@ -251,6 +251,20 @@ See [`docs/deployment.md`](docs/deployment.md) for step-by-step setup.
 
 > Historical planning and design docs are in [`docs/archive/`](docs/archive/) — do not use for reference.
 
+## Screenshots
+
+| Login | Artifacts | Inventory |
+|------|-----------|-----------|
+| ![Login](docs/images/hp-v2-login.png) | ![Artifacts](docs/images/hp-v2-artifacts.png) | ![Inventory](docs/images/hp-v2-inventory.png) |
+
+| Drift Detection | Knowledge Base | Journal |
+|----------------|----------------|---------|
+| ![Drift](docs/images/hp-v2-drift.png) | ![KB](docs/images/hp-v2-kb.png) | ![Journal](docs/images/hp-v2-journal.png) |
+
+| Settings | Tokens | Health | Review |
+|----------|--------|--------|--------|
+| ![Settings](docs/images/hp-v2-settings.png) | ![Tokens](docs/images/hp-v2-tokens.png) | ![Health](docs/images/hp-v2-health.png) | ![Review](docs/images/hp-v2-review.png) |
+
 ## License
 
 AGPL-3.0
