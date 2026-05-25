@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import signal
 import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
@@ -284,10 +285,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("MCP server not mounted — HP_MCP_TOKEN not set")
 
+    # Register SIGTERM handler for graceful shutdown in Docker
+    _shutdown_event = asyncio.Event()
+
+    def _sigterm_handler() -> None:
+        logger.info("Received SIGTERM — initiating graceful shutdown")
+        _shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
+    except (OSError, ValueError):
+        logger.debug("Could not register SIGTERM handler (ok in non-Docker env)")
+
     yield
 
-    await reconciler_scheduler.stop()
-    await state.database.close()
+    logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+    try:
+        await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
+    try:
+        await asyncio.wait_for(state.database.close(), timeout=10.0)
+    except asyncio.TimeoutError:
+        logger.warning("Database close timed out after 10s — proceeding")
+    except Exception as exc:
+        logger.warning("Database close error (ok on restart): %s", exc)
     from .mcp.server import _server_context
 
     _server_context.clear()
@@ -533,10 +556,15 @@ if _UI_DIR is not None:
     from fastapi.responses import FileResponse
 
     _ui_dir: Path = _UI_DIR
-    _app_static_dir = _ui_dir / "_app"
-    if _app_static_dir.is_dir():
-        app.mount("/ui/_app", StaticFiles(directory=str(_app_static_dir)))
+    _ui_static = StaticFiles(directory=str(_ui_dir))
 
-    @app.api_route("/ui/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.get("/ui/_app/{path:path}", include_in_schema=False)
+    async def ui_static_assets(path: str, request: Request) -> Response:
+        return await _ui_static.get_response(f"_app/{path}", request.scope)
+
+    @app.get("/ui/{path:path}", include_in_schema=False)
     async def ui_spa(path: str, request: Request) -> Response:
+        full = _ui_dir / path
+        if full.exists() and full.is_file():
+            return await _ui_static.get_response(path, request.scope)
         return FileResponse(_ui_dir / "index.html")

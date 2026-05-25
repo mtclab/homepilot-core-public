@@ -4,7 +4,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.2.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.2.2}
     build:
       context: .
       dockerfile: Dockerfile
@@ -90,6 +90,14 @@ services:
     networks:
       - homepilot
 
+  # ── Embedding service ──────────────────────────────────────────────────
+  # REQUIRED for KB vector search. Without it, KB search falls back to
+  # keyword-only mode (still functional, but less relevant results).
+  #
+  # GPU mode:  docker compose --profile gpu up
+  # CPU mode:   docker compose --profile cpu up   (slower, no nvidia required)
+  # Neither:    KB search works in keyword-only mode with a warning in logs.
+  #
   llm-embed:
     container_name: llm-embed
     profiles: ["gpu"]
@@ -115,8 +123,10 @@ services:
     networks:
       - homepilot
 
+  # CPU-only fallback for environments without NVIDIA GPU.
+  # Use: docker compose --profile cpu up
   llm-embed-cpu:
-    container_name: llm-embed-cpu
+    container_name: llm-embed
     profiles: ["cpu"]
     image: ghcr.io/ggerganov/llama.cpp:server
     ports:
@@ -125,6 +135,7 @@ services:
       LLAMA_ARG_MODEL: /models/bge-m3.gguf
       LLAMA_ARG_HOST: "0.0.0.0"
       LLAMA_ARG_PORT: "8081"
+      LLAMA_ARG_THREADS: "4"
     volumes:
       - ./agent/data/llm-embed-models:/models
     restart: unless-stopped

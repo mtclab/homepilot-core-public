@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -14,28 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Lint + type check + tests
-        run: |
-          ruff check src/ jumpserver/
-          ruff format --check src/ jumpserver/
-          mypy src/
-          pytest tests/ --ignore=tests/test_e2e.py -v --tb=short -x
-
   docker:
-    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2

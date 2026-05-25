@@ -10,15 +10,28 @@ from homepilot.config import Settings
 
 
 class TestSettingsDefaults:
-    def test_vault_passphrase_auto_generated_when_missing(self, tmp_path):
+    def test_vault_passphrase_not_auto_generated_without_env(self, tmp_path):
         data_dir = tmp_path / "hp"
         data_dir.mkdir(parents=True, exist_ok=True)
-        s = Settings(
-            secret_key="testkey",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
-        assert s.vault_passphrase is not None
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": ""}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
+        assert s.vault_passphrase == ""
+
+    def test_vault_passphrase_auto_generated_with_env(self, tmp_path):
+        data_dir = tmp_path / "hp"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "true"}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
         assert s.vault_passphrase != ""
         assert len(s.vault_passphrase) > 30
         pf = data_dir / ".vault_passphrase"
@@ -29,16 +42,19 @@ class TestSettingsDefaults:
     def test_vault_passphrase_auto_generated_persisted_and_reused(self, tmp_path):
         data_dir = tmp_path / "hp"
         data_dir.mkdir(parents=True, exist_ok=True)
-        s1 = Settings(
-            secret_key="testkey",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
-        s2 = Settings(
-            secret_key="testkey2",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "true"}, clear=False):
+            s1 = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
+            s2 = Settings(
+                secret_key="testkey2",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
         assert s1.vault_passphrase == s2.vault_passphrase
 
     def test_vault_passphrase_auto_generated_empty_file_regenerates(self, tmp_path):
@@ -46,36 +62,27 @@ class TestSettingsDefaults:
         data_dir.mkdir(parents=True, exist_ok=True)
         pf = data_dir / ".vault_passphrase"
         pf.write_text("")
-        s = Settings(
-            secret_key="testkey",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
-        assert s.vault_passphrase is not None
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "1"}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
         assert s.vault_passphrase != ""
         assert pf.read_text().strip() == s.vault_passphrase
 
     def test_vault_passphrase_auto_generated_oserror_falls_back(self, tmp_path):
         data_dir = tmp_path / "hp"
         data_dir.mkdir(parents=True, exist_ok=True)
-        s = Settings(
-            secret_key="testkey",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
-        assert s.vault_passphrase is not None
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "yes"}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
         assert s.vault_passphrase != ""
-
-    def test_vault_passphrase_empty_string_disables_vault(self, tmp_path):
-        data_dir = tmp_path / "hp"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        s = Settings(
-            secret_key="testkey",
-            vault_passphrase="",
-            data_dir=str(data_dir),
-            artifacts_dir=str(data_dir / "artifacts"),
-        )
-        assert s.vault_passphrase == ""
 
     def test_default_data_dir(self):
         s = Settings(secret_key="testkey")
@@ -163,6 +170,7 @@ class TestSettingsDefaults:
         s = Settings(
             secret_key="testkey",
             vault_passphrase_file=str(pf),
+            vault_passphrase="",
             data_dir=str(tmp_path / "hp"),
             artifacts_dir=str(tmp_path / "hp" / "artifacts"),
         )
@@ -183,9 +191,7 @@ class TestSettingsDefaults:
         with caplog.at_level(logging.DEBUG, logger="homepilot.config"):
             s = Settings(secret_key="testkey", vault_passphrase="env-pass")
         assert s.vault_passphrase == "env-pass"
-        assert not any(
-            "auto-generated" in r.message for r in caplog.records if "passphrase" in r.message
-        )
+        assert not any("auto-generated" in r.message for r in caplog.records if "passphrase" in r.message)
 
     def test_prod_env_stable_key_required(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HP_ENV", "production")

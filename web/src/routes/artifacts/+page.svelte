@@ -49,7 +49,7 @@
 		loading = true;
 		error = '';
 		try {
-			const res = await api.listArtifacts({ limit: 2000 });
+			const res = await api.listArtifacts({ limit: 1000 });
 			allItems = res.items;
 			applyFilter();
 		} catch (e) {

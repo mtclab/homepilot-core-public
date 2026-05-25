@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.2.3 (2026-05-25)
+
+### Security
+
+- **vitest 2.1.9→4.1.7**: Dev dependency bump in `/web/` (PR #287).
+- **esbuild 0.25.12**: Fixed esbuild dev server CVE (medium, absorbed via transitive dep).
+- **vite 6.4.2**: Fixed CVE-2026-39365 path traversal (medium, absorbed via transitive dep).
+- **Deferred**: CVE-2024-47764 cookie (low, SvelteKit transitive dep, no safe fix).
+
 ## v2.2.2 (2026-05-16)
 
 ### Features

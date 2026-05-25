@@ -23,6 +23,7 @@
 	$: isLoginRoute = $page.url.pathname === base + '/login';
 
 	let me: MeInfo | null = null;
+	let sessionLoading = true;
 
 	onMount(async () => {
 		if (!hasCookieSession() && !isLoginRoute) {
@@ -31,6 +32,7 @@
 			return;
 		}
 		me = await refreshSession();
+		sessionLoading = false;
 	});
 
 	async function handleLogout() {
@@ -84,6 +86,11 @@
 				<button class="text-xs text-slate-500 hover:text-red-400 transition-colors mt-1 block" on:click={handleLogout}>
 					Log out
 				</button>
+			{:else if sessionLoading}
+				<div class="flex items-center gap-2">
+					<span class="w-2 h-2 rounded-full bg-yellow-400 inline-block animate-pulse"></span>
+					<span class="text-xs text-slate-500">Loading…</span>
+				</div>
 			{:else}
 				<div class="flex items-center gap-2">
 					<span class="w-2 h-2 rounded-full bg-red-400 inline-block"></span>

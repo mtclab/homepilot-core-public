@@ -34,9 +34,24 @@ async def _call_embed_service(url: str, model: str, text: str) -> list[float] | 
             else:
                 embedding_data = data.get("data", [])
                 embedding = embedding_data[0].get("embedding") if embedding_data else None
+            if embedding is None:
+                logger.error(
+                    "Embedding service %s returned empty/null embedding (model=%s, response_keys=%s)",
+                    url, model, list(data.keys()),
+                )
             return embedding
-    except Exception as e:
+    except (httpx.ConnectError, ConnectionRefusedError) as e:
+        logger.error(
+            "Embedding service unreachable at %s (model=%s): %s — "
+            "ensure llm-embed service is running or configure HP_EMBEDDING_FALLBACK_URL",
+            url, model, e,
+        )
+        return None
+    except (httpx.HTTPError, ConnectionError, OSError) as e:
         logger.warning("Embedding call to %s failed: %s", url, e)
+        return None
+    except Exception as e:
+        logger.error("Unexpected error calling embedding service %s: %s", url, e)
         return None
 
 
@@ -57,7 +72,12 @@ async def _get_embedding(text: str) -> list[float] | None:
         if embedding is not None:
             return embedding
 
-    logger.warning("All embedding services failed for query length %d", len(text))
+    logger.warning(
+        "All embedding services unavailable for query (len=%d) — "
+        "falling back to keyword search. Ensure llm-embed service is running "
+        "or HP_EMBEDDING_SERVICE_URL/HP_EMBEDDING_FALLBACK_URL are configured.",
+        len(text),
+    )
     return None
 
 
@@ -192,7 +212,6 @@ class KBService:
                 deleted = len(artifact_doc_ids)
                 reindexed = 0
                 errors = 0
-                keyword_only = 0
 
                 from homepilot.executor import kb_note as kb_note_executor
 
@@ -205,25 +224,8 @@ class KBService:
                         )
                         if result.get("success"):
                             reindexed += 1
-                            if "keyword-only" in (result.get("execution_log") or ""):
-                                keyword_only += 1
-                                if no_embeddings:
-                                    logger.info(
-                                        "KB reindex: %s stored keyword-only (no_embeddings=True)",
-                                        artifact_id,
-                                    )
-                                else:
-                                    logger.warning(
-                                        "KB reindex: %s keyword-only (embedding service down)",
-                                        artifact_id,
-                                    )
                         else:
                             errors += 1
-                            logger.warning(
-                                "KB reindex: %s failed: %s",
-                                artifact_id,
-                                result.get("execution_log", "unknown error"),
-                            )
                     except (OSError, ValueError, sqlite3.OperationalError) as exc:
                         logger.warning("Reindex failed for %s: %s", artifact_id, exc)
                         errors += 1
@@ -232,8 +234,6 @@ class KBService:
                     "status": "completed",
                     "deleted": deleted,
                     "reindexed": reindexed,
-                    "keyword_only": keyword_only,
-                    "with_embeddings": reindexed - keyword_only,
                     "errors": errors,
                 }
             finally:
@@ -246,7 +246,6 @@ class KBService:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         embedding = await _get_embedding(query)
-        search_mode = "keyword"
 
         if embedding:
             vec_bytes = _embedding_to_bytes(embedding)
@@ -276,35 +275,14 @@ class KBService:
                             "title": row.get("title"),
                             "content": row.get("content"),
                             "score": score,
-                            "search_mode": "vector",
                         }
                     )
                 results.sort(key=lambda x: x.get("score", 0), reverse=True)
-                if results:
-                    logger.info(
-                        "KB search: vector match returned %d results for query '%s'",
-                        len(results),
-                        query[:50],
-                    )
-                    return results
-                logger.info(
-                    "KB search: vector 0 results, falling back to keyword for '%s'",
-                    query[:50],
-                )
-                search_mode = "keyword_fallback_empty"
+                return results
             except (sqlite3.OperationalError, ValueError) as e:
                 logger.warning("Vector search failed, falling back to keyword: %s", e)
-                search_mode = "keyword_fallback_error"
 
-        if not embedding:
-            logger.warning(
-                "KB search: embedding service unavailable, using keyword search for query '%s'",
-                query[:50],
-            )
-        results = await self._keyword_search(query, kind, limit)
-        for r in results:
-            r["search_mode"] = search_mode
-        return results
+        return await self._keyword_search(query, kind, limit)
 
     async def _keyword_search(
         self, query: str, kind: str | None = None, limit: int = 10
@@ -341,6 +319,32 @@ class KBService:
             )
         return results
 
+    async def embedding_status(self) -> dict[str, Any]:
+        settings = get_settings()
+        primary_url = settings.embedding_service_url
+        fallback_url = settings.embedding_fallback_url
+        test_vec = await _call_embed_service(primary_url, settings.embedding_model, "test")
+        primary_ok = test_vec is not None
+        fallback_ok = False
+        if fallback_url and not primary_ok:
+            fb_vec = await _call_embed_service(fallback_url, settings.embedding_model, "test")
+            fallback_ok = fb_vec is not None
+        rows = await self.repo.db.fetchone("SELECT COUNT(*) AS c FROM vec_docs")
+        indexed = rows["c"] if rows else 0
+        total = 0
+        t_rows = await self.repo.db.fetchone("SELECT COUNT(*) AS c FROM doc_metadata")
+        if t_rows:
+            total = t_rows["c"]
+        return {
+            "primary_url": primary_url,
+            "primary_ok": primary_ok,
+            "fallback_url": fallback_url or "",
+            "fallback_ok": fallback_ok,
+            "indexed_with_embeddings": indexed,
+            "total_docs": total,
+            "search_mode": "vector" if primary_ok else ("fallback_vector" if fallback_ok else "keyword"),
+        }
+
     async def reindex_if_needed(self, reason: str = "lifecycle") -> None:
         applied_notes = self.store.list(kind="kb-note", status="applied")
         row = await self.repo.db.fetchone(
@@ -360,7 +364,7 @@ class KBService:
 
     async def _run_reindex(self, reason: str) -> None:
         try:
-            result = await self.reindex(no_embeddings=False, reason=reason)
+            result = await self.reindex(no_embeddings=True, reason=reason)
             logger.info("KB reindex complete: reason=%s, result=%s", reason, result)
         except Exception:  # background task must not crash, logs full exception
             logger.exception("KB reindex failed: reason=%s", reason)

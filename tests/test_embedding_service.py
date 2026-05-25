@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
@@ -199,7 +200,7 @@ class TestCallEmbedServiceProtocol:
             mock_client = AsyncMock()
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(side_effect=Exception("connection refused"))
+            mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
             mock_client_cls.return_value = mock_client
 
             result = await _call_embed_service(

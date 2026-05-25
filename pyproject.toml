@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "2.2.2"
+version = "2.2.5"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -33,7 +33,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
-    "pytest-timeout>=2.3",
     "httpx>=0.28",
     "faker>=37.0",
     "freezegun>=1.5",
@@ -87,8 +86,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-timeout = 30
 markers = [
     "e2e: end-to-end tests requiring a live HomePilot instance (HP_TEST_TOKEN must be set)",
-    "integration: integration tests requiring live services or slow setup — run locally, not in CI",
 ]

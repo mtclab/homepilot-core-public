@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from homepilot.config import Settings
-from homepilot.executor.orchestrator import ExecutionResult, ExecutorError
+from homepilot.executor.orchestrator import ExecutionResult
 from homepilot.reconciler import ApplyReconciler, ReconcilerResult, ReconcilerScheduler
 
 
@@ -143,7 +143,7 @@ class TestApplyReconcilerAutoApply:
 
         async def apply_side_effect(artifact_id, approved_by):
             if artifact_id == "art-fail":
-                raise ExecutorError("apply failed")
+                raise ValueError("apply failed")
             return ExecutionResult(
                 success=True, execution_log="ok", snapshot_id=None, failure_reason=None
             )

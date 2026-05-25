@@ -36,6 +36,18 @@ class DriftReconciler(Reconciler):
             applied = self.store.list(status=ArtifactStatus.APPLIED.value)
             checkable = [a for a in applied if a.get("kind") != ArtifactKind.KB_NOTE.value]
 
+            if not checkable:
+                return ReconcilerResult(name="drift", success=True, details={"checked": 0, "drifted": 0, "skipped_kb_notes": 0, "errors": 0, "skipped_no_executor": 0})
+
+            if self.executor is None:
+                skipped_no_executor = len(checkable)
+                logger.warning("DriftReconciler: skipping %d artifacts — no executor configured (Proxmox client unavailable)", skipped_no_executor)
+                return ReconcilerResult(
+                    name="drift",
+                    success=True,
+                    details={"checked": 0, "drifted": 0, "skipped_kb_notes": 0, "errors": 0, "skipped_no_executor": skipped_no_executor},
+                )
+
             checked = 0
             drifted = 0
             skipped = 0
@@ -76,6 +88,7 @@ class DriftReconciler(Reconciler):
                 "drifted": drifted,
                 "skipped_kb_notes": skipped,
                 "errors": errors,
+                "skipped_no_executor": 0,
             }
 
             try:

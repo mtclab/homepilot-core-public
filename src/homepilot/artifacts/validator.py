@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from .models import (
-    VALID_TRANSITIONS,
     ArtifactKind,
     ArtifactStatus,
+    ConflictError,
     Idempotence,
     LifecycleError,
     Target,
+    VALID_TRANSITIONS,
     compute_body_hash,
     extract_composite_steps,
     utcnow_iso,
@@ -40,7 +41,7 @@ def validate_composite_spec(body: str) -> None:
 def validate_transition(current: ArtifactStatus, target: ArtifactStatus) -> None:
     allowed = VALID_TRANSITIONS.get(current, set())
     if target not in allowed:
-        raise LifecycleError(f"Invalid transition: {current.value} → {target.value}")
+        raise ConflictError(f"Invalid transition: {current.value} → {target.value}")
 
 
 def validate_propose_spec(spec: dict[str, Any], store: ArtifactStore) -> tuple[dict[str, Any], str]:

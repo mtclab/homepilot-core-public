@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { base } from '$app/paths';
-	import { api, setToken, hasCookieSession } from '$lib/api';
+	import { api, setToken, hasCookieSession, refreshSession } from '$lib/api';
 	import { notify } from '$lib/stores';
 
 	let token = '';
@@ -29,6 +29,7 @@
 		try {
 			setToken(token.trim());
 			await api.login(token.trim());
+			await refreshSession();
 			notify('Connected');
 			const params = new URLSearchParams(window.location.search);
 			const returnTo = params.get('returnTo') || `${base}/artifacts`;

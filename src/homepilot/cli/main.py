@@ -939,10 +939,19 @@ def token_create(
 
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
+                # Use admin_secret (from env or vault), not vault_passphrase
+                admin_secret = getattr(settings, "admin_secret", "") or ""
+                if not admin_secret:
+                    # Fallback: try to get it from vault directly
+                    passphrase = getattr(settings, "vault_passphrase", "") or ""
+                    if passphrase and hasattr(settings, "_try_vault_secret"):
+                        admin_secret = settings._try_vault_secret("admin-secret") or passphrase
+                    else:
+                        admin_secret = passphrase
                 resp = await client.post(
                     f"http://127.0.0.1:{port}/auth/tokens",
                     json={"label": label, "scope": scope},
-                    headers={"x-hp-admin-secret": passphrase},
+                    headers={"x-hp-admin-secret": admin_secret},
                 )
                 if resp.status_code == 201:
                     return str(resp.json()["token"])

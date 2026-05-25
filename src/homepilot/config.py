@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import logging
-import os
-import secrets
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
-
-_logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
@@ -17,19 +12,23 @@ class ConfigError(ValueError):
 
 
 def _env_files() -> list[str]:
+    import os as _os
+
     candidates = [
         str(Path.home() / ".hp" / ".env"),
-        str(Path(os.environ.get("HP_DATA_DIR", str(Path.home() / ".hp"))) / ".env"),
+        str(Path(_os.environ.get("HP_DATA_DIR", str(Path.home() / ".hp"))) / ".env"),
         ".env",
     ]
     files = [f for f in dict.fromkeys(candidates) if Path(f).exists()]
     if files:
-        _logger.debug("Loading config from: %s", ", ".join(files))
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug("Loading config from: %s", ", ".join(files))
     return files
 
 
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "HP_", "env_file": _env_files()}
+    model_config = {"env_prefix": "HP_", "env_file": _env_files(), "extra": "ignore"}
 
     data_dir: str = str(Path.home() / ".hp")
     artifacts_dir: str = str(Path.home() / ".hp" / "artifacts")
@@ -46,7 +45,7 @@ class Settings(BaseSettings):
     proxmox_verify_ssl: bool = True
 
     vault_dir: str = ""
-    vault_passphrase: str | None = None
+    vault_passphrase: str = ""
     vault_passphrase_file: str = ""
 
     jump_server_host: str = "jumpserver"
@@ -77,8 +76,8 @@ class Settings(BaseSettings):
     auto_apply_enabled: bool = False
     auto_apply_interval_seconds: int = 300
 
-    daemon_host: str = "0.0.0.0"
-    daemon_port: int = 8000
+    daemon_host: str = Field(default="0.0.0.0", validation_alias="HP_HOST")
+    daemon_port: int = Field(default=8000, validation_alias="HP_PORT")
     log_level: str = "info"
     trusted_proxies: str = ""
     cors_origins: str = (
@@ -87,7 +86,7 @@ class Settings(BaseSettings):
     cookie_secure: bool = True
     rate_limit_backend: str = "memory"
 
-    def _auto_generate_passphrase(self, secrets_mod: Any, logger: logging.Logger) -> str:
+    def _auto_generate_passphrase(self, secrets_mod: object, logger: object) -> str:
         passphrase_path = Path(self.data_dir) / ".vault_passphrase"
         try:
             if passphrase_path.exists():
@@ -95,7 +94,7 @@ class Settings(BaseSettings):
                 if passphrase:
                     logger.info("Vault passphrase loaded from %s", passphrase_path)
                     return passphrase
-            passphrase = str(secrets_mod.token_urlsafe(32))
+            passphrase = secrets_mod.token_urlsafe(32)
             passphrase_path.parent.mkdir(parents=True, exist_ok=True)
             passphrase_path.write_text(passphrase)
             passphrase_path.chmod(0o600)
@@ -105,7 +104,7 @@ class Settings(BaseSettings):
             )
             return passphrase
         except OSError:
-            passphrase = str(secrets_mod.token_urlsafe(32))
+            passphrase = secrets_mod.token_urlsafe(32)
             logger.warning(
                 "No HP_VAULT_PASSPHRASE — auto-generated (could not persist to %s). "
                 "Passphrase will change on restart.",
@@ -113,9 +112,7 @@ class Settings(BaseSettings):
             )
             return passphrase
 
-    def _auto_generate_secret_key(
-        self, secrets_mod: Any, logger: logging.Logger
-    ) -> tuple[str, bool]:
+    def _auto_generate_secret_key(self, secrets_mod: object, logger: object) -> tuple[str, bool]:
         persisted_key_path = Path(self.data_dir) / ".secret_key"
         try:
             if persisted_key_path.exists():
@@ -125,7 +122,7 @@ class Settings(BaseSettings):
                     persisted_key_path,
                 )
                 return key, False
-            key = str(secrets_mod.token_urlsafe(32))
+            key = secrets_mod.token_urlsafe(32)
             persisted_key_path.parent.mkdir(parents=True, exist_ok=True)
             persisted_key_path.write_text(key)
             persisted_key_path.chmod(0o600)
@@ -136,7 +133,7 @@ class Settings(BaseSettings):
             )
             return key, True
         except OSError:
-            key = str(secrets_mod.token_urlsafe(32))
+            key = secrets_mod.token_urlsafe(32)
             logger.warning(
                 "HP_SECRET_KEY not set — auto-generated (could not persist to %s). "
                 "Key will change on restart.",
@@ -145,23 +142,42 @@ class Settings(BaseSettings):
             return key, True
 
     def _try_vault_secret(self, name: str) -> str:
+        """Attempt to load a secret from the vault.
+
+        Uses a best-effort approach: if called inside a running event loop
+        (e.g., during Settings init via lru_cache), the async vault call
+        cannot run directly, so we dispatch it via a thread pool executor.
+        This avoids the ``asyncio.run()`` crash when Settings is created
+        inside an already-running event loop.
+        """
         try:
+            import asyncio
+            import concurrent.futures
+
             from .vault import VaultManager
 
             vault_dir = Path(self.vault_dir) if self.vault_dir else Path(self.data_dir) / "vault"
             if not vault_dir.exists():
                 return ""
-            passphrase = self.vault_passphrase or ""
+            passphrase = self.vault_passphrase
             if not passphrase and self.vault_passphrase_file:
                 passphrase = Path(self.vault_passphrase_file).read_text().strip()
             if not passphrase:
                 return ""
             vault = VaultManager(Path(self.data_dir), passphrase)
-            secret = __import__("asyncio").run(vault.get_secret(name))
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, vault.get_secret(name))
+                secret = future.result(timeout=5)
+            else:
+                secret = asyncio.run(vault.get_secret(name))
             for key in ("value", "secret", "key", "token"):
-                val: Any = secret.get(key)
-                if val:
-                    return str(val)
+                if secret.get(key):
+                    return secret[key]
             if secret:
                 first_val = next(iter(secret.values()), "")
                 if isinstance(first_val, str) and first_val:
@@ -171,9 +187,13 @@ class Settings(BaseSettings):
             return ""
 
     def model_post_init(self, __context: object) -> None:
+        import logging
+        import os as _os
+        import secrets as _secrets
+
         logger = logging.getLogger(__name__)
 
-        if os.environ.get("HP_AUTO_APPLY_MUTATING"):
+        if _os.environ.get("HP_AUTO_APPLY_MUTATING"):
             logger.warning(
                 "HP_AUTO_APPLY_MUTATING is no longer supported. "
                 "All mutating artifacts require explicit approval via 'hp artifacts approve'."
@@ -185,9 +205,17 @@ class Settings(BaseSettings):
             self.ssh_key_dir = str(Path(self.data_dir) / "ssh")
 
         # ── Resolve vault passphrase FIRST (vault reads depend on it) ──
-        if self.vault_passphrase is None and not self.vault_passphrase_file:
-            self.vault_passphrase = self._auto_generate_passphrase(secrets, logger)
+        if not self.vault_passphrase and not self.vault_passphrase_file:
+            auto_init = _os.environ.get("HP_VAULT_AUTO_INIT", "").lower() in ("1", "true", "yes")
+            if auto_init:
+                self.vault_passphrase = self._auto_generate_passphrase(_secrets, logger)
+            else:
+                logger.info(
+                    "Vault passphrase not set and HP_VAULT_AUTO_INIT not enabled — vault disabled"
+                )
         else:
+            if self.vault_passphrase:
+                logger.info("Vault passphrase loaded from HP_VAULT_PASSPHRASE env var")
             if self.vault_passphrase_file:
                 try:
                     self.vault_passphrase = Path(self.vault_passphrase_file).read_text().strip()
@@ -195,14 +223,12 @@ class Settings(BaseSettings):
                     raise ConfigError(
                         f"HP_VAULT_PASSPHRASE_FILE not found: {self.vault_passphrase_file}"
                     ) from exc
-            elif self.vault_passphrase:
-                logger.debug("HP_VAULT_PASSPHRASE is set — using provided passphrase")
 
         # ── Resolve secrets: vault → file → auto-generate ──
         _secret_key_auto_generated = False
 
         if not self.secret_key:
-            secret_key_file = os.environ.get("HP_SECRET_KEY_FILE", "")
+            secret_key_file = _os.environ.get("HP_SECRET_KEY_FILE", "")
             if secret_key_file:
                 try:
                     self.secret_key = Path(secret_key_file).read_text().strip()
@@ -214,8 +240,8 @@ class Settings(BaseSettings):
                     self.secret_key = _vault_key
                     logger.info("HP_SECRET_KEY loaded from vault")
                 else:
-                    self.secret_key, _secret_key_auto_generated = self._auto_generate_secret_key(
-                        secrets, logger
+                    self.secret_key, _secret_key_auto_generated = (
+                        self._auto_generate_secret_key(_secrets, logger)
                     )
 
         if not self.admin_secret:

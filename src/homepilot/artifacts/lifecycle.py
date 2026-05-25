@@ -10,6 +10,7 @@ import httpx
 from ..events import emit_event
 from .file_store import ArtifactFileStore
 from .models import ArtifactStatus
+from .models import ConflictError as ConflictError
 from .models import LifecycleError as LifecycleError
 from .store import ArtifactStore
 from .transitions import ArtifactTransitionManager

@@ -13,6 +13,11 @@ class LifecycleError(Exception):
     pass
 
 
+class ConflictError(LifecycleError):
+    """Raised when a state transition is invalid (e.g., already in target state)."""
+    pass
+
+
 class ArtifactKind(StrEnum):
     ANSIBLE_PLAYBOOK = "ansible-playbook"
     PROXMOX_API_SEQUENCE = "proxmox-api-sequence"

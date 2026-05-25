@@ -45,8 +45,17 @@ async def execute(
     if not no_embeddings:
         try:
             embedding = await _compute_embedding(body)
+        except ValueError as exc:
+            logger.warning(
+                "Embedding computation failed for %s: %s — doc will be indexed keyword-only",
+                artifact_id, exc,
+            )
         except Exception as exc:
-            logger.warning("Embedding computation failed for %s: %s", artifact_id, exc)
+            logger.error(
+                "Unexpected error computing embedding for %s: %s — "
+                "ensure llm-embed service is running (see docker-compose gpu profile)",
+                artifact_id, exc,
+            )
 
     try:
         doc_id = await db_repo.create_doc_metadata(
@@ -105,6 +114,16 @@ async def _compute_embedding(text: str) -> list[float]:
                 embedding = embedding_data[0].get("embedding") if embedding_data else None
             if embedding:
                 return embedding
+            logger.error(
+                "Primary embedding service returned null embedding (url=%s, model=%s)",
+                primary_url, primary_model,
+            )
+    except (httpx.ConnectError, ConnectionRefusedError) as exc:
+        logger.error(
+            "Primary embedding service unreachable (url=%s): %s — "
+            "ensure llm-embed service is running (docker compose --profile gpu up)",
+            primary_url, exc,
+        )
     except Exception as exc:
         logger.warning("Primary embedding service failed, trying fallback: %s", exc)
 
@@ -124,6 +143,16 @@ async def _compute_embedding(text: str) -> list[float]:
                     embedding = embedding_data[0].get("embedding") if embedding_data else None
                 if embedding:
                     return embedding
+                logger.error(
+                    "Fallback embedding service returned null embedding (url=%s, model=%s)",
+                    fallback_url, fallback_model,
+                )
+        except (httpx.ConnectError, ConnectionRefusedError) as exc:
+            logger.error(
+                "Fallback embedding service unreachable (url=%s): %s — "
+                "KB search will use keyword-only mode",
+                fallback_url, exc,
+            )
         except Exception as exc:
             logger.error("Fallback embedding service also failed: %s", exc)
 

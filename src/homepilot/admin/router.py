@@ -51,6 +51,29 @@ async def reload_secrets(
         proxmox_port = getattr(settings, "proxmox_port", 8006) if settings else 8006
         proxmox_verify_ssl = getattr(settings, "proxmox_verify_ssl", True) if settings else True
 
+        # Reload admin-secret from vault/env if not set
+        if settings and not getattr(settings, "admin_secret", ""):
+            from ..vault import VaultError as _VE
+
+            try:
+                admin_data = await vault.get_secret("admin-secret")
+                admin_val = admin_data.get("secret", "") or admin_data.get("value", "")
+                if not admin_val:
+                    for v in admin_data.values():
+                        if isinstance(v, str) and v:
+                            admin_val = v
+                            break
+                if admin_val:
+                    settings.admin_secret = admin_val
+                    reloaded.append("admin-secret")
+            except (_VE, OSError):
+                logger.debug("Vault 'admin-secret' unavailable during reload", exc_info=True)
+        if not reloaded or "admin-secret" not in reloaded:
+            admin_env = os.environ.get("HP_ADMIN_SECRET", "")
+            if admin_env and settings and not getattr(settings, "admin_secret", ""):
+                settings.admin_secret = admin_env
+                reloaded.append("admin-secret")
+
         if proxmox_host:
             from ..vault import VaultError
 

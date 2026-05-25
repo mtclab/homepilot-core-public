@@ -14,7 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from ..auth.deps import require_scope
 from ..sse import bus as sse_bus
-from .lifecycle import ArtifactLifecycle, LifecycleError
+from .lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
 from .store import ArtifactStore
 
 logger = logging.getLogger(__name__)
@@ -180,6 +180,8 @@ async def approve_artifact(request: Request, artifact_id: str) -> dict[str, Any]
     reason = body.get("reason")
     try:
         await lifecycle.approve(artifact_id, user, reason)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         msg = str(e)
         if "Invalid transition" in msg:
@@ -198,6 +200,8 @@ async def reject_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     reason = body.get("reason")
     try:
         await lifecycle.reject(artifact_id, user, reason)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         msg = str(e)
         if "Invalid transition" in msg:
@@ -222,6 +226,8 @@ async def apply_artifact(
 
     try:
         task_info = await task_runner.start_apply(artifact_id, approved_by)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         msg = str(e)
         if "Invalid transition" in msg:
@@ -265,6 +271,8 @@ async def revoke_artifact(
 
     try:
         task_info = await task_runner.start_revoke(artifact_id, user, reason)
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:

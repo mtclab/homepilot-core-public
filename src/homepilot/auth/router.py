@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import time
 from collections import defaultdict
@@ -33,8 +34,39 @@ _TOKEN_CREATE_RATE_WINDOW = 60
 _token_create_attempts: dict[str, list[float]] = defaultdict(list)
 
 
-def _cookie_secure() -> bool:
-    return get_settings().cookie_secure
+def _cookie_secure(request: Request | None = None) -> bool:
+    if not get_settings().cookie_secure:
+        return False
+    return not (request is not None and request.url.scheme == "http")
+
+
+async def resolve_admin_secret(request: Request) -> str:
+    """Resolve admin secret from settings, then vault at runtime, then env."""
+    settings = get_settings()
+    admin_secret = settings.admin_secret
+    if admin_secret:
+        return admin_secret
+
+    vault = getattr(request.app.state, "vault", None)
+    if vault is not None:
+        from ..vault import VaultError
+
+        try:
+            secret_data = await vault.get_secret("admin-secret")
+            val = secret_data.get("secret", "") or secret_data.get("value", "")
+            if val:
+                return val
+            for v in secret_data.values():
+                if isinstance(v, str) and v:
+                    return v
+        except (VaultError, OSError):
+            logger.debug("Vault 'admin-secret' unavailable at runtime", exc_info=True)
+
+    env_secret = os.environ.get("HP_ADMIN_SECRET", "")
+    if env_secret:
+        return env_secret
+
+    return ""
 
 
 class LoginRequest(BaseModel):
@@ -138,7 +170,7 @@ async def login(
         raw_token,
         httponly=True,
         samesite=_same_site_lax,
-        secure=_cookie_secure(),
+        secure=_cookie_secure(request),
         path="/",
         max_age=60 * 60 * 24 * 30,
     )
@@ -147,7 +179,7 @@ async def login(
         csrf_token,
         httponly=False,
         samesite=_same_site_lax,
-        secure=_cookie_secure(),
+        secure=_cookie_secure(request),
         path="/",
         max_age=60 * 60 * 24 * 30,
     )
@@ -176,10 +208,10 @@ async def logout(
             pass
 
     response.delete_cookie(
-        _COOKIE_HP_TOKEN, path="/", secure=_cookie_secure(), samesite=_same_site_lax
+        _COOKIE_HP_TOKEN, path="/", secure=_cookie_secure(request), samesite=_same_site_lax
     )
     response.delete_cookie(
-        _COOKIE_HP_CSRF, path="/", secure=_cookie_secure(), samesite=_same_site_lax
+        _COOKIE_HP_CSRF, path="/", secure=_cookie_secure(request), samesite=_same_site_lax
     )
     return {"status": "ok"}
 
@@ -190,7 +222,7 @@ async def admin_create_token(
     request: Request,
     db: Repository = _get_db_dep,
 ) -> dict[str, str]:
-    """Create an API token via admin secret. Avoids direct DB access when backend is live."""
+    """Create an API token via admin secret. Checks vault at runtime if not in settings."""
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
     window = _token_create_attempts[client_ip]
@@ -201,15 +233,17 @@ async def admin_create_token(
         raise HTTPException(status_code=429, detail="Rate limit exceeded for token creation")
     _token_create_attempts[client_ip].append(now)
 
-    settings = get_settings()
-    admin_secret = settings.admin_secret
+    admin_secret = await resolve_admin_secret(request)
     if not admin_secret:
         logger.warning("Admin token creation attempted but HP_ADMIN_SECRET is not configured")
         raise HTTPException(
             status_code=403,
             detail="HP_ADMIN_SECRET must be configured to use admin token creation",
         )
-    header_secret = request.headers.get("x-hp-admin-secret", "")
+    # Accept both X-Hp-Admin-Secret (canonical) and X-Admin-Secret (common convention)
+    header_secret = request.headers.get("x-hp-admin-secret") or request.headers.get(
+        "x-admin-secret", ""
+    )
     if not secrets.compare_digest(header_secret.encode(), admin_secret.encode()):
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 

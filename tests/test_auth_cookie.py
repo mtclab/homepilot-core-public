@@ -304,7 +304,7 @@ class TestCookieSecureFlag:
         client, token = setup
         import homepilot.auth.router as router_mod
 
-        monkeypatch.setattr(router_mod, "_cookie_secure", lambda: True)
+        monkeypatch.setattr(router_mod, "_cookie_secure", lambda req=None: True)
 
         resp = client.post("/auth/login", json={"token": token})
         assert resp.status_code == 200
@@ -320,7 +320,7 @@ class TestCookieSecureFlag:
         resp = client.post("/auth/login", json={"token": token})
         assert resp.status_code == 200
         set_cookie = resp.headers.get("set-cookie", "")
-        assert "Secure" in set_cookie
+        assert "Secure" not in set_cookie
 
 
 class TestRevokeTokenEndpoint:

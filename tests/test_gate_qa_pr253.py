@@ -187,15 +187,13 @@ class TestAdminTokenCreationEdgeCases:
             mock_settings.admin_secret = "correct-secret"
             import homepilot.auth.router as router_mod
 
-            router_mod._token_create_attempts.clear()
-
             with patch.object(router_mod, "get_settings", return_value=mock_settings):
                 resp = client.post(
                     "/auth/tokens",
                     json={"label": "ci", "scope": "read"},
                     headers={"x-hp-admin-secret": "wrong-secret"},
                 )
-                assert resp.status_code in (403, 429)
+                assert resp.status_code == 403
         finally:
             await db.close()
 
@@ -271,7 +269,7 @@ class TestRateLimitBoundaries:
         _RATE_WINDOW.clear()
 
     async def test_expired_requests_dont_count(self):
-        from homepilot.main import _RATE_WINDOW, _RATE_WINDOW_SEC, rate_limit_middleware
+        from homepilot.main import _RATE_WINDOW_SEC, _RATE_WINDOW, rate_limit_middleware
 
         _RATE_WINDOW.clear()
         import time as _time
@@ -422,6 +420,7 @@ class TestConfigAdminSecret:
     def test_default_empty(self):
         s = Settings(
             secret_key="test-secret-key-for-pytest-only-not-for-production",
+            admin_secret="",
         )
         assert s.admin_secret == ""
 

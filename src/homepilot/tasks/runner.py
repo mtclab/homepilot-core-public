@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from ..artifacts.lifecycle import ArtifactLifecycle, LifecycleError
+from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
 from ..artifacts.models import ArtifactStatus
 from ..artifacts.store import ArtifactStore
 from ..executor.orchestrator import ArtifactExecutor
@@ -54,8 +54,8 @@ class TaskRunner:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
         status = ArtifactStatus(fm["status"])
-        if status not in (ArtifactStatus.APPROVED,):
-            raise LifecycleError(f"Invalid transition: {status.value} → apply")
+        if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED):
+            raise ConflictError(f"Invalid transition: {status.value} → apply")
 
         assert task_id is not None
         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
@@ -82,7 +82,7 @@ class TaskRunner:
 
         status = ArtifactStatus(fm["status"])
         if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED, ArtifactStatus.FAILED):
-            raise LifecycleError(f"Invalid transition: {status.value} → revoke")
+            raise ConflictError(f"Invalid transition: {status.value} → revoke")
 
         task_id = await self.repo.create_task(artifact_id, "revoke")
         task = asyncio.create_task(self._run_revoke(task_id, artifact_id, user, reason))

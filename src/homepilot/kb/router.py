@@ -83,6 +83,12 @@ async def search_kb(
     return {"results": results, "total": len(results), "search_mode": primary}
 
 
+@router.get("/embedding-status", dependencies=[Depends(require_scope("admin"))])
+async def embedding_status(request: Request) -> dict[str, Any]:
+    svc = _get_service(request)
+    return await svc.embedding_status()
+
+
 @router.post("", dependencies=[Depends(require_scope("write"))])
 async def record_fact(request: Request, body: CreateNoteRequest) -> dict[str, Any]:
     svc = _get_service(request)

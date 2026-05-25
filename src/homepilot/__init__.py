@@ -11,7 +11,7 @@ def _read_pyproject_version() -> str:
         stripped = line.strip()
         if stripped.startswith("version"):
             return stripped.split("=", 1)[1].strip().strip('"').strip("'")
-    return "0.0.0"
+    return "2.2.5"
 
 
 try:
