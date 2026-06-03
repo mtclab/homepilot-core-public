@@ -39,7 +39,7 @@ Web UI: **http://localhost:8000/ui**
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=2.2.0 docker compose pull
+HP_IMAGE_TAG=2.2.5 docker compose pull
 docker compose up -d
 ```
 

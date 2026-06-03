@@ -392,7 +392,7 @@ Client config (e.g. in a Kasm workspace):
 ### Deploy
 
 ```bash
-HP_IMAGE_TAG=v2.2.0 docker compose up -d backend
+HP_IMAGE_TAG=v2.2.5 docker compose up -d backend
 ```
 
 Migrations run automatically on startup.
