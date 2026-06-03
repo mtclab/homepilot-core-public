@@ -50,7 +50,7 @@ The `VaultManager.get_secret` is an async method being called synchronously from
 **Severity**: Medium  
 **Status**: Found, not yet fixed  
 **Location**: `src/homepilot/auth/router.py` — `login()` function  
-**Description**: The login endpoint sets cookies with `Secure` flag, but the dev server runs on HTTP (`http://your-server.local:8000`). Browsers correctly refuse to send `Secure` cookies over plain HTTP, causing authentication to fail in real browser contexts. The Playwright Python `add_cookies` workaround (removing the Secure flag) works but shouldn't be necessary.
+**Description**: The login endpoint sets cookies with `Secure` flag, but the dev server runs on HTTP (`http://10.0.0.100:8000`). Browsers correctly refuse to send `Secure` cookies over plain HTTP, causing authentication to fail in real browser contexts. The Playwright Python `add_cookies` workaround (removing the Secure flag) works but shouldn't be necessary.
 
 **Fix**: Make the `Secure` flag conditional on the request scheme — set `Secure=True` only when `request.url.scheme == 'https'`.
 

@@ -2,7 +2,7 @@
 """Screenshot documentation pages from HomePilot with automatic censoring of sensitive data.
 
 Usage:
-    .venv/bin/python scripts/screenshot-docs.py [--output-dir docs/screenshots] [--base-url http://your-server.local:8000]
+    .venv/bin/python scripts/screenshot-docs.py [--output-dir docs/screenshots] [--base-url http://10.0.0.100:8000]
 
 Censoring rules:
     - API tokens/secrets: replaced with colored rectangles
@@ -147,7 +147,7 @@ def take_screenshot(page, url, page_info, output_dir, auth_token=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Screenshot HomePilot docs with censoring")
-    parser.add_argument("--base-url", default="http://your-server.local:8000", help="Base URL")
+    parser.add_argument("--base-url", default="http://10.0.0.100:8000", help="Base URL")
     parser.add_argument("--output-dir", default="docs/screenshots", help="Output directory")
     parser.add_argument("--auth-token", default=None, help="Auth token for authenticated pages")
     args = parser.parse_args()
