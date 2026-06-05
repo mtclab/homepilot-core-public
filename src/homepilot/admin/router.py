@@ -53,7 +53,7 @@ async def reload_secrets(
 
         # Reload admin-secret from vault/env if not set
         if settings and not getattr(settings, "admin_secret", ""):
-            from ..vault import VaultError as _VE
+            from ..vault import VaultError
 
             try:
                 admin_data = await vault.get_secret("admin-secret")
@@ -66,7 +66,7 @@ async def reload_secrets(
                 if admin_val:
                     settings.admin_secret = admin_val
                     reloaded.append("admin-secret")
-            except (_VE, OSError):
+            except (VaultError, OSError):
                 logger.debug("Vault 'admin-secret' unavailable during reload", exc_info=True)
         if not reloaded or "admin-secret" not in reloaded:
             admin_env = os.environ.get("HP_ADMIN_SECRET", "")

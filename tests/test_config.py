@@ -191,7 +191,9 @@ class TestSettingsDefaults:
         with caplog.at_level(logging.DEBUG, logger="homepilot.config"):
             s = Settings(secret_key="testkey", vault_passphrase="env-pass")
         assert s.vault_passphrase == "env-pass"
-        assert not any("auto-generated" in r.message for r in caplog.records if "passphrase" in r.message)
+        assert not any(
+            "auto-generated" in r.message for r in caplog.records if "passphrase" in r.message
+        )
 
     def test_prod_env_stable_key_required(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HP_ENV", "production")

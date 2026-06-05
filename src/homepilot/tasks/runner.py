@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
+from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError
 from ..artifacts.models import ArtifactStatus
 from ..artifacts.store import ArtifactStore
 from ..executor.orchestrator import ArtifactExecutor

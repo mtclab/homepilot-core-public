@@ -497,8 +497,8 @@ class TestTaskRunner:
 async def _create_authenticated_client(
     db: Database, task_repo: TaskRepository, task_runner: TaskRunner
 ):
+    import httpx
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient as _TestClient
 
     from homepilot.artifacts.router import router as artifacts_router
     from homepilot.auth.deps import require_scope, require_token
@@ -558,7 +558,13 @@ async def _create_authenticated_client(
     app.include_router(artifacts_router, prefix="/artifacts")
     app.include_router(tasks_router, prefix="/tasks")
 
-    client = _TestClient(app, raise_server_exceptions=False)
+    # httpx AsyncClient over ASGITransport runs the app in the SAME event loop as
+    # the test, so the fire-and-forget apply/revoke task (asyncio.create_task in
+    # start_apply) is tracked + cancelled by pytest-asyncio at loop close. The old
+    # sync TestClient ran requests in a separate portal loop, orphaning that task
+    # and intermittently wedging fixture teardown (issue #298).
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    client = httpx.AsyncClient(transport=transport, base_url="http://test", follow_redirects=True)
     client._auth_headers = {"Authorization": f"Bearer {raw_token}"}
     return client
 
@@ -578,7 +584,7 @@ class TestTaskEndpoints:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get(f"/tasks/{task_id}", headers=client._auth_headers)
+        resp = await client.get(f"/tasks/{task_id}", headers=client._auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == task_id
@@ -597,7 +603,7 @@ class TestTaskEndpoints:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get("/tasks/nonexistent-id", headers=client._auth_headers)
+        resp = await client.get("/tasks/nonexistent-id", headers=client._auth_headers)
         assert resp.status_code == 404
 
     async def test_list_tasks_for_artifact(self, task_repo: TaskRepository, mock_store: MagicMock):
@@ -618,7 +624,9 @@ class TestTaskEndpoints:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get("/tasks/", params={"artifact_id": aid}, headers=client._auth_headers)
+        resp = await client.get(
+            "/tasks/", params={"artifact_id": aid}, headers=client._auth_headers
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] == 2
@@ -640,7 +648,7 @@ class TestTaskEndpoints:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get(
+        resp = await client.get(
             "/tasks/",
             params={"artifact_id": aid, "limit": 2, "offset": 0},
             headers=client._auth_headers,
@@ -669,7 +677,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.post(
+        resp = await client.post(
             "/artifacts/2025-01-01-test-abc123/apply",
             json={"approved_by": "test"},
             headers=client._auth_headers,
@@ -705,7 +713,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.post(
+        resp = await client.post(
             "/artifacts/2025-01-01-test-abc123/apply",
             json={"approved_by": "test"},
             headers=client._auth_headers,
@@ -727,7 +735,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.post(
+        resp = await client.post(
             "/artifacts/nonexistent-id/apply",
             json={"approved_by": "test"},
             headers=client._auth_headers,
@@ -755,7 +763,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.request(
+        resp = await client.request(
             "DELETE",
             "/artifacts/2025-01-01-test-abc123",
             json={"user": "admin"},
@@ -783,7 +791,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.request(
+        resp = await client.request(
             "DELETE",
             "/artifacts/2025-01-01-test-abc123",
             json={"user": "admin"},
@@ -815,7 +823,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get("/artifacts/2025-01-01-test-abc123", headers=client._auth_headers)
+        resp = await client.get("/artifacts/2025-01-01-test-abc123", headers=client._auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["active_task"] is not None
@@ -839,7 +847,7 @@ class TestArtifactEndpointsAsync:
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
-        resp = client.get("/artifacts/2025-01-01-test-abc123", headers=client._auth_headers)
+        resp = await client.get("/artifacts/2025-01-01-test-abc123", headers=client._auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["active_task"] is None

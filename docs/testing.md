@@ -53,9 +53,12 @@ playwright install chromium
 ```bash
 export HP_TEST_URL=http://homepilot:8000
 export HP_TEST_TOKEN=hp_60709341b3d8c1b602b5d82eb5429344375debdcc3c5f83a14dfaed645c89c66
+export HP_TEST_ADMIN_SECRET=your-admin-secret  # required for token CRUD tests
 
 pytest tests/test_e2e.py -v
 ```
+
+> **Note:** E2e tests should be run **in isolation** (not after the full unit test suite) because unit tests hit auth endpoints heavily and can exhaust the server's per-IP rate limit window. If running after unit tests, wait ~70s for the rate limit window to reset.
 
 On the Kasm workspace (no display needed — runs headless):
 
@@ -67,11 +70,28 @@ DISPLAY=:1.0 HP_TEST_TOKEN=hp_... pytest tests/test_e2e.py -v
 
 | Test class | What it verifies |
 |---|---|
-| `TestAuthRedirect` | Fresh browser → redirected to `/settings`; login → redirect back |
+| `TestAuthRedirect` | Fresh browser → redirected to `/login`; login → redirect back |
 | `TestAPIHealth` | `/health` OK; authenticated requests succeed; unauthenticated → 401 |
 | `TestUIPages` | All 7 UI routes render without inline 401 errors |
-| `TestRateLimiting` | Authenticated requests bypass rate limit; unauthenticated login flood → 429 |
 | `TestAdminTokenCreate` | `/auth/tokens` without admin secret → 403 |
+| `TestTokenCRUD` | Create, list, and revoke tokens via admin secret |
+| `TestKBCRUD` | Create and search KB notes |
+| `TestCSRFProtection` | Mutation without CSRF headers → 403; with CSRF → accepted |
+| `TestTokenScopeEnforcement` | Read-only token cannot delete or access admin endpoints |
+| `TestPathTraversal` | Path traversal in ingest paths rejected |
+| `TestSessionIndicator` | `auth/me` returns authenticated user info |
+| `TestAuthRoundTrip` | Login → me → logout → me=401 flow |
+| `TestAuthBypass` | Unauthenticated requests to protected paths → 401/403/429 |
+| `TestRateLimiting` | Authenticated requests within limit; unauthenticated flood → 429 |
+
+### Auth model
+
+E2e tests use **two auth patterns**:
+
+1. **Bearer auth** — API calls that don't need cookies (health, artifacts, KB search, etc.)
+2. **Cookie auth + CSRF** — Browser-authenticated mutations (token create/revoke, KB create, UI navigation)
+
+The `session_auth` fixture pre-creates all needed tokens at session start (with 429 retry logic) so individual tests don't hit the token creation rate limit.
 
 ### Skip in CI
 

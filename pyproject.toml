@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "2.2.5"
+version = "2.3.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -41,11 +41,12 @@ dev = [
     "types-PyYAML>=6.0",
     "respx>=0.22",
     "playwright>=1.40",
+    "pytest-timeout>=2.3",
 ]
 
 security = [
     "pip-audit>=0.1",
-    "bandit>=1.8",
+    "bandit>=1.9.4,<2",
     "detect-secrets>=1.5",
 ]
 
@@ -65,7 +66,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
-per-file-ignores = { "tests/*" = ["E501"] }
+per-file-ignores = { "tests/*" = ["E501"], "scripts/*" = ["E501"] }
 
 [tool.mypy]
 python_version = "3.11"
@@ -86,6 +87,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Bound every test (and unblock an intermittent async-teardown hang); thread
+# method so a stuck socket/subprocess can't wedge the whole run. See issue #295.
+timeout = 120
+timeout_method = "thread"
 markers = [
     "e2e: end-to-end tests requiring a live HomePilot instance (HP_TEST_TOKEN must be set)",
+    "integration: integration tests that exercise multiple components together",
 ]

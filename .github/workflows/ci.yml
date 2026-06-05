@@ -1,16 +1,15 @@
 name: CI
 
 on:
-  workflow_dispatch: {}
   push:
-    branches: [main]
+    branches: [master, dev]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
       - "LICENSE"
       - ".gitignore"
   pull_request:
-    branches: [main]
+    branches: [master, dev]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
@@ -21,9 +20,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# dorny/paths-filter lists changed files via the PR API on pull_request events,
-# which needs pull-requests:read. Without it the job fails with
-# "Resource not accessible by integration".
+# dorny/paths-filter queries the PR's changed files via the API on
+# pull_request events — it needs read access to contents + pull-requests.
 permissions:
   contents: read
   pull-requests: read
@@ -31,12 +29,14 @@ permissions:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       python: ${{ steps.filter.outputs.python }}
       web: ${{ steps.filter.outputs.web }}
+      go: ${{ steps.filter.outputs.go }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      - uses: dorny/paths-filter@v4
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -49,11 +49,64 @@ jobs:
             web:
               - 'web/**'
               - '.github/workflows/ci.yml'
+            go:
+              - 'agent/go/**'
+              - '.github/workflows/ci.yml'
 
-  lint:
+  go-agent:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Vet + test
+        working-directory: agent/go
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build static (amd64 + arm64)
+        working-directory: agent/go
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /tmp/agent-host-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /tmp/agent-host-arm64 .
+
+  test:
     needs: changes
     if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src/ jumpserver/
+
+      - name: Format check
+        run: ruff format --check src/ jumpserver/
+
+      - name: Type check
+        run: mypy src/
+
+      - name: Tests
+        run: pytest tests/ --ignore=tests/test_e2e.py -v --tb=short -x
+
+  smoke:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
@@ -62,33 +115,45 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -e ".[dev]"
-      - name: Ruff check
-        run: ruff check src/ jumpserver/ tests/
-      - name: Ruff format check
-        run: ruff format --check src/ jumpserver/ tests/
-      - name: Mypy
-        run: mypy src/
+      - name: Start server in background
+        run: |
+          uvicorn homepilot.main:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 10); do
+            curl -sf http://localhost:8000/health && break
+            sleep 2
+          done
+        env:
+          HP_SECRET_KEY: test-secret-key-for-ci
+          HP_VAULT_PASSPHRASE: test-vault-passphrase
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh http://localhost:8000
 
   build-web:
     needs: changes
     if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
+
       - name: Install web dependencies
         run: npm ci
         working-directory: web
+
       - name: Type check
         run: npm run check
         working-directory: web
+
       - name: Unit tests
         run: npm test
         working-directory: web
+
       - name: Build
         run: npm run build
         working-directory: web

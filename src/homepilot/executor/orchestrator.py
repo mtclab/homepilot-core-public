@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
 from homepilot.adapters.ssh import SSHAdapter
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
@@ -47,6 +48,7 @@ class ArtifactExecutor:
         ssh: SSHAdapter,
         vault: VaultManager,
         pve_nodes: list[str] | None = None,
+        agent: AgentAdapter | None = None,
     ):
         self.store = store
         self.lifecycle = lifecycle
@@ -55,6 +57,17 @@ class ArtifactExecutor:
         self.ssh = ssh
         self.vault = vault
         self.pve_nodes = pve_nodes or []
+        self.agent = agent
+
+    @property
+    def host_adapter(self) -> AgentAdapter | SSHAdapter:
+        """Return agent adapter if available, otherwise SSH.
+
+        Agent adapter tries the agent hub first and falls back to SSH.
+        """
+        if self.agent is not None:
+            return self.agent
+        return self.ssh
 
     async def apply(self, artifact_id: str, approved_by: str) -> ExecutionResult:
         fm, body = self.store.read(artifact_id)
@@ -201,7 +214,9 @@ class ArtifactExecutor:
     ) -> ExecutionResult:
         result: dict[str, Any]
         if kind == ArtifactKind.ANSIBLE_PLAYBOOK:
-            result = await ansible_execute(fm, body, target, self.ssh, self.repo, self.pve_nodes)
+            result = await ansible_execute(
+                fm, body, target, self.host_adapter, self.repo, self.pve_nodes
+            )
         elif kind == ArtifactKind.PROXMOX_API_SEQUENCE:
             result = await proxmox_api_execute(fm, body, target, self.proxmox, self.vault)
         elif kind == ArtifactKind.HTTP_SEQUENCE:
@@ -209,7 +224,7 @@ class ArtifactExecutor:
         elif kind == ArtifactKind.COMPOSITE:
             result = await composite_execute(fm, body, self.lifecycle, self)
         elif kind == ArtifactKind.SHELL_SCRIPT:
-            result = await shell_script_execute(fm, body, target, self.ssh, self.pve_nodes)
+            result = await shell_script_execute(fm, body, target, self.host_adapter, self.pve_nodes)
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:
@@ -242,7 +257,7 @@ class ArtifactExecutor:
         try:
             if kind == ArtifactKind.ANSIBLE_PLAYBOOK:
                 await ansible_execute(
-                    fm, body, target, self.ssh, self.repo, self.pve_nodes, rollback=True
+                    fm, body, target, self.host_adapter, self.repo, self.pve_nodes, rollback=True
                 )
             elif kind == ArtifactKind.PROXMOX_API_SEQUENCE:
                 await proxmox_api_execute(fm, body, target, self.proxmox, self.vault, rollback=True)
@@ -250,7 +265,7 @@ class ArtifactExecutor:
                 await http_sequence_execute(fm, body, target, self.vault, rollback=True)
             elif kind == ArtifactKind.SHELL_SCRIPT:
                 await shell_script_execute(
-                    fm, body, target, self.ssh, self.pve_nodes, rollback=True
+                    fm, body, target, self.host_adapter, self.pve_nodes, rollback=True
                 )
             elif kind == ArtifactKind.COMPOSITE:
                 await composite_execute(fm, body, self.lifecycle, self, rollback=True)

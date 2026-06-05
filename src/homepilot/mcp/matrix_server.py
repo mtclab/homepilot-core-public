@@ -266,8 +266,8 @@ def _load_room_id() -> str:
 
 
 def _parse_sender_role(sender: str) -> str:
-    """Extract role from sender like @hp-architect:example.com."""
-    m = re.match(r"@hp-([a-z]+):example\.com", sender)
+    """Extract role from sender like @hp-architect:matrix.example.com."""
+    m = re.match(r"@hp-([a-z]+):", sender)
     if m:
         return m.group(1)
     return "unknown"

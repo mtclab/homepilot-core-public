@@ -15,6 +15,7 @@ class LifecycleError(Exception):
 
 class ConflictError(LifecycleError):
     """Raised when a state transition is invalid (e.g., already in target state)."""
+
     pass
 
 

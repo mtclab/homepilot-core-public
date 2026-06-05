@@ -55,7 +55,7 @@ async def resolve_admin_secret(request: Request) -> str:
             secret_data = await vault.get_secret("admin-secret")
             val = secret_data.get("secret", "") or secret_data.get("value", "")
             if val:
-                return val
+                return str(val)
             for v in secret_data.values():
                 if isinstance(v, str) and v:
                     return v

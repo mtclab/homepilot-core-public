@@ -353,10 +353,10 @@ class TestMigrationV2:
         assert "idx_drift_checks_artifact" in idx_names
         assert "idx_drift_checks_drifted" in idx_names
 
-    async def test_schema_version_is_8(self, real_db):
+    async def test_schema_version_is_9(self, real_db):
         row = await real_db.fetchone("SELECT value FROM settings WHERE key = 'schema_version'")
         assert row is not None
-        assert int(row["value"]) == 8
+        assert int(row["value"]) == 9
 
     async def test_drift_checks_unique_constraint(self, real_db):
         import datetime

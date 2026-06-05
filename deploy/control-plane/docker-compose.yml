@@ -1,0 +1,49 @@
+# HomePilot v2 — control-plane only (backend + agent-hub).
+# Jumpserver is intentionally absent: the host agent (agent-hub) replaced it.
+# Agent-stack services (llm, n8n, searxng, radicale, …) live in the
+# homepilot-agent monitoring/matrix stack, not here.
+#
+# Layout on the deployment host:
+#   /opt/homepilot/
+#     docker-compose.yml   <- this file
+#     .env                 <- from .env.example
+#     repo/                <- homepilot-v2 source (Docker build context)
+#
+# Data (db + vault) lives in the named volume `hp-data`, which inherits the
+# image's homepilot:homepilot (uid 999) ownership on first use — so there is no
+# host-side chown step. If you prefer a host bind mount for easy backups, use
+#   volumes: ["./data/hp:/home/homepilot/.hp"]
+# and `chown -R 999:999 ./data/hp` before the first start (see docs/bugs-found.md
+# Bug 8).
+services:
+  backend:
+    container_name: homepilot
+    image: homepilot-v2:${HP_IMAGE_TAG:-2.3.0}
+    build:
+      context: ./repo
+      dockerfile: Dockerfile
+    ports:
+      - "${HP_DAEMON_PORT:-8000}:8000"
+      - "${HP_AGENT_HUB_PORT:-8443}:8443"
+    volumes:
+      - hp-data:/home/homepilot/.hp
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    networks:
+      - homepilot
+
+networks:
+  homepilot:
+    driver: bridge
+
+volumes:
+  hp-data:

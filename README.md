@@ -51,6 +51,7 @@ Available tags: `latest`, `2.2.0`, `2.2`, `2` — see [Releases](https://github.
 |---|---|---|
 | backend | 8000 | FastAPI + web UI at `/ui` |
 | jumpserver | 50051 | TCP SSH relay for managed hosts (length-prefixed JSON protocol) |
+| agent hub | 8443 | TCP agent relay (outbound from managed hosts, length-prefixed JSON) |
 
 ## Configuration
 
@@ -67,6 +68,11 @@ Key settings:
 | `HP_JUMP_ENABLED` | `false` | Enable SSH via jumpserver relay |
 | `HP_ARTIFACTS_REMOTE` | — | Git remote for artifact backup (e.g. `git@github.com:org/homepilot-artifacts.git`) |
 | `HP_ARTIFACTS_SSH_KEY` | — | Absolute path to SSH private key for artifacts remote (inside container) |
+| `HP_AGENT_HUB_ENABLED` | `false` | Enable agent hub TCP server |
+| `HP_AGENT_HUB_HOST` | `0.0.0.0` | Hub bind address |
+| `HP_AGENT_HUB_PORT` | `8443` | Hub listen port |
+| `HP_AGENT_HUB_AUTH_TOKEN` | — | Shared secret for agent authentication |
+| `HP_AGENT_HUB_TLS` | `false` | Enable TLS on hub (`HP_AGENT_HUB_CERT`/`HP_AGENT_HUB_KEY` required) |
 
 ## Artifact Git Backup
 
@@ -92,6 +98,94 @@ Setup steps:
 6. Set `HP_ARTIFACTS_REMOTE` and `HP_ARTIFACTS_SSH_KEY` in `.env` and restart
 
 Push failures are non-fatal — HomePilot continues normally if the remote is unreachable.
+
+## Agent Hub
+
+HomePilot can manage remote hosts through a lightweight agent daemon instead of SSH, reducing SSH dependency by ~90%. The agent connects outbound to the hub — no inbound ports needed on managed hosts.
+
+### How it works
+
+1. **Hub server** runs inside the HomePilot Docker container (TCP port 8443)
+2. **Agent daemon** (`agent-host`) runs on each managed host, connects to hub via persistent TCP
+3. **AgentAdapter** routes commands through the hub when an agent is connected, falls back to SSH via jumpserver when no agent is available
+4. Commands are restricted by an allowlist (safe commands always, privileged commands require `HP_AGENT_PRIVILEGED=true`)
+5. File reads/writes are restricted to allowed path prefixes
+
+### Agent deployment
+
+```bash
+# Option 1: Standalone binary (recommended, no Python needed on target)
+cd agent/
+pip install pyinstaller
+pyinstaller agent-host.spec
+scp dist/agent-host target:/usr/local/bin/
+ssh target 'chmod +x /usr/local/bin/agent-host'
+
+# Option 2: Pip install (for development)
+pip install "git+https://github.com/mtclab/homepilot-core-public.git#subdirectory=agent"
+# or, from a checkout: pip install ./agent
+
+# Configure via environment variables
+export HP_AGENT_HUB_HOST=homelab.local
+export HP_AGENT_HUB_PORT=8443
+export HP_AGENT_AUTH_TOKEN=<token-from-agent-host-token>
+
+# Or use a one-time bootstrap token (24h expiry, consumed on first connect)
+export HP_AGENT_AUTH_TOKEN=hpbat_<bootstrap-token>
+
+agent-host
+```
+
+Systemd unit file is included at `agent/agent-host.service` (calls `/usr/local/bin/agent-host`).
+
+### Zabbix trapper integration
+
+When `HP_ZABBIX_ENABLED=true`, the agent pushes system metrics (CPU, memory, disk, load) directly to your Zabbix server via the sender protocol (TCP port 10051) — no zabbix-agent2 needed on managed hosts. Metrics are sent on a configurable interval and on-demand via the API.
+
+### Agent environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HP_AGENT_HUB_HOST` | `localhost` | Hub server hostname |
+| `HP_AGENT_HUB_PORT` | `8443` | Hub server port |
+| `HP_AGENT_AUTH_TOKEN` | — | Persistent auth token or one-time bootstrap token |
+| `HP_AGENT_PRIVILEGED` | `false` | Enable docker/systemctl/apt commands |
+| `HP_AGENT_TLS` | `false` | Enable TLS for hub connection |
+| `HP_AGENT_TLS_CA` | — | CA certificate path for TLS |
+| `HP_AGENT_TLS_CERT` | — | Client certificate path for mTLS |
+| `HP_AGENT_TLS_KEY` | — | Client key path for mTLS |
+| `HP_ZABBIX_ENABLED` | `false` | Enable Zabbix trapper push |
+| `HP_ZABBIX_SERVER` | `localhost` | Zabbix server IP |
+| `HP_ZABBIX_PORT` | `10051` | Zabbix trapper port |
+| `HP_ZABBIX_HOSTNAME` | system hostname | Hostname as registered in Zabbix |
+| `HP_ZABBIX_SEND_INTERVAL` | `60` | Push interval in seconds |
+
+### Agent API endpoints
+
+All require API authentication. Endpoints marked **(admin)** require admin scope.
+
+| Method | Path | Scope | Description |
+|---|---|---|---|
+| GET | `/api/agents/` | read | List connected agents |
+| GET | `/api/agents/token` | admin | Get hub auth token for agent config |
+| GET | `/api/agents/bootstrap` | admin | Generate one-time bootstrap token |
+| GET | `/api/agents/audit` | admin | Query audit log |
+| GET | `/api/agents/hostname/{hostname}/connected` | read | Check if agent is connected |
+| POST | `/api/agents/host/exec` | admin | Execute command on host (via agent or SSH fallback) |
+| POST | `/api/agents/host/read-file` | admin | Read file from host |
+| POST | `/api/agents/host/write-file` | admin | Write file to host (allowed prefixes only) |
+| POST | `/api/agents/{agent_id}/zabbix-push` | admin | Trigger on-demand Zabbix metrics push |
+| POST | `/api/agents/{agent_id}/exec` | admin | Execute command on specific agent |
+| POST | `/api/agents/{agent_id}/read-file` | admin | Read file from specific agent |
+| POST | `/api/agents/{agent_id}/write-file` | admin | Write file to specific agent |
+
+### Agent CLI commands
+
+```bash
+hp agent token          # Show hub auth token
+hp agent bootstrap      # Generate one-time bootstrap token
+hp agent list           # List connected agents
+```
 
 ## CLI
 
@@ -128,6 +222,9 @@ hp webhook add                # register a webhook endpoint
 hp webhook list               # list webhook configurations
 hp webhook delete             # remove a webhook endpoint
 hp webhook test               # send a test event to a webhook
+hp agent token                # show hub auth token for agent config
+hp agent bootstrap            # generate one-time bootstrap token
+hp agent list                 # list connected agents
 ```
 
 ## MCP Server

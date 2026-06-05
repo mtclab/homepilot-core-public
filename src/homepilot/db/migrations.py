@@ -214,6 +214,12 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
     8: [
         ("ALTER TABLE api_tokens ADD COLUMN fingerprint TEXT", "api_tokens", "fingerprint"),
     ],
+    9: [
+        """CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+            token_hash     TEXT PRIMARY KEY,
+            expires_at     REAL NOT NULL
+        )""",
+    ],
 }
 
 

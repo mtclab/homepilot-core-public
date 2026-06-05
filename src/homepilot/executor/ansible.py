@@ -5,11 +5,14 @@ import re
 import shlex
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
 from homepilot.adapters.ssh import GuestHostError
+
+if TYPE_CHECKING:
+    from homepilot.adapters import HostAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +32,12 @@ async def execute(
     frontmatter: dict[str, Any],
     body: str,
     target: dict[str, Any],
-    ssh: object,
+    host_adapter: object,
     repo: object | None = None,
     pve_nodes: list[str] | None = None,
     rollback: bool = False,
 ) -> dict[str, Any]:
-    from homepilot.adapters.ssh import SSHAdapter
-
-    ssh_adapter: SSHAdapter = ssh  # type: ignore[assignment]
+    ssh_adapter: HostAdapter = cast("HostAdapter", host_adapter)
 
     tag = "ansible-rollback" if rollback else "ansible-spec"
     spec_yaml = _extract_spec(body, tag)
@@ -71,7 +72,7 @@ async def execute(
             "failure_reason": "missing host",
         }
 
-    if pve_nodes:
+    if pve_nodes and hasattr(ssh_adapter, "_validate_guest_only"):
         try:
             ssh_adapter._validate_guest_only(host, pve_nodes)
         except GuestHostError as e:

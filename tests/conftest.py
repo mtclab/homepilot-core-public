@@ -7,6 +7,17 @@ import pytest
 os.environ["HP_SECRET_KEY"] = "test-secret-key-for-pytest-only-not-for-production"
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _reset_global_rate_limits():
+    """Clear in-memory rate limit state before test session."""
+    from homepilot import main as main_mod
+    from homepilot.auth import router as auth_router
+
+    auth_router._token_create_attempts.clear()
+    main_mod._RATE_WINDOW.clear()
+    yield
+
+
 @pytest.fixture
 def tmp_artifacts_dir(tmp_path: Path) -> Path:
     d = tmp_path / "artifacts"

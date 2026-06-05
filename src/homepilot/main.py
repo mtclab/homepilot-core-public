@@ -153,8 +153,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.kb_service = state.kb_service
     app.state.sse_bus = state.sse_bus
 
+    if state.agent_hub is not None:
+        app.state.agent_hub = state.agent_hub
+        app.state.agent_registry = state.agent_registry
+        hub_task = asyncio.create_task(state.agent_hub.start())
+        app.state.agent_hub_task = hub_task
+        logger.info(
+            "Agent hub task started on %s:%s",
+            settings.agent_hub_host,
+            settings.agent_hub_port,
+        )
+    else:
+        app.state.agent_hub = None
+        app.state.agent_registry = None
+        app.state.agent_hub_task = None
+
     try:
+        from .adapters.agent import AgentAdapter
         from .executor import ArtifactExecutor
+
+        agent_adapter = None
+        if state.agent_hub is not None and state.ssh is not None:
+            agent_adapter = AgentAdapter(
+                hub_server=state.agent_hub,
+                jump_client=state.jump_client,
+                pve_nodes=state.artifact_lifecycle._pve_nodes_list
+                if hasattr(state.artifact_lifecycle, "_pve_nodes_list")
+                else [],
+            )
 
         if state.proxmox and state.ssh and state.vault:
             app.state.artifact_executor = ArtifactExecutor(
@@ -164,6 +190,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 proxmox=state.proxmox,
                 ssh=state.ssh,
                 vault=state.vault,
+                agent=agent_adapter,
             )
     except (ImportError, OSError, ConnectionError):
         logger.warning("Could not initialize artifact executor", exc_info=True)
@@ -267,7 +294,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 state.artifact_lifecycle._pve_nodes_list = pve_nodes
             except (httpx.HTTPError, OSError, ConnectionError):
                 state.artifact_lifecycle._pve_nodes_list = []
+            from .adapters.agent import AgentAdapter
             from .executor import ArtifactExecutor
+
+            mcp_agent = None
+            if state.agent_hub is not None and state.jump_client is not None:
+                mcp_agent = AgentAdapter(
+                    hub_server=state.agent_hub,
+                    jump_client=state.jump_client,
+                    pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
+                )
 
             executor = ArtifactExecutor(
                 store=state.artifact_store,
@@ -277,6 +313,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 ssh=state.ssh,
                 vault=state.vault,
                 pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
+                agent=mcp_agent,
             )
             state.artifact_lifecycle._executor_ref = executor
         mcp_app = create_http_app(srv)
@@ -301,13 +338,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+
+    agent_hub = getattr(app.state, "agent_hub", None)
+    if agent_hub is not None:
+        try:
+            await asyncio.wait_for(agent_hub.stop(), timeout=10.0)
+            logger.info("Agent hub stopped")
+        except TimeoutError:
+            logger.warning("Agent hub stop timed out after 10s — proceeding")
+
     try:
         await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
     try:
         await asyncio.wait_for(state.database.close(), timeout=10.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("Database close timed out after 10s — proceeding")
     except Exception as exc:
         logger.warning("Database close error (ok on restart): %s", exc)
@@ -447,6 +493,7 @@ async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
 
 
 from .admin.router import router as admin_router  # noqa: E402
+from .agent_hub.router import router as agent_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
 from .audit.router import router as audit_router  # noqa: E402
 from .auth.router import router as auth_router  # noqa: E402
@@ -456,6 +503,9 @@ from .tasks.router import router as tasks_router  # noqa: E402
 
 app.include_router(admin_router, prefix="/admin")
 app.include_router(auth_router, prefix="/auth")
+app.include_router(
+    agent_router, prefix="/api", tags=["agents"], dependencies=[Depends(require_token)]
+)
 app.include_router(
     audit_router, prefix="/audit", tags=["audit"], dependencies=[Depends(require_token)]
 )
@@ -514,6 +564,16 @@ async def health(request: Request) -> JSONResponse:
             vault_status = "locked"
     checks["vault"] = vault_status
 
+    agent_registry = getattr(request.app.state, "agent_registry", None)
+    if agent_registry is not None:
+        connected = agent_registry.list_connected()
+        checks["agent_hub"] = "ok"
+        checks["agents_connected"] = str(len(connected))
+    elif settings and settings.agent_hub_enabled:
+        checks["agent_hub"] = "error"
+    else:
+        checks["agent_hub"] = "not_configured"
+
     cors_val = _cors_validation or validate_cors_config(
         getattr(request.app.state, "settings", None) or _settings
     )
@@ -537,7 +597,7 @@ async def health(request: Request) -> JSONResponse:
     status_code = 503 if overall == "down" else 200
     return JSONResponse(
         status_code=status_code,
-        content={"status": overall, "checks": checks},
+        content={"status": overall, "version": __version__, "checks": checks},
     )
 
 

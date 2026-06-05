@@ -36,15 +36,20 @@ async def _call_embed_service(url: str, model: str, text: str) -> list[float] | 
                 embedding = embedding_data[0].get("embedding") if embedding_data else None
             if embedding is None:
                 logger.error(
-                    "Embedding service %s returned empty/null embedding (model=%s, response_keys=%s)",
-                    url, model, list(data.keys()),
+                    "Embedding service %s returned empty/null embedding "
+                    "(model=%s, response_keys=%s)",
+                    url,
+                    model,
+                    list(data.keys()),
                 )
             return embedding
     except (httpx.ConnectError, ConnectionRefusedError) as e:
         logger.error(
             "Embedding service unreachable at %s (model=%s): %s — "
             "ensure llm-embed service is running or configure HP_EMBEDDING_FALLBACK_URL",
-            url, model, e,
+            url,
+            model,
+            e,
         )
         return None
     except (httpx.HTTPError, ConnectionError, OSError) as e:
@@ -342,7 +347,9 @@ class KBService:
             "fallback_ok": fallback_ok,
             "indexed_with_embeddings": indexed,
             "total_docs": total,
-            "search_mode": "vector" if primary_ok else ("fallback_vector" if fallback_ok else "keyword"),
+            "search_mode": (
+                "vector" if primary_ok else ("fallback_vector" if fallback_ok else "keyword")
+            ),
         }
 
     async def reindex_if_needed(self, reason: str = "lifecycle") -> None:

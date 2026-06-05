@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     daemon_host: str = Field(default="0.0.0.0", validation_alias="HP_HOST")
     daemon_port: int = Field(default=8000, validation_alias="HP_PORT")
     log_level: str = "info"
+    agent_hub_enabled: bool = False
+    agent_hub_host: str = "0.0.0.0"
+    agent_hub_port: int = 8443
+    agent_hub_auth_token: str = ""
+    agent_hub_heartbeat_interval: int = 30
+    agent_hub_tls: bool = False
+    agent_hub_tls_cert: str = ""
+    agent_hub_tls_key: str = ""
+    agent_hub_tls_ca: str = ""
+
     trusted_proxies: str = ""
     cors_origins: str = (
         "http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
@@ -86,7 +96,11 @@ class Settings(BaseSettings):
     cookie_secure: bool = True
     rate_limit_backend: str = "memory"
 
-    def _auto_generate_passphrase(self, secrets_mod: object, logger: object) -> str:
+    def _auto_generate_passphrase(self) -> str:
+        import logging
+        import secrets as secrets_mod
+
+        logger = logging.getLogger(__name__)
         passphrase_path = Path(self.data_dir) / ".vault_passphrase"
         try:
             if passphrase_path.exists():
@@ -112,7 +126,11 @@ class Settings(BaseSettings):
             )
             return passphrase
 
-    def _auto_generate_secret_key(self, secrets_mod: object, logger: object) -> tuple[str, bool]:
+    def _auto_generate_secret_key(self) -> tuple[str, bool]:
+        import logging
+        import secrets as secrets_mod
+
+        logger = logging.getLogger(__name__)
         persisted_key_path = Path(self.data_dir) / ".secret_key"
         try:
             if persisted_key_path.exists():
@@ -177,7 +195,7 @@ class Settings(BaseSettings):
                 secret = asyncio.run(vault.get_secret(name))
             for key in ("value", "secret", "key", "token"):
                 if secret.get(key):
-                    return secret[key]
+                    return str(secret[key])
             if secret:
                 first_val = next(iter(secret.values()), "")
                 if isinstance(first_val, str) and first_val:
@@ -189,7 +207,6 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: object) -> None:
         import logging
         import os as _os
-        import secrets as _secrets
 
         logger = logging.getLogger(__name__)
 
@@ -208,7 +225,7 @@ class Settings(BaseSettings):
         if not self.vault_passphrase and not self.vault_passphrase_file:
             auto_init = _os.environ.get("HP_VAULT_AUTO_INIT", "").lower() in ("1", "true", "yes")
             if auto_init:
-                self.vault_passphrase = self._auto_generate_passphrase(_secrets, logger)
+                self.vault_passphrase = self._auto_generate_passphrase()
             else:
                 logger.info(
                     "Vault passphrase not set and HP_VAULT_AUTO_INIT not enabled — vault disabled"
@@ -240,9 +257,7 @@ class Settings(BaseSettings):
                     self.secret_key = _vault_key
                     logger.info("HP_SECRET_KEY loaded from vault")
                 else:
-                    self.secret_key, _secret_key_auto_generated = (
-                        self._auto_generate_secret_key(_secrets, logger)
-                    )
+                    self.secret_key, _secret_key_auto_generated = self._auto_generate_secret_key()
 
         if not self.admin_secret:
             _admin = self._try_vault_secret("admin-secret")

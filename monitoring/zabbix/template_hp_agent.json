@@ -1,0 +1,181 @@
+{
+  "zabbix_export": {
+    "version": "6.0",
+    "date": "2026-06-04",
+    "templates": [
+      {
+        "template": "Template HP Agent",
+        "name": "Template HP Agent",
+        "groups": [
+          {"name": "HomePilot"}
+        ],
+        "items": [
+          {
+            "key": "hp.agent.status",
+            "name": "HP Agent: Status",
+            "type": 2,
+            "value_type": 3,
+            "delay": "0",
+            "history": "7d",
+            "trends": "14d",
+            "description": "1=online, 0=offline",
+            "triggers": []
+          },
+          {
+            "key": "hp.agent.cpu.count",
+            "name": "HP Agent: CPU count",
+            "type": 2,
+            "value_type": 3,
+            "delay": "0",
+            "history": "7d",
+            "trends": "14d"
+          },
+          {
+            "key": "hp.agent.disk.total_gb",
+            "name": "HP Agent: Disk total (GB)",
+            "type": 2,
+            "value_type": 0,
+            "units": "GB",
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.disk.free_gb",
+            "name": "HP Agent: Disk free (GB)",
+            "type": 2,
+            "value_type": 0,
+            "units": "GB",
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.memory.total_gb",
+            "name": "HP Agent: Memory total (GB)",
+            "type": 2,
+            "value_type": 0,
+            "units": "GB",
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.memory.free_gb",
+            "name": "HP Agent: Memory free (GB)",
+            "type": 2,
+            "value_type": 0,
+            "units": "GB",
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.load.1m",
+            "name": "HP Agent: Load 1m",
+            "type": 2,
+            "value_type": 0,
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.load.5m",
+            "name": "HP Agent: Load 5m",
+            "type": 2,
+            "value_type": 0,
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          },
+          {
+            "key": "hp.agent.load.15m",
+            "name": "HP Agent: Load 15m",
+            "type": 2,
+            "value_type": 0,
+            "delay": "0",
+            "history": "7d",
+            "trends": "90d"
+          }
+        ],
+        "triggers": [
+          {
+            "name": "HP Agent: Offline",
+            "expression": "last(/Template HP Agent/hp.agent.status)=0",
+            "priority": 3,
+            "description": "HP agent stopped sending metrics"
+          },
+          {
+            "name": "HP Agent: Low disk space",
+            "expression": "last(/Template HP Agent/hp.agent.disk.free_gb)<5",
+            "priority": 2,
+            "description": "Less than 5GB free disk space"
+          },
+          {
+            "name": "HP Agent: High load",
+            "expression": "last(/Template HP Agent/hp.agent.load.1m)>last(/Template HP Agent/hp.agent.cpu.count)*2",
+            "priority": 2,
+            "description": "Load average exceeds 2x CPU count"
+          },
+          {
+            "name": "HP Agent: Low memory",
+            "expression": "last(/Template HP Agent/hp.agent.memory.free_gb)<0.5",
+            "priority": 3,
+            "description": "Less than 500MB free memory"
+          }
+        ],
+        "dashboards": [
+          {
+            "name": "HP Agent Overview",
+            "pages": [
+              {
+                "widgets": [
+                  {
+                    "type": "graph",
+                    "name": "Disk Usage",
+                    "x": 0,
+                    "y": 0,
+                    "width": 12,
+                    "height": 5,
+                    "items": [
+                      {"item": "Template HP Agent/hp.agent.disk.total_gb"},
+                      {"item": "Template HP Agent/hp.agent.disk.free_gb"}
+                    ]
+                  },
+                  {
+                    "type": "graph",
+                    "name": "Memory Usage",
+                    "x": 12,
+                    "y": 0,
+                    "width": 12,
+                    "height": 5,
+                    "items": [
+                      {"item": "Template HP Agent/hp.agent.memory.total_gb"},
+                      {"item": "Template HP Agent/hp.agent.memory.free_gb"}
+                    ]
+                  },
+                  {
+                    "type": "graph",
+                    "name": "Load Average",
+                    "x": 0,
+                    "y": 5,
+                    "width": 12,
+                    "height": 5,
+                    "items": [
+                      {"item": "Template HP Agent/hp.agent.load.1m"},
+                      {"item": "Template HP Agent/hp.agent.load.5m"},
+                      {"item": "Template HP Agent/hp.agent.load.15m"}
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "groups": [
+      {"name": "HomePilot"}
+    ]
+  }
+}

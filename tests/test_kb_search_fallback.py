@@ -54,13 +54,15 @@ class TestKBSearchFallbackLogging:
             target="redis",
         )
 
-        with caplog.at_level(logging.WARNING):
-            with patch(
+        with (
+            caplog.at_level(logging.WARNING),
+            patch(
                 "homepilot.kb.service._call_embed_service",
                 new_callable=AsyncMock,
                 return_value=None,
-            ):
-                results = await kb_service.search("redis")
+            ),
+        ):
+            results = await kb_service.search("redis")
 
         assert any("redis" in r["content"].lower() for r in results)
 
@@ -73,17 +75,29 @@ class TestKBSearchFallbackLogging:
         )
 
         fake_embedding = [0.1] * 768
-        with patch(
-            "homepilot.kb.service._get_embedding",
-            new_callable=AsyncMock,
-            return_value=fake_embedding,
-        ):
-            with patch(
+        with (
+            patch(
+                "homepilot.kb.service._get_embedding",
+                new_callable=AsyncMock,
+                return_value=fake_embedding,
+            ),
+            patch(
                 "homepilot.kb.service.KBService._keyword_search",
                 new_callable=AsyncMock,
-                return_value=[{"id": 1, "source": "test", "kind": "note", "target": None, "title": "PVE config", "content": "proxmox cluster setup guide", "score": 0.0}],
-            ):
-                results = await kb_service.search("proxmox")
+                return_value=[
+                    {
+                        "id": 1,
+                        "source": "test",
+                        "kind": "note",
+                        "target": None,
+                        "title": "PVE config",
+                        "content": "proxmox cluster setup guide",
+                        "score": 0.0,
+                    }
+                ],
+            ),
+        ):
+            results = await kb_service.search("proxmox")
 
         assert len(results) >= 1
 
@@ -92,16 +106,21 @@ class TestKBSearchFallbackLogging:
 
         with caplog.at_level(logging.ERROR):
             from homepilot.kb.service import _call_embed_service
+
             result = await _call_embed_service(
                 "http://llm-embed:8081/v1/embeddings", "bge-m3", "test query"
             )
 
         assert result is None
         has_actionable = any(
-            "llm-embed" in r.message or "unreachable" in r.message.lower() or "ensure" in r.message.lower()
+            "llm-embed" in r.message
+            or "unreachable" in r.message.lower()
+            or "ensure" in r.message.lower()
             for r in caplog.records
         )
-        assert has_actionable, f"Expected actionable log message, got: {[r.message for r in caplog.records]}"
+        assert has_actionable, (
+            f"Expected actionable log message, got: {[r.message for r in caplog.records]}"
+        )
 
 
 class TestEmbeddingStatus:

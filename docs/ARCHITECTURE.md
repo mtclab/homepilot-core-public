@@ -29,30 +29,36 @@
 ║  │   exec_on_guest_readonly check_artifact_drift                │  ║
 ║  └───────────┬────────────────────────────┬──────────────────────┘  ║
 ║              │                            │                          ║
-║  ┌───────────▼────────────┐  ┌────────────▼───────────────────────┐ ║
-║  │  Core Services         │  │  Data Layer                        │ ║
-║  │                        │  │                                    │ ║
-║  │  ArtifactLifecycle     │  │  SQLite  — hosts, services,        │ ║
-║  │  ArtifactExecutor      │  │    artifacts, KB entries,          │ ║
-║  │  KBService             │  │    audit log, vector index         │ ║
-║  │  InventoryService      │  │                                    │ ║
-║  │  VaultManager          │  │  Artifact Store — markdown files   │ ║
-║  │  EventBus / Webhooks   │  │    (one file per artifact)         │ ║
-║  └───────────┬────────────┘  │    (one file per artifact)         │ ║
+║   ┌───────────▼────────────┐  ┌────────────▼───────────────────────┐ ║
+║   │  Core Services         │  │  Data Layer                        │ ║
+║   │                        │  │                                    │ ║
+║   │  ArtifactLifecycle     │  │  SQLite  — hosts, services,        │ ║
+║   │  ArtifactExecutor      │  │    artifacts, KB entries,          │ ║
+║   │  KBService             │  │    audit log, vector index,        │ ║
+║   │  InventoryService      │  │    bootstrap tokens                │ ║
+║   │  VaultManager          │  │                                    │ ║
+║   │  EventBus / Webhooks   │  │  Artifact Store — markdown files   │ ║
+║   │  AgentAdapter          │  │    (one file per artifact)         │ ║
+║   │  AgentHubServer        │  │                                    │ ║
+║   └───────────┬────────────┘  │    (one file per artifact)         │ ║
 ║              │               │                                    │ ║
 ║   ┌──────────┼───────────┐   │  Vault — age-encrypted secrets     │ ║
 ║   │          │           │   │    (Proxmox token, service creds)  │ ║
 ║   ▼          ▼           ▼   └────────────────────────────────────┘ ║
-║  Proxmox   SSH Jump   Adopted                                        ║
-║  REST API  Server     Services                                       ║
-║  :8006     :50051    (Authentik,                                     ║
-║           (TCP relay  Traefik, …)                                    ║
-║            length-prefixed                                           ║
-║            JSON protocol)                                            ║
+║  Proxmox   SSH Jump   Agent Hub                                      ║
+║  REST API  Server     :8443                                           ║
+║  :8006     :50051    (TCP relay)                                      ║
+║           (TCP relay  ┌──────────────────────────┐                    ║
+║            length-    │  Managed Hosts           │                    ║
+║            prefixed   │                          │                    ║
+║            JSON       │  agent-host daemon ────────┼──► outbound TCP   ║
+║            protocol)  │  (exec, read/write file, │    to hub :8443    ║
+║                       │   heartbeat, zabbix push)│                    ║
+║                       └──────────────────────────┘                    ║
 ║          ┌───▼───────────────────┐                                   ║
 ║          │  Guest VMs / LXC      │                                   ║
-║          │  (read-only SSH exec  │                                   ║
-║          │   + SFTP file reads)  │                                   ║
+║          │  (SSH fallback when   │                                   ║
+║          │   no agent connected) │                                   ║
 ║          └───────────────────────┘                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
@@ -202,14 +208,140 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `search_kb` | no | read | Vector + keyword search over KB notes/policies/decisions |
 | `proxmox_api_read` | no | read | GET-only Proxmox REST call; allowlisted paths only |
 | `http_call_read` | no | read | GET-only call to an adopted service; vault-resolved creds |
-| `read_file_on_guest` | no | read | SFTP file read from guest via jump server |
-| `exec_on_guest_readonly` | no | read | Whitelisted read-only SSH exec (cat, ls, ps, systemctl status…) |
+| `read_file_on_guest` | no | read | File read from guest via agent hub or SSH fallback |
+| `exec_on_guest_readonly` | no | read | Read-only exec on guest via agent hub or SSH (cat, ls, ps…) |
 | `check_artifact_drift` | no | read | Check whether an applied artifact has drifted from desired state |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
 | `approve_artifact` | yes | write | Approve a proposed artifact; rate-limited 10/min per caller |
 
 `propose_artifact` initiates a change (requires write scope). `approve_artifact` advances it (also write scope, rate-limited). All other tools are read-only and require only read scope. Agents with read-only tokens cannot call write-scoped tools.
+
+---
+
+## Agent Hub
+
+The agent hub reduces SSH dependency by ~90%. Instead of SSH-ing into every host, a lightweight agent daemon on each managed host maintains a persistent outbound TCP connection to the hub. Commands flow through this connection; SSH is only used as a fallback when no agent is connected.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  HomePilot Server (Docker)                                      │
+│                                                                 │
+│  ┌────────────────┐    ┌──────────────┐    ┌──────────────────┐│
+│  │  FastAPI /api/  │    │  AgentHub   │    │  AgentAdapter    ││
+│  │  agents/*      ├───►│  Server      │◄───┤  (host_adapter)  ││
+│  │  (REST API)    │    │  :8443      │    │  agent→SSH fallback││
+│  └────────────────┘    └──────┬───────┘    └────────┬─────────┘│
+│                               │                       │         │
+│                        ┌──────┴───────┐        ┌──────┴──────┐  │
+│                        │  Registry    │        │  JumpServer │  │
+│                        │  + AuditLog  │        │  :50051     │  │
+│                        │  + Tokens    │        │  (SSH relay)│  │
+│                        └──────────────┘        └─────────────┘  │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ TCP (outbound from agents)
+                    ┌──────────┼──────────┐
+                    ▼          ▼          ▼
+              ┌─────────┐ ┌─────────┐ ┌─────────┐
+              │agent-host │ │agent-host │ │agent-host │
+              │ app-server │ │monitoring-host│ │  host3  │
+              │(Zabbix) │ │(Zabbix) │ │(Zabbix) │
+              └─────────┘ └─────────┘ └─────────┘
+```
+
+### Protocol
+
+Both the jumpserver relay and the agent hub use the same **length-prefixed JSON** protocol over TCP:
+
+```
+[4 bytes: big-endian length N][N bytes: UTF-8 JSON]
+```
+
+This enables zero-protocol-migration: the agent adapter switches between agent hub and jumpserver without changing the wire format.
+
+### Authentication
+
+1. **Persistent token** (`HP_AGENT_AUTH_TOKEN`): Shared secret between hub and agent. Set once, works forever.
+2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `GET /api/agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
+
+### Authorization
+
+Agent API endpoints use scope-based access control:
+- **read scope**: List agents, check connectivity
+- **admin scope**: Hub auth token, bootstrap tokens, audit log, exec/read/write on agents, Zabbix push
+
+### Agent allowlist
+
+Two tiers:
+
+| Tier | Commands | Requirement |
+|------|----------|-------------|
+| Safe | `ls`, `cat`, `ps`, `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl status`, `journalctl`, `dpkg -l` | Always allowed |
+| Privileged | `docker pull/compose/run/stop/rm/restart`, `apt-get install`, `systemctl start/stop/restart/enable/disable/daemon-reload`, `mkdir`, `chmod`, `cp`, `mv` | Requires `HP_AGENT_PRIVILEGED=true` |
+
+Blocked commands return `exit_code=-1` with stderr `"command blocked: ..."`.
+
+### File access
+
+**Read prefixes**: `/var/log/`, `/etc/`, `/opt/homepilot/`, `/proc/`, `/sys/`, `/tmp/homepilot/`, `/home/`, `/usr/local/bin/`
+
+**Write prefixes**: `/etc/homepilot/`, `/opt/homepilot/`, `/tmp/homepilot/`, `/etc/systemd/system/`, `/etc/docker/`, `/etc/nginx/`, `/etc/zabbix/`
+
+Write attempts outside allowed prefixes return an error.
+
+### Zabbix trapper integration
+
+When `HP_ZABBIX_ENABLED=true`, the agent pushes these metrics to Zabbix via the sender protocol (TCP 10051):
+
+| Item key | Type | Description |
+|----------|------|-------------|
+| `hp.agent.status` | unsigned | 1=online |
+| `hp.agent.cpu.count` | unsigned | CPU core count |
+| `hp.agent.disk.total_gb` | float | Total disk GB |
+| `hp.agent.disk.free_gb` | float | Free disk GB |
+| `hp.agent.memory.total_gb` | float | Total memory GB |
+| `hp.agent.memory.free_gb` | float | Free memory GB |
+| `hp.agent.load.1m` | float | 1-minute load average |
+| `hp.agent.load.5m` | float | 5-minute load average |
+| `hp.agent.load.15m` | float | 15-minute load average |
+
+Items must exist on the Zabbix host as **Zabbix trapper** type. Push interval configured via `HP_ZABBIX_SEND_INTERVAL` (default 60s). On-demand push available via `POST /api/agents/{agent_id}/zabbix-push`.
+
+### Audit logging
+
+All agent operations (exec, read_file, write_file) are logged to an in-memory rotating deque (max 1000 entries) and Python logging. Queryable via `GET /api/agents/audit` (admin scope).
+
+### Agent binary packaging
+
+The `agent-host` daemon is distributed as a **standalone binary**, built with PyInstaller. This eliminates the need for Python on managed hosts — deployment is just `scp` + `chmod +x`:
+
+```bash
+# Build the binary
+cd agent/
+pip install pyinstaller
+pyinstaller --onefile --name agent-host hp_agent/main.py
+# Output: dist/agent-host
+
+# Deploy to managed host
+scp dist/agent-host target:/usr/local/bin/
+ssh target 'chmod +x /usr/local/bin/agent-host'
+```
+
+The binary bundles Python 3.10+ stdlib and all dependencies (asyncio, ssl, json, subprocess). No virtualenv or pip install needed on the target host. Systemd unit file (`agent-host.service`) calls `/usr/local/bin/agent-host` directly.
+
+Source code also available for `pip install` into a venv during development: `pip install -e agent/`.
+
+### AgentAdapter with SSH fallback
+
+The `AgentAdapter` class implements the `HostAdapter` protocol alongside `SSHAdapter`. When the orchestrator needs to run a command on a host:
+
+1. Check if an agent is connected for that hostname → route through hub
+2. No agent → fall back to SSH via jumpserver
+3. No SSH → raise `AgentAdapterError`
+
+This makes the agent a **drop-in** replacement — existing artifact executors (`shell_script.py`, `ansible.py`) work unchanged with either adapter.
 
 ---
 

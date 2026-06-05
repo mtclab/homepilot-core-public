@@ -74,7 +74,18 @@ def _get_lifecycle() -> ArtifactLifecycle:
 
 
 @app.command()
-def init() -> None:
+def init(
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        "-y",
+        help=(
+            "Skip prompts (Docker/scripted bootstrap): take PVE_API_TOKEN / "
+            "HP_ADMIN_SECRET / HP_VAULT_PASSPHRASE from the environment and "
+            "auto-generate any that are blank. Proxmox host is left to .env."
+        ),
+    ),
+) -> None:
     """Interactive setup: configure PVE, vault, and create ~/.hp/ structure."""
     import secrets as _secrets
 
@@ -85,19 +96,31 @@ def init() -> None:
 
     console.print("[bold]HomePilot Init[/bold]\n")
 
-    pve_url = typer.prompt("Proxmox VE URL (e.g. https://pve1.lan:8006)", default="")
-    pve_token = typer.prompt("Proxmox API Token (PVEAPIToken=...)", default="", hide_input=True)
-    admin_secret = typer.prompt(
-        "Admin secret for API (leave blank to auto-generate)",
-        default="",
-        hide_input=True,
-    )
-    passphrase = typer.prompt(
-        "Master passphrase for vault (leave blank to auto-generate)",
-        default="",
-        hide_input=True,
-        confirmation_prompt=True,
-    )
+    if non_interactive:
+        # Headless bootstrap: secrets come from the environment (the same .env
+        # the backend reads), blanks are auto-generated below. Proxmox host is
+        # already configured via .env, so we don't rewrite it here.
+        pve_url = ""
+        pve_token = os.environ.get("PVE_API_TOKEN", "")
+        admin_secret = os.environ.get("HP_ADMIN_SECRET", "")
+        passphrase = os.environ.get("HP_VAULT_PASSPHRASE", "")
+        console.print(
+            "[dim]non-interactive: reading secrets from env, auto-generating blanks[/dim]"
+        )
+    else:
+        pve_url = typer.prompt("Proxmox VE URL (e.g. https://pve1.lan:8006)", default="")
+        pve_token = typer.prompt("Proxmox API Token (PVEAPIToken=...)", default="", hide_input=True)
+        admin_secret = typer.prompt(
+            "Admin secret for API (leave blank to auto-generate)",
+            default="",
+            hide_input=True,
+        )
+        passphrase = typer.prompt(
+            "Master passphrase for vault (leave blank to auto-generate)",
+            default="",
+            hide_input=True,
+            confirmation_prompt=True,
+        )
 
     if not passphrase:
         passphrase = _secrets.token_urlsafe(24)
@@ -733,13 +756,13 @@ def import_backup(
             artifact_members = [m for m in tar.getmembers() if m.name.startswith("artifacts")]
             if artifact_members:
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
-                tar.extractall(str(data_dir), members=artifact_members)
+                tar.extractall(str(data_dir), members=artifact_members, filter="data")
                 console.print(f"[green]Artifacts restored to {artifacts_dir}[/green]")
 
             # Extract DB
             try:
                 db_member = tar.getmember("homepilot.db")
-                tar.extractall(str(data_dir), members=[db_member])
+                tar.extractall(str(data_dir), members=[db_member], filter="data")
                 console.print(f"[green]Database restored to {db_path}[/green]")
             except KeyError:
                 console.print("[yellow]No homepilot.db found in archive — skipped[/yellow]")
@@ -917,6 +940,58 @@ def kb_reindex(
     )
 
 
+async def _mint_token_via_api(
+    settings: Any, label: str, scope: str
+) -> tuple[str | None, str | None]:
+    """Create an API token through the running backend's admin endpoint.
+
+    Avoids sqlite write-lock contention with a live backend (the backend owns
+    the DB). Returns ``(token, error)``:
+      * ``(token, None)`` — created via the API.
+      * ``(None, None)``  — backend not reachable; caller should fall back to
+        the direct-DB path.
+      * ``(None, msg)``   — backend reached but refused (e.g. admin-secret not
+        configured / mismatched); caller should surface ``msg`` and NOT touch
+        the DB (it is locked).
+
+    The admin secret is resolved exactly like the backend's
+    ``resolve_admin_secret`` (settings/env, then vault) — no passphrase
+    fallback, which previously produced confusing 403s."""
+    import httpx
+
+    admin_secret = getattr(settings, "admin_secret", "") or ""
+    if not admin_secret and hasattr(settings, "_try_vault_secret"):
+        admin_secret = settings._try_vault_secret("admin-secret") or ""
+    port = getattr(settings, "daemon_port", 8000)
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{port}/auth/tokens",
+                json={"label": label, "scope": scope},
+                headers={"x-hp-admin-secret": admin_secret},
+            )
+    except httpx.ConnectError:
+        return None, None  # backend down → caller falls back to direct DB
+    except Exception:
+        return None, None
+
+    if resp.status_code == 201:
+        return str(resp.json()["token"]), None
+
+    detail = ""
+    try:
+        detail = str(resp.json().get("detail", ""))
+    except Exception:
+        detail = resp.text
+    hint = (
+        " Bootstrap the admin secret with `hp init --non-interactive` "
+        "(stores it in the vault), or stop the backend to create a token via "
+        "the local DB."
+    )
+    return None, f"Backend refused token creation ({resp.status_code}): {detail}.{hint}"
+
+
 @token_app.command("create")
 def token_create(
     label: str = typer.Option("admin", "--label", "-l", help="Display name for the token owner"),
@@ -927,48 +1002,6 @@ def token_create(
 ) -> None:
     """Create an API token non-interactively (safe for Docker / CI environments)."""
 
-    async def _try_via_api(settings: object) -> str | None:
-        """POST to the running backend to avoid DB lock contention."""
-        import logging
-
-        passphrase = getattr(settings, "vault_passphrase", "")
-        if not passphrase:
-            return None
-        port = getattr(settings, "daemon_port", 8000)
-        import httpx
-
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                # Use admin_secret (from env or vault), not vault_passphrase
-                admin_secret = getattr(settings, "admin_secret", "") or ""
-                if not admin_secret:
-                    # Fallback: try to get it from vault directly
-                    passphrase = getattr(settings, "vault_passphrase", "") or ""
-                    if passphrase and hasattr(settings, "_try_vault_secret"):
-                        admin_secret = settings._try_vault_secret("admin-secret") or passphrase
-                    else:
-                        admin_secret = passphrase
-                resp = await client.post(
-                    f"http://127.0.0.1:{port}/auth/tokens",
-                    json={"label": label, "scope": scope},
-                    headers={"x-hp-admin-secret": admin_secret},
-                )
-                if resp.status_code == 201:
-                    return str(resp.json()["token"])
-                if resp.status_code == 403:
-                    err_console.print(
-                        "[red]Backend rejected admin secret (403). "
-                        "HP_VAULT_PASSPHRASE may not match the running backend.[/red]"
-                    )
-                    raise typer.Exit(1)
-        except ConnectionError:
-            logging.debug("Backend not reachable, falling back to direct DB")
-        except typer.Exit:
-            raise
-        except Exception:  # intentional broad catch — prints user-friendly message and falls back
-            logging.warning("Unexpected error contacting backend, falling back to direct DB")
-        return None
-
     async def _create() -> str:
         from aiosqlite import OperationalError
 
@@ -978,9 +1011,14 @@ def token_create(
 
         settings = _get_settings()
 
-        via_api = await _try_via_api(settings)
-        if via_api:
-            return via_api
+        token, err = await _mint_token_via_api(settings, label, scope)
+        if token:
+            return token
+        if err:
+            # Backend is up but refused — do not fall back to the DB path
+            # (it would only hit the write lock). Surface the real reason.
+            err_console.print(f"[red]{err}[/red]")
+            raise typer.Exit(1)
 
         data_dir = Path(settings.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1138,12 +1176,37 @@ def inventory_refresh(
     """Sync inventory from Proxmox (requires HP_PROXMOX_HOST configured)."""
 
     async def _refresh() -> dict[str, Any]:
+        settings = _get_settings()
+
+        # Prefer the API when the backend is running — it owns the sqlite write
+        # lock, so a direct CLI write would hit "database is locked" (Bug 10).
+        token, err = await _mint_token_via_api(settings, "cli-inventory-refresh", "write")
+        if token:
+            import httpx
+
+            port = getattr(settings, "daemon_port", 8000)
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{port}/inventory/refresh",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"scope": scope} if scope else {},
+                )
+                resp.raise_for_status()
+                return dict(resp.json())
+        if err:
+            err_console.print(f"[yellow]{err}[/yellow]")
+            err_console.print(
+                "[yellow]The backend refreshes inventory automatically; you can "
+                "also use the UI 'Sync from Proxmox' button.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        # Backend not running → refresh directly against the DB.
         from homepilot.db.connection import Database
         from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
         from homepilot.inventory.service import InventoryService
 
-        settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         db = Database(str(db_path))
         await db.connect()
@@ -1401,3 +1464,196 @@ def webhook_test(
         console.print("[green]Test event sent[/green]")
 
     asyncio.run(_test())
+
+
+# ── Agent management ──────────────────────────────────────────────────────────
+
+agent_app = typer.Typer(help="Agent hub management")
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command("bootstrap")
+def agent_bootstrap(
+    hub_host: str = typer.Option("localhost", help="Agent hub host"),
+    hub_port: int = typer.Option(8443, help="Agent hub port"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Generate a bootstrap token for agent enrollment."""
+    from homepilot.agent_hub.tokens import generate_bootstrap_token
+
+    token = generate_bootstrap_token()
+    get_settings()
+
+    if json_output:
+        console.print_json(
+            data={
+                "token": token,
+                "hub_host": hub_host,
+                "hub_port": hub_port,
+                "command": (
+                    f"HP_AGENT_HUB_HOST={hub_host} "
+                    f"HP_AGENT_HUB_PORT={hub_port} "
+                    f"HP_AGENT_AUTH_TOKEN={token} "
+                    f"agent-host"
+                ),
+            }
+        )
+    else:
+        console.print(
+            Panel(token, title="Bootstrap Token", subtitle="One-time use, expires in 24h")
+        )
+        cmd = (
+            f"HP_AGENT_HUB_HOST={hub_host} "
+            f"HP_AGENT_HUB_PORT={hub_port} "
+            f"HP_AGENT_AUTH_TOKEN={token} "
+            f"agent-host"
+        )
+        console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
+        console.print(
+            "\n[dim]Store the token hash in HP_AGENT_HUB_AUTH_TOKEN for hub verification.[/dim]"
+        )
+        console.print(f"[dim]Token hash: {token[:8]}...[/dim]")
+
+
+@agent_app.command("list")
+def agent_list() -> None:
+    """List connected agents."""
+    from homepilot.app_state import get_agent_registry
+
+    registry = get_agent_registry()
+    if registry is None:
+        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+        raise typer.Exit(1)
+    agents = registry.list_connected()
+    if not agents:
+        console.print("[dim]No agents connected[/dim]")
+        return
+    table = Table(title="Connected Agents")
+    table.add_column("Agent ID", style="cyan")
+    table.add_column("Hostname", style="green")
+    table.add_column("OS", style="blue")
+    table.add_column("Last Heartbeat", style="dim")
+    table.add_column("Stale (s)", style="yellow")
+    for a in agents:
+        sys_info = a.get("system_info", {})
+        table.add_row(
+            a["agent_id"],
+            a["hostname"],
+            f"{sys_info.get('os', '?')} {sys_info.get('arch', '?')}",
+            a["last_heartbeat"],
+            str(a["stale_seconds"]),
+        )
+    console.print(table)
+
+
+@agent_app.command("token")
+def agent_token(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Show the agent hub auth token for configuring agents."""
+    from homepilot.app_state import get_agent_registry
+
+    registry = get_agent_registry()
+    if registry is None or registry.hub_server is None:
+        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+        raise typer.Exit(1)
+    hub = registry.hub_server
+    token = hub.auth_token or ""
+    if json_output:
+        console.print_json(
+            data={
+                "auth_token": token,
+                "hub_host": hub.host,
+                "hub_port": hub.port,
+            }
+        )
+    else:
+        if token:
+            console.print(
+                Panel(token, title="Agent Hub Auth Token", subtitle="Set HP_AGENT_HUB_AUTH_TOKEN")
+            )
+        else:
+            console.print("[yellow]No auth token configured — set HP_AGENT_HUB_AUTH_TOKEN[/yellow]")
+        console.print(f"[dim]Hub endpoint: {hub.host}:{hub.port}[/dim]")
+
+
+@agent_app.command("bootstrap")
+def agent_bootstrap_cmd(
+    hub_host: str = typer.Option("localhost", help="Agent hub host"),
+    hub_port: int = typer.Option(8443, help="Agent hub port"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Generate a one-time bootstrap token for agent enrollment."""
+    from homepilot.app_state import get_agent_registry
+
+    registry = get_agent_registry()
+    if registry is None or registry.hub_server is None:
+        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+        raise typer.Exit(1)
+
+    hub = registry.hub_server
+    token = asyncio.run(hub._token_store.create())
+
+    if json_output:
+        console.print_json(
+            data={
+                "bootstrap_token": token,
+                "hub_host": hub_host,
+                "hub_port": hub_port,
+                "command": (
+                    f"HP_AGENT_HUB_HOST={hub_host} "
+                    f"HP_AGENT_HUB_PORT={hub_port} "
+                    f"HP_AGENT_AUTH_TOKEN={token} "
+                    f"agent-host"
+                ),
+            }
+        )
+    else:
+        console.print(
+            Panel(token, title="Bootstrap Token", subtitle="One-time use, expires in 24h")
+        )
+        cmd = (
+            f"HP_AGENT_HUB_HOST={hub_host} "
+            f"HP_AGENT_HUB_PORT={hub_port} "
+            f"HP_AGENT_AUTH_TOKEN={token} "
+            f"agent-host"
+        )
+        console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
+
+
+@agent_app.command("zabbix-push")
+def agent_zabbix_push(
+    agent_id: str = typer.Argument(..., help="Agent ID or hostname"),
+) -> None:
+    """Trigger Zabbix metrics push for a connected agent."""
+    from homepilot.app_state import get_agent_registry
+
+    registry = get_agent_registry()
+    if registry is None or registry.hub_server is None:
+        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+        raise typer.Exit(1)
+
+    agent = registry.get(agent_id) or registry.get_by_hostname(agent_id)
+    if not agent:
+        err_console.print(f"[red]Agent '{agent_id}' not connected[/red]")
+        raise typer.Exit(1)
+
+    hub = registry.hub_server
+
+    async def _push() -> dict[str, Any]:
+        return await hub.send_zabbix_push(agent.agent_id)
+
+    try:
+        result = asyncio.run(_push())
+        metrics_sent = result.get("metrics_sent", 0)
+        zabbix_resp = result.get("zabbix_response", {})
+        console.print(f"[green]Pushed {metrics_sent} metrics to Zabbix[/green]")
+        if zabbix_resp:
+            info = zabbix_resp.get("info", "")
+            console.print(f"[dim]Zabbix response: {info}[/dim]")
+    except ConnectionError as exc:
+        err_console.print(f"[red]Agent not connected: {exc}[/red]")
+        raise typer.Exit(1) from None
+    except TimeoutError:
+        err_console.print("[red]Zabbix push timed out[/red]")
+        raise typer.Exit(1) from None

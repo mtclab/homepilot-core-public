@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from .models import (
+    VALID_TRANSITIONS,
     ArtifactKind,
     ArtifactStatus,
     ConflictError,
     Idempotence,
     LifecycleError,
     Target,
-    VALID_TRANSITIONS,
     compute_body_hash,
     extract_composite_steps,
     utcnow_iso,

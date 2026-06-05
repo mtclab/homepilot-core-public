@@ -4,9 +4,10 @@ import logging
 import re
 import secrets
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-from homepilot.adapters.ssh import GuestHostError
+if TYPE_CHECKING:
+    from homepilot.adapters import HostAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,12 @@ async def execute(
     frontmatter: dict[str, Any],
     body: str,
     target: dict[str, Any],
-    ssh: object,
+    host_adapter: object,
     pve_nodes: list[str] | None = None,
     rollback: bool = False,
 ) -> dict[str, Any]:
-    from homepilot.adapters.ssh import SSHAdapter
 
-    ssh_adapter: SSHAdapter = ssh  # type: ignore[assignment]
+    ssh_adapter: HostAdapter = cast("HostAdapter", host_adapter)
 
     tag = _ROLLBACK_FENCE if rollback else _SPEC_FENCE
     script = _extract_script(body, tag)
@@ -88,10 +88,14 @@ async def execute(
         }
 
     if pve_nodes:
-        try:
-            ssh_adapter._validate_guest_only(host, pve_nodes)
-        except GuestHostError as e:
-            return {"success": False, "execution_log": str(e), "failure_reason": "forbidden target"}
+        host_lower = host.lower().strip()
+        for node in pve_nodes:
+            if host_lower == node.lower().strip():
+                return {
+                    "success": False,
+                    "execution_log": f"shell-script forbidden for PVE node '{host}'",
+                    "failure_reason": "forbidden target",
+                }
 
     log_lines: list[str] = []
     start = time.monotonic()

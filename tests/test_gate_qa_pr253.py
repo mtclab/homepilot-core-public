@@ -151,7 +151,7 @@ class TestAdminTokenCreationEdgeCases:
             client = TestClient(app)
             app.include_router(auth_router, prefix="/auth")
 
-            mock_settings = MagicMock()
+            mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
             mock_settings.admin_secret = "my-secret"
             import homepilot.auth.router as router_mod
 
@@ -183,9 +183,11 @@ class TestAdminTokenCreationEdgeCases:
             client = TestClient(app)
             app.include_router(auth_router, prefix="/auth")
 
-            mock_settings = MagicMock()
+            mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
             mock_settings.admin_secret = "correct-secret"
             import homepilot.auth.router as router_mod
+
+            router_mod._token_create_attempts.clear()
 
             with patch.object(router_mod, "get_settings", return_value=mock_settings):
                 resp = client.post(
@@ -269,7 +271,7 @@ class TestRateLimitBoundaries:
         _RATE_WINDOW.clear()
 
     async def test_expired_requests_dont_count(self):
-        from homepilot.main import _RATE_WINDOW_SEC, _RATE_WINDOW, rate_limit_middleware
+        from homepilot.main import _RATE_WINDOW, _RATE_WINDOW_SEC, rate_limit_middleware
 
         _RATE_WINDOW.clear()
         import time as _time
@@ -339,7 +341,7 @@ class TestHealthStructuredResponse:
         mock_db.execute = AsyncMock(return_value=None)
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
-        mock_settings = MagicMock()
+        mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
         self._setup_state(
@@ -361,8 +363,10 @@ class TestHealthStructuredResponse:
         mock_db.execute = AsyncMock(return_value=None)
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
-        mock_settings = MagicMock()
+        mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
+        mock_settings.cors_origins = "http://localhost:5173"
+        mock_settings.agent_hub_enabled = False
 
         self._setup_state(
             client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings
@@ -380,7 +384,7 @@ class TestHealthStructuredResponse:
         mock_db.execute = AsyncMock(side_effect=Exception("connection lost"))
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
-        mock_settings = MagicMock()
+        mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
         self._setup_state(

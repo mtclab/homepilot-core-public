@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +42,8 @@ class Database:
             except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as exc:
                 last_exc = exc
                 if self._connection is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         await self._connection.close()
-                    except Exception:
-                        pass
                     self._connection = None
                 if attempt < _CONNECT_RETRIES:
                     logger.warning(

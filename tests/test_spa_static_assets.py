@@ -4,9 +4,8 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.testclient import TestClient
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
@@ -90,18 +89,18 @@ class TestSPAStaticAssets:
 class TestSPARouteOrdering:
     def test_static_assets_not_intercepted_by_spa_catchall(self, spa_app: FastAPI):
         routes = spa_app.routes
-        static_routes = [r for r in routes if hasattr(r, 'path') and '/_app/' in r.path]
-        spa_routes = [r for r in routes if hasattr(r, 'path') and r.path == '/ui/{path:path}']
+        static_routes = [r for r in routes if hasattr(r, "path") and "/_app/" in r.path]
+        spa_routes = [r for r in routes if hasattr(r, "path") and r.path == "/ui/{path:path}"]
         assert len(static_routes) > 0, "/ui/_app/ route must exist"
         assert len(spa_routes) > 0, "/ui/{path:path} SPA catch-all route must exist"
 
         static_index = None
         spa_index = None
         for i, r in enumerate(routes):
-            if hasattr(r, 'path'):
-                if '/_app/' in r.path:
+            if hasattr(r, "path"):
+                if "/_app/" in r.path:
                     static_index = i
-                if r.path == '/ui/{path:path}':
+                if r.path == "/ui/{path:path}":
                     spa_index = i
         assert static_index is not None, "Static asset route not found"
         assert spa_index is not None, "SPA catch-all route not found"

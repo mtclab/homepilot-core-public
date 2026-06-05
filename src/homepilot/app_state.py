@@ -5,14 +5,24 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import ConfigError, get_settings
 from .db.connection import Database
 from .db.migrations import run_migrations
 from .db.repository import Repository
 
+if TYPE_CHECKING:
+    from .agent_hub.registry import AgentRegistry
+
 logger = logging.getLogger(__name__)
+
+_agent_registry: AgentRegistry | None = None  # module-level singleton for agent hub registry
+
+
+def get_agent_registry() -> AgentRegistry | None:
+    return _agent_registry
+
 
 _PVE_TOKEN_RE = re.compile(r"^[^@]+@[^!]+![^=]+=.+$")
 
@@ -45,6 +55,8 @@ class AppState:
     jump_token_source: str = ""
     webhook_secret_source: str = ""
     n8n_key_source: str = ""
+    agent_hub: Any = None
+    agent_registry: Any = None
 
 
 async def create_app_state(settings: Any | None = None) -> AppState:
@@ -208,14 +220,14 @@ async def create_app_state(settings: Any | None = None) -> AppState:
             secret_val = webhook_secret.get("secret", "")
             if secret_val:
                 settings.events_webhook_secret = secret_val
-                webhook_secret_source = "vault"
+                webhook_secret_source = "vault"  # pragma: allowlist secret
         except (_VaultErrorWebhook, OSError):
             logger.debug(
                 "Vault 'webhook-secret' unavailable, falling back to env",
                 exc_info=True,
             )
     if not webhook_secret_source and os.environ.get("HP_EVENTS_WEBHOOK_SECRET"):
-        webhook_secret_source = "env"
+        webhook_secret_source = "env"  # pragma: allowlist secret
         logger.warning("HP_EVENTS_WEBHOOK_SECRET via env var — use vault for better security")
     if webhook_secret_source:
         logger.info("Webhook secret resolved (from %s)", webhook_secret_source)
@@ -308,6 +320,54 @@ async def create_app_state(settings: Any | None = None) -> AppState:
 
     from .sse import bus as sse_bus
 
+    agent_hub = None
+    agent_registry = None
+    if settings.agent_hub_enabled:
+        from .agent_hub.registry import AgentRegistry
+        from .agent_hub.server import AgentHubServer
+        from .agent_hub.tokens import BootstrapTokenStore
+
+        agent_registry = AgentRegistry()
+        global _agent_registry
+        _agent_registry = agent_registry
+
+        _token_store = BootstrapTokenStore(db=database)
+        await _token_store.load_from_db()
+
+        ssl_ctx = None
+        if settings.agent_hub_tls:
+            import ssl as _ssl
+
+            ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            if settings.agent_hub_tls_cert and settings.agent_hub_tls_key:
+                ssl_ctx.load_cert_chain(
+                    certfile=settings.agent_hub_tls_cert,
+                    keyfile=settings.agent_hub_tls_key,
+                )
+            if settings.agent_hub_tls_ca:
+                ssl_ctx.load_verify_locations(settings.agent_hub_tls_ca)
+                ssl_ctx.verify_mode = _ssl.CERT_REQUIRED
+            else:
+                ssl_ctx.verify_mode = _ssl.CERT_NONE
+            logger.info("Agent hub TLS enabled (cert_required=%s)", bool(settings.agent_hub_tls_ca))
+        else:
+            logger.warning("Agent hub running without TLS — enable HP_AGENT_HUB_TLS for production")
+
+        agent_hub = AgentHubServer(
+            host=settings.agent_hub_host,
+            port=settings.agent_hub_port,
+            auth_token=settings.agent_hub_auth_token,
+            registry=agent_registry,
+            ssl_context=ssl_ctx,
+            token_store=_token_store,
+        )
+        agent_registry.hub_server = agent_hub
+        logger.info(
+            "Agent hub initialized on %s:%s",
+            settings.agent_hub_host,
+            settings.agent_hub_port,
+        )
+
     return AppState(
         settings=settings,
         database=database,
@@ -325,4 +385,6 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         jump_token_source=jump_token_source,
         webhook_secret_source=webhook_secret_source,
         n8n_key_source=n8n_key_source,
+        agent_hub=agent_hub,
+        agent_registry=agent_registry,
     )

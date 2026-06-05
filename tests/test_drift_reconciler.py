@@ -500,12 +500,12 @@ class TestDriftReconciler:
         assert result.details["checked"] == 1
         assert result.details["drifted"] == 0
 
-    async def test_run_handles_errors(self, repo, mock_store):
+    async def test_run_handles_errors(self, repo, mock_store, mock_executor):
         fm1 = _make_artifact_fm(artifact_id="art-1", kind="ansible-playbook", status="applied")
         mock_store.list.return_value = [fm1]
         mock_store.read.side_effect = RuntimeError("broken")
 
-        reconciler = DriftReconciler(mock_store, repo, executor=None, inter_check_delay=0)
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
         result = await reconciler.run()
         assert result.success is True
         assert result.details["errors"] == 1

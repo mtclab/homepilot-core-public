@@ -1,0 +1,33 @@
+[Unit]
+Description=HomePilot Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hp-agent
+Group=hp-agent
+Environment=HP_AGENT_HUB_HOST=%H
+Environment=HP_AGENT_HUB_PORT=8443
+Environment=HP_AGENT_AUTH_TOKEN=%h/.hp/agent-token
+Environment=HP_AGENT_LOG_LEVEL=INFO
+ExecStart=/usr/local/bin/hp-agent
+Restart=always
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/homepilot /opt/homepilot /tmp/homepilot /var/log/homepilot
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
