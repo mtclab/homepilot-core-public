@@ -307,7 +307,7 @@ export const api = {
 	getHostDoc(id: string) {
 		return req<HostDoc>(`/inventory/${id}/doc`);
 	},
-	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean }) {
+	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean; import_state?: string; status?: string }) {
 		return req<Host>(`/inventory/${id}`, {
 			method: 'PATCH',
 			body: JSON.stringify(data),

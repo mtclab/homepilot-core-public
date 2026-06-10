@@ -165,6 +165,29 @@ class TestRefreshInventory:
         assert guest["hostname"] == "web-vm"
         assert guest["pve_status"] == "running"
 
+    async def test_refresh_derives_status_for_stopped_vm(self, repo):
+        # A stopped guest must surface as "offline", not "unknown", on refresh
+        # alone — without requiring a separate enrichment pass.
+        def _proxmox_read(path):
+            if path == "/nodes":
+                return {"data": [{"node": "pve1", "ip": "10.0.0.1"}]}
+            if path == "/nodes/pve1/qemu":
+                return {"data": [{"vmid": 101, "name": "off-vm", "status": "stopped"}]}
+            return {"data": []}
+
+        mock_proxmox = AsyncMock()
+        mock_proxmox.read = AsyncMock(side_effect=_proxmox_read)
+        svc = InventoryService(repo=repo, proxmox=mock_proxmox)
+        # create path
+        await svc.refresh_inventory()
+        guest = await repo.get_host_by_proxmox_id(101)
+        assert guest["pve_status"] == "stopped"
+        assert guest["status"] == "offline"
+        # update path (existing host) must also re-derive
+        await svc.refresh_inventory()
+        guest = await repo.get_host_by_proxmox_id(101)
+        assert guest["status"] == "offline"
+
     async def test_refresh_uses_guess_ip_when_no_ip(self, repo):
         mock_proxmox = AsyncMock()
         mock_proxmox.read = AsyncMock(

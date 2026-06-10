@@ -1,5 +1,52 @@
 # Changelog
 
+## v2.3.6 (2026-06-10)
+
+### Features
+
+- **Inventory import/sync of external PVE VMs**: discover and adopt VMs/LXC that
+  were created outside HomePilot.
+
+### Bug Fixes
+
+- **Inventory status on refresh (#318)**: a guest that is shut down now surfaces
+  as `offline` after an inventory refresh, instead of staying `unknown`. Derived
+  `status` was previously computed only during enrichment; the refresh path now
+  derives it (`stopped → offline`, `running + ip → online`) for nodes and guests,
+  on both create and update. `Repository.create_host` gains a `status` argument
+  (was hard-coded to `unknown`).
+- **Proxmox settings endpoints + client close**: restored the admin Proxmox
+  settings endpoints and fixed a client-close bug.
+
+### UI
+
+- **Drift page "uncovered" hosts (#318)**: the list previously labelled
+  "unmanaged hosts" is renamed **"uncovered"**. It means *no applied artifact
+  targets the host* — it is unrelated to the inventory `managed` flag. Adopting a
+  host in inventory does not "cover" it; an artifact must target it. Label and
+  help text updated to remove the ambiguity.
+
+### Security
+
+- **Scrub tooling no longer leaks into public mirrors (#316)**: `scrub-for-public.sh`
+  and `validate-scrub.sh` are now deleted from the export, and the validator no
+  longer excludes itself from the scan. Previously these scripts shipped to the
+  public repos carrying the real PVE token and operator identifiers as pattern
+  literals, and the self-exclusion hid them. The leaked PVE token was rotated and
+  the public repo history was reset. Also fixed a sed BRE bug where the
+  `10.x.x.[0-9]+` subnet replacement never matched.
+- **Public nginx proxy template documented (#311)**: the scrubbed
+  `deploy/control-plane/nginx-hp-proxy.conf` now carries a banner stating that its
+  `proxy_pass` upstreams are placeholders the operator must set.
+
+### Chores
+
+- **Lint/type/security clean (#311)**: cleared ruff (`E501`, `SIM105`, `RUF059`),
+  ruff-format, mypy (`no-any-return`), bandit (`B110`), and detect-secrets findings
+  so the integration suite passes end-to-end. Upgraded CI pip before `pip-audit`
+  to clear a pip self-advisory; guarded the `hp_agent` zabbix tests with
+  `importorskip` so they skip where the host-agent package isn't installed.
+
 ## v2.3.4 (2026-06-09)
 
 ### Features
@@ -25,7 +72,7 @@
 
 ### Testing
 
-- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance.
+- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance at `10.0.0.1:8000`.
 - **Rate limit resilience**: Session-scoped `session_auth` fixture pre-creates all tokens (session, revoke target, scope target, read-only, roundtrip) with 429 retry logic. Individual tests reuse pre-created tokens instead of creating new ones on the fly, eliminating rate-limit skips.
 - **Browser cookie auth**: `auth_page` fixture authenticates via browser UI login so cookies (`hp_token`, `hp_csrf`) are set correctly in the Playwright context.
 - **CSRF headers**: All cookie-authenticated mutations include `x-csrf-token` + `x-requested-with: XMLHttpRequest` headers.

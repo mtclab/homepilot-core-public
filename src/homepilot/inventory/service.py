@@ -284,6 +284,7 @@ class InventoryService:
                     "role": "node",
                     "ip_address": node_ip,
                     "pve_status": "running",
+                    "status": derive_status("running", node_ip),
                     "source": "hp_created",
                     "role_source": "user",
                     "ip_source": "pve",
@@ -298,6 +299,7 @@ class InventoryService:
                         role="node",
                         ip_address=node_ip,
                         pve_status="running",
+                        status=derive_status("running", node_ip),
                         source="hp_created",
                         role_source="user",
                         ip_source="pve",
@@ -322,6 +324,7 @@ class InventoryService:
                                 data = {
                                     "host_type": guest_type,
                                     "pve_status": g_status,
+                                    "status": derive_status(g_status, g_existing.get("ip_address")),
                                     "description": (
                                         g_description or g_existing.get("description") or None
                                     ),
@@ -340,6 +343,7 @@ class InventoryService:
                                     proxmox_id=vmid,
                                     node=node_name,
                                     pve_status=g_status,
+                                    status=derive_status(g_status, None),
                                     source="discovered",
                                     description=g_description,
                                     import_state="pending",

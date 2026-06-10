@@ -152,7 +152,7 @@
 			       {showUnmanaged ? 'bg-slate-700 border-slate-600 text-slate-300' : 'border-slate-600 text-slate-500'}"
 			on:click={() => (showUnmanaged = !showUnmanaged)}
 		>
-			○ {unmanagedHosts.length} unmanaged hosts
+			○ {unmanagedHosts.length} uncovered hosts
 		</button>
 	</div>
 
@@ -250,8 +250,12 @@
 
 		{#if showUnmanaged && unmanagedHosts.length}
 			<div class="card space-y-2">
-				<h2 class="text-sm font-semibold text-slate-400">○ Unmanaged Hosts</h2>
-				<p class="text-xs text-slate-500">Hosts in inventory with no active artifacts.</p>
+				<h2 class="text-sm font-semibold text-slate-400">○ Uncovered Hosts</h2>
+				<p class="text-xs text-slate-500">
+					In inventory but not targeted by any applied artifact — config drift can't be
+					tracked for them. Adopting a host in inventory does not cover it; an artifact must
+					target it. Not related to the inventory "managed" flag.
+				</p>
 				<div class="flex flex-wrap gap-2">
 					{#each unmanagedHosts as h}
 						<a

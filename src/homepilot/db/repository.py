@@ -244,6 +244,7 @@ class Repository:
         import_state: str | None = None,
         role_source: str = "inferred",
         ip_source: str | None = None,
+        status: str | None = None,
     ) -> str:
         host_id = uuid4()
         ts = now()
@@ -255,7 +256,7 @@ class Repository:
                 pve_status, source, description, artifact_id, import_state,
                 role_source, ip_source, created_at, updated_at)
                VALUES (
-                   ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?, ?
                )""",
             (
@@ -267,6 +268,7 @@ class Repository:
                 role,
                 ip_address,
                 fqdn,
+                status or "unknown",
                 tags,
                 managed_by,
                 int(managed),
