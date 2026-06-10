@@ -1,0 +1,214 @@
+{
+  "name": "Chat Assistant (Read-Only)",
+  "nodes": [
+    {
+      "id": "ca-tg-trigger-0001",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [260, 300],
+      "webhookId": "ca-webhook-0001",
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_ME",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "ca-ai-agent-0002",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.6,
+      "position": [500, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message.text }}",
+        "options": {
+          "systemMessage": "You are a read-only homelab assistant. You can query HomePilot to answer questions about the homelab but cannot make changes.\n\nAvailable tools: query_inventory, get_environment_doc, search_kb.\n\nRules:\n- Answer homelab questions by querying HomePilot tools.\n- If asked to make a change, explain that this chat mode is read-only. Suggest using the full personal assistant for mutations.\n- Be concise. Plain text only — no markdown (not rendered in Telegram).\n- If HomePilot tools return no results, say so honestly.",
+          "maxIterations": 6
+        }
+      }
+    },
+    {
+      "id": "ca-llm-0003",
+      "name": "Qwen LLM",
+      "type": "@n8n/n8n-nodes-langchain.lmOpenAi",
+      "typeVersion": 1.1,
+      "position": [500, 520],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "{{ $env.LLM_MODEL }}",
+          "mode": "list",
+          "cachedResultName": "{{ $env.LLM_MODEL }}"
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 1024
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "CONFIGURE_ME",
+          "name": "LLM API"
+        }
+      }
+    },
+    {
+      "id": "ca-hp-query-inv-0004",
+      "name": "query_inventory",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 520],
+      "parameters": {
+        "name": "query_inventory",
+        "description": "Query HomePilot inventory for homelab hosts, services, VMs, containers, and their current state. Input: query string.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"query_inventory\",\"arguments\":{\"query\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "ca-hp-get-env-0005",
+      "name": "get_environment_doc",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 620],
+      "parameters": {
+        "name": "get_environment_doc",
+        "description": "Get documentation about the homelab environment. Input: document name or topic.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"get_environment_doc\",\"arguments\":{\"name\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "ca-hp-search-kb-0006",
+      "name": "search_kb",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 720],
+      "parameters": {
+        "name": "search_kb",
+        "description": "Search the HomePilot knowledge base for homelab facts, configurations, and notes. Input: search query string.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"search_kb\",\"arguments\":{\"query\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "ca-send-reply-0007",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [740, 300],
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.output }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_ME",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [{ "node": "AI Agent", "type": "main", "index": 0 }]
+      ]
+    },
+    "Qwen LLM": {
+      "ai_languageModel": [
+        [{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "query_inventory": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "get_environment_doc": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "search_kb": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [{ "node": "Send Reply", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ca000000-0000-0000-0000-000000000003",
+  "id": "chat-assistant",
+  "meta": {
+    "instanceId": "CONFIGURE_ME"
+  },
+  "tags": [
+    { "name": "personal-agent" },
+    { "name": "read-only" }
+  ],
+  "pinData": {}
+}

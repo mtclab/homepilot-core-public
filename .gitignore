@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.venv312/
+test-results/
+DEV_ENVIRONMENT.md
+
+# Agent runtime data (bind mounts)
+agent/data/
+agent/models/
+.opencode/state
+AGENTS.md
+.pip_packages/
+*.so
+agent_cli.py

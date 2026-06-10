@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+	* {
+		box-sizing: border-box;
+	}
+	:root {
+		color-scheme: dark;
+	}
+}
+
+@layer components {
+	.badge {
+		@apply inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium;
+	}
+	.badge-proposed   { @apply bg-sky-900 text-sky-300 border border-sky-700; }
+	.badge-approved   { @apply bg-emerald-900 text-emerald-300 border border-emerald-700; }
+	.badge-applied    { @apply bg-green-900 text-green-300 border border-green-700; }
+	.badge-rejected   { @apply bg-red-900 text-red-300 border border-red-700; }
+	.badge-revoked    { @apply bg-slate-700 text-slate-400 border border-slate-600; }
+	.badge-failed     { @apply bg-orange-900 text-orange-300 border border-orange-700; }
+	.badge-superseded { @apply bg-slate-700 text-slate-500 border border-slate-600; }
+
+	.btn {
+		@apply px-3 py-1.5 rounded text-sm font-mono font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+	}
+	.btn-primary  { @apply bg-sky-700 hover:bg-sky-600 text-white; }
+	.btn-success  { @apply bg-emerald-700 hover:bg-emerald-600 text-white; }
+	.btn-danger   { @apply bg-red-800 hover:bg-red-700 text-white; }
+	.btn-ghost    { @apply bg-slate-700 hover:bg-slate-600 text-slate-200; }
+
+	.card {
+		@apply bg-slate-800 border border-slate-700 rounded-lg p-4;
+	}
+
+	.input {
+		@apply bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm font-mono text-slate-200
+		       focus:outline-none focus:border-sky-500 placeholder-slate-500;
+	}
+}

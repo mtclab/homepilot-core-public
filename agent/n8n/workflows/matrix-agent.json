@@ -1,0 +1,437 @@
+{
+  "name": "Matrix Agent",
+  "nodes": [
+    {
+      "id": "ma-matrix-trigger-0001",
+      "name": "Matrix Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [260, 300],
+      "webhookId": "ma-webhook-0001",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "matrix-incoming",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "ma-filter-own-0002",
+      "name": "Filter Own Messages",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.4,
+      "position": [480, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "" },
+          "conditions": [
+            {
+              "id": "not-own-msg",
+              "leftValue": "={{ $json.body.sender !== 'bot-username' }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "ma-extract-text-0003",
+      "name": "Extract Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [700, 300],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "msg-text",
+              "name": "messageText",
+              "value": "={{ $json.body.content?.body || $json.body.content?.formatted_body || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "room-id",
+              "name": "roomId",
+              "value": "={{ $json.body.room_id || $env.MATRIX_ROOM_ID }}",
+              "type": "string"
+            },
+            {
+              "id": "sender",
+              "name": "sender",
+              "value": "={{ $json.body.sender || 'unknown' }}",
+              "type": "string"
+            },
+            {
+              "id": "event-id",
+              "name": "eventId",
+              "value": "={{ $json.body.event_id || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "ma-ai-agent-0004",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.6,
+      "position": [940, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.messageText }}",
+        "options": {
+          "systemMessage": "You are HomePilot, a homelab infrastructure assistant accessible via Matrix chat. You manage hosts, services, VMs, containers, and infrastructure-as-code artifacts.\n\nRules:\n- For homelab questions (hosts, services, drift, artifacts, KB facts): always call HomePilot tools first.\n- For web questions not in the homelab KB: use web_search.\n- For changes (software updates, config changes, new services): use propose_artifact — the human MUST approve in HomePilot UI before anything applies. Always explain this approval gate.\n- Use search_kb to look up homelab facts before answering.\n- Use record_fact to store new facts the user shares.\n- Be concise. Markdown IS supported in Matrix — use it for formatting.\n- Never guess at infrastructure details — query HomePilot instead.\n- Identify yourself as HomePilot when asked.",
+          "maxIterations": 10
+        }
+      }
+    },
+    {
+      "id": "ma-llm-0005",
+      "name": "LLM",
+      "type": "@n8n/n8n-nodes-langchain.lmOpenAi",
+      "typeVersion": 1.1,
+      "position": [940, 520],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "{{ $env.LLM_MODEL }}",
+          "mode": "list",
+          "cachedResultName": "{{ $env.LLM_MODEL }}"
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 2048
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "CONFIGURE_ME",
+          "name": "LLM API"
+        }
+      }
+    },
+    {
+      "id": "ma-hp-query-inv-0006",
+      "name": "query_inventory",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 520],
+      "parameters": {
+        "name": "query_inventory",
+        "description": "Query HomePilot inventory for homelab hosts, services, VMs, containers, and their current state. Input: a query string describing what to look for (e.g. 'all proxmox nodes', 'nginx containers', 'hosts with drift').",
+        "method": "GET",
+        "url": "={{ $env.HP_API_URL }}/inventory",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={tool_input}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ma-hp-search-kb-0007",
+      "name": "search_kb",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 620],
+      "parameters": {
+        "name": "search_kb",
+        "description": "Search the HomePilot knowledge base for homelab facts, configurations, decisions, and notes. Input: search query string.",
+        "method": "GET",
+        "url": "={{ $env.HP_API_URL }}/kb",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={tool_input}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ma-hp-list-artifacts-0008",
+      "name": "list_artifacts",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 720],
+      "parameters": {
+        "name": "list_artifacts",
+        "description": "List HomePilot artifacts (proposed changes, approved, applied, or rejected). Input: optional filter string e.g. 'pending', 'approved', 'host=proxmox-1'.",
+        "method": "GET",
+        "url": "={{ $env.HP_API_URL }}/artifacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={tool_input}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ma-hp-propose-0009",
+      "name": "propose_artifact",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 520],
+      "parameters": {
+        "name": "propose_artifact",
+        "description": "Propose a change to the homelab infrastructure via HomePilot. Creates a pending artifact requiring human approval in the UI — no change applies automatically. Use only when the user explicitly asks to make a change. Input: JSON with 'intent' (string describing the change), 'kind' (type of change), and 'host' (target host).",
+        "method": "POST",
+        "url": "={{ $env.HP_API_URL }}/artifacts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={tool_input}"
+      }
+    },
+    {
+      "id": "ma-hp-record-fact-0010",
+      "name": "record_fact",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 620],
+      "parameters": {
+        "name": "record_fact",
+        "description": "Store a new fact about the homelab in the HomePilot KB. Use when the user tells you something new about their infrastructure. Input: JSON with 'fact' (string) and optional 'tags' (array of strings).",
+        "method": "POST",
+        "url": "={{ $env.HP_API_URL }}/kb",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={tool_input}"
+      }
+    },
+    {
+      "id": "ma-hp-health-0011",
+      "name": "check_health",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 720],
+      "parameters": {
+        "name": "check_health",
+        "description": "Check HomePilot system health status. Returns service health, uptime, and version info. Input: ignored.",
+        "method": "GET",
+        "url": "={{ $env.HP_API_URL }}/health",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_API_TOKEN }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ma-searxng-0012",
+      "name": "web_search",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 820],
+      "parameters": {
+        "name": "web_search",
+        "description": "Search the web for current information not available in the homelab KB. Use when the user asks about external topics, software documentation, or recent events. Input: search query string.",
+        "method": "GET",
+        "url": "={{ $env.SEARXNG_URL }}/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={tool_input}"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ma-send-reply-0013",
+      "name": "Send Matrix Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 300],
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $env.MATRIX_SERVER }}/_matrix/client/v3/rooms/{{ $env.MATRIX_ROOM_ID }}/send/m.room.message/{{ $now.format('yyyyMMddHHmmssSSS') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MATRIX_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"msgtype\":\"m.text\",\"body\":{{ JSON.stringify($json.output) }}}"
+      }
+    }
+  ],
+  "connections": {
+    "Matrix Trigger": {
+      "main": [
+        [{ "node": "Filter Own Messages", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter Own Messages": {
+      "main": [
+        [{ "node": "Extract Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extract Message": {
+      "main": [
+        [{ "node": "AI Agent", "type": "main", "index": 0 }]
+      ]
+    },
+    "LLM": {
+      "ai_languageModel": [
+        [{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "query_inventory": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "search_kb": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "list_artifacts": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "propose_artifact": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "record_fact": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "check_health": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "web_search": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [{ "node": "Send Matrix Reply", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ma000000-0000-0000-0000-000000000001",
+  "id": "matrix-agent",
+  "meta": {
+    "instanceId": "CONFIGURE_ME"
+  },
+  "tags": [
+    { "name": "matrix-agent" }
+  ],
+  "pinData": {}
+}

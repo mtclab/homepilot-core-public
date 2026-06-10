@@ -1,0 +1,407 @@
+{
+  "name": "Personal Assistant",
+  "nodes": [
+    {
+      "id": "pa-tg-trigger-0001",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [260, 300],
+      "webhookId": "pa-webhook-0001",
+      "parameters": {
+        "updates": ["message"],
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_ME",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "id": "pa-ai-agent-0002",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.6,
+      "position": [500, 300],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message.text }}",
+        "options": {
+          "systemMessage": "You are a homelab assistant with access to HomePilot (IaC engine), web search via SearXNG, and a calendar via Radicale.\n\nRules:\n- For homelab questions (hosts, services, drift, artifacts, KB facts): always call HomePilot tools first.\n- For web questions not in the homelab KB: use web_search.\n- For scheduling or calendar requests: use radicale_read_events / radicale_write_event.\n- For changes (software updates, config changes, new services): use propose_artifact — the human MUST approve in HomePilot UI before anything applies. Always explain this.\n- Use record_fact to store new homelab facts the user tells you.\n- Be concise. Markdown is NOT rendered in Telegram — use plain text.\n- Never guess at infrastructure details — query HomePilot instead.",
+          "maxIterations": 10
+        }
+      }
+    },
+    {
+      "id": "pa-llm-0003",
+      "name": "Qwen LLM",
+      "type": "@n8n/n8n-nodes-langchain.lmOpenAi",
+      "typeVersion": 1.1,
+      "position": [500, 520],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "{{ $env.LLM_MODEL }}",
+          "mode": "list",
+          "cachedResultName": "{{ $env.LLM_MODEL }}"
+        },
+        "options": {
+          "temperature": 0.7,
+          "maxTokens": 2048
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "CONFIGURE_ME",
+          "name": "LLM API"
+        }
+      }
+    },
+    {
+      "id": "pa-hp-query-inv-0004",
+      "name": "query_inventory",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 520],
+      "parameters": {
+        "name": "query_inventory",
+        "description": "Query HomePilot inventory for homelab hosts, services, VMs, containers, and their current state. Input: a query string describing what to look for (e.g. 'all proxmox nodes', 'nginx containers', 'hosts with drift').",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"query_inventory\",\"arguments\":{\"query\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-hp-search-kb-0005",
+      "name": "search_kb",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 620],
+      "parameters": {
+        "name": "search_kb",
+        "description": "Search the HomePilot knowledge base for homelab facts, configurations, decisions, and notes. Input: search query string.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"search_kb\",\"arguments\":{\"query\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-hp-get-env-0006",
+      "name": "get_environment_doc",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 720],
+      "parameters": {
+        "name": "get_environment_doc",
+        "description": "Get a documentation document about the homelab environment (architecture, network layout, service inventory). Input: document name or topic.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"get_environment_doc\",\"arguments\":{\"name\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-hp-query-artifacts-0007",
+      "name": "query_artifacts",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [260, 820],
+      "parameters": {
+        "name": "query_artifacts",
+        "description": "Query pending and recent HomePilot artifacts (proposed changes awaiting approval). Input: filter string e.g. 'pending', 'approved', 'host=proxmox-1'.",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"query_artifacts\",\"arguments\":{\"filter\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-hp-record-fact-0008",
+      "name": "record_fact",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 520],
+      "parameters": {
+        "name": "record_fact",
+        "description": "Store a new fact about the homelab in the HomePilot KB. Use when the user tells you something new about their infrastructure. Input: JSON with 'fact' (string) and optional 'tags' (array of strings).",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_TOKEN_RW ? $env.HP_MCP_URL : 'http://localhost:1/blocked' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN_RW }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"record_fact\",\"arguments\":{\"fact\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-hp-propose-0009",
+      "name": "propose_artifact",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 620],
+      "parameters": {
+        "name": "propose_artifact",
+        "description": "Propose a change to the homelab infrastructure via HomePilot. This creates a pending artifact that requires human approval in the HomePilot web UI — no change is applied automatically. Use only when the user explicitly asks to make a change. Input: JSON with 'intent' (string describing the change), 'kind' (type of change), and 'host' (target host).",
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_TOKEN_RW ? $env.HP_MCP_URL : 'http://localhost:1/blocked' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN_RW }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"propose_artifact\",\"arguments\":{\"intent\":\"{tool_input}\"}},\"id\":1}"
+      }
+    },
+    {
+      "id": "pa-searxng-0010",
+      "name": "web_search",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 720],
+      "parameters": {
+        "name": "web_search",
+        "description": "Search the web for current information not available in the homelab KB. Use when the user asks about external topics, software documentation, or recent events. Input: search query string.",
+        "method": "GET",
+        "url": "=http://searxng:8888/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={tool_input}"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "pa-radicale-read-0011",
+      "name": "radicale_read_events",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [740, 820],
+      "parameters": {
+        "name": "radicale_read_events",
+        "description": "Read calendar events from the homelab calendar. Returns iCal format. Use when the user asks about scheduled tasks, upcoming events, or reminders. Input: ignored — returns all events.",
+        "method": "GET",
+        "url": "=http://radicale:5232/admin/homelab.ics",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from($env.RADICALE_USER + ':' + $env.RADICALE_PASSWORD).toString('base64') }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "pa-radicale-write-0012",
+      "name": "radicale_write_event",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [980, 520],
+      "parameters": {
+        "name": "radicale_write_event",
+        "description": "Create or update a calendar event. Use when the user asks to schedule something, set a reminder, or plan a maintenance window. Input: JSON with 'summary' (title), 'dtstart' (ISO8601 datetime), 'dtend' (ISO8601 datetime), and optional 'description'. Add 'hp:propose <intent>' to description to trigger HomePilot automation at that time.",
+        "method": "PUT",
+        "url": "=http://radicale:5232/admin/homelab.ics/{tool_input_uid}.ics",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from($env.RADICALE_USER + ':' + $env.RADICALE_PASSWORD).toString('base64') }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "text/calendar"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "body": "={tool_input}"
+      }
+    },
+    {
+      "id": "pa-send-reply-0013",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [740, 300],
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').item.json.message.chat.id }}",
+        "text": "={{ $json.output }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_ME",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [{ "node": "AI Agent", "type": "main", "index": 0 }]
+      ]
+    },
+    "Qwen LLM": {
+      "ai_languageModel": [
+        [{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "query_inventory": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "search_kb": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "get_environment_doc": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "query_artifacts": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "record_fact": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "propose_artifact": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "web_search": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "radicale_read_events": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "radicale_write_event": {
+      "ai_tool": [
+        [{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [{ "node": "Send Reply", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "pa000000-0000-0000-0000-000000000001",
+  "id": "personal-assistant",
+  "meta": {
+    "instanceId": "CONFIGURE_ME"
+  },
+  "tags": [
+    { "name": "personal-agent" }
+  ],
+  "pinData": {}
+}

@@ -1,0 +1,48 @@
+use_default_settings: true
+
+server:
+  bind_address: "0.0.0.0:8080"
+  # Secret key set via SEARXNG_SECRET env var in docker-compose.yml
+  # SearXNG reads SEARXNG_SECRET automatically at startup
+  secret_key: ""
+  limiter: true
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: bv
+    disabled: true
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: true
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 30.0
+
+ui:
+  default_locale: ""
+  query_in_title: false
+  infinite_scroll: false
+  default_theme: simple

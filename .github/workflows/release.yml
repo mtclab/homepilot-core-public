@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=HomePilot
+            org.opencontainers.image.description=AI-first, artifact-backed homelab platform
+            org.opencontainers.image.licenses=AGPL-3.0
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-agent:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed  # v5.1.0
+        with:
+          go-version: "1.23"
+
+      - name: Build hp-agent
+        working-directory: agent/go
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+          -o ../../dist/hp-agent-${{ matrix.goos }}-${{ matrix.goarch }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hp-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/hp-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  github-release:
+    needs: [docker, build-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download agent binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: hp-agent-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
+        with:
+          generate_release_notes: true
+          files: dist/hp-agent-*
+          body: |
+            ## Docker
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            Or with docker compose — set `HP_IMAGE_TAG=${{ github.ref_name }}` in your `.env`.
+
+            ## Agent Binary
+
+            Download the `hp-agent` binary for your managed hosts:
+
+            ```bash
+            # Linux amd64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hp-agent-linux-amd64
+            chmod +x hp-agent-linux-amd64
+            sudo mv hp-agent-linux-amd64 /usr/local/bin/hp-agent
+
+            # Or use the install script
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install-agent.sh | bash
+            ```

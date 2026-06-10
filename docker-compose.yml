@@ -1,0 +1,155 @@
+services:
+  # ═══════════════════════════════════════════════════════════════════════
+  #  HomePilot v2 — core backend
+  # ═══════════════════════════════════════════════════════════════════════
+  backend:
+    container_name: homepilot
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.3.4}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${HP_DAEMON_PORT:-8000}:8000"
+      - "${HP_AGENT_HUB_PORT:-8443}:8443"
+    volumes:
+      - ./data/hp:/home/homepilot/.hp
+    env_file:
+      - .env
+    environment:
+      HP_AGENT_HUB_ENABLED: ${HP_AGENT_HUB_ENABLED:-false}
+      HP_AGENT_HUB_PORT: "8443"
+      HP_AGENT_HUB_AUTH_TOKEN: ${HP_AGENT_HUB_AUTH_TOKEN:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - homepilot
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  Agent services (from homepilot-agent repo — merged into v2)
+  # ═══════════════════════════════════════════════════════════════════════
+
+  # ── n8n (workflow automation) ────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:1.98.0
+    container_name: n8n
+    environment:
+      N8N_HOST: ${N8N_HOST:-localhost}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: ${TZ:-Etc/UTC}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      HP_MCP_URL: http://backend:8000/mcp
+      HP_MCP_TOKEN: ${HP_MCP_TOKEN:-}
+      HP_MCP_TOKEN_RW: ${HP_MCP_TOKEN_RW:-}
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
+      MATRIX_ROOM_ID: ${MATRIX_ROOM_ID:-}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+    volumes:
+      - n8n-data:/home/node/.n8n
+    depends_on:
+      searxng:
+        condition: service_healthy
+      radicale:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  # ── SearXNG (meta search) ──────────────────────────────────────────────
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    volumes:
+      - ./agent/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_SECRET_KEY: ${SEARXNG_SECRET_KEY}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  # ── Radicale (CalDAV/CardDAV) ───────────────────────────────────────────
+  radicale:
+    image: tomsquest/docker-radicale:3.3.2.0
+    container_name: radicale
+    volumes:
+      - ./agent/radicale/config:/config/config:ro
+      - ./agent/data/radicale:/data
+      - ./agent/radicale/htpasswd:/data/htpasswd:ro
+    environment:
+      RADICALE_CONFIG: /config/config
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5232/.well-known/caldav/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  # ── Whisper (speech-to-text) ────────────────────────────────────────────
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: whisper
+    environment:
+      WHISPER__MODEL: base
+      WHISPER__COMPUTE_TYPE: int8
+      WHISPER__DEVICE: cpu
+    volumes:
+      - ./agent/data/whisper:/root/.config/faster-whisper-server
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+  # ── Piper (text-to-speech) ─────────────────────────────────────────────
+  piper:
+    image: rhasspy/wyoming-piper:v2.4.0
+    container_name: piper
+    environment:
+      PIPER_VOICE: en_US-lessac-medium
+      PIPER_LENGTH_SCALE: 1.0
+      PIPER_NOISE_SCALE: 0.667
+      PIPER_NOISE_W: 0.333
+    volumes:
+      - ./agent/data/piper:/voices
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:10200/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - homepilot
+
+networks:
+  homepilot:
+    driver: bridge
+
+volumes:
+  n8n-data:

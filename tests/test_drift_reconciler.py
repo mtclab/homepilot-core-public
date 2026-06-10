@@ -1,0 +1,849 @@
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+
+from homepilot.reconciler import (
+    DriftReconciler,
+    verify_artifact,
+)
+
+
+@pytest.fixture
+async def real_db(tmp_path: Path):
+    from homepilot.db.connection import Database
+    from homepilot.db.migrations import run_migrations
+
+    db = Database(str(tmp_path / "test.db"))
+    await db.connect()
+    await run_migrations(db)
+    yield db
+    await db.close()
+
+
+@pytest.fixture
+async def repo(real_db):
+    from homepilot.db.repository import Repository
+
+    return Repository(real_db)
+
+
+@pytest.fixture
+def mock_store():
+    store = MagicMock()
+    return store
+
+
+@pytest.fixture
+def mock_executor():
+    executor = MagicMock()
+    executor.ssh = AsyncMock()
+    executor.proxmox = AsyncMock()
+    executor.vault = MagicMock()
+    executor.pve_nodes = []
+    return executor
+
+
+def _make_artifact_fm(
+    artifact_id: str = "2025-01-01-test-art",
+    kind: str = "ansible-playbook",
+    status: str = "applied",
+    host: str = "testhost",
+    **extra: object,
+) -> dict:
+    fm = {
+        "id": artifact_id,
+        "kind": kind,
+        "status": status,
+        "intent": "test intent",
+        "target": {"host": host, "kind": "vm", "node": "pve1", "vmid": 100},
+        **extra,
+    }
+    return fm
+
+
+class TestVerifyArtifactNonApplied:
+    async def test_proposed_returns_not_applied(self, repo, mock_store):
+        fm = _make_artifact_fm(status="proposed")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, executor=None)
+        assert result.drifted is False
+        assert result.details["reason"] == "not_applied"
+
+    async def test_approved_returns_not_applied(self, repo, mock_store):
+        fm = _make_artifact_fm(status="approved")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, executor=None)
+        assert result.drifted is False
+        assert result.details["reason"] == "not_applied"
+
+
+class TestVerifyArtifactKbNote:
+    async def test_kb_note_skipped(self, repo, mock_store):
+        fm = _make_artifact_fm(kind="kb-note", status="applied")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, executor=None)
+        assert result.drifted is False
+        assert result.details["reason"] == "kb_note_skipped"
+
+
+class TestVerifyArtifactNoExecutor:
+    async def test_no_executor_returns_gracefully(self, repo, mock_store):
+        fm = _make_artifact_fm(status="applied")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, executor=None)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_executor"
+
+
+class TestVerifyArtifactFileNotFound:
+    async def test_file_not_found_propagates(self, repo, mock_store):
+        mock_store.read.side_effect = FileNotFoundError("not found")
+        with pytest.raises(FileNotFoundError):
+            await verify_artifact("missing", repo, mock_store)
+
+
+class TestVerifyShellScript:
+    async def test_shell_script_unverifiable(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="shell-script", status="applied")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "shell_script_unverifiable"
+
+
+class TestVerifyAnsible:
+    async def test_ansible_no_spec(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        mock_store.read.return_value = (fm, "no spec here")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_spec"
+
+    async def test_ansible_no_host(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        fm["target"] = {}
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_host"
+
+    async def test_ansible_no_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.ssh.exec = AsyncMock(
+            return_value=(0, "PLAY RECAP *** changed=0 unreachable=0 failed=0", "")
+        )
+        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
+            mock_sem.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.__aexit__ = AsyncMock(return_value=None)
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["changed"] is False
+
+    async def test_ansible_detected_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.ssh.exec = AsyncMock(
+            return_value=(0, "PLAY RECAP *** changed=2 unreachable=0 failed=0", "")
+        )
+        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
+            mock_sem.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.__aexit__ = AsyncMock(return_value=None)
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is True
+        assert result.details["changed"] is True
+
+    async def test_ansible_forbidden_host(self, repo, mock_store, mock_executor):
+        from homepilot.adapters.ssh import GuestHostError
+
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.pve_nodes = ["pve1"]
+        mock_executor.ssh._validate_guest_only = MagicMock(side_effect=GuestHostError("forbidden"))
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "forbidden_host"
+
+
+class TestVerifyProxmoxApi:
+    async def test_proxmox_no_spec(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        mock_store.read.return_value = (fm, "no spec")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_spec"
+
+    async def test_proxmox_no_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/lxc/100/config\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /nodes/pve1/lxc/100/config\n"
+            "      skip_if: \"response['status'] == 'running'\"\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "running", "data": {}})
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+
+    async def test_proxmox_detected_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/lxc/100/config\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /nodes/pve1/lxc/100/config\n"
+            "      skip_if: \"response['status'] == 'running'\"\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "stopped", "data": {}})
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is True
+        assert "step1" in result.details["drifted_steps"]
+
+    async def test_proxmox_get_step_skipped(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: GET\n"
+            "    path: /nodes/pve1/status\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert "step1" in result.details["skipped_steps"]
+
+    async def test_proxmox_no_precheck_skipped(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/lxc/100/config\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert "step1" in result.details["skipped_steps"]
+
+    async def test_proxmox_cluster_target(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        fm["target"] = {"kind": "cluster"}
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/lxc/100/config\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /nodes/pve1/status\n"
+            "      skip_if: \"response['status'] == 'online'\"\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "online"})
+        with patch(
+            "homepilot.executor.proxmox_api._pick_cluster_node",
+            new_callable=AsyncMock,
+            return_value="pve1",
+        ):
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+
+
+class TestVerifyHttpSequence:
+    async def test_http_no_spec(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="http-sequence", status="applied")
+        mock_store.read.return_value = (fm, "no spec")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_spec"
+
+    async def test_http_no_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="http-sequence", status="applied")
+        body = (
+            "```yaml http-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    name: test-svc\n"
+            "    method: POST\n"
+            "    path: /api/v1/config\n"
+            "    precheck:\n"
+            "      name: test-svc\n"
+            "      method: GET\n"
+            "      path: /api/v1/config\n"
+            '      skip_if: "response.status_code == 200"\n'
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        mock_creds = {
+            "base_url": "https://test.example.com",
+            "headers": {},
+            "verify_tls": True,
+        }
+        mock_executor.vault.get_secret = AsyncMock(return_value=mock_creds)
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.request = AsyncMock(return_value=mock_resp)
+            mock_client_instance.aclose = AsyncMock()
+            mock_client.return_value = mock_client_instance
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+
+        assert result.drifted is False
+
+    async def test_http_detected_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="http-sequence", status="applied")
+        body = (
+            "```yaml http-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    name: test-svc\n"
+            "    method: POST\n"
+            "    path: /api/v1/config\n"
+            "    precheck:\n"
+            "      name: test-svc\n"
+            "      method: GET\n"
+            "      path: /api/v1/config\n"
+            '      skip_if: "response.status_code == 200"\n'
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+
+        mock_creds = {
+            "base_url": "https://test.example.com",
+            "headers": {},
+            "verify_tls": True,
+        }
+        mock_executor.vault.get_secret = AsyncMock(return_value=mock_creds)
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.request = AsyncMock(return_value=mock_resp)
+            mock_client_instance.aclose = AsyncMock()
+            mock_client.return_value = mock_client_instance
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+
+        assert result.drifted is True
+        assert "step1" in result.details["drifted_steps"]
+
+
+class TestVerifyComposite:
+    async def test_composite_no_spec(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="composite", status="applied")
+        mock_store.read.return_value = (fm, "no spec")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "no_spec"
+
+    async def test_composite_no_drift_in_subs(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="composite", status="applied")
+        body = (
+            "```yaml composite-spec\n"
+            "steps:\n"
+            "  - id: s1\n"
+            "    artifact: sub-1\n"
+            "  - id: s2\n"
+            "    artifact: sub-2\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+
+        sub_fm = _make_artifact_fm(artifact_id="sub-1", kind="shell-script", status="applied")
+        sub_fm2 = _make_artifact_fm(artifact_id="sub-2", kind="shell-script", status="applied")
+
+        call_count = 0
+
+        def side_effect(aid):
+            nonlocal call_count
+            call_count += 1
+            data = {
+                "art-1": (fm, body),
+                "sub-1": (sub_fm, "shell script body"),
+                "sub-2": (sub_fm2, "shell script body"),
+            }
+            if aid in data:
+                return data[aid]
+            raise FileNotFoundError(aid)
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+
+    async def test_composite_drift_in_sub(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="composite", status="applied")
+        body = "```yaml composite-spec\nsteps:\n  - id: s1\n    artifact: sub-1\n```\n"
+        mock_store.read.return_value = (fm, body)
+
+        sub_fm_drifted = _make_artifact_fm(
+            artifact_id="sub-1", kind="proxmox-api-sequence", status="applied"
+        )
+        sub_body_drifted = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /test\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /test\n"
+            '      skip_if: "response.json.ok == true"\n'
+            "```\n"
+        )
+
+        call_count = 0
+
+        def side_effect(aid):
+            nonlocal call_count
+            if aid == "art-1":
+                return (fm, body)
+            elif aid == "sub-1":
+                return (sub_fm_drifted, sub_body_drifted)
+            raise FileNotFoundError(aid)
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+        mock_executor.proxmox.call = AsyncMock(return_value={"ok": False})
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is True
+        assert "sub-1" in result.details["drifted_subs"]
+
+
+class TestVerifyUnknownKind:
+    async def test_unknown_kind(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="future-kind", status="applied")
+        mock_store.read.return_value = (fm, "body")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "unknown_kind"
+
+
+class TestVerifyTimeout:
+    async def test_timeout_returns_no_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.ssh.exec = AsyncMock(side_effect=TimeoutError())
+        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
+            mock_sem.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.__aexit__ = AsyncMock(return_value=None)
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "timeout"
+
+
+class TestDriftReconciler:
+    async def test_run_empty_store(self, repo, mock_store):
+        mock_store.list.return_value = []
+        reconciler = DriftReconciler(mock_store, repo, executor=None)
+        result = await reconciler.run()
+        assert result.name == "drift"
+        assert result.success is True
+        assert result.details["checked"] == 0
+        assert result.details["drifted"] == 0
+        assert result.details["skipped_kb_notes"] == 0
+
+    async def test_run_skips_kb_notes(self, repo, mock_store):
+        fm_kb = _make_artifact_fm(kind="kb-note", status="applied")
+        mock_store.list.return_value = [fm_kb]
+        reconciler = DriftReconciler(mock_store, repo, executor=None)
+        result = await reconciler.run()
+        assert result.success is True
+        assert result.details["skipped_kb_notes"] == 1
+        assert result.details["checked"] == 0
+
+    async def test_run_checks_applied(self, repo, mock_store, mock_executor):
+        fm1 = _make_artifact_fm(artifact_id="art-1", kind="shell-script", status="applied")
+        mock_store.list.return_value = [fm1]
+
+        def side_effect(aid):
+            if aid == "art-1":
+                return (fm1, "script body")
+            raise FileNotFoundError(aid)
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
+        result = await reconciler.run()
+        assert result.success is True
+        assert result.details["checked"] == 1
+        assert result.details["drifted"] == 0
+
+    async def test_run_handles_errors(self, repo, mock_store, mock_executor):
+        fm1 = _make_artifact_fm(artifact_id="art-1", kind="ansible-playbook", status="applied")
+        mock_store.list.return_value = [fm1]
+        mock_store.read.side_effect = RuntimeError("broken")
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
+        result = await reconciler.run()
+        assert result.success is True
+        assert result.details["errors"] == 1
+
+    async def test_run_audit_log_written(self, repo, mock_store, mock_executor):
+        fm1 = _make_artifact_fm(artifact_id="art-1", kind="shell-script", status="applied")
+        mock_store.list.return_value = [fm1]
+
+        def side_effect(aid):
+            return (fm1, "script body")
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
+        await reconciler.run()
+
+        rows = await repo.db.fetchall(
+            "SELECT * FROM audit_log WHERE source = 'reconciler:drift' AND action = 'check_cycle'"
+        )
+        assert len(rows) >= 1
+
+    async def test_run_failure(self, repo, mock_store):
+        mock_store.list.side_effect = RuntimeError("store broken")
+        reconciler = DriftReconciler(mock_store, repo, executor=None)
+        result = await reconciler.run()
+        assert result.success is False
+        assert "error" in result.details
+
+
+class TestDriftReconcilerCheckSingle:
+    async def test_check_single_persists_drift(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(artifact_id="art-1", kind="shell-script", status="applied")
+
+        def side_effect(aid):
+            return (fm, "script body")
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor)
+        result = await reconciler.check_single("art-1")
+
+        assert result.drifted is False
+        row = await repo.get_drift_check("art-1")
+        assert row is not None
+        assert row["drifted"] == 0
+
+    async def test_check_single_file_not_found(self, repo, mock_store):
+        mock_store.read.side_effect = FileNotFoundError("not found")
+        reconciler = DriftReconciler(mock_store, repo, executor=None)
+        with pytest.raises(FileNotFoundError):
+            await reconciler.check_single("missing")
+
+    async def test_check_single_audit_log(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(artifact_id="art-1", kind="shell-script", status="applied")
+
+        def side_effect(aid):
+            return (fm, "script body")
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor)
+        await reconciler.check_single("art-1")
+
+        rows = await repo.db.fetchall(
+            "SELECT * FROM audit_log WHERE source = 'reconciler:drift' AND action = 'check_drift'"
+        )
+        assert len(rows) >= 1
+        assert rows[0]["artifact_id"] == "art-1"
+
+
+class TestRepositoryDriftMethods:
+    async def test_upsert_drift_check_insert(self, repo):
+        await repo.upsert_drift_check("art-1", drifted=False)
+        row = await repo.get_drift_check("art-1")
+        assert row is not None
+        assert row["artifact_id"] == "art-1"
+        assert row["drifted"] == 0
+
+    async def test_upsert_drift_check_update(self, repo):
+        await repo.upsert_drift_check("art-1", drifted=False)
+        await repo.upsert_drift_check("art-1", drifted=True, details_json='{"reason":"x"}')
+        row = await repo.get_drift_check("art-1")
+        assert row["drifted"] == 1
+        assert row["details_json"] == '{"reason":"x"}'
+
+    async def test_get_drift_checks_all(self, repo):
+        await repo.upsert_drift_check("art-1", drifted=False)
+        await repo.upsert_drift_check("art-2", drifted=True)
+        rows = await repo.get_drift_checks()
+        assert len(rows) == 2
+
+    async def test_get_drift_checks_filter_drifted(self, repo):
+        await repo.upsert_drift_check("art-1", drifted=False)
+        await repo.upsert_drift_check("art-2", drifted=True)
+        rows = await repo.get_drift_checks(drifted=True)
+        assert len(rows) == 1
+        assert rows[0]["artifact_id"] == "art-2"
+
+    async def test_get_drift_check_not_found(self, repo):
+        row = await repo.get_drift_check("nonexistent")
+        assert row is None
+
+    async def test_get_drift_checks_with_details(self, repo):
+        await repo.upsert_drift_check(
+            "art-1", drifted=True, details_json='{"reason":"config_changed"}'
+        )
+        rows = await repo.get_drift_checks(drifted=True)
+        assert len(rows) == 1
+        assert rows[0]["details_json"] == '{"reason":"config_changed"}'
+
+    async def test_get_drift_checks_pagination(self, repo):
+        for i in range(5):
+            await repo.upsert_drift_check(f"art-{i}", drifted=False)
+        rows = await repo.get_drift_checks(limit=2, offset=0)
+        assert len(rows) == 2
+        rows2 = await repo.get_drift_checks(limit=2, offset=2)
+        assert len(rows2) == 2
+
+
+class TestAnsibleOutputParsing:
+    def test_no_changes(self):
+        assert _ansible_output_has_changes("PLAY RECAP **** changed=0 unreachable=0") is False
+
+    def test_has_changes(self):
+        assert _ansible_output_has_changes("PLAY RECAP **** changed=3 unreachable=0") is True
+
+    def test_no_recap_no_changes(self):
+        assert _ansible_output_has_changes("ok: [host]") is False
+
+    def test_changed_keyword_without_recap(self):
+        assert _ansible_output_has_changes("changed: [host]") is True
+
+    def test_changed_zero_in_text(self):
+        assert _ansible_output_has_changes("changed=0 failed=0") is False
+
+
+def _ansible_output_has_changes(output: str) -> bool:
+    import re
+
+    recap_match = re.search(r"changed=(\d+)", output)
+    if recap_match:
+        return int(recap_match.group(1)) > 0
+    return "changed" in output.lower() and "changed=0" not in output
+
+
+class TestVerifyArtifactEdgeCases:
+    async def test_error_during_verify(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /test\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /test\n"
+            '      skip_if: "response.status_code == 200"\n'
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(side_effect=httpx.ConnectError("conn refused"))
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert "step1" in result.details.get("skipped_steps", [])
+
+    async def test_proxmox_precheck_no_skip_if(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /test\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /test\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(return_value={"data": {}})
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert "step1" in result.details["skipped_steps"]
+
+
+class TestDriftReconcilerMixedKinds:
+    async def test_mixed_applied_and_kb_note(self, repo, mock_store, mock_executor):
+        fm_shell = _make_artifact_fm(artifact_id="art-shell", kind="shell-script", status="applied")
+        fm_kb = _make_artifact_fm(artifact_id="art-kb", kind="kb-note", status="applied")
+
+        mock_store.list.return_value = [fm_shell, fm_kb]
+
+        def side_effect(aid):
+            if aid == "art-shell":
+                return (fm_shell, "script body")
+            elif aid == "art-kb":
+                return (fm_kb, "note body")
+            raise FileNotFoundError(aid)
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
+        result = await reconciler.run()
+        assert result.success is True
+        assert result.details["checked"] == 1
+        assert result.details["skipped_kb_notes"] == 1
+
+
+class TestDriftReconcilerCheckSingleSkips:
+    async def test_check_single_kb_note_skipped(self, repo, mock_executor):
+        fm_kb = _make_artifact_fm(artifact_id="art-kb", kind="kb-note", status="applied")
+        store = MagicMock()
+        store.read.return_value = (fm_kb, "note body")
+        reconciler = DriftReconciler(store, repo, executor=mock_executor)
+        result = await reconciler.check_single("art-kb")
+        assert result.drifted is False
+        assert result.details["reason"] == "kb_note_skipped"
+        row = await repo.get_drift_check("art-kb")
+        assert row is not None
+        assert row["drifted"] == 0
+
+    async def test_check_single_non_applied_skipped(self, repo, mock_executor):
+        fm_proposed = _make_artifact_fm(
+            artifact_id="art-prop", kind="shell-script", status="proposed"
+        )
+        store = MagicMock()
+        store.read.return_value = (fm_proposed, "body")
+        reconciler = DriftReconciler(store, repo, executor=mock_executor)
+        result = await reconciler.check_single("art-prop")
+        assert result.drifted is False
+        assert result.details["reason"] == "not_applied"
+
+    async def test_check_single_nonexistent_raises(self, repo, mock_executor):
+        store = MagicMock()
+        store.read.side_effect = FileNotFoundError("gone")
+        reconciler = DriftReconciler(store, repo, executor=mock_executor)
+        with pytest.raises(FileNotFoundError):
+            await reconciler.check_single("ghost")
+
+
+class TestRepositoryDriftRoundTrip:
+    async def test_upsert_get_round_trip(self, repo):
+        await repo.upsert_drift_check("art-rt", drifted=True, details_json='{"x":1}')
+        row = await repo.get_drift_check("art-rt")
+        assert row["artifact_id"] == "art-rt"
+        assert row["drifted"] == 1
+        assert row["details_json"] == '{"x":1}'
+        assert row["checked_at"] is not None
+
+        await repo.upsert_drift_check("art-rt", drifted=False, details_json=None)
+        row2 = await repo.get_drift_check("art-rt")
+        assert row2["drifted"] == 0
+        assert row2["details_json"] is None
+        assert row2["checked_at"] >= row["checked_at"]
+
+    async def test_get_drift_checks_filter_not_drifted(self, repo):
+        await repo.upsert_drift_check("art-a", drifted=False)
+        await repo.upsert_drift_check("art-b", drifted=True)
+        rows = await repo.get_drift_checks(drifted=False)
+        assert len(rows) == 1
+        assert rows[0]["artifact_id"] == "art-a"
+
+    async def test_get_drift_checks_empty_table(self, repo):
+        rows = await repo.get_drift_checks()
+        assert rows == []
+
+
+class TestSecurityHostnameValidation:
+    async def test_ansible_invalid_hostname_rejected(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        fm["target"]["host"] = "evil host\n[extra]"
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.drifted is False
+        assert result.details["reason"] == "invalid_host"
+
+    async def test_ansible_valid_hostname_accepted(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.ssh.exec = AsyncMock(
+            return_value=(0, "PLAY RECAP *** changed=0 unreachable=0 failed=0", "")
+        )
+        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
+            mock_sem.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.__aexit__ = AsyncMock(return_value=None)
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.details.get("reason") != "invalid_host"
+
+    async def test_ansible_hostname_with_dots(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        fm["target"]["host"] = "web-server.example.com"
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.ssh.exec = AsyncMock(
+            return_value=(0, "PLAY RECAP *** changed=0 unreachable=0 failed=0", "")
+        )
+        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
+            mock_sem.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.__aexit__ = AsyncMock(return_value=None)
+            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.details.get("reason") != "invalid_host"
+
+
+class TestSecurityDepthGuard:
+    async def test_max_depth_exceeded(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="composite", status="applied")
+        body = "```yaml composite-spec\nsteps:\n  - id: s1\n    artifact: sub-1\n```\n"
+        mock_store.read.return_value = (fm, body)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor, _depth=11)
+        assert result.drifted is False
+        assert result.details["reason"] == "max_depth"
+
+    async def test_depth_at_limit_still_runs(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="shell-script", status="applied")
+        mock_store.read.return_value = (fm, "script body")
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor, _depth=10)
+        assert result.drifted is False
+        assert result.details["reason"] == "shell_script_unverifiable"
+
+    async def test_composite_passes_incremented_depth(self, repo, mock_store, mock_executor):
+        fm = _make_artifact_fm(kind="composite", status="applied")
+        body = "```yaml composite-spec\nsteps:\n  - id: s1\n    artifact: sub-1\n```\n"
+        sub_fm = _make_artifact_fm(artifact_id="sub-1", kind="shell-script", status="applied")
+
+        call_count = 0
+
+        def side_effect(aid):
+            nonlocal call_count
+            call_count += 1
+            if aid == "art-1":
+                return (fm, body)
+            elif aid == "sub-1":
+                return (sub_fm, "shell script body")
+            raise FileNotFoundError(aid)
+
+        mock_store.read = MagicMock(side_effect=side_effect)
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor, _depth=5)
+        assert result.drifted is False

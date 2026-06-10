@@ -1,0 +1,168 @@
+{
+  "name": "Artifact Notification",
+  "nodes": [
+    {
+      "id": "an-webhook-0001",
+      "name": "Artifact Proposed Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [260, 300],
+      "webhookId": "an-webhook-artifact-proposed",
+      "parameters": {
+        "path": "artifact-proposed",
+        "responseMode": "onReceived",
+        "responseData": "noData",
+        "httpMethod": "POST",
+        "options": {}
+      }
+    },
+    {
+      "id": "an-format-0002",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.2,
+      "position": [480, 300],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "an-assign-msg",
+              "name": "matrix_message",
+              "value": "=**Artifact proposed** — {{ $json.body.artifact.kind }}\n\nIntent: {{ $json.body.artifact.intent }}\nHost: {{ $json.body.artifact.host }}\nProposed: {{ $json.body.artifact.proposed_at }}\n\nReview: {{ $env.HP_MCP_URL.replace('/mcp', '') }}/artifacts/{{ $json.body.artifact.id }}",
+              "type": "string"
+            },
+            {
+              "id": "an-assign-tg",
+              "name": "telegram_message",
+              "value": "=Artifact proposed: {{ $json.body.artifact.kind }}\nIntent: {{ $json.body.artifact.intent }}\nHost: {{ $json.body.artifact.host }}\nReview: {{ $env.HP_MCP_URL.replace('/mcp', '') }}/artifacts/{{ $json.body.artifact.id }}",
+              "type": "string"
+            },
+            {
+              "id": "an-assign-room",
+              "name": "matrix_room_id",
+              "value": "={{ $env.MATRIX_ROOM_ID }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "an-matrix-0003",
+      "name": "Send Matrix Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 220],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MATRIX_HOMESERVER }}/_matrix/client/v3/rooms/{{ encodeURIComponent($json.matrix_room_id) }}/send/m.room.message/{{ $now.toFormat('x') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MATRIX_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({msgtype: 'm.text', body: $json.matrix_message, format: 'org.matrix.custom.html', formatted_body: $json.matrix_message.replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>').replace(/\\n/g, '<br/>')}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "an-telegram-gate-0004",
+      "name": "Telegram Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 420],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "an-cond-tg",
+              "leftValue": "={{ $env.TELEGRAM_BOT_TOKEN }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "an-telegram-0005",
+      "name": "Send Telegram Notification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [920, 380],
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_ALLOWED_USER_ID }}",
+        "text": "={{ $('Format Message').item.json.telegram_message }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "CONFIGURE_ME",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Artifact Proposed Webhook": {
+      "main": [
+        [{ "node": "Format Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Message": {
+      "main": [
+        [
+          { "node": "Send Matrix Notification", "type": "main", "index": 0 },
+          { "node": "Telegram Enabled?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Telegram Enabled?": {
+      "main": [
+        [{ "node": "Send Telegram Notification", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "an000000-0000-0000-0000-000000000002",
+  "id": "artifact-notification",
+  "meta": {
+    "instanceId": "CONFIGURE_ME"
+  },
+  "tags": [
+    { "name": "notifications" }
+  ],
+  "pinData": {}
+}

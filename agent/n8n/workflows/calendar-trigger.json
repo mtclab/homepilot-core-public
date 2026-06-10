@@ -1,0 +1,163 @@
+{
+  "name": "Calendar → HomePilot Trigger",
+  "nodes": [
+    {
+      "id": "ct-schedule-0001",
+      "name": "Poll Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [260, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ct-fetch-cal-0002",
+      "name": "Fetch Calendar",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "=http://radicale:5232/admin/homelab.ics",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Basic {{ Buffer.from($env.RADICALE_USER + ':' + $env.RADICALE_PASSWORD).toString('base64') }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "ct-parse-0003",
+      "name": "Find hp:propose Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 300],
+      "parameters": {
+        "jsCode": "const icalText = $input.first().json.data || '';\n\nif (!icalText) {\n  return [];\n}\n\n// Dedup: use workflow static data to track processed UID+DTSTART combos\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedCalendarUids) {\n  staticData.processedCalendarUids = {};\n}\n\n// TTL cleanup: remove entries older than 48 hours\nconst ttlMs = 48 * 60 * 60 * 1000;\nconst nowMs = Date.now();\nfor (const key of Object.keys(staticData.processedCalendarUids)) {\n  const ts = new Date(staticData.processedCalendarUids[key]).getTime();\n  if (nowMs - ts > ttlMs) {\n    delete staticData.processedCalendarUids[key];\n  }\n}\n\n// Parse VEVENT blocks from iCal text\nconst eventBlocks = icalText.split('BEGIN:VEVENT').slice(1);\nconst now = new Date();\nconst windowMs = 5 * 60 * 1000; // 5 minutes\n\nconst dueEvents = [];\n\nfor (const block of eventBlocks) {\n  const getField = (name) => {\n    const match = block.match(new RegExp(`^${name}[^:]*:(.+)$`, 'm'));\n    return match ? match[1].trim() : null;\n  };\n\n  const uid = getField('UID');\n  const summary = getField('SUMMARY');\n  const description = getField('DESCRIPTION') || '';\n  const dtstart = getField('DTSTART');\n  const status = getField('STATUS') || 'CONFIRMED';\n\n  // Only process events with hp:propose in description\n  if (!description.includes('hp:propose')) continue;\n\n  // Only process confirmed (not cancelled) events\n  if (status === 'CANCELLED') continue;\n\n  if (!dtstart) continue;\n\n  // Parse datetime (basic iCal datetime: YYYYMMDDTHHmmssZ or YYYYMMDDTHHmmss)\n  let eventTime;\n  try {\n    const d = dtstart.replace('Z', '');\n    eventTime = new Date(\n      `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}T${d.slice(9,11)}:${d.slice(11,13)}:${d.slice(13,15)}${dtstart.endsWith('Z') ? 'Z' : ''}`\n    );\n  } catch (e) {\n    continue;\n  }\n\n  // Dedup: skip if this UID+DTSTART was already processed\n  const dedupKey = `${uid}::${dtstart}`;\n  if (staticData.processedCalendarUids[dedupKey]) continue;\n\n  // Fire if event is within the next poll window (or overdue by up to 5 min)\n  const diffMs = eventTime - now;\n  if (diffMs >= -windowMs && diffMs <= windowMs) {\n    const intentMatch = description.match(/hp:propose\\s+(.+?)(?:\\n|$)/i);\n    const intent = intentMatch ? intentMatch[1].trim() : summary;\n\n    // Mark as processed before proposing\n    staticData.processedCalendarUids[dedupKey] = eventTime.toISOString();\n\n    dueEvents.push({\n      uid,\n      summary,\n      description,\n      intent,\n      dtstart,\n      eventTime: eventTime.toISOString()\n    });\n  }\n}\n\nif (dueEvents.length === 0) {\n  return [];\n}\n\nreturn dueEvents.map(e => ({ json: e }));"
+      }
+    },
+    {
+      "id": "ct-propose-0004",
+      "name": "Propose HomePilot Artifact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.HP_MCP_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HP_MCP_TOKEN_RW }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({jsonrpc: '2.0', method: 'tools/call', params: {name: 'propose_artifact', arguments: {intent: $json.intent, source: 'calendar', calendar_uid: $json.uid, scheduled_for: $json.eventTime}}, id: 1}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "ct-notify-0005",
+      "name": "Notify Matrix",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.MATRIX_HOMESERVER }}/_matrix/client/v3/rooms/{{ encodeURIComponent($env.MATRIX_ROOM_ID) }}/send/m.room.message/{{ $now.toFormat('x') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MATRIX_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({msgtype: 'm.text', body: 'Calendar trigger: proposed artifact for \"' + $('Find hp:propose Events').item.json.intent + '\" (scheduled ' + $('Find hp:propose Events').item.json.eventTime + ')'}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Poll Every 5 Minutes": {
+      "main": [
+        [{ "node": "Fetch Calendar", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Calendar": {
+      "main": [
+        [{ "node": "Find hp:propose Events", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find hp:propose Events": {
+      "main": [
+        [{ "node": "Propose HomePilot Artifact", "type": "main", "index": 0 }]
+      ]
+    },
+    "Propose HomePilot Artifact": {
+      "main": [
+        [{ "node": "Notify Matrix", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "ct000000-0000-0000-0000-000000000005",
+  "id": "calendar-trigger",
+  "meta": {
+    "instanceId": "CONFIGURE_ME"
+  },
+  "tags": [
+    { "name": "automation" }
+  ],
+  "pinData": {}
+}

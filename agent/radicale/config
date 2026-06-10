@@ -1,0 +1,19 @@
+[server]
+hosts = 0.0.0.0:5232
+max_connections = 20
+max_content_length = 100000000
+timeout = 30
+
+[auth]
+type = htpasswd
+htpasswd_filename = /run/secrets/radicale_htpasswd
+htpasswd_encryption = bcrypt
+# Credentials stored as Docker secret — generate with:
+#   scripts/setup-credentials.sh
+# Or manually: htpasswd -Bc secrets/radicale_htpasswd.txt admin
+
+[storage]
+filesystem_folder = /data/collections
+
+[logging]
+level = info
