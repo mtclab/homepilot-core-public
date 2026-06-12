@@ -238,3 +238,52 @@ class TestAdvertisedHub:
         host, port = router._advertised_hub(self._req("ui.example.com"), "10.5.5.5", 8443)
         assert host == "10.5.5.5"
         assert port == 8443
+
+
+class TestRegistryPersistence:
+    """Agents must survive a backend restart: register/disconnect/state writes
+    go to the agents table (committed), and a second DB connection sees them."""
+
+    @pytest.fixture
+    async def db_repo(self, tmp_path):
+        from homepilot.db.connection import Database
+        from homepilot.db.migrations import run_migrations
+        from homepilot.db.repository import Repository
+
+        db = Database(str(tmp_path / "t.db"))
+        await db.connect()
+        await run_migrations(db)
+        yield Repository(db), tmp_path
+        await db.close()
+
+    async def test_register_persists_and_survives(self, db_repo):
+        repo, tmp_path = db_repo
+        reg = AgentRegistry(repo=repo)
+        reg.register(agent_id="a-1", hostname="web01", system_info={"os": "Linux"})
+        await asyncio.sleep(0)  # let the persistence task run
+        await asyncio.sleep(0.05)
+
+        from homepilot.db.connection import Database
+
+        other = Database(str(tmp_path / "t.db"))
+        await other.connect()
+        rows = await other.fetchall("SELECT agent_id, hostname, connected FROM agents")
+        await other.close()
+        assert rows and rows[0]["agent_id"] == "a-1"
+        assert rows[0]["connected"] == 1
+
+    async def test_unregister_marks_disconnected(self, db_repo):
+        repo, _ = db_repo
+        reg = AgentRegistry(repo=repo)
+        reg.register(agent_id="a-2", hostname="db01")
+        await asyncio.sleep(0.05)
+        reg.unregister("a-2")
+        await asyncio.sleep(0.05)
+        agents = await repo.list_agents()
+        assert agents[0]["connected"] == 0
+        assert agents[0]["disconnected_at"]
+
+    async def test_no_repo_is_noop(self):
+        reg = AgentRegistry()
+        reg.register(agent_id="a-3", hostname="x")
+        reg.unregister("a-3")  # must not raise

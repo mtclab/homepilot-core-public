@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.4.0 (2026-06-12)
+
+### Features
+
+- **Agents survive backend restarts (#343)**: the agent registry is now
+  persisted (migration v11 `agents` table). After a backend update agents show
+  as known/reconnecting instead of vanishing, and coverage no longer flaps to
+  "uncovered." `GET /agents/` overlays live connections on the persisted set;
+  UI shows connected / stale / disconnected.
+- **Overview dashboard (#344)**: the home page is now a current-state dashboard
+  — coverage %, uncovered hosts, in-spec %, agent fleet, and status/role/artifact
+  donuts. New `GET /dashboard/summary` (+ `/dashboard/config`). Hand-rolled SVG
+  charts, no new dependency. HomePilot shows current state; history stays in
+  Zabbix.
+- **Zabbix deep-links (#345)**: `HP_ZABBIX_URL` (default `/zabbix`, the bundled
+  reverse-proxy path) powers "Metrics ↗" links per host on Inventory and Agents.
+- **Logo + favicon (#346)**: HomePilot mark; fixes the prior favicon 404.
+
 ## v2.3.10 (2026-06-12)
 
 ### Bug Fixes

@@ -518,6 +518,7 @@ from .agent_hub.router import router as agent_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
 from .audit.router import router as audit_router  # noqa: E402
 from .auth.router import router as auth_router  # noqa: E402
+from .dashboard.router import router as dashboard_router  # noqa: E402
 from .inventory.router import router as inventory_router  # noqa: E402
 from .kb.router import router as kb_router  # noqa: E402
 from .tasks.router import router as tasks_router  # noqa: E402
@@ -538,6 +539,7 @@ app.include_router(
     tasks_router, prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_token)]
 )
 app.include_router(kb_router, prefix="/kb", tags=["kb"], dependencies=[Depends(require_token)])
+app.include_router(dashboard_router, dependencies=[Depends(require_token)])
 
 
 @app.get("/health")

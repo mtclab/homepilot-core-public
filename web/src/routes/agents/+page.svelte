@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type AgentInfo } from '$lib/api';
+	import { api, zabbixHostUrl, type AgentInfo } from '$lib/api';
 	import { notify } from '$lib/stores';
 
 	let agents: AgentInfo[] = [];
+	let zabbixUrl = '';
 	let loading = true;
 	let isAdmin = true;
 
@@ -78,20 +79,42 @@
 		return String(v);
 	}
 
-	// The registry only lists connected agents; freshness comes from heartbeat
-	// age. Treat > ~3 missed heartbeats (90s) as stale.
-	function isFresh(a: { stale_seconds?: number }): boolean {
-		return (a.stale_seconds ?? 0) < 90;
+	// The list overlays live connections on the persisted registry: persisted
+	// entries carry connected:false (known host, reconnecting/offline). For live
+	// ones freshness comes from heartbeat age (~3 missed heartbeats = stale).
+	type AgentStatus = 'connected' | 'stale' | 'disconnected';
+	function agentStatus(a: { connected?: boolean; stale_seconds?: number }): AgentStatus {
+		if (a.connected === false) return 'disconnected';
+		return (a.stale_seconds ?? 0) < 90 ? 'connected' : 'stale';
 	}
+	const statusDot: Record<AgentStatus, string> = {
+		connected: 'bg-emerald-400',
+		stale: 'bg-yellow-400',
+		disconnected: 'bg-slate-500'
+	};
+	const statusText: Record<AgentStatus, string> = {
+		connected: 'text-emerald-400',
+		stale: 'text-yellow-400',
+		disconnected: 'text-slate-500'
+	};
 
-	onMount(load);
+	onMount(async () => {
+		try {
+			zabbixUrl = (await api.getUiConfig()).zabbix_url;
+		} catch {
+			zabbixUrl = '';
+		}
+		await load();
+	});
 </script>
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
 		<h1 class="text-lg font-bold text-slate-100">Agents</h1>
 		<div class="flex gap-2 items-center">
-			<span class="text-slate-500 text-xs">{agents.length} connected</span>
+			<span class="text-slate-500 text-xs">
+				{agents.filter((a) => agentStatus(a) === 'connected').length} connected / {agents.length} known
+			</span>
 			{#if isAdmin}
 				<button class="btn btn-primary text-xs" on:click={() => (showBootstrap = !showBootstrap)}>
 					{showBootstrap ? 'Cancel' : 'Enroll Agent'}
@@ -194,8 +217,8 @@
 							<td class="py-2 pr-4 text-slate-400 font-mono text-[11px]">{a.agent_id.slice(0, 8)}…</td>
 							<td class="py-2 pr-4">
 								<span class="inline-flex items-center gap-1">
-									<span class="w-1.5 h-1.5 rounded-full {isFresh(a) ? 'bg-emerald-400' : 'bg-yellow-400'}"></span>
-									<span class="{isFresh(a) ? 'text-emerald-400' : 'text-yellow-400'}">{isFresh(a) ? 'connected' : 'stale'}</span>
+									<span class="w-1.5 h-1.5 rounded-full {statusDot[agentStatus(a)]}"></span>
+									<span class={statusText[agentStatus(a)]}>{agentStatus(a)}</span>
 								</span>
 							</td>
 							<td class="py-2 pr-4 text-slate-500">{fmtDate(a.connected_at)}</td>
@@ -204,6 +227,15 @@
 								<button class="btn btn-ghost text-xs" on:click={() => (selectedAgent = selectedAgent?.agent_id === a.agent_id ? null : a)}>
 									Details
 								</button>
+								{#if zabbixUrl}
+									<a
+										class="text-sky-400 hover:text-sky-300 text-xs ml-2"
+										href={zabbixHostUrl(zabbixUrl, a.hostname)}
+										target="_blank"
+										rel="noopener"
+										title="Open this host's metrics in Zabbix">Metrics ↗</a
+									>
+								{/if}
 							</td>
 						</tr>
 						{#if selectedAgent?.agent_id === a.agent_id}

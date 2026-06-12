@@ -127,6 +127,8 @@ export interface AgentInfo {
 	connected_at: string;
 	last_heartbeat: string;
 	stale_seconds?: number;
+	connected?: boolean;
+	disconnected_at?: string | null;
 }
 
 export interface AgentDetail {
@@ -137,6 +139,25 @@ export interface AgentDetail {
 	connected_at: string;
 	last_heartbeat: string;
 	stale_seconds?: number;
+	connected?: boolean;
+	disconnected_at?: string | null;
+}
+
+export interface DashboardSummary {
+	inventory: {
+		total: number;
+		managed: number;
+		uncovered: number;
+		coverage_pct: number;
+		by_status: Record<string, number>;
+		by_role: Record<string, number>;
+		by_type: Record<string, number>;
+	};
+	drift: { total: number; drifted: number; in_spec_pct: number };
+	artifacts: Record<string, number>;
+	tasks: Record<string, number>;
+	agents: { known: number; connected: number };
+	zabbix_url: string;
 }
 
 export interface HealthInfo {
@@ -421,6 +442,12 @@ export const api = {
 	getHealth() {
 		return req<HealthInfo>('/health');
 	},
+	getDashboard() {
+		return req<DashboardSummary>('/dashboard/summary');
+	},
+	getUiConfig() {
+		return req<{ zabbix_url: string }>('/dashboard/config');
+	},
 
 	getProxmoxSettings() {
 		return req<ProxmoxSettings>('/admin/settings/proxmox');
@@ -473,4 +500,12 @@ export async function refreshSession(): Promise<MeInfo | null> {
 		sessionStore.set(null);
 		return null;
 	}
+}
+// Deep-link to a host's page in Zabbix (HomePilot owns state; Zabbix owns
+// history). `base` is HP_ZABBIX_URL (e.g. "/zabbix" via the bundled proxy, or
+// an absolute URL). Filters the Zabbix host view by visible name.
+export function zabbixHostUrl(base: string, hostname: string): string {
+	if (!base || !hostname) return '';
+	const b = base.replace(/\/+$/, '');
+	return `${b}/zabbix.php?action=host.view&filter_name=${encodeURIComponent(hostname)}&filter_set=1`;
 }

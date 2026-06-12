@@ -226,6 +226,81 @@ class Repository:
         await self.db.execute(
             "UPDATE api_tokens SET fingerprint = ? WHERE id = ?", (fingerprint, token_id)
         )
+        await self.db.conn.commit()
+
+    # ── Agent registry persistence (survives backend restart/update) ──────────
+    async def upsert_agent(
+        self,
+        agent_id: str,
+        hostname: str,
+        system_info: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+        connected: bool = True,
+    ) -> None:
+        import json as _json
+
+        ts = now()
+        await self.db.execute(
+            """INSERT INTO agents
+                 (agent_id, hostname, system_info, state, connected,
+                  first_seen, connected_at, last_heartbeat, disconnected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+               ON CONFLICT(agent_id) DO UPDATE SET
+                 hostname=excluded.hostname,
+                 system_info=excluded.system_info,
+                 state=excluded.state,
+                 connected=excluded.connected,
+                 connected_at=excluded.connected_at,
+                 last_heartbeat=excluded.last_heartbeat,
+                 disconnected_at=NULL""",
+            (
+                agent_id,
+                hostname,
+                _json.dumps(system_info or {}),
+                _json.dumps(state or {}),
+                int(connected),
+                ts,
+                ts,
+                ts,
+            ),
+        )
+        await self.db.conn.commit()
+
+    async def touch_agent(self, agent_id: str, state: dict[str, Any] | None = None) -> None:
+        import json as _json
+
+        if state is not None:
+            await self.db.execute(
+                "UPDATE agents SET last_heartbeat = ?, state = ? WHERE agent_id = ?",
+                (now(), _json.dumps(state), agent_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE agents SET last_heartbeat = ? WHERE agent_id = ?", (now(), agent_id)
+            )
+        await self.db.conn.commit()
+
+    async def mark_agent_disconnected(self, agent_id: str) -> None:
+        await self.db.execute(
+            "UPDATE agents SET connected = 0, disconnected_at = ? WHERE agent_id = ?",
+            (now(), agent_id),
+        )
+        await self.db.conn.commit()
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        import json as _json
+
+        rows = await self.db.fetchall("SELECT * FROM agents ORDER BY hostname")
+        out = []
+        for r in rows:
+            d = dict(r)
+            for f in ("system_info", "state"):
+                try:
+                    d[f] = _json.loads(d[f]) if d.get(f) else {}
+                except (ValueError, TypeError):
+                    d[f] = {}
+            out.append(d)
+        return out
 
     async def create_host(
         self,

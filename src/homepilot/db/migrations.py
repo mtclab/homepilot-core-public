@@ -263,6 +263,24 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
         "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
     ],
+    11: [
+        # Persist the agent registry so connected agents survive a backend
+        # restart/update: the Agents view + coverage show last-known agents
+        # (reconnecting) instead of flapping to empty until each agent redials.
+        """CREATE TABLE IF NOT EXISTS agents (
+            agent_id        TEXT PRIMARY KEY,
+            hostname        TEXT NOT NULL,
+            system_info     TEXT,
+            state           TEXT,
+            connected       INTEGER NOT NULL DEFAULT 0,
+            first_seen      TEXT,
+            connected_at    TEXT,
+            last_heartbeat  TEXT,
+            disconnected_at TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_agents_hostname ON agents(hostname)",
+        "CREATE INDEX IF NOT EXISTS idx_agents_connected ON agents(connected)",
+    ],
 }
 
 
