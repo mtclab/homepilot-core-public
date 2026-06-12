@@ -123,18 +123,20 @@ export interface AgentInfo {
 	agent_id: string;
 	hostname: string;
 	system_info: Record<string, unknown>;
-	state: string;
+	state: Record<string, unknown>;
 	connected_at: string;
 	last_heartbeat: string;
+	stale_seconds?: number;
 }
 
 export interface AgentDetail {
 	agent_id: string;
 	hostname: string;
 	system_info: Record<string, unknown>;
-	state: string;
+	state: Record<string, unknown>;
 	connected_at: string;
 	last_heartbeat: string;
+	stale_seconds?: number;
 }
 
 export interface HealthInfo {

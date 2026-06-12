@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.3.10 (2026-06-12)
+
+### Bug Fixes
+
+- **Agents tab renders state/system_info correctly (#341)**: the agent `state`
+  object (and nested `system_info` entries like disk/load/memory) showed as
+  `[object Object]`, and the status badge compared `state === 'connected'`
+  (never true). Now renders objects as compact JSON (empty as `—`) and derives
+  the connected/stale badge from heartbeat age (`stale_seconds`).
+
 ## v2.3.9 (2026-06-12)
 
 ### Features
