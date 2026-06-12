@@ -100,6 +100,6 @@ docker compose exec backend hp agent list
 ## Architecture Notes
 
 - **Agent connects outbound** to HomePilot on TCP 8443 — no inbound ports on managed host
-- **Protocol**: Length-prefixed JSON over TCP (same as old jumpserver, but encrypted with TLS)
+- **Protocol**: Length-prefixed JSON over TCP, encrypted with TLS
 - **Authentication**: Shared secret (`HP_AGENT_HUB_AUTH_TOKEN`) set once at enrollment
 - **Authorization**: Command allowlist — safe commands always allowed, privileged commands require `HP_AGENT_PRIVILEGED=true`

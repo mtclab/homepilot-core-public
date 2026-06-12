@@ -452,3 +452,57 @@ class TestTokenPrefixLength:
         _full_token, prefix, _ = generate_api_token()
         hex_part = prefix[3:]
         assert len(hex_part) == 13
+
+
+class TestTokenAdminEndpoints:
+    """list/revoke must accept the admin secret (like POST create) so the CLI,
+    which holds the secret rather than a bearer token, works. Regression for
+    the live-test finding: `hp token list`/`revoke` got 401 'Missing
+    credentials' because they only honored an admin-scope bearer."""
+
+    @pytest_asyncio.fixture()
+    async def secret_app(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("HP_ADMIN_SECRET", "test-admin-secret")
+        db = Database(str(tmp_path / "admin_ep_test.db"))
+        await db.connect()
+        await run_migrations(db)
+        repo = Repository(db)
+        user_id = await repo.create_user("admin", "admin@test.com")
+        _full_token, prefix, token_hash = generate_api_token()
+        await repo.create_api_token(
+            user_id=user_id, token_type="api", prefix=prefix, hash=token_hash, scope="*"
+        )
+        await db.conn.commit()
+
+        app = FastAPI()
+        app.state.repo = repo
+        app.include_router(auth_router, prefix="/auth")
+        # admin_secret empty in settings → resolve_admin_secret falls to env.
+        with patch("homepilot.auth.router.get_settings") as gs:
+            gs.return_value = MagicMock(admin_secret="")
+            yield TestClient(app, raise_server_exceptions=True), prefix
+        await db.close()
+
+    def test_list_with_admin_secret(self, secret_app):
+        client, prefix = secret_app
+        resp = client.get("/auth/tokens", headers={"x-hp-admin-secret": "test-admin-secret"})
+        assert resp.status_code == 200
+        prefixes = [t["prefix"] for t in resp.json()["items"]]
+        assert prefix in prefixes
+
+    def test_list_bad_secret_rejected(self, secret_app):
+        client, _ = secret_app
+        resp = client.get("/auth/tokens", headers={"x-hp-admin-secret": "wrong"})
+        assert resp.status_code == 401
+
+    def test_revoke_with_admin_secret(self, secret_app):
+        client, prefix = secret_app
+        resp = client.delete(
+            f"/auth/tokens/{prefix}", headers={"x-hp-admin-secret": "test-admin-secret"}
+        )
+        assert resp.status_code == 204
+        # gone now
+        resp2 = client.delete(
+            f"/auth/tokens/{prefix}", headers={"x-hp-admin-secret": "test-admin-secret"}
+        )
+        assert resp2.status_code == 404

@@ -429,3 +429,31 @@ class TestRevokeTokenEndpoint:
         )
         assert resp.status_code == 403
         await db.close()
+
+
+class TestFingerprintAdvisory:
+    """A fingerprint mismatch must NOT destroy the shared token (#323): the
+    UI, the CLI, and API integrations all hold the same personal token, and
+    rotating-and-deleting it on a second login from a different IP/UA silently
+    killed it for every other client."""
+
+    def test_second_login_different_fingerprint_keeps_token_alive(self, setup):
+        client, token = setup
+        # First login binds the fingerprint.
+        r1 = client.post(
+            "/auth/login",
+            json={"token": token},
+            headers={"x-hp-session-fingerprint": "1.1.1.1:browser"},
+        )
+        assert r1.status_code == 200
+        # Second login from a different client (the CLI, say) — mismatched
+        # fingerprint must be tolerated, not fatal.
+        r2 = client.post(
+            "/auth/login",
+            json={"token": token},
+            headers={"x-hp-session-fingerprint": "2.2.2.2:curl"},
+        )
+        assert r2.status_code == 200
+        # And the ORIGINAL token still authenticates afterward.
+        r3 = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
+        assert r3.status_code == 200

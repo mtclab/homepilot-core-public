@@ -1,0 +1,40 @@
+name: Auto-tag release on version bump
+
+# When main advances and pyproject's version has no matching tag yet, create and
+# push `v<version>`. On the public mirror that tag triggers release.yml → the
+# Docker image build. So: scrub+sync to public main (manual, security-reviewed) →
+# this auto-tags → the image builds. No manual tagging.
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Tag v<version> if new
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          if [ -z "$VERSION" ]; then echo "no version in pyproject.toml"; exit 1; fi
+          TAG="v$VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+          echo "Created + pushed $TAG (triggers release.yml)."

@@ -48,13 +48,6 @@ class Settings(BaseSettings):
     vault_passphrase: str = ""
     vault_passphrase_file: str = ""
 
-    jump_server_host: str = "jumpserver"
-    jump_server_port: int = 50051
-    jump_server_tls: bool = False
-    jump_server_tls_ca: str = ""
-    jump_server_tls_cert: str = ""
-    jump_server_tls_key: str = ""
-
     ssh_key_dir: str = ""
 
     allowed_http_domains: str = ""

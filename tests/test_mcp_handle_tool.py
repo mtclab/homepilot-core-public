@@ -41,7 +41,7 @@ def ctx():
         "lifecycle": lifecycle,
         "store": store,
         "kb_service": kb_service,
-        "ssh_adapter": ssh,
+        "agent_adapter": ssh,
         "proxmox": proxmox,
         "vault": vault,
     }
@@ -135,15 +135,15 @@ class TestExecOnGuestReadonlyStructured:
 
     @pytest.mark.asyncio
     async def test_raises_when_no_ssh(self, ctx):
-        ctx["ssh_adapter"] = None
-        with pytest.raises(RuntimeError, match="SSH not configured"):
+        ctx["agent_adapter"] = None
+        with pytest.raises(RuntimeError, match="no agent hub"):
             await call("exec_on_guest_readonly", {"host": "pve1", "command": "uptime"}, ctx)
 
     @pytest.mark.asyncio
     async def test_readonly_error_propagates(self, ctx):
         from homepilot.adapters.ssh import ReadOnlyCommandError
 
-        ctx["ssh_adapter"].exec_readonly.side_effect = ReadOnlyCommandError("rm not allowed")
+        ctx["agent_adapter"].exec_readonly.side_effect = ReadOnlyCommandError("rm not allowed")
         with pytest.raises(ReadOnlyCommandError):
             await call("exec_on_guest_readonly", {"host": "pve1", "command": "rm -rf /"}, ctx)
 
@@ -331,12 +331,12 @@ class TestReadFileOnGuestTextOnly:
 
     @pytest.mark.asyncio
     async def test_no_ssh_raises(self, ctx):
-        ctx["ssh_adapter"] = None
-        with pytest.raises(RuntimeError, match="SSH not configured"):
+        ctx["agent_adapter"] = None
+        with pytest.raises(RuntimeError, match="no agent hub"):
             await call("read_file_on_guest", {"host": "pve1", "path": "/etc/hosts"}, ctx)
 
     @pytest.mark.asyncio
     async def test_read_error_propagates(self, ctx):
-        ctx["ssh_adapter"].read_file = AsyncMock(side_effect=OSError("permission denied"))
+        ctx["agent_adapter"].read_file = AsyncMock(side_effect=OSError("permission denied"))
         with pytest.raises(OSError, match="permission denied"):
             await call("read_file_on_guest", {"host": "pve1", "path": "/etc/shadow"}, ctx)

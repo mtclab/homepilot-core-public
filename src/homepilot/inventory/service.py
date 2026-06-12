@@ -9,7 +9,6 @@ from typing import Any
 import httpx
 
 from homepilot.adapters.proxmox import ProxmoxClient
-from homepilot.adapters.ssh import SSHAdapter
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
 
@@ -130,13 +129,11 @@ class InventoryService:
         self,
         repo: Repository,
         proxmox: ProxmoxClient | None = None,
-        ssh: SSHAdapter | None = None,
         kb_service: Any = None,
         proxmox_host: str = "",
     ):
         self.repo = repo
         self.proxmox = proxmox
-        self.ssh = ssh
         self.kb_service = kb_service
         self.proxmox_host = proxmox_host
 

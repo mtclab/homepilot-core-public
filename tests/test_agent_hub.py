@@ -91,21 +91,21 @@ class TestAgentAdapterFallback:
     def test_adapter_error_when_no_connections(self):
         from homepilot.adapters.agent import AgentAdapter, AgentAdapterError
 
-        adapter = AgentAdapter(hub_server=None, jump_client=None)
-        with pytest.raises(AgentAdapterError, match="no agent or SSH"):
+        adapter = AgentAdapter(hub_server=None)
+        with pytest.raises(AgentAdapterError, match="no agent connected"):
             asyncio.run(adapter.exec("host1", "hostname"))
 
     def test_readonly_command_validation(self):
         from homepilot.adapters.agent import AgentAdapter, ReadOnlyCommandError
 
-        adapter = AgentAdapter(hub_server=None, jump_client=None)
+        adapter = AgentAdapter(hub_server=None)
         with pytest.raises(ReadOnlyCommandError):
             asyncio.run(adapter.exec_readonly("host1", "rm -rf /"))
 
     def test_guest_host_blocked(self):
         from homepilot.adapters.agent import AgentAdapter, GuestHostError
 
-        adapter = AgentAdapter(hub_server=None, jump_client=None, pve_nodes=["pve1"])
+        adapter = AgentAdapter(hub_server=None, pve_nodes=["pve1"])
         with pytest.raises(GuestHostError):
             asyncio.run(adapter.exec("pve1", "hostname"))
 

@@ -84,20 +84,31 @@ class TaskRepository:
         return dict(row) if row is not None else None
 
     async def list_tasks(
-        self, artifact_id: str, limit: int = 50, offset: int = 0
+        self, artifact_id: str | None = None, limit: int = 50, offset: int = 0
     ) -> list[dict[str, Any]]:
-        rows = await self.db.fetchall(
-            """SELECT * FROM tasks WHERE artifact_id = ?
-               ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-            (artifact_id, limit, offset),
-        )
+        # artifact_id=None lists tasks across the whole system (the operator's
+        # "what's running" view); a value scopes to one artifact.
+        if artifact_id is None:
+            rows = await self.db.fetchall(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        else:
+            rows = await self.db.fetchall(
+                """SELECT * FROM tasks WHERE artifact_id = ?
+                   ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (artifact_id, limit, offset),
+            )
         return [dict(r) for r in rows]
 
-    async def count_tasks(self, artifact_id: str) -> int:
-        row = await self.db.fetchone(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE artifact_id = ?",
-            (artifact_id,),
-        )
+    async def count_tasks(self, artifact_id: str | None = None) -> int:
+        if artifact_id is None:
+            row = await self.db.fetchone("SELECT COUNT(*) as cnt FROM tasks", ())
+        else:
+            row = await self.db.fetchone(
+                "SELECT COUNT(*) as cnt FROM tasks WHERE artifact_id = ?",
+                (artifact_id,),
+            )
         return row["cnt"] if row else 0
 
     async def fail_orphaned_tasks(self) -> int:

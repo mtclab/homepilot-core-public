@@ -232,14 +232,14 @@ The agent hub reduces SSH dependency by ~90%. Instead of SSH-ing into every host
 │  ┌────────────────┐    ┌──────────────┐    ┌──────────────────┐│
 │  │  FastAPI /api/  │    │  AgentHub   │    │  AgentAdapter    ││
 │  │  agents/*      ├───►│  Server      │◄───┤  (host_adapter)  ││
-│  │  (REST API)    │    │  :8443      │    │  agent→SSH fallback││
-│  └────────────────┘    └──────┬───────┘    └────────┬─────────┘│
-│                               │                       │         │
-│                        ┌──────┴───────┐        ┌──────┴──────┐  │
-│                        │  Registry    │        │  JumpServer │  │
-│                        │  + AuditLog  │        │  :50051     │  │
-│                        │  + Tokens    │        │  (SSH relay)│  │
-│                        └──────────────┘        └─────────────┘  │
+│  │  (REST API)    │    │  :8443      │    │                  ││
+│  └────────────────┘    └──────┬───────┘    └──────────────────┘│
+│                               │                                 │
+│                        ┌──────┴───────┐                         │
+│                        │  Registry    │                         │
+│                        │  + AuditLog  │                         │
+│                        │  + Tokens    │                         │
+│                        └──────────────┘                         │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ TCP (outbound from agents)
                     ┌──────────┼──────────┐
@@ -253,7 +253,7 @@ The agent hub reduces SSH dependency by ~90%. Instead of SSH-ing into every host
 
 ### Protocol
 
-The agent hub uses **length-prefixed JSON** over TCP (replacing the old jumpserver relay):
+The agent hub uses **length-prefixed JSON** over TCP:
 
 ```
 [4 bytes: big-endian length N][N bytes: UTF-8 JSON]

@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.3.7 (2026-06-12)
+
+### Bug Fixes
+
+- **Shared tokens survive multi-client logins (#323/#325)**: login no longer
+  rotates-and-deletes a token when a second client (different IP/User-Agent)
+  authenticates with it. The fingerprint is advisory: a mismatch is logged and
+  the token stays valid.
+- **Agent executor actually runs (#327)**: a latent gate on the removed SSH
+  transport meant the agent-backed artifact executor was never constructed in
+  production. Removed with the transport; agent execution now works as
+  documented.
+- **`hp token list` / `hp token revoke` work (#328)**: both accepted only an
+  admin-scope bearer while the CLI sends the admin secret; they now accept
+  either, matching token create. `list` shows all tokens, not just the
+  caller's.
+- **Root path redirects (#321)**: `GET /` returns 307 to `/ui/`.
+- **Login errors are human-readable (#321)**: the web UI maps API errors to
+  messages instead of dumping raw JSON.
+
+### Changed
+
+- **Jumpserver removed (#327)**: the SSH relay (code, image, compose service,
+  `HP_JUMP_*` settings) is gone; the agent hub is the only host-management
+  path. Stale `HP_JUMP_*` variables in an existing `.env` are ignored.
+- **Rate limiter hardening (#321)**: anonymous requests no longer trigger a
+  database token lookup, bounding flood amplification.
+- **Metrics cardinality (#321)**: Prometheus labels use the route template
+  (`/artifacts/{artifact_id}`) instead of the raw URL.
+- **`GET /tasks` (#321)**: `artifact_id` is now optional — omitting it lists
+  tasks system-wide.
+- **Releases auto-tagged (#306/#329)**: a push to main with a new version in
+  pyproject creates the `v<version>` tag automatically.
+- **Dependencies**: aiohttp 3.14.0, starlette 1.0.1, transitive `cookie`
+  override to ^0.7.0 (clears a low-severity advisory).
+
 ## v2.3.6 (2026-06-10)
 
 ### Features

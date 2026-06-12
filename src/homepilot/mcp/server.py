@@ -96,11 +96,17 @@ async def _bootstrap() -> dict[str, Any]:
 
     lifecycle = state.artifact_lifecycle
     proxmox = state.proxmox
-    ssh_adapter = state.ssh
     vault = state.vault
 
+    # Host ops route through the agent hub (the SSH/jump transport was removed).
+    from homepilot.adapters.agent import AgentAdapter
+
+    agent_adapter = (
+        AgentAdapter(hub_server=state.agent_hub) if state.agent_hub is not None else None
+    )
+
     lifecycle._proxmox = proxmox
-    lifecycle._ssh = ssh_adapter
+    lifecycle._ssh = agent_adapter
     lifecycle._vault_mgr = vault
     if proxmox:
         try:
@@ -119,15 +125,15 @@ async def _bootstrap() -> dict[str, Any]:
 
     from homepilot.executor.orchestrator import ArtifactExecutor
 
-    if proxmox and ssh_adapter and vault:
+    if proxmox and vault and agent_adapter is not None:
         executor = ArtifactExecutor(
             store=state.artifact_store,
             lifecycle=lifecycle,
             repo=state.repo,
             proxmox=proxmox,
-            ssh=ssh_adapter,
             vault=vault,
             pve_nodes=lifecycle._pve_nodes_list or [],
+            agent=agent_adapter,
         )
         lifecycle._executor_ref = executor
 
@@ -149,8 +155,7 @@ async def _bootstrap() -> dict[str, Any]:
         "store": state.artifact_store,
         "vault": vault,
         "proxmox": proxmox,
-        "ssh_adapter": ssh_adapter,
-        "jump_client": state.jump_client,
+        "agent_adapter": agent_adapter,
         "kb_service": state.kb_service,
         "drift_reconciler": drift_reconciler,
     }
@@ -289,9 +294,6 @@ async def run_server() -> None:
             proxmox = ctx.get("proxmox")
             if proxmox:
                 await proxmox.close()
-            jump_client = ctx.get("jump_client")
-            if jump_client:
-                await jump_client.close()
             database = ctx.get("database")
             if database:
                 await database.close()
@@ -334,7 +336,7 @@ def create_http_app(srv: Server) -> Any:
         async with session_manager.run():
             logger.info("HomePilot MCP HTTP server ready at /mcp")
             yield
-        for key in ("proxmox", "jump_client", "database"):
+        for key in ("proxmox", "database"):
             obj = _server_context.get(key)
             if obj:
                 with contextlib.suppress(Exception):

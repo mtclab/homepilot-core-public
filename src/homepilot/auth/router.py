@@ -8,13 +8,13 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
 from ..db.repository import Repository
 from .deps import get_db, require_scope, require_token
-from .tokens import PREFIX_LENGTH, generate_api_token, validate_token
+from .tokens import PREFIX_LENGTH, generate_api_token, normalize_scope, validate_token
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,43 @@ async def resolve_admin_secret(request: Request) -> str:
     return ""
 
 
+async def require_admin_or_secret(
+    request: Request,
+    authorization: str | None = Header(None),
+    hp_token: str | None = Cookie(None),
+    hp_csrf: str | None = Cookie(None),
+    db: Repository = _get_db_dep,
+) -> dict[str, Any]:
+    """Authorize token-management (list/revoke) by EITHER an admin-scope token
+    OR the admin secret.
+
+    The sibling POST /tokens (create) already accepts the admin secret, but the
+    list/revoke endpoints only honored an admin-scope bearer — so the CLI, which
+    holds the admin secret (vault) rather than a token, got 401 on `hp token
+    list`/`revoke`. Accept the admin secret here too. When the secret is used
+    there is no user context, so the caller sees the fleet-wide token list.
+    """
+    header_secret = request.headers.get("x-hp-admin-secret") or request.headers.get(
+        "x-admin-secret", ""
+    )
+    if header_secret:
+        admin_secret = await resolve_admin_secret(request)
+        if admin_secret and secrets.compare_digest(header_secret.encode(), admin_secret.encode()):
+            return {"auth": "admin-secret", "user_id": None}
+
+    token = await require_token(request, authorization, hp_token, hp_csrf, db)
+    normalized = normalize_scope(token.get("scope"), token.get("role"))
+    if "*" in normalized or "admin" in normalized:
+        return token
+    raise HTTPException(
+        status_code=403,
+        detail=f"Insufficient scope: requires 'admin', has '{token.get('scope')}'",
+    )
+
+
+_require_admin_or_secret_dep = Depends(require_admin_or_secret)
+
+
 class LoginRequest(BaseModel):
     token: str = Field(..., max_length=256)
 
@@ -120,11 +157,16 @@ async def me(
 
 @router.get("/tokens")
 async def list_tokens(
-    token: dict[str, Any] = _require_admin_dep,
+    auth: dict[str, Any] = _require_admin_or_secret_dep,
     db: Repository = _get_db_dep,
 ) -> dict[str, Any]:
-    user_id = token.get("user_id")
-    rows = await db.list_tokens_for_user(str(user_id))
+    user_id = auth.get("user_id")
+    # Admin-secret callers (the CLI) have no user context — show the fleet-wide
+    # token list. A user-scoped admin token sees only its own tokens.
+    if user_id is None:
+        rows = await db.list_all_tokens()
+    else:
+        rows = await db.list_tokens_for_user(str(user_id))
     return {"items": rows, "total": len(rows)}
 
 
@@ -147,19 +189,18 @@ async def login(
     )
 
     if stored_fingerprint and stored_fingerprint != current_fingerprint:
-        full_token, prefix, token_hash = generate_api_token()
-        await db.create_api_token(
-            user_id=row["user_id"],
-            token_type="personal",
-            prefix=prefix,
-            hash=token_hash,
-            scope=row.get("scope", "full"),
-            label=row.get("label", "rotated"),
-            fingerprint=current_fingerprint,
+        # A personal API token is shared across the UI, the CLI, and any API
+        # integration. Rotating-and-deleting it on a fingerprint mismatch
+        # silently killed the token for every OTHER holder the moment a second
+        # client logged in from a different IP/User-Agent — the cause of
+        # "tokens die within minutes" (#323). Fingerprint is advisory only
+        # (the security note above says as much: the real protection is the
+        # HMAC token compare + the cookie flags), so log the mismatch and keep
+        # the token alive instead of destroying it.
+        logger.info(
+            "token fingerprint mismatch for prefix=%s — proceeding (advisory)",
+            str(row.get("prefix", ""))[:16],
         )
-        await db.delete_token(row["id"])
-        await db.db.conn.commit()
-        raw_token = full_token
     elif not stored_fingerprint:
         await db.update_token_fingerprint(row["id"], current_fingerprint)
         await db.db.conn.commit()
@@ -270,7 +311,7 @@ async def admin_create_token(
 @router.delete("/tokens/{prefix}", status_code=204)
 async def revoke_token(
     prefix: str,
-    token: dict[str, Any] = _require_admin_dep,
+    auth: dict[str, Any] = _require_admin_or_secret_dep,
     db: Repository = _get_db_dep,
 ) -> Response:
     """Revoke an API token by its prefix.
@@ -287,6 +328,6 @@ async def revoke_token(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Token not found")
     await db.delete_token(row["id"])
-    logger.info("Token revoked: prefix=%s, by=%s", prefix, token.get("prefix", "unknown"))
+    logger.info("Token revoked: prefix=%s, by=%s", prefix, auth.get("prefix", "admin-secret"))
     await db.db.conn.commit()
     return Response(status_code=204)

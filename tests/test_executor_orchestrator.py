@@ -91,7 +91,7 @@ class TestFullLifecycleAnsible:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -134,7 +134,7 @@ class TestFullLifecycleProxmox:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
         )
 
@@ -167,7 +167,7 @@ class TestFullLifecycleShellScript:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -195,7 +195,7 @@ class TestOrchestratorValidation:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
         )
 
@@ -220,7 +220,7 @@ class TestOrchestratorValidation:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -255,7 +255,7 @@ class TestOrchestratorValidation:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -287,7 +287,7 @@ class TestOrchestratorValidation:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
         )
 
@@ -323,7 +323,7 @@ class TestOrchestratorSnapshot:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -353,7 +353,7 @@ class TestOrchestratorSnapshot:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -392,7 +392,7 @@ class TestOrchestratorSnapshot:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -420,7 +420,7 @@ class TestOrchestratorSnapshot:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -454,7 +454,7 @@ class TestOrchestratorSnapshot:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -511,7 +511,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -544,7 +544,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -579,7 +579,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
         )
 
@@ -616,7 +616,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -665,7 +665,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
         )
 
@@ -716,7 +716,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )
@@ -791,7 +791,7 @@ steps:
             lifecycle=lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1"],
         )

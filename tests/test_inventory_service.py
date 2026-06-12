@@ -117,11 +117,11 @@ class TestQueryInventory:
         assert result[0]["services"][0]["name"] == "nginx"
 
     async def test_filter_by_hostname_partial(self, svc, repo):
-        await repo.create_host(hostname="jellyfin-lxc", host_type="lxc", role="guest")
+        await repo.create_host(hostname="media-lxc", host_type="lxc", role="guest")
         await repo.create_host(hostname="vaultwarden-lxc", host_type="lxc", role="guest")
-        result = await svc.query_inventory(filter={"hostname": "jellyfin"})
+        result = await svc.query_inventory(filter={"hostname": "media"})
         assert len(result) == 1
-        assert "jellyfin" in result[0]["hostname"]
+        assert "media" in result[0]["hostname"]
 
 
 # ── InventoryService.refresh_inventory ───────────────────────────────────────

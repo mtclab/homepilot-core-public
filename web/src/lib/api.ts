@@ -2,6 +2,42 @@ import { get, writable } from 'svelte/store';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
+// A failed request carries its HTTP status and a human-readable message —
+// never the raw `401: {"detail":...}` JSON the API returns. `.detail` keeps
+// the server's text for callers that want it.
+export class ApiError extends Error {
+	status: number;
+	detail: string;
+	constructor(status: number, body: string) {
+		let detail = body;
+		try {
+			const parsed = JSON.parse(body);
+			if (parsed && typeof parsed.detail === 'string') detail = parsed.detail;
+		} catch {
+			// non-JSON body: keep as-is
+		}
+		super(ApiError.humanize(status, detail));
+		this.status = status;
+		this.detail = detail;
+		this.name = 'ApiError';
+	}
+	static humanize(status: number, detail: string): string {
+		switch (status) {
+			case 401:
+				return 'Invalid or expired token.';
+			case 403:
+				return "You don't have permission for that.";
+			case 404:
+				return 'Not found.';
+			case 429:
+				return 'Too many requests — wait a moment and try again.';
+			default:
+				if (status >= 500) return 'The server hit an error. Try again shortly.';
+				return detail || `Request failed (${status}).`;
+		}
+	}
+}
+
 const _tokenStore = writable('');
 export const sessionStore = writable<MeInfo | null>(null);
 
@@ -38,7 +74,7 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
 	});
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);
-		throw new Error(`${res.status}: ${text}`);
+		throw new ApiError(res.status, text);
 	}
 	if (res.status === 204) return undefined as T;
 	return res.json() as Promise<T>;

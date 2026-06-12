@@ -201,6 +201,15 @@ class Repository:
         rows = await self.db.fetchall(sql, (user_id,))
         return [dict(r) for r in rows]
 
+    async def list_all_tokens(self) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT id, prefix, scope, role, label, token_type, "
+            "created_at, last_used_at, expires_at "
+            "FROM api_tokens ORDER BY created_at DESC"
+        )
+        rows = await self.db.fetchall(sql)
+        return [dict(r) for r in rows]
+
     async def get_token_by_prefix(self, prefix: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM api_tokens WHERE prefix = ?", (prefix,))
         return dict(row) if row is not None else None

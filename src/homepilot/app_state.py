@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .config import ConfigError, get_settings
+from .config import get_settings
 from .db.connection import Database
 from .db.migrations import run_migrations
 from .db.repository import Repository
@@ -44,15 +44,12 @@ class AppState:
     repo: Repository
     vault: Any = None
     proxmox: Any = None
-    ssh: Any = None
-    jump_client: Any = None
     artifacts_dir: Path = field(default_factory=Path)
     artifact_store: Any = None
     artifact_lifecycle: Any = None
     kb_service: Any = None
     sse_bus: Any = None
     pve_token_source: str = ""
-    jump_token_source: str = ""
     webhook_secret_source: str = ""
     n8n_key_source: str = ""
     agent_hub: Any = None
@@ -85,8 +82,6 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         logger.warning("Vault passphrase not set — secrets unavailable until configured")
 
     proxmox: Any = None
-    ssh: Any = None
-    jump_client: Any = None
 
     pve_token_source = ""
 
@@ -175,77 +170,6 @@ async def create_app_state(settings: Any | None = None) -> AppState:
                 logger.warning("Proxmox host configured but no token available — Proxmox disabled")
     except (ImportError, OSError, ConnectionError) as exc:
         logger.warning("Could not initialize Proxmox adapter: %s", exc, exc_info=True)
-
-    jump_token_source = ""
-    try:
-        from .adapters.ssh import SSHAdapter
-        from .jumpserver.client import JumpServerClient
-
-        if os.environ.get("HP_JUMP_ENABLED", "").lower() in ("1", "true"):
-            ssl_ctx = None
-            if settings.jump_server_tls:
-                import ssl as _ssl
-
-                ssl_ctx = (
-                    _ssl.create_default_context(cafile=settings.jump_server_tls_ca)
-                    if settings.jump_server_tls_ca
-                    else _ssl.create_default_context()
-                )
-                if settings.jump_server_tls_cert and settings.jump_server_tls_key:
-                    ssl_ctx.load_cert_chain(
-                        certfile=settings.jump_server_tls_cert, keyfile=settings.jump_server_tls_key
-                    )
-            auth_token_val = ""
-            if vault:
-                from .vault import VaultError as _VaultErrorJump
-
-                try:
-                    jump_secret = await vault.get_secret("jumpserver-token")
-                    auth_token_val = jump_secret.get("token", "")
-                    if auth_token_val:
-                        jump_token_source = "vault"
-                except (_VaultErrorJump, OSError):
-                    logger.debug(
-                        "Vault 'jumpserver-token' unavailable, falling back to env",
-                        exc_info=True,
-                    )
-            if not auth_token_val:
-                auth_token_val = os.environ.get("HP_JUMP_TOKEN", "") or os.environ.get(
-                    "JUMPSERVER_AUTH_TOKEN", ""
-                )
-                auth_token_file = os.environ.get("HP_JUMP_TOKEN_FILE", "") or os.environ.get(
-                    "JUMPSERVER_AUTH_TOKEN_FILE", ""
-                )
-                if auth_token_file:
-                    try:
-                        auth_token_val = Path(auth_token_file).read_text().strip()
-                    except FileNotFoundError as exc:
-                        raise ConfigError(
-                            f"HP_JUMP_TOKEN_FILE / JUMPSERVER_AUTH_TOKEN_FILE"
-                            f" not found: {auth_token_file}"
-                        ) from exc
-                if auth_token_val and not jump_token_source:
-                    jump_token_source = "env"
-                    logger.warning("JumpServer token via env var — use vault for better security")
-            _jump_client = JumpServerClient(
-                host=settings.jump_server_host,
-                port=settings.jump_server_port,
-                auth_token=auth_token_val or None,
-                ssl_context=ssl_ctx,
-            )
-            jump_client = _jump_client
-            try:
-                await _jump_client.connect()
-            except (ConnectionError, OSError):
-                logger.warning("Jump server connection failed — SSH unavailable")
-                jump_client = None
-            if jump_client:
-                ssh = SSHAdapter(jump_client)
-    except (ImportError, OSError, ConnectionError) as exc:
-        logger.warning("Could not initialize SSH adapter: %s", exc, exc_info=True)
-    else:
-        if jump_token_source:
-            logger.info("JumpServer adapter initialized (token from %s)", jump_token_source)
 
     webhook_secret_source = ""
     if vault:
@@ -410,15 +334,12 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         repo=repo,
         vault=vault,
         proxmox=proxmox,
-        ssh=ssh,
-        jump_client=jump_client,
         artifacts_dir=artifacts_dir,
         artifact_store=artifact_store,
         artifact_lifecycle=artifact_lifecycle,
         kb_service=kb_service,
         sse_bus=sse_bus,
         pve_token_source=pve_token_source if proxmox_host else "",
-        jump_token_source=jump_token_source,
         webhook_secret_source=webhook_secret_source,
         n8n_key_source=n8n_key_source,
         agent_hub=agent_hub,

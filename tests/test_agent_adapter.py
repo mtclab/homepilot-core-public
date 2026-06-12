@@ -40,13 +40,13 @@ class TestAgentAdapterExec:
         assert out == "web1"
         hub.send_command.assert_called_once_with("agent-001", "hostname", 30)
 
-    async def test_exec_hub_fails_fallback_no_ssh(self):
+    async def test_exec_hub_fails_no_agent(self):
         hub = MagicMock()
         agent = MagicMock()
         agent.agent_id = "agent-001"
         hub.registry.get_by_hostname.return_value = None
-        adapter = AgentAdapter(hub_server=hub, jump_client=None)
-        with pytest.raises(AgentAdapterError, match="no agent or SSH"):
+        adapter = AgentAdapter(hub_server=hub)
+        with pytest.raises(AgentAdapterError, match="no agent connected"):
             await adapter.exec("unknown", "hostname")
 
     async def test_exec_pve_node_blocked(self):
@@ -94,5 +94,5 @@ class TestAgentAdapterConnection:
     async def test_connection_no_agent_no_ssh(self):
         hub = MagicMock()
         hub.registry.get_by_hostname.return_value = None
-        adapter = AgentAdapter(hub_server=hub, jump_client=None)
+        adapter = AgentAdapter(hub_server=hub)
         assert await adapter.test_connection("unknown") is False

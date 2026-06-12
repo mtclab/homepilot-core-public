@@ -15,7 +15,7 @@ from typing import Any, cast
 import httpx
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, generate_latest
 
@@ -144,7 +144,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     inventory_service = InventoryService(
         state.repo,
         proxmox=state.proxmox,
-        ssh=state.ssh,
         kb_service=None,
         proxmox_host=settings.proxmox_host,
     )
@@ -173,22 +172,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from .executor import ArtifactExecutor
 
         agent_adapter = None
-        if state.agent_hub is not None and state.ssh is not None:
+        if state.agent_hub is not None:
             agent_adapter = AgentAdapter(
                 hub_server=state.agent_hub,
-                jump_client=state.jump_client,
                 pve_nodes=state.artifact_lifecycle._pve_nodes_list
                 if hasattr(state.artifact_lifecycle, "_pve_nodes_list")
                 else [],
             )
 
-        if state.proxmox and state.ssh and state.vault:
+        if state.proxmox and state.vault:
             app.state.artifact_executor = ArtifactExecutor(
                 store=state.artifact_store,
                 lifecycle=state.artifact_lifecycle,
                 repo=state.repo,
                 proxmox=state.proxmox,
-                ssh=state.ssh,
                 vault=state.vault,
                 agent=agent_adapter,
             )
@@ -274,7 +271,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "lifecycle": state.artifact_lifecycle,
                 "repo": state.repo,
                 "proxmox": state.proxmox,
-                "ssh_adapter": state.ssh,
                 "vault": state.vault,
                 "database": state.database,
                 "kb_service": state.kb_service,
@@ -282,7 +278,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "task_repo": task_repo,
             }
         )
-        if state.proxmox and state.ssh and state.vault:
+        if state.proxmox and state.vault:
             try:
                 pve_data = await state.proxmox.read("/nodes")
                 pve_nodes = [
@@ -298,10 +294,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             from .executor import ArtifactExecutor
 
             mcp_agent = None
-            if state.agent_hub is not None and state.jump_client is not None:
+            if state.agent_hub is not None:
                 mcp_agent = AgentAdapter(
                     hub_server=state.agent_hub,
-                    jump_client=state.jump_client,
                     pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
                 )
 
@@ -310,7 +305,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 lifecycle=state.artifact_lifecycle,
                 repo=state.repo,
                 proxmox=state.proxmox,
-                ssh=state.ssh,
                 vault=state.vault,
                 pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
                 agent=mcp_agent,
@@ -411,17 +405,30 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
         return cast(Response, await call_next(request))
 
     start = time.time()
-    authenticated = False
-    if request.url.path != "/auth/login":
-        authenticated = await _is_authenticated(request)
-
     client_ip = _get_client_ip(request, _trusted_proxy_networks)
-    limit = _AUTH_RATE_LIMIT if authenticated else _RATE_LIMIT
     now = time.time()
+
+    # Cheap tier first: count against the unauthenticated limit WITHOUT a token
+    # lookup, so an anonymous flood never costs a DB round-trip per request. The
+    # token lookup (to grant the higher authenticated limit) happens only when
+    # the cheap window is already full — bounding the amplification to one
+    # lookup per IP per minute past the anonymous cap.
     async with _RATE_LOCK:
-        window = _RATE_WINDOW[client_ip]
-        _RATE_WINDOW[client_ip] = [ts for ts in window if now - ts < _RATE_WINDOW_SEC]
-        if len(_RATE_WINDOW[client_ip]) >= limit:
+        window = [ts for ts in _RATE_WINDOW[client_ip] if now - ts < _RATE_WINDOW_SEC]
+        _RATE_WINDOW[client_ip] = window
+        count = len(window)
+
+    over_anon = count >= _RATE_LIMIT
+    authenticated = False
+    if over_anon and request.url.path != "/auth/login":
+        authenticated = await _is_authenticated(request)
+    limit = _AUTH_RATE_LIMIT if authenticated else _RATE_LIMIT
+
+    async with _RATE_LOCK:
+        # Re-read under lock: another request may have advanced the window.
+        window = [ts for ts in _RATE_WINDOW[client_ip] if now - ts < _RATE_WINDOW_SEC]
+        if len(window) >= limit:
+            _RATE_WINDOW[client_ip] = window
             logger.debug(
                 "rate_limited path=%s client_ip=%s authenticated=%s",
                 request.url.path,
@@ -433,15 +440,29 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
                 content={"detail": "rate limit exceeded"},
                 headers={"Retry-After": str(_RATE_WINDOW_SEC)},
             )
-        _RATE_WINDOW[client_ip].append(now)
+        window.append(now)
+        _RATE_WINDOW[client_ip] = window
         _cleanup_rate_window()
     response = cast(Response, await call_next(request))
     elapsed = time.time() - start
+    # Metric label is the ROUTE TEMPLATE (e.g. /agents/{agent_id}), not the raw
+    # URL, so scanner traffic and per-id paths can't explode label cardinality.
+    metric_path = _metric_path(request)
     _REQUEST_COUNT.labels(
-        method=request.method, path=request.url.path, status=response.status_code
+        method=request.method, path=metric_path, status=response.status_code
     ).inc()
-    _REQUEST_DURATION.labels(method=request.method, path=request.url.path).observe(elapsed)
+    _REQUEST_DURATION.labels(method=request.method, path=metric_path).observe(elapsed)
     return response
+
+
+def _metric_path(request: Request) -> str:
+    """The matched route's path template, or a fixed bucket for unmatched URLs —
+    keeps Prometheus label cardinality bounded under arbitrary traffic."""
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    if isinstance(path, str) and path:
+        return path
+    return "<unmatched>"
 
 
 async def _is_authenticated(request: Request) -> bool:
@@ -611,6 +632,12 @@ async def health(request: Request) -> JSONResponse:
         status_code=status_code,
         content={"status": overall, "version": __version__, "checks": checks},
     )
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    """Bare root sends the operator to the web UI (proxy-agnostic; #284)."""
+    return RedirectResponse(url="/ui/", status_code=307)
 
 
 @app.get("/metrics", include_in_schema=False)

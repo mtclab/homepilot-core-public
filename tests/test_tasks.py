@@ -63,6 +63,17 @@ class TestTaskRepository:
         assert task["action"] == "apply"
         assert task["status"] == "pending"
 
+    async def test_list_tasks_system_wide(self, task_repo: TaskRepository):
+        # artifact_id=None lists across all artifacts (the operator's view).
+        await task_repo.create_task("art-a", "apply")
+        await task_repo.create_task("art-b", "apply")
+        all_tasks = await task_repo.list_tasks()
+        assert len(all_tasks) == 2
+        assert await task_repo.count_tasks() == 2
+        scoped = await task_repo.list_tasks("art-a")
+        assert len(scoped) == 1
+        assert await task_repo.count_tasks("art-a") == 1
+
     async def test_create_task_revoke(self, task_repo: TaskRepository):
         task_id = await task_repo.create_task("2025-01-01-test-abc123", "revoke")
         task = await task_repo.get_task(task_id)

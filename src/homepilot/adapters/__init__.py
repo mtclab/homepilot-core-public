@@ -9,12 +9,12 @@ from homepilot.adapters.agent import (
     ReadOnlyCommandError,
 )
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
-from homepilot.adapters.ssh import SSHAdapter, SSHAdapterError
+from homepilot.adapters.ssh import SSHAdapterError
 
 
 @runtime_checkable
 class HostAdapter(Protocol):
-    """Protocol for host command execution adapters (SSH or Agent)."""
+    """Protocol for host command execution adapters (the agent hub)."""
 
     async def exec(self, host: str, command: str, timeout: int = 30) -> tuple[int, str, str]: ...
     async def exec_readonly(self, host: str, command: str) -> tuple[int, str, str]: ...
@@ -30,6 +30,5 @@ __all__ = [
     "ProxmoxClient",
     "ProxmoxError",
     "ReadOnlyCommandError",
-    "SSHAdapter",
     "SSHAdapterError",
 ]
