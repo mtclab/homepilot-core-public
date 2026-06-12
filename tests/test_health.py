@@ -255,3 +255,32 @@ class TestCORSWildcardGuard:
         result = validate_cors_config(type("S", (), {"cors_origins": "http://localhost:5173"})())
         assert result["allow_credentials"] is True
         assert result["misconfigured"] is False
+
+
+class TestRootRedirect:
+    def test_bare_root_redirects_to_ui(self, client):
+        # GET / used to 404 behind the proxy (#284); now it sends the operator
+        # to the web UI regardless of proxy root_path.
+        resp = client.get("/", follow_redirects=False)
+        assert resp.status_code == 307
+        assert resp.headers["location"] == "/ui/"
+
+
+class TestMetricPathTemplating:
+    def test_metric_path_uses_route_template(self):
+        from unittest.mock import MagicMock
+
+        from homepilot.main import _metric_path
+
+        req = MagicMock()
+        req.scope = {"route": MagicMock(path="/agents/{agent_id}")}
+        assert _metric_path(req) == "/agents/{agent_id}"
+
+    def test_metric_path_buckets_unmatched(self):
+        from unittest.mock import MagicMock
+
+        from homepilot.main import _metric_path
+
+        req = MagicMock()
+        req.scope = {}
+        assert _metric_path(req) == "<unmatched>"

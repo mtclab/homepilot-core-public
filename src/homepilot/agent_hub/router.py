@@ -41,7 +41,6 @@ def _get_agent_adapter() -> AgentAdapter:
 
     from ..main import app
 
-    jump_client = getattr(app.state, "jump_client", None) if app else None
     pve_nodes: list[str] = []
     lifecycle = getattr(app.state, "artifact_lifecycle", None) if app else None
     if lifecycle and hasattr(lifecycle, "_pve_nodes_list"):
@@ -49,7 +48,6 @@ def _get_agent_adapter() -> AgentAdapter:
 
     adapter = AgentAdapter(
         hub_server=hub,
-        jump_client=jump_client,
         pve_nodes=pve_nodes,
     )
     return adapter
@@ -153,7 +151,6 @@ async def test_adapter() -> dict[str, Any]:
 
     results["adapter_info"] = {
         "hub_available": adapter._hub is not None,
-        "jump_client_available": adapter._jump_client is not None,
         "pve_nodes": adapter._pve_nodes,
         "connected_agents": len(connected),
     }

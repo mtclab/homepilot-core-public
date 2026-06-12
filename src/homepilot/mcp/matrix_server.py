@@ -237,8 +237,20 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 
+def _default_secrets_dir() -> str:
+    """Default secrets location — NOT a world-readable /tmp path. Prefers
+    HP_SECRETS_DIR, then XDG state, then ~/.local/state/homepilot/secrets."""
+    explicit = os.environ.get("HP_SECRETS_DIR")
+    if explicit:
+        return explicit
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(base, "homepilot", "secrets")
+
+
 def _load_tokens() -> dict[str, str]:
-    secrets_dir = os.environ.get("HP_SECRETS_DIR", "/tmp/opencode/secrets")
+    secrets_dir = _default_secrets_dir()
     token_file = os.path.join(secrets_dir, "matrix_tokens.json")
     try:
         with open(token_file) as f:
@@ -252,7 +264,7 @@ def _load_room_id() -> str:
     room_id = os.environ.get("MATRIX_ROOM_ID", "")
     if room_id:
         return room_id
-    secrets_dir = os.environ.get("HP_SECRETS_DIR", "/tmp/opencode/secrets")
+    secrets_dir = _default_secrets_dir()
     room_file = os.path.join(secrets_dir, "matrix_room.json")
     try:
         with open(room_file) as f:

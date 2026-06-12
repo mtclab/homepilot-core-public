@@ -23,7 +23,7 @@ async def get_task(request: Request, task_id: str) -> Any:
 @router.get("")
 async def list_tasks(
     request: Request,
-    artifact_id: str = Query(...),
+    artifact_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> Any:

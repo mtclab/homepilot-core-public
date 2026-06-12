@@ -8,8 +8,8 @@ from typing import Any
 
 import httpx
 
+from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient
-from homepilot.adapters.ssh import SSHAdapter
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactStatus
 from homepilot.vault import VaultManager
@@ -61,7 +61,7 @@ async def http_call(
 
 
 async def exec_on_guest(
-    ssh_adapter: SSHAdapter,
+    ssh_adapter: AgentAdapter,
     host: str,
     command: str,
     timeout: int = 30,
@@ -71,12 +71,12 @@ async def exec_on_guest(
 
 
 async def write_file_on_guest(
-    ssh_adapter: SSHAdapter,
+    ssh_adapter: AgentAdapter,
     host: str,
     path: str,
     content: str,
 ) -> dict[str, Any]:
-    result = await ssh_adapter.write_file(host=host, path=path, content=content)
+    result: dict[str, Any] = await ssh_adapter.write_file(host=host, path=path, content=content)
     return result
 
 

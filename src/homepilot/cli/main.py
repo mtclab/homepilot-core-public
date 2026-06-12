@@ -797,7 +797,6 @@ def policy_init() -> None:
         ("DNS provider (e.g. cloudflare, pi-hole)", "dns_provider"),
         ("Backup solution (e.g. proxmox-backup-client)", "backup_solution"),
         ("Automatic updates for guests? (y/n)", "auto_updates"),
-        ("Jump server host", "jump_server"),
         ("Notification method (e.g. smtp, gotify, none)", "notifications"),
         ("Naming convention for hosts (e.g. service-lxc, service.service)", "naming_convention"),
     ]
@@ -874,9 +873,13 @@ def kb_reindex(
                     result: dict[str, Any] | None = resp.json()
                     return result
             except _httpx.ConnectError:
-                pass
-            except Exception:  # intentional broad catch — silently falls back to direct DB
-                pass
+                pass  # backend down → fall back to direct DB below
+            except Exception:
+                # any other API failure: fall back to the direct-DB path, but
+                # leave a breadcrumb instead of swallowing it silently.
+                import logging as _logging
+
+                _logging.getLogger(__name__).debug("token API mint failed, using DB", exc_info=True)
         return None
 
     async def _do(skip_embeddings: bool = False) -> dict[str, Any]:
@@ -1065,6 +1068,79 @@ def token_create(
         console.print(json.dumps({"token": token, "scope": scope}))
     else:
         console.print(token)
+
+
+async def _admin_request(settings: Any, method: str, path: str) -> tuple[Any | None, str | None]:
+    """Call a backend admin endpoint with the resolved admin secret. Returns
+    (json_or_None, error_or_None) — backend-down and refusals both report a
+    message so the CLI never fails silently."""
+    import httpx
+
+    admin_secret = getattr(settings, "admin_secret", "") or ""
+    if not admin_secret and hasattr(settings, "_try_vault_secret"):
+        admin_secret = settings._try_vault_secret("admin-secret") or ""
+    port = getattr(settings, "daemon_port", 8000)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.request(
+                method,
+                f"http://127.0.0.1:{port}{path}",
+                headers={"x-hp-admin-secret": admin_secret},
+            )
+    except httpx.ConnectError:
+        return None, "Backend not reachable — start it first (token list/revoke need the live API)."
+    except Exception as exc:
+        return None, f"Request failed: {exc}"
+    if resp.status_code in (200, 204):
+        return (resp.json() if resp.content else None), None
+    detail = ""
+    try:
+        detail = str(resp.json().get("detail", ""))
+    except Exception:
+        detail = resp.text
+    return None, f"Backend refused ({resp.status_code}): {detail}"
+
+
+@token_app.command("list")
+def token_list(
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List API tokens (prefix, label, scope, last-used) via the live backend."""
+    settings = _get_settings()
+    data, err = asyncio.run(_admin_request(settings, "GET", "/auth/tokens"))
+    if err:
+        err_console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1)
+    tokens = data if isinstance(data, list) else (data or {}).get("items", [])
+    if output == "json":
+        console.print(json.dumps(tokens))
+        return
+    if not tokens:
+        console.print("No tokens.")
+        return
+    table = Table("Prefix", "Label", "Scope", "Last used", "Expires")
+    for t in tokens:
+        table.add_row(
+            str(t.get("prefix", "")),
+            str(t.get("label", t.get("display_name", ""))),
+            str(t.get("scope", "")),
+            str(t.get("last_used_at") or "never"),
+            str(t.get("expires_at") or "—"),
+        )
+    console.print(table)
+
+
+@token_app.command("revoke")
+def token_revoke(
+    prefix: str = typer.Argument(..., help="The token prefix (first 16 chars) to revoke"),
+) -> None:
+    """Revoke an API token by its prefix via the live backend."""
+    settings = _get_settings()
+    _, err = asyncio.run(_admin_request(settings, "DELETE", f"/auth/tokens/{prefix}"))
+    if err:
+        err_console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1)
+    console.print(f"Revoked token {prefix}.")
 
 
 @inventory_app.command("list")

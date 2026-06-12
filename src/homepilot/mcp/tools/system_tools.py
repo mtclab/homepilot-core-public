@@ -9,8 +9,8 @@ from typing import Any
 import httpx
 from mcp.types import TextContent
 
+from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient
-from homepilot.adapters.ssh import SSHAdapter
 from homepilot.mcp.tools.ssrf_guard import SSRFError, _PinnedTransport, validate_url
 from homepilot.vault import VaultManager
 
@@ -218,22 +218,22 @@ async def handle_http_call_read(
 async def handle_read_file_on_guest(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> list[TextContent]:
-    ssh_adapter: SSHAdapter | None = ctx.get("ssh_adapter")
-    if ssh_adapter is None:
-        raise RuntimeError("SSH not configured — jump server unavailable")
+    agent_adapter: AgentAdapter | None = ctx.get("agent_adapter")
+    if agent_adapter is None:
+        raise RuntimeError("no agent hub — host operations unavailable")
     host = arguments["host"]
     path = arguments["path"]
-    content = await ssh_adapter.read_file(host, path)
+    content = await agent_adapter.read_file(host, path)
     return [TextContent(type="text", text=content)]
 
 
 async def handle_exec_on_guest_readonly(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    ssh_adapter: SSHAdapter | None = ctx.get("ssh_adapter")
-    if ssh_adapter is None:
-        raise RuntimeError("SSH not configured — jump server unavailable")
+    agent_adapter: AgentAdapter | None = ctx.get("agent_adapter")
+    if agent_adapter is None:
+        raise RuntimeError("no agent hub — host operations unavailable")
     host = arguments["host"]
     command = arguments["command"]
-    exit_code, stdout, stderr = await ssh_adapter.exec_readonly(host, command)
+    exit_code, stdout, stderr = await agent_adapter.exec_readonly(host, command)
     return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}

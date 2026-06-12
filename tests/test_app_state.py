@@ -16,7 +16,6 @@ class TestAppStateDataclass:
         state = AppState(settings=MagicMock(), database=MagicMock(), repo=MagicMock())
         assert state.vault is None
         assert state.proxmox is None
-        assert state.ssh is None
         assert state.pve_token_source == ""
 
 

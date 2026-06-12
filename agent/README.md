@@ -96,10 +96,9 @@ A template JSON is at `monitoring/zabbix/template_hp_agent.json`.
 
 ## Protocol
 
-Length-prefixed JSON over TCP (same as HomePilot jumpserver relay):
+Length-prefixed JSON over TCP:
 
 ```
 [4 bytes: big-endian length N][N bytes: UTF-8 JSON]
 ```
 
-Zero-protocol-migration — `AgentAdapter` switches between agent hub and SSH relay without changing the wire format.

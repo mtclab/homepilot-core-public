@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "2.3.6"
+version = "2.3.7"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -8,7 +8,7 @@ readme = "README.md"
 
 dependencies = [
     "fastapi>=0.115",
-    "starlette>=0.40",
+    "starlette>=1.0.1",
     "uvicorn[standard]>=0.34",
     "pydantic[email]>=2.10",
     "pydantic-settings>=2.7",
@@ -23,7 +23,7 @@ dependencies = [
     "cryptography>=44.0",
     "pyrage>=0.4",
     "jinja2>=3.1",
-    "aiohttp>=3.9",
+    "aiohttp>=3.14.0",
     "sse-starlette>=1.6",
     "prometheus-client>=0.21",
 ]
@@ -95,3 +95,11 @@ markers = [
     "e2e: end-to-end tests requiring a live HomePilot instance (HP_TEST_TOKEN must be set)",
     "integration: integration tests that exercise multiple components together",
 ]
+[tool.bandit]
+# HomePilot is an infrastructure-automation tool: running subprocesses (always
+# with list args, never shell=True) and resolving 'git'/'ansible-playbook' off
+# PATH are by-design, not findings. These categories are skipped project-wide;
+# the residual reviewed false positives (field-name string literals, SQL built
+# from code-controlled column lists with ?-bound values) stay in
+# .bandit_baseline.json so a genuinely NEW finding still fails CI.
+skips = ["B404", "B603", "B607"]

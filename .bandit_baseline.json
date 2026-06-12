@@ -1,17 +1,17 @@
 {
   "errors": [],
-  "generated_at": "2026-06-05T06:28:10Z",
+  "generated_at": "2026-06-12T06:25:47Z",
   "metrics": {
     "_totals": {
-      "CONFIDENCE.HIGH": 31,
-      "CONFIDENCE.LOW": 8,
-      "CONFIDENCE.MEDIUM": 34,
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 9,
+      "CONFIDENCE.MEDIUM": 31,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 51,
-      "SEVERITY.MEDIUM": 22,
+      "SEVERITY.LOW": 19,
+      "SEVERITY.MEDIUM": 21,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 12885,
+      "loc": 13221,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -37,7 +37,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 28,
+      "loc": 27,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -50,7 +50,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 177,
+      "loc": 127,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -63,7 +63,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 99,
+      "loc": 121,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -76,7 +76,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 123,
+      "loc": 21,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -96,26 +96,13 @@
     "src/homepilot/admin/router.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 1,
+      "CONFIDENCE.MEDIUM": 4,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 1,
+      "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 148,
-      "nosec": 0,
-      "skipped_tests": 0
-    },
-    "src/homepilot/agent_cli.py": {
-      "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 0,
-      "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 0,
-      "SEVERITY.UNDEFINED": 0,
-      "loc": 4,
+      "loc": 325,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -167,7 +154,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 256,
+      "loc": 253,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -198,15 +185,15 @@
       "skipped_tests": 0
     },
     "src/homepilot/app_state.py": {
-      "CONFIDENCE.HIGH": 7,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 14,
+      "CONFIDENCE.MEDIUM": 11,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 20,
+      "SEVERITY.LOW": 10,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 344,
+      "loc": 302,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -263,12 +250,12 @@
       "skipped_tests": 0
     },
     "src/homepilot/artifacts/router.py": {
-      "CONFIDENCE.HIGH": 3,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 3,
+      "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 296,
@@ -276,12 +263,12 @@
       "skipped_tests": 0
     },
     "src/homepilot/artifacts/store.py": {
-      "CONFIDENCE.HIGH": 3,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 3,
+      "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 339,
@@ -382,13 +369,13 @@
     "src/homepilot/auth/router.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 3,
+      "CONFIDENCE.MEDIUM": 2,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 3,
+      "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 239,
+      "loc": 230,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -432,15 +419,15 @@
       "skipped_tests": 0
     },
     "src/homepilot/cli/main.py": {
-      "CONFIDENCE.HIGH": 15,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 1,
       "CONFIDENCE.MEDIUM": 4,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 18,
+      "SEVERITY.LOW": 3,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1377,
+      "loc": 1443,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -466,7 +453,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 233,
+      "loc": 227,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -505,7 +492,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 268,
+      "loc": 311,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -518,7 +505,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 9,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 740,
+      "loc": 786,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -570,7 +557,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 158,
+      "loc": 157,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -648,7 +635,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 239,
+      "loc": 235,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -713,46 +700,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 80,
+      "loc": 171,
       "nosec": 0,
       "skipped_tests": 0
     },
     "src/homepilot/inventory/service.py": {
       "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 1,
+      "CONFIDENCE.LOW": 2,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 1,
+      "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 210,
-      "nosec": 0,
-      "skipped_tests": 0
-    },
-    "src/homepilot/jumpserver/__init__.py": {
-      "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 0,
-      "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 0,
-      "SEVERITY.UNDEFINED": 0,
-      "loc": 2,
-      "nosec": 0,
-      "skipped_tests": 0
-    },
-    "src/homepilot/jumpserver/client.py": {
-      "CONFIDENCE.HIGH": 2,
-      "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 0,
-      "CONFIDENCE.UNDEFINED": 0,
-      "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 2,
-      "SEVERITY.MEDIUM": 0,
-      "SEVERITY.UNDEFINED": 0,
-      "loc": 143,
+      "loc": 425,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -804,7 +765,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 524,
+      "loc": 547,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -837,13 +798,13 @@
     "src/homepilot/mcp/matrix_server.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 2,
+      "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 2,
+      "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 523,
+      "loc": 533,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -856,7 +817,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 342,
+      "loc": 341,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -999,7 +960,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 73,
+      "loc": 74,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1051,7 +1012,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 101,
+      "loc": 110,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1069,15 +1030,15 @@
       "skipped_tests": 0
     },
     "src/homepilot/tasks/runner.py": {
-      "CONFIDENCE.HIGH": 1,
+      "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 1,
+      "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 150,
+      "loc": 151,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1136,9 +1097,9 @@
   },
   "results": [
     {
-      "code": "79 \n80             new_token = \"\"\n81             new_source = \"\"\n",
-      "col_offset": 24,
-      "end_col_offset": 26,
+      "code": "65 async def _resolve_proxmox_token(request: Request) -> tuple[str, str]:\n66     token = \"\"\n67     source = \"\"\n",
+      "col_offset": 12,
+      "end_col_offset": 14,
       "filename": "src/homepilot/admin/router.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -1147,9 +1108,69 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 80,
+      "line_number": 66,
       "line_range": [
-        80
+        66
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "87 async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:\n88     write_token = \"\"\n89     source = \"\"\n",
+      "col_offset": 18,
+      "end_col_offset": 20,
+      "filename": "src/homepilot/admin/router.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: ''",
+      "line_number": 88,
+      "line_range": [
+        88
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "262 \n263     new_token = \"\"\n264     new_source = \"\"\n",
+      "col_offset": 16,
+      "end_col_offset": 18,
+      "filename": "src/homepilot/admin/router.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: ''",
+      "line_number": 263,
+      "line_range": [
+        263
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "281 \n282         new_write_token = \"\"\n283         new_write_source = \"\"\n",
+      "col_offset": 26,
+      "end_col_offset": 28,
+      "filename": "src/homepilot/admin/router.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: ''",
+      "line_number": 282,
+      "line_range": [
+        282
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -1182,7 +1203,7 @@
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "90 \n91     pve_token_source = \"\"\n92 \n",
+      "code": "85 \n86     pve_token_source = \"\"\n87 \n",
       "col_offset": 23,
       "end_col_offset": 25,
       "filename": "src/homepilot/app_state.py",
@@ -1193,16 +1214,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 91,
+      "line_number": 86,
       "line_range": [
-        91
+        86
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "96         if settings.proxmox_host:\n97             token = \"\"\n98             if vault:\n",
+      "code": "113         if proxmox_host:\n114             token = \"\"\n115             if vault:\n",
       "col_offset": 20,
       "end_col_offset": 22,
       "filename": "src/homepilot/app_state.py",
@@ -1213,16 +1234,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 97,
+      "line_number": 114,
       "line_range": [
-        97
+        114
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "106                             logger.warning(\"PVE token from vault has invalid format \u2014 skipping\")\n107                             token = \"\"\n108                         else:\n",
+      "code": "123                             logger.warning(\"PVE token from vault has invalid format \u2014 skipping\")\n124                             token = \"\"\n125                         else:\n",
       "col_offset": 36,
       "end_col_offset": 38,
       "filename": "src/homepilot/app_state.py",
@@ -1233,16 +1254,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 107,
+      "line_number": 124,
       "line_range": [
-        107
+        124
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "108                         else:\n109                             pve_token_source = \"vault\"\n110                 except (VaultError, OSError):\n",
+      "code": "125                         else:\n126                             pve_token_source = \"vault\"\n127                 except (VaultError, OSError):\n",
       "col_offset": 47,
       "end_col_offset": 54,
       "filename": "src/homepilot/app_state.py",
@@ -1253,16 +1274,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'vault'",
-      "line_number": 109,
+      "line_number": 126,
       "line_range": [
-        109
+        126
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "120                         else:\n121                             pve_token_source = \"env\"\n122                             logger.warning(\n",
+      "code": "137                         else:\n138                             pve_token_source = \"env\"\n139                             logger.warning(\n",
       "col_offset": 47,
       "end_col_offset": 52,
       "filename": "src/homepilot/app_state.py",
@@ -1273,16 +1294,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 121,
+      "line_number": 138,
       "line_range": [
-        121
+        138
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "128                 if _validate_pve_token(env_token):\n129                     pve_token_source = \"env\"\n130                     logger.warning(\"PVE_API_TOKEN via env var \u2014 use vault for better security\")\n",
+      "code": "145                 if _validate_pve_token(env_token):\n146                     pve_token_source = \"env\"\n147                     logger.warning(\"PVE_API_TOKEN via env var \u2014 use vault for better security\")\n",
       "col_offset": 39,
       "end_col_offset": 44,
       "filename": "src/homepilot/app_state.py",
@@ -1293,18 +1314,18 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 129,
+      "line_number": 146,
       "line_range": [
-        129
+        146
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "142 \n143     jump_token_source = \"\"\n144     try:\n",
-      "col_offset": 24,
-      "end_col_offset": 26,
+      "code": "149             if token:\n150                 write_token = \"\"\n151                 if vault:\n",
+      "col_offset": 30,
+      "end_col_offset": 32,
       "filename": "src/homepilot/app_state.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -1313,76 +1334,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 143,
+      "line_number": 150,
       "line_range": [
-        143
+        150
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "161                     )\n162             auth_token_val = \"\"\n163             if vault:\n",
-      "col_offset": 29,
-      "end_col_offset": 31,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: ''",
-      "line_number": 162,
-      "line_range": [
-        162
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "169                     if auth_token_val:\n170                         jump_token_source = \"vault\"\n171                 except (_VaultErrorJump, OSError):\n",
-      "col_offset": 44,
-      "end_col_offset": 51,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: 'vault'",
-      "line_number": 170,
-      "line_range": [
-        170
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "191                 if auth_token_val and not jump_token_source:\n192                     jump_token_source = \"env\"\n193                     logger.warning(\"JumpServer token via env var \u2014 use vault for better security\")\n",
-      "col_offset": 40,
-      "end_col_offset": 45,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 192,
-      "line_range": [
-        192
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "213 \n214     webhook_secret_source = \"\"\n215     if vault:\n",
+      "code": "173 \n174     webhook_secret_source = \"\"\n175     if vault:\n",
       "col_offset": 28,
       "end_col_offset": 30,
       "filename": "src/homepilot/app_state.py",
@@ -1393,16 +1354,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 214,
+      "line_number": 174,
       "line_range": [
-        214
+        174
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "222                 settings.events_webhook_secret = secret_val\n223                 webhook_secret_source = \"vault\"\n224         except (_VaultErrorWebhook, OSError):\n",
+      "code": "182                 settings.events_webhook_secret = secret_val\n183                 webhook_secret_source = \"vault\"  # pragma: allowlist secret\n184         except (_VaultErrorWebhook, OSError):\n",
       "col_offset": 40,
       "end_col_offset": 47,
       "filename": "src/homepilot/app_state.py",
@@ -1413,16 +1374,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'vault'",
-      "line_number": 223,
+      "line_number": 183,
       "line_range": [
-        223
+        183
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "229     if not webhook_secret_source and os.environ.get(\"HP_EVENTS_WEBHOOK_SECRET\"):\n230         webhook_secret_source = \"env\"\n231         logger.warning(\"HP_EVENTS_WEBHOOK_SECRET via env var \u2014 use vault for better security\")\n",
+      "code": "189     if not webhook_secret_source and os.environ.get(\"HP_EVENTS_WEBHOOK_SECRET\"):\n190         webhook_secret_source = \"env\"  # pragma: allowlist secret\n191         logger.warning(\"HP_EVENTS_WEBHOOK_SECRET via env var \u2014 use vault for better security\")\n",
       "col_offset": 32,
       "end_col_offset": 37,
       "filename": "src/homepilot/app_state.py",
@@ -1433,16 +1394,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 230,
+      "line_number": 190,
       "line_range": [
-        230
+        190
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "265         \"/proc\",\n266         \"/tmp\",\n267     )\n268     if not str(data_dir_resolved).startswith(\"/home\"):\n269         protected_paths = (*protected_paths, \"/home\")\n270     for blocked in protected_paths:\n271         if str(artifacts_dir) == blocked or str(artifacts_dir).startswith(blocked + \"/\"):\n272             raise ValueError(f\"artifacts_dir ({artifacts_dir}) points to a protected path\")\n273     if not str(artifacts_dir).startswith(str(data_dir_resolved)):\n274         raise ValueError(\n275             f\"artifacts_dir ({artifacts_dir}) is outside data_dir ({data_dir_resolved})\"\n276         )\n",
+      "code": "225         \"/proc\",\n226         \"/tmp\",\n227     )\n228     if not str(data_dir_resolved).startswith(\"/home\"):\n229         protected_paths = (*protected_paths, \"/home\")\n230     for blocked in protected_paths:\n231         if str(artifacts_dir) == blocked or str(artifacts_dir).startswith(blocked + \"/\"):\n232             raise ValueError(f\"artifacts_dir ({artifacts_dir}) points to a protected path\")\n233     if not str(artifacts_dir).startswith(str(data_dir_resolved)):\n234         raise ValueError(\n235             f\"artifacts_dir ({artifacts_dir}) is outside data_dir ({data_dir_resolved})\"\n236         )\n",
       "col_offset": 8,
       "end_col_offset": 14,
       "filename": "src/homepilot/app_state.py",
@@ -1453,336 +1414,22 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Probable insecure usage of temp file/directory.",
-      "line_number": 266,
+      "line_number": 226,
       "line_range": [
-        258,
-        259,
-        260,
-        261,
-        262,
-        263,
-        264,
-        265,
-        266,
-        267
+        218,
+        219,
+        220,
+        221,
+        222,
+        223,
+        224,
+        225,
+        226,
+        227
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b108_hardcoded_tmp_directory.html",
       "test_id": "B108",
       "test_name": "hardcoded_tmp_directory"
-    },
-    {
-      "code": "280         try:\n281             import subprocess\n282 \n",
-      "col_offset": 12,
-      "end_col_offset": 29,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Consider possible security implications associated with the subprocess module.",
-      "line_number": 281,
-      "line_range": [
-        281
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess",
-      "test_id": "B404",
-      "test_name": "blacklist"
-    },
-    {
-      "code": "282 \n283             subprocess.run(\n284                 [\"git\", \"init\"],\n285                 cwd=str(artifacts_dir),\n286                 capture_output=True,\n287                 check=False,\n288             )\n289             if (\n",
-      "col_offset": 12,
-      "end_col_offset": 13,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 283,
-      "line_range": [
-        283,
-        284,
-        285,
-        286,
-        287,
-        288
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "282 \n283             subprocess.run(\n284                 [\"git\", \"init\"],\n285                 cwd=str(artifacts_dir),\n286                 capture_output=True,\n287                 check=False,\n288             )\n289             if (\n",
-      "col_offset": 12,
-      "end_col_offset": 13,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 283,
-      "line_range": [
-        283,
-        284,
-        285,
-        286,
-        287,
-        288
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "289             if (\n290                 subprocess.run(\n291                     [\"git\", \"rev-parse\", \"--is-inside-work-tree\"],\n292                     cwd=str(artifacts_dir),\n293                     capture_output=True,\n294                 ).returncode\n295                 != 0\n",
-      "col_offset": 16,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 290,
-      "line_range": [
-        290,
-        291,
-        292,
-        293,
-        294
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "289             if (\n290                 subprocess.run(\n291                     [\"git\", \"rev-parse\", \"--is-inside-work-tree\"],\n292                     cwd=str(artifacts_dir),\n293                     capture_output=True,\n294                 ).returncode\n295                 != 0\n",
-      "col_offset": 16,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 290,
-      "line_range": [
-        290,
-        291,
-        292,
-        293,
-        294
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "296             ):\n297                 subprocess.run(\n298                     [\"git\", \"init\"],\n299                     cwd=str(artifacts_dir),\n300                     capture_output=True,\n301                     check=False,\n302                 )\n303         except FileNotFoundError:\n",
-      "col_offset": 16,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 297,
-      "line_range": [
-        297,
-        298,
-        299,
-        300,
-        301,
-        302
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "296             ):\n297                 subprocess.run(\n298                     [\"git\", \"init\"],\n299                     cwd=str(artifacts_dir),\n300                     capture_output=True,\n301                     check=False,\n302                 )\n303         except FileNotFoundError:\n",
-      "col_offset": 16,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 297,
-      "line_range": [
-        297,
-        298,
-        299,
-        300,
-        301,
-        302
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "5 import logging\n6 import subprocess\n7 import time\n",
-      "col_offset": 0,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/artifacts/router.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Consider possible security implications associated with the subprocess module.",
-      "line_number": 6,
-      "line_range": [
-        6
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess",
-      "test_id": "B404",
-      "test_name": "blacklist"
-    },
-    {
-      "code": "144         rel = path.relative_to(store.root)\n145         result = subprocess.run(\n146             [\"git\", \"diff\", \"HEAD~1\", \"--\", str(rel)],\n147             cwd=store.root,\n148             capture_output=True,\n149             text=True,\n150             timeout=30,\n151         )\n152         diff = result.stdout\n",
-      "col_offset": 17,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/artifacts/router.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 145,
-      "line_range": [
-        145,
-        146,
-        147,
-        148,
-        149,
-        150,
-        151
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "144         rel = path.relative_to(store.root)\n145         result = subprocess.run(\n146             [\"git\", \"diff\", \"HEAD~1\", \"--\", str(rel)],\n147             cwd=store.root,\n148             capture_output=True,\n149             text=True,\n150             timeout=30,\n151         )\n152         diff = result.stdout\n",
-      "col_offset": 17,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/artifacts/router.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 145,
-      "line_range": [
-        145,
-        146,
-        147,
-        148,
-        149,
-        150,
-        151
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "6 import sqlite3\n7 import subprocess\n8 import time\n",
-      "col_offset": 0,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/artifacts/store.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Consider possible security implications associated with the subprocess module.",
-      "line_number": 7,
-      "line_range": [
-        7
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess",
-      "test_id": "B404",
-      "test_name": "blacklist"
-    },
-    {
-      "code": "123         try:\n124             result = subprocess.run(\n125                 [\"git\", *args],\n126                 cwd=self.root,\n127                 capture_output=True,\n128                 check=check,\n129                 timeout=timeout,\n130                 env=env,\n131             )\n132             return result\n",
-      "col_offset": 21,
-      "end_col_offset": 13,
-      "filename": "src/homepilot/artifacts/store.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 124,
-      "line_range": [
-        124,
-        125,
-        126,
-        127,
-        128,
-        129,
-        130,
-        131
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "123         try:\n124             result = subprocess.run(\n125                 [\"git\", *args],\n126                 cwd=self.root,\n127                 capture_output=True,\n128                 check=check,\n129                 timeout=timeout,\n130                 env=env,\n131             )\n132             return result\n",
-      "col_offset": 21,
-      "end_col_offset": 13,
-      "filename": "src/homepilot/artifacts/store.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 124,
-      "line_range": [
-        124,
-        125,
-        126,
-        127,
-        128,
-        129,
-        130,
-        131
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
     },
     {
       "code": "26 \n27 _COOKIE_HP_TOKEN = \"hp_token\"\n28 _COOKIE_HP_CSRF = \"hp_csrf\"\n",
@@ -1805,35 +1452,7 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "152             user_id=row[\"user_id\"],\n153             token_type=\"personal\",\n154             prefix=prefix,\n155             hash=token_hash,\n156             scope=row.get(\"scope\", \"full\"),\n157             label=row.get(\"label\", \"rotated\"),\n158             fingerprint=current_fingerprint,\n159         )\n160         await db.delete_token(row[\"id\"])\n161         await db.db.conn.commit()\n162         raw_token = full_token\n",
-      "col_offset": 14,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/auth/router.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 153,
-      "line_range": [
-        151,
-        152,
-        153,
-        154,
-        155,
-        156,
-        157,
-        158,
-        159
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
-      "test_id": "B106",
-      "test_name": "hardcoded_password_funcarg"
-    },
-    {
-      "code": "258         user_id=user_id,\n259         token_type=\"personal\",\n260         prefix=prefix,\n261         hash=token_hash,\n262         scope=body.scope,\n263         label=body.label,\n264         expires_at=None,\n265     )\n266     await db.db.conn.commit()\n267     return {\"token\": full_token, \"scope\": body.scope}\n268 \n",
+      "code": "257         user_id=user_id,\n258         token_type=\"personal\",\n259         prefix=prefix,\n260         hash=token_hash,\n261         scope=body.scope,\n262         label=body.label,\n263         expires_at=None,\n264     )\n265     await db.db.conn.commit()\n266     return {\"token\": full_token, \"scope\": body.scope}\n267 \n",
       "col_offset": 10,
       "end_col_offset": 5,
       "filename": "src/homepilot/auth/router.py",
@@ -1844,8 +1463,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 259,
+      "line_number": 258,
       "line_range": [
+        256,
         257,
         258,
         259,
@@ -1853,32 +1473,11 @@
         261,
         262,
         263,
-        264,
-        265
+        264
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
       "test_id": "B106",
       "test_name": "hardcoded_password_funcarg"
-    },
-    {
-      "code": "6 import os\n7 import subprocess\n8 import tarfile\n",
-      "col_offset": 0,
-      "end_col_offset": 17,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Consider possible security implications associated with the subprocess module.",
-      "line_number": 7,
-      "line_range": [
-        7
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess",
-      "test_id": "B404",
-      "test_name": "blacklist"
     },
     {
       "code": "174             user_id=str(user_id),\n175             token_type=\"personal\",\n176             prefix=token_prefix,\n177             hash=token_hash,\n178             scope=\"read,write\",\n179             expires_at=None,\n180         )\n181         await database.conn.commit()\n182         await database.close()\n183 \n",
@@ -1908,146 +1507,6 @@
       "test_name": "hardcoded_password_funcarg"
     },
     {
-      "code": "193 \n194     subprocess.run([\"git\", \"init\"], cwd=str(artifacts_dir), capture_output=True, check=False)\n195     subprocess.run(\n",
-      "col_offset": 4,
-      "end_col_offset": 93,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 194,
-      "line_range": [
-        194
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "193 \n194     subprocess.run([\"git\", \"init\"], cwd=str(artifacts_dir), capture_output=True, check=False)\n195     subprocess.run(\n",
-      "col_offset": 4,
-      "end_col_offset": 93,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 194,
-      "line_range": [
-        194
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "194     subprocess.run([\"git\", \"init\"], cwd=str(artifacts_dir), capture_output=True, check=False)\n195     subprocess.run(\n196         [\"git\", \"config\", \"user.email\", \"homepilot@localhost\"],\n197         cwd=str(artifacts_dir),\n198         capture_output=True,\n199         check=False,\n200     )\n201     subprocess.run(\n",
-      "col_offset": 4,
-      "end_col_offset": 5,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 195,
-      "line_range": [
-        195,
-        196,
-        197,
-        198,
-        199,
-        200
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "194     subprocess.run([\"git\", \"init\"], cwd=str(artifacts_dir), capture_output=True, check=False)\n195     subprocess.run(\n196         [\"git\", \"config\", \"user.email\", \"homepilot@localhost\"],\n197         cwd=str(artifacts_dir),\n198         capture_output=True,\n199         check=False,\n200     )\n201     subprocess.run(\n",
-      "col_offset": 4,
-      "end_col_offset": 5,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 195,
-      "line_range": [
-        195,
-        196,
-        197,
-        198,
-        199,
-        200
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "200     )\n201     subprocess.run(\n202         [\"git\", \"config\", \"user.name\", \"HomePilot\"],\n203         cwd=str(artifacts_dir),\n204         capture_output=True,\n205         check=False,\n206     )\n207 \n",
-      "col_offset": 4,
-      "end_col_offset": 5,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 201,
-      "line_range": [
-        201,
-        202,
-        203,
-        204,
-        205,
-        206
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "200     )\n201     subprocess.run(\n202         [\"git\", \"config\", \"user.name\", \"HomePilot\"],\n203         cwd=str(artifacts_dir),\n204         capture_output=True,\n205         check=False,\n206     )\n207 \n",
-      "col_offset": 4,
-      "end_col_offset": 5,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 201,
-      "line_range": [
-        201,
-        202,
-        203,
-        204,
-        205,
-        206
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
       "code": "264     transport: str = typer.Option(\"stdio\", \"--transport\", help=\"Transport: stdio or http\"),\n265     host: str = typer.Option(\"0.0.0.0\", \"--host\", help=\"Bind host (http only)\"),\n266     port: int = typer.Option(8000, \"--port\", help=\"Bind port (http only)\"),\n",
       "col_offset": 29,
       "end_col_offset": 38,
@@ -2066,176 +1525,6 @@
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
-    },
-    {
-      "code": "364     try:\n365         result = subprocess.run(\n366             [\"git\", \"log\", \"--oneline\", f\"-{lines}\", \"--\", rel_path],\n367             cwd=artifacts_dir,\n368             capture_output=True,\n369             text=True,\n370         )\n371     except FileNotFoundError:\n",
-      "col_offset": 17,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 365,
-      "line_range": [
-        365,
-        366,
-        367,
-        368,
-        369,
-        370
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "364     try:\n365         result = subprocess.run(\n366             [\"git\", \"log\", \"--oneline\", f\"-{lines}\", \"--\", rel_path],\n367             cwd=artifacts_dir,\n368             capture_output=True,\n369             text=True,\n370         )\n371     except FileNotFoundError:\n",
-      "col_offset": 17,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 365,
-      "line_range": [
-        365,
-        366,
-        367,
-        368,
-        369,
-        370
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "382     try:\n383         log_result = subprocess.run(\n384             [\"git\", \"log\", \"--oneline\", \"-5\", \"--\", rel_path],\n385             cwd=artifacts_dir,\n386             capture_output=True,\n387             text=True,\n388         )\n389     except FileNotFoundError:\n",
-      "col_offset": 21,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 383,
-      "line_range": [
-        383,
-        384,
-        385,
-        386,
-        387,
-        388
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "382     try:\n383         log_result = subprocess.run(\n384             [\"git\", \"log\", \"--oneline\", \"-5\", \"--\", rel_path],\n385             cwd=artifacts_dir,\n386             capture_output=True,\n387             text=True,\n388         )\n389     except FileNotFoundError:\n",
-      "col_offset": 21,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 383,
-      "line_range": [
-        383,
-        384,
-        385,
-        386,
-        387,
-        388
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "396     try:\n397         diff_result = subprocess.run(\n398             [\"git\", \"diff\", \"HEAD~1\", \"--\", rel_path],\n399             cwd=artifacts_dir,\n400             capture_output=True,\n401             text=True,\n402         )\n403     except FileNotFoundError:\n",
-      "col_offset": 22,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Starting a process with a partial executable path",
-      "line_number": 397,
-      "line_range": [
-        397,
-        398,
-        399,
-        400,
-        401,
-        402
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
-      "test_id": "B607",
-      "test_name": "start_process_with_partial_path"
-    },
-    {
-      "code": "396     try:\n397         diff_result = subprocess.run(\n398             [\"git\", \"diff\", \"HEAD~1\", \"--\", rel_path],\n399             cwd=artifacts_dir,\n400             capture_output=True,\n401             text=True,\n402         )\n403     except FileNotFoundError:\n",
-      "col_offset": 22,
-      "end_col_offset": 9,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 397,
-      "line_range": [
-        397,
-        398,
-        399,
-        400,
-        401,
-        402
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
-    },
-    {
-      "code": "459     editor = os.environ.get(\"EDITOR\", \"vi\")\n460     subprocess.run([editor, str(path)], check=False)\n461 \n",
-      "col_offset": 4,
-      "end_col_offset": 52,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 78,
-        "link": "https://cwe.mitre.org/data/definitions/78.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 460,
-      "line_range": [
-        460
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
-      "test_id": "B603",
-      "test_name": "subprocess_without_shell_equals_true"
     },
     {
       "code": "688         readme = (\n689             \"# HomePilot Export\\n\\n\"\n690             f\"Generated: {datetime.now(UTC).isoformat()}\\n\\n\"\n691             \"## Contents\\n\\n\"\n692             \"- `artifacts/` \u2014 Git repo of artifact Markdown files\\n\"\n693             \"- `homepilot.db` \u2014 SQLite database (inventory, KB, journal)\\n\\n\"\n694             \"## How to read without HomePilot\\n\\n\"\n695             \"- Artifacts: Markdown files in `artifacts/YYYY/MM/<id>.md`\\n\"\n696             '- Database: `sqlite3 homepilot.db \"SELECT * FROM hosts;\"`\\n'\n697         )\n",
@@ -2265,28 +1554,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "877                 pass\n878             except Exception:  # intentional broad catch \u2014 silently falls back to direct DB\n879                 pass\n880         return None\n",
-      "col_offset": 12,
-      "end_col_offset": 20,
-      "filename": "src/homepilot/cli/main.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Try, Except, Pass detected.",
-      "line_number": 878,
-      "line_range": [
-        878,
-        879
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
-      "test_id": "B110",
-      "test_name": "try_except_pass"
-    },
-    {
-      "code": "1042                 user_id=str(user_id),\n1043                 token_type=\"personal\",\n1044                 prefix=prefix,\n1045                 hash=token_hash,\n1046                 scope=scope,\n1047                 expires_at=None,\n1048             )\n1049             await database.conn.commit()\n1050             await database.close()\n1051         except OperationalError as exc:\n",
+      "code": "1045                 user_id=str(user_id),\n1046                 token_type=\"personal\",\n1047                 prefix=prefix,\n1048                 hash=token_hash,\n1049                 scope=scope,\n1050                 expires_at=None,\n1051             )\n1052             await database.conn.commit()\n1053             await database.close()\n1054         except OperationalError as exc:\n",
       "col_offset": 18,
       "end_col_offset": 13,
       "filename": "src/homepilot/cli/main.py",
@@ -2297,23 +1565,23 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 1043,
+      "line_number": 1046,
       "line_range": [
-        1041,
-        1042,
-        1043,
         1044,
         1045,
         1046,
         1047,
-        1048
+        1048,
+        1049,
+        1050,
+        1051
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
       "test_id": "B106",
       "test_name": "hardcoded_password_funcarg"
     },
     {
-      "code": "1220 \n1221                 token = \"\"\n1222                 import os as _os\n",
+      "code": "1296 \n1297                 token = \"\"\n1298                 import os as _os\n",
       "col_offset": 24,
       "end_col_offset": 26,
       "filename": "src/homepilot/cli/main.py",
@@ -2324,16 +1592,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 1221,
+      "line_number": 1297,
       "line_range": [
-        1221
+        1297
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "78 \n79     daemon_host: str = Field(default=\"0.0.0.0\", validation_alias=\"HP_HOST\")\n80     daemon_port: int = Field(default=8000, validation_alias=\"HP_PORT\")\n",
+      "code": "71 \n72     daemon_host: str = Field(default=\"0.0.0.0\", validation_alias=\"HP_HOST\")\n73     daemon_port: int = Field(default=8000, validation_alias=\"HP_PORT\")\n",
       "col_offset": 37,
       "end_col_offset": 46,
       "filename": "src/homepilot/config.py",
@@ -2344,16 +1612,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 79,
+      "line_number": 72,
       "line_range": [
-        79
+        72
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "82     agent_hub_enabled: bool = False\n83     agent_hub_host: str = \"0.0.0.0\"\n84     agent_hub_port: int = 8443\n",
+      "code": "75     agent_hub_enabled: bool = False\n76     agent_hub_host: str = \"0.0.0.0\"\n77     agent_hub_port: int = 8443\n",
       "col_offset": 26,
       "end_col_offset": 35,
       "filename": "src/homepilot/config.py",
@@ -2364,16 +1632,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 83,
+      "line_number": 76,
       "line_range": [
-        83
+        76
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "175         await self.db.execute(\n176             f\"INSERT INTO api_tokens ({col_names}) VALUES ({placeholders})\",\n177             vals,\n",
+      "code": "189         await self.db.execute(\n190             f\"INSERT INTO api_tokens ({col_names}) VALUES ({placeholders})\",\n191             vals,\n",
       "col_offset": 14,
       "end_col_offset": 38,
       "filename": "src/homepilot/db/repository.py",
@@ -2384,16 +1652,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 176,
+      "line_number": 190,
       "line_range": [
-        176
+        190
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "279         params.extend([limit, offset])\n280         rows = await self.db.fetchall(f\"SELECT * FROM hosts{where} LIMIT ? OFFSET ?\", params)\n281         return [dict(r) for r in rows]\n",
+      "code": "325         params.extend([limit, offset])\n326         rows = await self.db.fetchall(f\"SELECT * FROM hosts{where} LIMIT ? OFFSET ?\", params)\n327         return [dict(r) for r in rows]\n",
       "col_offset": 40,
       "end_col_offset": 59,
       "filename": "src/homepilot/db/repository.py",
@@ -2404,16 +1672,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 280,
+      "line_number": 326,
       "line_range": [
-        280
+        326
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "299         vals = [*set_vals, now(), host_id]\n300         await self.db.execute(f\"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?\", vals)\n301 \n",
+      "code": "345         vals = [*set_vals, now(), host_id]\n346         await self.db.execute(f\"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?\", vals)\n347 \n",
       "col_offset": 32,
       "end_col_offset": 49,
       "filename": "src/homepilot/db/repository.py",
@@ -2424,16 +1692,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 300,
+      "line_number": 346,
       "line_range": [
-        300
+        346
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "341         vals = [*set_vals, now(), service_id]\n342         await self.db.execute(f\"UPDATE services SET {sets}, updated_at = ? WHERE id = ?\", vals)\n343 \n",
+      "code": "387         vals = [*set_vals, now(), service_id]\n388         await self.db.execute(f\"UPDATE services SET {sets}, updated_at = ? WHERE id = ?\", vals)\n389 \n",
       "col_offset": 32,
       "end_col_offset": 52,
       "filename": "src/homepilot/db/repository.py",
@@ -2444,16 +1712,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 342,
+      "line_number": 388,
       "line_range": [
-        342
+        388
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "408         rows = await self.db.fetchall(\n409             f\"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?\",\n410             params,\n",
+      "code": "454         rows = await self.db.fetchall(\n455             f\"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?\",\n456             params,\n",
       "col_offset": 14,
       "end_col_offset": 37,
       "filename": "src/homepilot/db/repository.py",
@@ -2464,16 +1732,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 409,
+      "line_number": 455,
       "line_range": [
-        409
+        455
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "435         where = (\" WHERE \" + \" AND \".join(clauses)) if clauses else \"\"\n436         row = await self.db.fetchone(f\"SELECT COUNT(*) as cnt FROM audit_log{where}\", params)\n437         return row[\"cnt\"] if row else 0\n",
+      "code": "481         where = (\" WHERE \" + \" AND \".join(clauses)) if clauses else \"\"\n482         row = await self.db.fetchone(f\"SELECT COUNT(*) as cnt FROM audit_log{where}\", params)\n483         return row[\"cnt\"] if row else 0\n",
       "col_offset": 39,
       "end_col_offset": 76,
       "filename": "src/homepilot/db/repository.py",
@@ -2484,16 +1752,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 436,
+      "line_number": 482,
       "line_range": [
-        436
+        482
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "509         rows = await self.db.fetchall(\n510             f\"SELECT * FROM artifacts{where} ORDER BY created_at DESC LIMIT ? OFFSET ?\",\n511             params,\n",
+      "code": "555         rows = await self.db.fetchall(\n556             f\"SELECT * FROM artifacts{where} ORDER BY created_at DESC LIMIT ? OFFSET ?\",\n557             params,\n",
       "col_offset": 14,
       "end_col_offset": 37,
       "filename": "src/homepilot/db/repository.py",
@@ -2504,16 +1772,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 510,
+      "line_number": 556,
       "line_range": [
-        510
+        556
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "525         vals.append(artifact_id)\n526         await self.db.execute(f\"UPDATE artifacts SET {', '.join(sets_parts)} WHERE id = ?\", vals)\n527 \n",
+      "code": "571         vals.append(artifact_id)\n572         await self.db.execute(f\"UPDATE artifacts SET {', '.join(sets_parts)} WHERE id = ?\", vals)\n573 \n",
       "col_offset": 32,
       "end_col_offset": 53,
       "filename": "src/homepilot/db/repository.py",
@@ -2524,16 +1792,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 526,
+      "line_number": 572,
       "line_range": [
-        526
+        572
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "650         vals.append(doc_id)\n651         await self.db.execute(f\"UPDATE doc_metadata SET {', '.join(sets)} WHERE id = ?\", vals)\n652         await self.db.conn.commit()\n",
+      "code": "696         vals.append(doc_id)\n697         await self.db.execute(f\"UPDATE doc_metadata SET {', '.join(sets)} WHERE id = ?\", vals)\n698         await self.db.conn.commit()\n",
       "col_offset": 32,
       "end_col_offset": 56,
       "filename": "src/homepilot/db/repository.py",
@@ -2544,16 +1812,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 651,
+      "line_number": 697,
       "line_range": [
-        651
+        697
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "88         hosts = await self.repo.db.fetchall(\n89             f\"SELECT * FROM hosts{where} ORDER BY hostname LIMIT ? OFFSET ?\",\n90             params,\n",
+      "code": "169         hosts = await self.repo.db.fetchall(\n170             f\"SELECT * FROM hosts{where} ORDER BY hostname LIMIT ? OFFSET ?\",\n171             params,\n",
       "col_offset": 14,
       "end_col_offset": 33,
       "filename": "src/homepilot/inventory/service.py",
@@ -2564,53 +1832,34 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 89,
+      "line_number": 170,
       "line_range": [
-        89
+        170
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "107         await self._ensure_connected()\n108         assert self._writer is not None\n109         assert self._reader is not None\n",
-      "col_offset": 8,
-      "end_col_offset": 39,
-      "filename": "src/homepilot/jumpserver/client.py",
-      "issue_confidence": "HIGH",
+      "code": "381                 (\n382                     f\"SELECT * FROM hosts\"\n383                     f\"{' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''}\"\n384                 ),\n",
+      "col_offset": 22,
+      "end_col_offset": 41,
+      "filename": "src/homepilot/inventory/service.py",
+      "issue_confidence": "LOW",
       "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
       },
-      "issue_severity": "LOW",
-      "issue_text": "Use of assert detected. The enclosed code will be removed when compiling to optimised byte code.",
-      "line_number": 108,
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 382,
       "line_range": [
-        108
+        382,
+        383
       ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b101_assert_used.html",
-      "test_id": "B101",
-      "test_name": "assert_used"
-    },
-    {
-      "code": "108         assert self._writer is not None\n109         assert self._reader is not None\n110         msg[\"request_id\"] = str(uuid.uuid4())\n",
-      "col_offset": 8,
-      "end_col_offset": 39,
-      "filename": "src/homepilot/jumpserver/client.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Use of assert detected. The enclosed code will be removed when compiling to optimised byte code.",
-      "line_number": 109,
-      "line_range": [
-        109
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b101_assert_used.html",
-      "test_id": "B101",
-      "test_name": "assert_used"
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
     },
     {
       "code": "64     rows = await repo.db.fetchall(\n65         f\"SELECT * FROM doc_metadata{where} ORDER BY embedded_at DESC LIMIT ? OFFSET ?\",\n66         params,\n",
@@ -2653,47 +1902,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "240 def _load_tokens() -> dict[str, str]:\n241     secrets_dir = os.environ.get(\"HP_SECRETS_DIR\", \"/tmp/opencode/secrets\")\n242     token_file = os.path.join(secrets_dir, \"matrix_tokens.json\")\n",
-      "col_offset": 51,
-      "end_col_offset": 74,
-      "filename": "src/homepilot/mcp/matrix_server.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 377,
-        "link": "https://cwe.mitre.org/data/definitions/377.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Probable insecure usage of temp file/directory.",
-      "line_number": 241,
-      "line_range": [
-        241
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b108_hardcoded_tmp_directory.html",
-      "test_id": "B108",
-      "test_name": "hardcoded_tmp_directory"
-    },
-    {
-      "code": "254         return room_id\n255     secrets_dir = os.environ.get(\"HP_SECRETS_DIR\", \"/tmp/opencode/secrets\")\n256     room_file = os.path.join(secrets_dir, \"matrix_room.json\")\n",
-      "col_offset": 51,
-      "end_col_offset": 74,
-      "filename": "src/homepilot/mcp/matrix_server.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 377,
-        "link": "https://cwe.mitre.org/data/definitions/377.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Probable insecure usage of temp file/directory.",
-      "line_number": 255,
-      "line_range": [
-        255
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b108_hardcoded_tmp_directory.html",
-      "test_id": "B108",
-      "test_name": "hardcoded_tmp_directory"
-    },
-    {
-      "code": "406 \n407 async def run_server_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n408     import uvicorn\n",
+      "code": "408 \n409 async def run_server_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n410     import uvicorn\n",
       "col_offset": 38,
       "end_col_offset": 47,
       "filename": "src/homepilot/mcp/server.py",
@@ -2704,16 +1913,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 407,
+      "line_number": 409,
       "line_range": [
-        407
+        409
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "420 \n421 def main_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n422     logging.basicConfig(level=logging.INFO, format=\"%(name)s %(levelname)s: %(message)s\")\n",
+      "code": "422 \n423 def main_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n424     logging.basicConfig(level=logging.INFO, format=\"%(name)s %(levelname)s: %(message)s\")\n",
       "col_offset": 26,
       "end_col_offset": 35,
       "filename": "src/homepilot/mcp/server.py",
@@ -2724,33 +1933,13 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 421,
+      "line_number": 423,
       "line_range": [
-        421
+        423
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
-    },
-    {
-      "code": "59 \n60         assert task_id is not None\n61         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))\n",
-      "col_offset": 8,
-      "end_col_offset": 34,
-      "filename": "src/homepilot/tasks/runner.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 703,
-        "link": "https://cwe.mitre.org/data/definitions/703.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Use of assert detected. The enclosed code will be removed when compiling to optimised byte code.",
-      "line_number": 60,
-      "line_range": [
-        60
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b101_assert_used.html",
-      "test_id": "B101",
-      "test_name": "assert_used"
     }
   ]
 }

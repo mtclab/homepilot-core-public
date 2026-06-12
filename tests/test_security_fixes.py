@@ -8,11 +8,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
+from homepilot.adapters.ssh import GuestHostError, _validate_hostname
 from homepilot.auth.deps import require_scope
 from homepilot.config import Settings
 from homepilot.db.repository import _sanitize_audit_field
 from homepilot.db.utils import escape_like
-from homepilot.jumpserver.client import JumpServerError, _validate_hostname
 from homepilot.main import _get_client_ip
 from homepilot.vault.manager import VaultManager
 
@@ -82,19 +82,19 @@ class TestHostnameValidation:
         _validate_hostname("my-host.example.com")
 
     async def test_rejects_newline(self):
-        with pytest.raises(JumpServerError, match="Invalid hostname"):
+        with pytest.raises(GuestHostError, match="Invalid hostname"):
             _validate_hostname("evil\nhost")
 
     async def test_rejects_semicolon(self):
-        with pytest.raises(JumpServerError, match="Invalid hostname"):
+        with pytest.raises(GuestHostError, match="Invalid hostname"):
             _validate_hostname("host;cmd")
 
     async def test_rejects_dotdot_slash(self):
-        with pytest.raises(JumpServerError, match="Invalid hostname"):
+        with pytest.raises(GuestHostError, match="Invalid hostname"):
             _validate_hostname("../../../evil")
 
     async def test_rejects_empty(self):
-        with pytest.raises(JumpServerError, match="Invalid hostname"):
+        with pytest.raises(GuestHostError, match="Invalid hostname"):
             _validate_hostname("")
 
 
@@ -161,22 +161,6 @@ class TestTrustedProxies:
         req = self._make_request("10.0.0.1", xff="not-an-ip, 10.0.0.1")
         nets = [ipaddress.ip_network("10.0.0.0/8")]
         assert _get_client_ip(req, nets) == "10.0.0.1"
-
-
-class TestJumpServerTLSDefaults:
-    async def test_tls_field_exists_default_false(self):
-        s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
-        )
-        assert s.jump_server_tls is False
-
-    async def test_tls_fields_exist(self):
-        s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
-        )
-        assert hasattr(s, "jump_server_tls_ca")
-        assert hasattr(s, "jump_server_tls_cert")
-        assert hasattr(s, "jump_server_tls_key")
 
 
 class TestRateLimiterExcludesUiRoutes:

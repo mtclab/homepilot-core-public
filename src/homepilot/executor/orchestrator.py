@@ -8,7 +8,6 @@ import httpx
 
 from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
-from homepilot.adapters.ssh import SSHAdapter
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import (
     ArtifactKind,
@@ -45,7 +44,6 @@ class ArtifactExecutor:
         lifecycle: ArtifactLifecycle,
         repo: Repository,
         proxmox: ProxmoxClient,
-        ssh: SSHAdapter,
         vault: VaultManager,
         pve_nodes: list[str] | None = None,
         agent: AgentAdapter | None = None,
@@ -54,20 +52,17 @@ class ArtifactExecutor:
         self.lifecycle = lifecycle
         self.repo = repo
         self.proxmox = proxmox
-        self.ssh = ssh
         self.vault = vault
         self.pve_nodes = pve_nodes or []
         self.agent = agent
 
     @property
-    def host_adapter(self) -> AgentAdapter | SSHAdapter:
-        """Return agent adapter if available, otherwise SSH.
-
-        Agent adapter tries the agent hub first and falls back to SSH.
-        """
-        if self.agent is not None:
-            return self.agent
-        return self.ssh
+    def host_adapter(self) -> AgentAdapter:
+        """The agent hub is the only host-management transport (the SSH/jump
+        server was removed). Host operations require a connected agent."""
+        if self.agent is None:
+            raise RuntimeError("no host adapter — the agent hub is required for host operations")
+        return self.agent
 
     async def apply(self, artifact_id: str, approved_by: str) -> ExecutionResult:
         fm, body = self.store.read(artifact_id)

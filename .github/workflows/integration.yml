@@ -45,10 +45,11 @@ jobs:
         run: pip-audit --desc
 
       - name: Security audit - bandit
-        # Baseline accepts the pre-existing findings (mostly intentional
-        # subprocess/SQL/assert patterns in this infra tool) and fails only on
-        # NEW issues. See issue #295 for per-finding triage.
-        run: bandit -r src/homepilot/ -b .bandit_baseline.json -f json -o bandit-report.json
+        # By-design subprocess categories (B404/B603/B607 — list-arg, no
+        # shell) are skipped in [tool.bandit]; the baseline holds the residual
+        # reviewed false positives (field-name strings, ?-bound SQL). Fails on
+        # any genuinely NEW finding.
+        run: bandit -r src/homepilot/ -c pyproject.toml -b .bandit_baseline.json -f json -o bandit-report.json
 
       - name: Security audit - detect-secrets
         run: |

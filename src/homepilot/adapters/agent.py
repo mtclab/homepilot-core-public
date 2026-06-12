@@ -5,8 +5,6 @@ import logging
 import re
 from typing import Any
 
-from homepilot.jumpserver.client import JumpServerClient, JumpServerError
-
 logger = logging.getLogger(__name__)
 
 _SHELL_METACHAR_RE = re.compile(r"[|;&`$<>!#\(\){}\[\]]")
@@ -50,23 +48,17 @@ class ReadOnlyCommandError(AgentAdapterError):
 
 
 class AgentAdapter:
-    """Drop-in replacement for SSHAdapter that routes through the agent hub.
-
-    The agent hub server is the central point where connected agents
-    register. When this adapter needs to execute a command on a host,
-    it checks if an agent is connected for that hostname. If so, it
-    routes the command through the hub. If not, it falls back to the
-    SSH-based JumpServerClient.
+    """Routes host commands through the agent hub — the only host-management
+    transport (the SSH/jump server was removed). An operation on a host with
+    no connected agent raises AgentAdapterError.
     """
 
     def __init__(
         self,
         hub_server: Any = None,
-        jump_client: JumpServerClient | None = None,
         pve_nodes: list[str] | None = None,
     ) -> None:
         self._hub = hub_server
-        self._jump_client = jump_client
         self._pve_nodes = pve_nodes or []
 
     def _check_guest_only(self, host: str) -> None:
@@ -94,34 +86,12 @@ class AgentAdapter:
                     result.get("stderr", ""),
                 )
             except (TimeoutError, ConnectionError) as exc:
-                logger.warning("agent exec failed for %s, falling back to SSH: %s", host, exc)
+                raise AgentAdapterError(f"agent exec failed for {host}: {exc}") from exc
 
-        if self._jump_client:
-            try:
-                result = await self._jump_client.exec(host=host, command=command, timeout=timeout)
-                return (
-                    result.get("exit_code", -1),
-                    result.get("stdout", ""),
-                    result.get("stderr", ""),
-                )
-            except JumpServerError as exc:
-                raise AgentAdapterError(str(exc)) from exc
-            except ConnectionError as exc:
-                raise AgentAdapterError(f"jump server connection lost: {exc}") from exc
-
-        raise AgentAdapterError(f"no agent or SSH connection available for {host}")
+        raise AgentAdapterError(f"no agent connected for {host}")
 
     async def test_connection(self, host: str) -> bool:
-        agent_id = self._resolve_agent_id(host)
-        if agent_id:
-            return True
-        if self._jump_client:
-            try:
-                result = await self._jump_client.exec(host=host, command="true", timeout=5)
-                return bool(result.get("exit_code") == 0)
-            except (JumpServerError, ConnectionError, OSError):
-                return False
-        return False
+        return self._resolve_agent_id(host) is not None
 
     async def read_file(self, host: str, path: str) -> str:
         self._check_guest_only(host)
@@ -132,18 +102,9 @@ class AgentAdapter:
                 result = await self._hub.send_read_file(agent_id, path)
                 return str(result.get("content", ""))
             except (TimeoutError, ConnectionError) as exc:
-                logger.warning("agent read_file failed for %s, falling back to SSH: %s", host, exc)
+                raise AgentAdapterError(f"agent read_file failed for {host}: {exc}") from exc
 
-        if self._jump_client:
-            try:
-                result = await self._jump_client.read_file(host=host, path=path)
-                return str(result.get("content", ""))
-            except JumpServerError as exc:
-                raise AgentAdapterError(str(exc)) from exc
-            except ConnectionError as exc:
-                raise AgentAdapterError(f"jump server connection lost: {exc}") from exc
-
-        raise AgentAdapterError(f"no agent or SSH connection available for {host}")
+        raise AgentAdapterError(f"no agent connected for {host}")
 
     async def write_file(self, host: str, path: str, content: str) -> dict[str, Any]:
         self._check_guest_only(host)
@@ -159,27 +120,12 @@ class AgentAdapter:
             before_hash = None
 
         agent_id = self._resolve_agent_id(host)
-        if agent_id:
-            try:
-                await self._hub.send_write_file(agent_id, path, content)
-            except (TimeoutError, ConnectionError) as exc:
-                logger.warning("agent write_file failed for %s, falling back to SSH: %s", host, exc)
-                if self._jump_client:
-                    try:
-                        await self._jump_client.write_file(host=host, path=path, content=content)
-                    except JumpServerError as exc2:
-                        raise AgentAdapterError(str(exc2)) from exc2
-                    except ConnectionError as exc2:
-                        raise AgentAdapterError(f"jump server connection lost: {exc2}") from exc2
-        elif self._jump_client:
-            try:
-                await self._jump_client.write_file(host=host, path=path, content=content)
-            except JumpServerError as exc:
-                raise AgentAdapterError(str(exc)) from exc
-            except ConnectionError as exc:
-                raise AgentAdapterError(f"jump server connection lost: {exc}") from exc
-        else:
-            raise AgentAdapterError(f"no agent or SSH connection available for {host}")
+        if not agent_id:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        try:
+            await self._hub.send_write_file(agent_id, path, content)
+        except (TimeoutError, ConnectionError) as exc:
+            raise AgentAdapterError(f"agent write_file failed for {host}: {exc}") from exc
 
         after_hash = hashlib.sha256(content.encode()).hexdigest()
         changed = before_hash != after_hash

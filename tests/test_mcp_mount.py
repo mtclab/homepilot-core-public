@@ -33,8 +33,6 @@ def _make_mock_state():
     state.vault.get_secret = AsyncMock(return_value={})
     state.kb_service = AsyncMock()
     state.kb_service.reindex_if_needed = AsyncMock()
-    state.jump_client = AsyncMock()
-    state.jump_client.close = AsyncMock()
     state.sse_bus = MagicMock()
     return state
 
@@ -108,7 +106,7 @@ class TestServerContextKeys:
             "lifecycle": mock_state.artifact_lifecycle,
             "repo": mock_state.repo,
             "proxmox": mock_state.proxmox,
-            "ssh_adapter": mock_state.ssh,
+            "agent_adapter": mock_state.ssh,
             "vault": mock_state.vault,
             "database": mock_state.database,
             "kb_service": mock_state.kb_service,
@@ -119,17 +117,17 @@ class TestServerContextKeys:
         mcp_mod._server_context.clear()
         mcp_mod._server_context.update(expected_context)
 
-        assert "ssh_adapter" in mcp_mod._server_context
+        assert "agent_adapter" in mcp_mod._server_context
         assert "store" in mcp_mod._server_context
         assert "ssh" not in mcp_mod._server_context
         assert "artifact_store" not in mcp_mod._server_context
 
-    def test_ssh_adapter_key_matches_tool_usage(self):
+    def test_agent_adapter_key_matches_tool_usage(self):
         ctx = {
-            "ssh_adapter": AsyncMock(),
+            "agent_adapter": AsyncMock(),
         }
         # Verify the key name matches what tools use
-        adapter = ctx.get("ssh_adapter")
+        adapter = ctx.get("agent_adapter")
         assert adapter is not None
         # Old key should NOT be present
         assert ctx.get("ssh") is None
@@ -163,7 +161,7 @@ class TestArtifactExecutorPveNodes:
             lifecycle=mock_lifecycle,
             repo=mock_repo,
             proxmox=mock_proxmox,
-            ssh=mock_ssh,
+            agent=mock_ssh,
             vault=mock_vault,
             pve_nodes=["pve1", "pve2"],
         )
@@ -178,7 +176,7 @@ class TestArtifactExecutorPveNodes:
             lifecycle=MagicMock(),
             repo=MagicMock(),
             proxmox=MagicMock(),
-            ssh=MagicMock(),
+            agent=MagicMock(),
             vault=MagicMock(),
         )
 

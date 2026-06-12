@@ -57,7 +57,10 @@ class TaskRunner:
         if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED):
             raise ConflictError(f"Invalid transition: {status.value} → apply")
 
-        assert task_id is not None
+        # task_id is non-None here (the None branch returned above); guard
+        # explicitly so it survives `python -O` (which strips asserts).
+        if task_id is None:  # pragma: no cover - defensive
+            raise RuntimeError("task_id unexpectedly None after creation")
         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
         self._track_task(task)
 
