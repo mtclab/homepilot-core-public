@@ -67,6 +67,23 @@
 		return port === 443 ? `https://${host}` : `http://${host}:${port}`;
 	}
 
+	// Render scalars as-is and objects as compact JSON (the agent's state and
+	// some system_info entries like disk/load/memory are nested objects).
+	function fmtVal(v: unknown): string {
+		if (v === null || v === undefined) return '—';
+		if (typeof v === 'object') {
+			const s = JSON.stringify(v);
+			return s === '{}' ? '—' : s;
+		}
+		return String(v);
+	}
+
+	// The registry only lists connected agents; freshness comes from heartbeat
+	// age. Treat > ~3 missed heartbeats (90s) as stale.
+	function isFresh(a: { stale_seconds?: number }): boolean {
+		return (a.stale_seconds ?? 0) < 90;
+	}
+
 	onMount(load);
 </script>
 
@@ -177,8 +194,8 @@
 							<td class="py-2 pr-4 text-slate-400 font-mono text-[11px]">{a.agent_id.slice(0, 8)}…</td>
 							<td class="py-2 pr-4">
 								<span class="inline-flex items-center gap-1">
-									<span class="w-1.5 h-1.5 rounded-full {a.state === 'connected' ? 'bg-emerald-400' : 'bg-yellow-400'}"></span>
-									<span class="{a.state === 'connected' ? 'text-emerald-400' : 'text-yellow-400'}">{a.state}</span>
+									<span class="w-1.5 h-1.5 rounded-full {isFresh(a) ? 'bg-emerald-400' : 'bg-yellow-400'}"></span>
+									<span class="{isFresh(a) ? 'text-emerald-400' : 'text-yellow-400'}">{isFresh(a) ? 'connected' : 'stale'}</span>
 								</span>
 							</td>
 							<td class="py-2 pr-4 text-slate-500">{fmtDate(a.connected_at)}</td>
@@ -198,7 +215,7 @@
 										<dt class="text-slate-500">Hostname</dt>
 										<dd class="text-slate-300">{a.hostname}</dd>
 										<dt class="text-slate-500">State</dt>
-										<dd class="text-slate-300">{a.state}</dd>
+										<dd class="text-slate-300">{fmtVal(a.state)}</dd>
 										<dt class="text-slate-500">Connected</dt>
 										<dd class="text-slate-300">{fmtDate(a.connected_at)}</dd>
 										<dt class="text-slate-500">Last Heartbeat</dt>
@@ -206,7 +223,7 @@
 										{#if a.system_info}
 											{#each Object.entries(a.system_info) as [k, v]}
 												<dt class="text-slate-500">{k}</dt>
-												<dd class="text-slate-300">{String(v)}</dd>
+												<dd class="text-slate-300">{fmtVal(v)}</dd>
 											{/each}
 										{/if}
 									</dl>
