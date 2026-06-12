@@ -102,12 +102,15 @@ $SUDO tee /etc/homepilot/agent.env >/dev/null <<EOF
 HP_AGENT_HUB_HOST=$HUB_HOST
 HP_AGENT_HUB_PORT=$HUB_PORT
 HP_AGENT_AUTH_TOKEN=$TOKEN
+HP_AGENT_TOKEN_FILE=/etc/homepilot/agent.token
 HP_AGENT_TLS=$USE_TLS
 HP_AGENT_PRIVILEGED=$PRIVILEGED
 HP_AGENT_LOG_LEVEL=INFO
 EOF
 $SUDO chmod 600 /etc/homepilot/agent.env
-$SUDO chown hp-agent:hp-agent /etc/homepilot/agent.env 2>/dev/null || true
+# The agent persists the durable token it's handed at enrollment to agent.token,
+# so it reconnects across hub restarts even if enrolled with a one-time bootstrap.
+$SUDO chown -R hp-agent:hp-agent /etc/homepilot 2>/dev/null || true
 
 # ─── Install the systemd unit ───
 $SUDO tee /etc/systemd/system/hp-agent.service >/dev/null <<'EOF'
@@ -128,6 +131,7 @@ Restart=always
 RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
+ReadWritePaths=/etc/homepilot
 ProtectHome=yes
 PrivateTmp=yes
 

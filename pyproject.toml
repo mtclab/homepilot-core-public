@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "2.4.0"
+version = "2.5.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"

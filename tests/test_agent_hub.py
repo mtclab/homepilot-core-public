@@ -287,3 +287,24 @@ class TestRegistryPersistence:
         reg = AgentRegistry()
         reg.register(agent_id="a-3", hostname="x")
         reg.unregister("a-3")  # must not raise
+
+
+class TestDurableTokenHandback:
+    """register_ack hands the agent the durable shared token so a bootstrap-
+    enrolled agent can persist it and reconnect after the hub restarts."""
+
+    def test_ack_includes_token_when_set(self):
+        from homepilot.agent_hub.server import AgentHubServer
+
+        srv = AgentHubServer(auth_token="shared-secret")
+        ack = srv._register_ack("agent-1", "req-9")
+        assert ack["action"] == "register_ack"
+        assert ack["agent_id"] == "agent-1"
+        assert ack["auth_token"] == "shared-secret"
+
+    def test_ack_omits_token_when_unset(self):
+        from homepilot.agent_hub.server import AgentHubServer
+
+        srv = AgentHubServer(auth_token=None)
+        ack = srv._register_ack("agent-1", "req-9")
+        assert "auth_token" not in ack
