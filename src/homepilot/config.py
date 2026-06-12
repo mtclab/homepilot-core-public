@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     agent_hub_enabled: bool = False
     agent_hub_host: str = "0.0.0.0"
     agent_hub_port: int = 8443
+    # Address agents should DIAL to reach the hub. agent_hub_host is the bind
+    # address (often 0.0.0.0) and is not routable; behind a reverse proxy the
+    # browser hostname isn't the raw-hub address either. Set this to the host
+    # (optionally host:port) agents can reach the hub on.
+    agent_hub_advertise_host: str = ""
     agent_hub_auth_token: str = ""
     agent_hub_heartbeat_interval: int = 30
     agent_hub_tls: bool = False

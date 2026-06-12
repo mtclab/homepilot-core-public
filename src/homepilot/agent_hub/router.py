@@ -19,17 +19,32 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 _admin_only = Depends(require_scope("admin"))
 
 
-def _advertised_hub_host(request: Request, bind_host: str) -> str:
-    """The host an agent should dial to reach the hub.
+def _advertised_hub(request: Request, bind_host: str, bind_port: int) -> tuple[str, int]:
+    """The host:port an agent should dial to reach the hub.
 
-    The hub's configured host is usually a bind address (0.0.0.0 / ::) which is
-    not routable. The operator reaches this API at a real address, so fall back
-    to the request's hostname for the install instructions.
+    Resolution order:
+      1. HP_AGENT_HUB_ADVERTISE_HOST (operator-set; may be "host" or "host:port") —
+         the only reliable source behind a reverse proxy.
+      2. the configured bind host, if it is not a wildcard.
+      3. the request hostname (the address the operator reached the API on).
     """
+    from homepilot.config import get_settings
+
+    advertise = (get_settings().agent_hub_advertise_host or "").strip()
+    if advertise:
+        advertise = advertise.removeprefix("http://").removeprefix("https://")
+        if ":" in advertise:
+            host, _, port = advertise.rpartition(":")
+            try:
+                return host, int(port)
+            except ValueError:
+                return advertise, bind_port
+        return advertise, bind_port
+
     # The "0.0.0.0" literal here is a comparison, not a socket bind.
     if bind_host and bind_host not in ("0.0.0.0", "::", ""):  # nosec B104
-        return bind_host
-    return request.url.hostname or bind_host
+        return bind_host, bind_port
+    return (request.url.hostname or bind_host), bind_port
 
 
 def _get_registry() -> AgentRegistry:
@@ -184,10 +199,11 @@ async def get_hub_token(request: Request) -> dict[str, Any]:
     if hub is None:
         raise HTTPException(status_code=503, detail="Agent hub server not available")
     token = hub.auth_token or ""
+    host, port = _advertised_hub(request, hub.host, hub.port)
     return {
         "auth_token": token,
-        "hub_host": _advertised_hub_host(request, hub.host),
-        "hub_port": hub.port,
+        "hub_host": host,
+        "hub_port": port,
     }
 
 
@@ -198,10 +214,11 @@ async def create_bootstrap_token(request: Request) -> dict[str, Any]:
     if hub is None:
         raise HTTPException(status_code=503, detail="Agent hub server not available")
     token = await hub._token_store.create()
+    host, port = _advertised_hub(request, hub.host, hub.port)
     return {
         "bootstrap_token": token,
-        "hub_host": _advertised_hub_host(request, hub.host),
-        "hub_port": hub.port,
+        "hub_host": host,
+        "hub_port": port,
     }
 
 

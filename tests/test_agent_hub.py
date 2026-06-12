@@ -181,3 +181,60 @@ class TestAuditLog:
         reg = AgentRegistry()
         assert hasattr(reg, "audit_log")
         assert isinstance(reg.audit_log, AuditLog)
+
+
+class TestAdvertisedHub:
+    """The /agents enrollment endpoints must advertise an address agents can
+    actually dial — never the 0.0.0.0 bind address — preferring the operator's
+    configured HP_AGENT_HUB_ADVERTISE_HOST."""
+
+    def _req(self, hostname: str = "ui.example.com"):
+        from unittest.mock import MagicMock
+
+        req = MagicMock()
+        req.url.hostname = hostname
+        return req
+
+    def test_prefers_advertise_setting_with_port(self, monkeypatch):
+        import homepilot.config as cfg
+        from homepilot.agent_hub import router
+
+        s = cfg.get_settings()
+        monkeypatch.setattr(s, "agent_hub_advertise_host", "10.0.0.1:9443", raising=False)
+        monkeypatch.setattr(cfg, "get_settings", lambda: s)
+        host, port = router._advertised_hub(self._req(), "0.0.0.0", 8443)
+        assert host == "10.0.0.1"
+        assert port == 9443
+
+    def test_advertise_setting_host_only_keeps_bind_port(self, monkeypatch):
+        import homepilot.config as cfg
+        from homepilot.agent_hub import router
+
+        s = cfg.get_settings()
+        monkeypatch.setattr(s, "agent_hub_advertise_host", "10.0.0.1", raising=False)
+        monkeypatch.setattr(cfg, "get_settings", lambda: s)
+        host, port = router._advertised_hub(self._req(), "0.0.0.0", 8443)
+        assert host == "10.0.0.1"
+        assert port == 8443
+
+    def test_falls_back_to_request_host_when_bind_wildcard(self, monkeypatch):
+        import homepilot.config as cfg
+        from homepilot.agent_hub import router
+
+        s = cfg.get_settings()
+        monkeypatch.setattr(s, "agent_hub_advertise_host", "", raising=False)
+        monkeypatch.setattr(cfg, "get_settings", lambda: s)
+        host, port = router._advertised_hub(self._req("hp.lan"), "0.0.0.0", 8443)
+        assert host == "hp.lan"
+        assert port == 8443
+
+    def test_uses_bind_host_when_not_wildcard(self, monkeypatch):
+        import homepilot.config as cfg
+        from homepilot.agent_hub import router
+
+        s = cfg.get_settings()
+        monkeypatch.setattr(s, "agent_hub_advertise_host", "", raising=False)
+        monkeypatch.setattr(cfg, "get_settings", lambda: s)
+        host, port = router._advertised_hub(self._req("ui.example.com"), "10.5.5.5", 8443)
+        assert host == "10.5.5.5"
+        assert port == 8443

@@ -33,6 +33,17 @@ class InventoryReconciler(Reconciler):
 
             result = await self.inventory_service.refresh_inventory()
 
+            # Enrich after refresh so IPs and derived status stay current without
+            # a manual Sync. Best-effort: enrichment does per-host network calls
+            # (guest agent / DNS) and must never fail the reconciler cycle.
+            enriched = 0
+            try:
+                enrich_result = await self.inventory_service.enrich_inventory()
+                if isinstance(enrich_result, dict):
+                    enriched = int(enrich_result.get("enriched", 0))
+            except Exception:
+                logger.warning("InventoryReconciler enrichment pass failed", exc_info=True)
+
             proxmox_ids: set[str] = set(result.get("proxmox_host_ids", []))
 
             absent_ids = pre_ids - proxmox_ids
@@ -48,6 +59,7 @@ class InventoryReconciler(Reconciler):
             details: dict[str, Any] = {
                 "hosts_refreshed": result.get("hosts", 0),
                 "services_refreshed": result.get("services", 0),
+                "hosts_enriched": enriched,
                 "absent_hosts": len(absent_ids),
                 "new_hosts": len(new_ids),
                 "changed_hosts": len(changed_ids),

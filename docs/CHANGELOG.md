@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.3.9 (2026-06-12)
+
+### Features
+
+- **Inventory auto-enriches each cycle (#338)**: the inventory reconciler now
+  runs an enrichment pass after each refresh, so IP addresses and derived
+  online/offline status populate automatically — no manual Sync needed after a
+  restart or for newly discovered guests. Best-effort: enrichment failures are
+  logged and never fail the cycle.
+- **Configurable hub advertise address (#339)**: `HP_AGENT_HUB_ADVERTISE_HOST`
+  (accepts `host` or `host:port`) controls the address the enrollment endpoints
+  and UI install command hand to agents. Set it to the HomePilot host's IP when
+  HomePilot sits behind a reverse proxy so agents dial the raw hub port instead
+  of the proxy. Resolution order: this setting → non-wildcard bind host →
+  request hostname.
+
 ## v2.3.8 (2026-06-12)
 
 ### Bug Fixes
