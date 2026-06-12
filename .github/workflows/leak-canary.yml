@@ -43,12 +43,10 @@ jobs:
           # 1. Known-bad strings (secrets + real PVE token IDs), matched by
           #    sha256 so this file never embeds them. Candidates = every
           #    UUID-shaped string and every PVE token-id-shaped string.
-          BAD_HASHES="76c66c2e8dc283f0c75987e837fb53c86dc1c1f190a007a499ffd9d1e5094d27
-eacf284b9edc9fae79aea7cda26c2f81a0767d7aab9971efce802631848ebd1e
-ac8208f66e47e80a23ecf36e5282fa59544a88376e8a5d2bc8f8d5ed6bd8a2eb"
+          BAD_HASHES="76c66c2e8dc283f0c75987e837fb53c86dc1c1f190a007a499ffd9d1e5094d27 eacf284b9edc9fae79aea7cda26c2f81a0767d7aab9971efce802631848ebd1e ac8208f66e47e80a23ecf36e5282fa59544a88376e8a5d2bc8f8d5ed6bd8a2eb"
           while read -r cand; do
             h=$(printf '%s' "$cand" | sha256sum | cut -d' ' -f1)
-            if printf '%s\n' "$BAD_HASHES" | grep -qx "$h"; then
+            if printf '%s\n' $BAD_HASHES | grep -qx "$h"; then
               echo "::error::Leak canary tripped: known leaked string present (sha256 $h)"
               grep -rIlF "$cand" . --exclude-dir=.git | head -5
               FAIL=1
