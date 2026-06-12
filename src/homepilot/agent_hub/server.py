@@ -67,6 +67,20 @@ class AgentHubServer:
         self._token_store = token_store or BootstrapTokenStore()
         self._server: asyncio.Server | None = None
 
+    def _register_ack(self, agent_id: str, request_id: str) -> dict[str, Any]:
+        ack: dict[str, Any] = {
+            "action": "register_ack",
+            "agent_id": agent_id,
+            "request_id": request_id,
+        }
+        # Durable-credential handback: an agent that enrolled with a one-time
+        # bootstrap token would fail to reconnect after the hub restarts (the
+        # token is consumed). Hand it the durable shared token so it can persist
+        # and reuse it. Only when a shared token is configured.
+        if self.auth_token:
+            ack["auth_token"] = self.auth_token
+        return ack
+
     async def _verify_auth(self, request: dict[str, Any]) -> bool:
         token = request.get("auth_token", "")
         if not token:
@@ -123,15 +137,7 @@ class AgentHubServer:
             )
             logger.info("agent registered: %s (host=%s)", agent_id, hostname)
 
-            writer.write(
-                _encode(
-                    {
-                        "action": "register_ack",
-                        "agent_id": agent_id,
-                        "request_id": handshake.get("request_id", ""),
-                    }
-                )
-            )
+            writer.write(_encode(self._register_ack(agent_id, handshake.get("request_id", ""))))
             await writer.drain()
 
             while True:

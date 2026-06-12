@@ -13,6 +13,7 @@ type Config struct {
 	HubHost           string
 	HubPort           int
 	AuthToken         string
+	AuthTokenFile     string
 	AgentID           string
 	HeartbeatInterval int
 	LogLevel          string
@@ -26,6 +27,20 @@ type Config struct {
 	ZabbixPort        int
 	ZabbixHostname    string
 	ZabbixInterval    int
+}
+
+// resolveToken prefers a persisted token file (the durable credential adopted
+// after enrollment) over the env token (which may be a one-time bootstrap token
+// already consumed by the hub). Falls back to env when the file is missing/empty.
+func resolveToken(tokenFile, envToken string) string {
+	if tokenFile != "" {
+		if b, err := os.ReadFile(tokenFile); err == nil {
+			if t := strings.TrimSpace(string(b)); t != "" {
+				return t
+			}
+		}
+	}
+	return envToken
 }
 
 func envBool(key string) bool {
@@ -56,7 +71,8 @@ func ConfigFromEnv() Config {
 	return Config{
 		HubHost:           envStr("HP_AGENT_HUB_HOST", "localhost"),
 		HubPort:           envInt("HP_AGENT_HUB_PORT", 8443),
-		AuthToken:         os.Getenv("HP_AGENT_AUTH_TOKEN"),
+		AuthToken:         resolveToken(os.Getenv("HP_AGENT_TOKEN_FILE"), os.Getenv("HP_AGENT_AUTH_TOKEN")),
+		AuthTokenFile:     os.Getenv("HP_AGENT_TOKEN_FILE"),
 		AgentID:           os.Getenv("HP_AGENT_ID"),
 		HeartbeatInterval: envInt("HP_AGENT_HEARTBEAT_INTERVAL", 30),
 		LogLevel:          envStr("HP_AGENT_LOG_LEVEL", "INFO"),

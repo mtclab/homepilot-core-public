@@ -90,6 +90,19 @@ func (a *Agent) register() error {
 	if id := str(resp, "agent_id"); id != "" {
 		a.agentID = id
 	}
+	// Durable-credential handback: if the hub returns a durable token (we may
+	// have enrolled with a one-time bootstrap token), adopt + persist it so we
+	// reconnect across hub restarts without manual re-enrollment.
+	if dt := str(resp, "auth_token"); dt != "" && dt != a.cfg.AuthToken {
+		a.cfg.AuthToken = dt
+		if a.cfg.AuthTokenFile != "" {
+			if err := os.WriteFile(a.cfg.AuthTokenFile, []byte(dt), 0o600); err != nil {
+				log.Printf("warning: could not persist durable token to %s: %v", a.cfg.AuthTokenFile, err)
+			} else {
+				log.Printf("adopted durable hub token (persisted to %s)", a.cfg.AuthTokenFile)
+			}
+		}
+	}
 	log.Printf("registered as agent %s", a.agentID)
 	return nil
 }

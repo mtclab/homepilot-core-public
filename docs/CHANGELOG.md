@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.5.0 (2026-06-12)
+
+### Features
+
+- **Agents reconnect after a backend restart even when bootstrap-enrolled
+  (#348)**: an agent enrolled with a one-time bootstrap token used to loop on
+  "registration failed: invalid auth_token" after the hub restarted (the token
+  is consumed). The hub now hands the durable shared token back in
+  `register_ack`; the agent persists it to `HP_AGENT_TOKEN_FILE`
+  (`/etc/homepilot/agent.token`) and prefers it over the env token on subsequent
+  starts. Enroll once with a bootstrap, reconnect forever. `install-agent.sh`
+  wires the token file + `ReadWritePaths`.
+
 ## v2.4.0 (2026-06-12)
 
 ### Features
