@@ -187,9 +187,29 @@ async def test_adapter() -> dict[str, Any]:
 
 
 @router.get("/", dependencies=[_admin_only])
-async def list_agents() -> list[dict[str, Any]]:
+async def list_agents(request: Request) -> list[dict[str, Any]]:
+    """Live connections overlaid on the persisted registry, so agents that are
+    mid-reconnect after a backend restart show as known/disconnected rather than
+    vanishing (and inventory coverage doesn't flap to 'uncovered')."""
     registry = _get_registry()
-    return registry.list_connected()
+    live = {a["agent_id"]: {**a, "connected": True} for a in registry.list_connected()}
+
+    repo = getattr(request.app.state, "repo", None)
+    if repo is not None:
+        for row in await repo.list_agents():
+            if row["agent_id"] in live:
+                continue  # live record is authoritative
+            live[row["agent_id"]] = {
+                "agent_id": row["agent_id"],
+                "hostname": row["hostname"],
+                "system_info": row.get("system_info") or {},
+                "state": row.get("state") or {},
+                "connected_at": row.get("connected_at"),
+                "last_heartbeat": row.get("last_heartbeat"),
+                "connected": False,
+                "disconnected_at": row.get("disconnected_at"),
+            }
+    return list(live.values())
 
 
 @router.get("/token", dependencies=[_admin_only])

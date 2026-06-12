@@ -287,7 +287,7 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         from .agent_hub.server import AgentHubServer
         from .agent_hub.tokens import BootstrapTokenStore
 
-        agent_registry = AgentRegistry()
+        agent_registry = AgentRegistry(repo=repo)
         global _agent_registry
         _agent_registry = agent_registry
 

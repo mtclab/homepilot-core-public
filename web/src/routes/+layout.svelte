@@ -8,6 +8,7 @@
 	import { hasCookieSession, api, sessionStore, refreshSession, type MeInfo } from '$lib/api';
 
 	const nav = [
+		{ href: '/',          label: 'Overview' },
 		{ href: '/artifacts', label: 'Artifacts' },
 		{ href: '/review',    label: 'Review' },
 		{ href: '/inventory', label: 'Inventory' },
@@ -58,14 +59,15 @@
 <div class="flex min-h-screen">
 	<!-- Sidebar -->
 	<nav class="w-44 shrink-0 bg-slate-900 border-r border-slate-700 flex flex-col py-4">
-		<div class="px-4 mb-6">
+		<div class="px-4 mb-6 flex items-center gap-2">
+			<img src="{base}/logo.svg" alt="" class="w-6 h-6" />
 			<span class="text-sky-400 font-bold text-sm tracking-widest">HOMEPILOT</span>
 		</div>
 		{#each nav as { href, label }}
 			<a
 				href="{base}{href}"
 				class="px-4 py-2 text-sm transition-colors
-				       {current.startsWith(base + href)
+				       {(href === '/' ? current === base + '/' || current === base : current.startsWith(base + href) && href !== '/')
 				         ? 'text-sky-400 bg-slate-800 border-l-2 border-sky-400'
 				         : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}"
 			>

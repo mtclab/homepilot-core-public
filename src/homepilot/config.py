@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     agent_hub_tls_key: str = ""
     agent_hub_tls_ca: str = ""
 
+    # Base URL of the Zabbix UI for deep-linking host metrics from HomePilot
+    # (HomePilot owns current state; historical telemetry lives in Zabbix).
+    # This is opened in the operator's BROWSER, so it must be browser-reachable —
+    # NOT the internal docker name (`http://zabbix:8080`, container-only). Default
+    # is the relative same-origin path served by the bundled reverse proxy
+    # (`/zabbix/` in nginx-hp-proxy.conf), so a standard co-deployment works with
+    # no config. Set an absolute URL if Zabbix is exposed elsewhere; set empty to
+    # hide the links.
+    zabbix_url: str = "/zabbix"
+
     trusted_proxies: str = ""
     cors_origins: str = (
         "http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"

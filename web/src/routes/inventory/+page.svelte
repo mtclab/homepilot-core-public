@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type Host } from '$lib/api';
+	import { api, zabbixHostUrl, type Host } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 
+	let zabbixUrl = '';
 	let items: Host[] = [];
 	let loading = true;
 	let syncing = false;
@@ -124,7 +125,14 @@
 		}
 	}
 
-	onMount(load);
+	onMount(async () => {
+		try {
+			zabbixUrl = (await api.getUiConfig()).zabbix_url;
+		} catch {
+			zabbixUrl = '';
+		}
+		await load();
+	});
 </script>
 
 <div class="space-y-4">
@@ -233,6 +241,15 @@
 									<span class="text-slate-500">Ignored</span>
 								{:else}
 									<span class="text-slate-600">—</span>
+								{/if}
+								{#if zabbixUrl}
+									<a
+										class="text-sky-400 hover:text-sky-300 text-[10px] ml-1"
+										href={zabbixHostUrl(zabbixUrl, h.hostname)}
+										target="_blank"
+										rel="noopener"
+										title="Open this host's metrics in Zabbix">Metrics ↗</a
+									>
 								{/if}
 							</td>
 							<td class="py-2 text-slate-400">{h.node ?? '—'}</td>

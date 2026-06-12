@@ -27,11 +27,32 @@ class ConnectedAgent:
 
 
 class AgentRegistry:
-    def __init__(self) -> None:
+    def __init__(self, repo: Any = None) -> None:
         self._agents: dict[str, ConnectedAgent] = {}
         self._hostname_index: dict[str, str] = {}
         self.hub_server: AgentHubServer | None = None
         self.audit_log: AuditLog = AuditLog()
+        # Optional Repository for persistence so agents survive a backend restart
+        # (Agents view + coverage show last-known agents instead of flapping to
+        # empty). Best-effort: never blocks or fails the hub.
+        self._repo = repo
+
+    def _persist(self, coro: Any) -> None:
+        if self._repo is None:
+            coro.close()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()  # no running loop (e.g. unit test) — skip
+            return
+        task = loop.create_task(coro)
+
+        def _log_err(t: asyncio.Task[Any]) -> None:
+            if not t.cancelled() and t.exception():
+                logger.warning("agent persistence failed: %s", t.exception())
+
+        task.add_done_callback(_log_err)
 
     def register(
         self,
@@ -49,6 +70,10 @@ class AgentRegistry:
         self._agents[agent_id] = agent
         self._hostname_index[hostname] = agent_id
         logger.info("registered agent %s (hostname=%s)", agent_id, hostname)
+        if self._repo is not None:
+            self._persist(
+                self._repo.upsert_agent(agent_id, hostname, system_info or {}, {}, connected=True)
+            )
 
     def unregister(self, agent_id: str) -> None:
         agent = self._agents.pop(agent_id, None)
@@ -61,6 +86,8 @@ class AgentRegistry:
                 if not fut.done():
                     fut.set_exception(ConnectionError(f"agent {agent_id} disconnected"))
             logger.info("unregistered agent %s", agent_id)
+            if self._repo is not None:
+                self._persist(self._repo.mark_agent_disconnected(agent_id))
 
     def get(self, agent_id: str) -> ConnectedAgent | None:
         return self._agents.get(agent_id)
@@ -83,6 +110,10 @@ class AgentRegistry:
         agent = self._agents.get(agent_id)
         if agent:
             agent.state.update(state)
+            # State pushes are periodic — a good cadence to persist fresh
+            # metrics + heartbeat without writing on every keepalive.
+            if self._repo is not None:
+                self._persist(self._repo.touch_agent(agent_id, agent.state))
 
     def store_command_result(self, agent_id: str, msg: dict[str, Any]) -> None:
         agent = self._agents.get(agent_id)
