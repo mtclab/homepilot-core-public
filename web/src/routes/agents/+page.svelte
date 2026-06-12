@@ -90,7 +90,8 @@
 		<div class="card p-4 space-y-4">
 			<h2 class="text-sm font-semibold text-slate-300">Enroll New Agent</h2>
 			<p class="text-xs text-slate-400">
-				Generate a bootstrap token and install the agent on any host:
+				Bootstrap tokens are single-use and expire — fine for a one-off connect. For a
+				permanent install that survives agent reboots, use the shared Hub Auth Token below.
 			</p>
 
 			{#if !bootstrapData}
@@ -110,7 +111,7 @@
 					<div class="bg-slate-900 border border-slate-600 rounded p-3">
 						<p class="text-xs text-slate-400 font-mono mb-1">One-liner install:</p>
 						<code class="text-xs text-slate-200 break-all select-all">
-							curl -sL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)} --token {bootstrapData.bootstrap_token}
+							curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)} --token {bootstrapData.bootstrap_token}
 						</code>
 					</div>
 					<button class="btn btn-ghost text-xs" on:click={generateBootstrap} disabled={generating}>
@@ -134,6 +135,12 @@
 				<div class="bg-slate-900 border border-slate-600 rounded p-3">
 					<p class="text-xs text-slate-400 mb-1">Hub: <code class="text-slate-200">{fmtHost(hubData.hub_host, hubData.hub_port)}</code></p>
 					<code class="text-xs text-slate-200 select-all">{hubData.auth_token}</code>
+				</div>
+				<div class="bg-slate-900 border border-slate-600 rounded p-3">
+					<p class="text-xs text-slate-400 font-mono mb-1">One-liner install (survives reboots):</p>
+					<code class="text-xs text-slate-200 break-all select-all">
+						curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(hubData.hub_host, hubData.hub_port)} --token {hubData.auth_token}
+					</code>
 				</div>
 			{/if}
 		</div>

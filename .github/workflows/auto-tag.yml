@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: auto-tag-${{ github.ref }}
@@ -37,4 +38,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
-          echo "Created + pushed $TAG (triggers release.yml)."
+          # Tags pushed with GITHUB_TOKEN do not fire on:push triggers
+          # (GitHub recursion guard) — dispatch the release explicitly.
+          gh workflow run release.yml --ref "$TAG" || echo "no release.yml to dispatch"
+          echo "Created + pushed $TAG (release dispatched)."
+        env:
+          GH_TOKEN: ${{ github.token }}
