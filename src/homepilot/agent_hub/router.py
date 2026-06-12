@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..auth.deps import require_scope
@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 _admin_only = Depends(require_scope("admin"))
+
+
+def _advertised_hub_host(request: Request, bind_host: str) -> str:
+    """The host an agent should dial to reach the hub.
+
+    The hub's configured host is usually a bind address (0.0.0.0 / ::) which is
+    not routable. The operator reaches this API at a real address, so fall back
+    to the request's hostname for the install instructions.
+    """
+    # The "0.0.0.0" literal here is a comparison, not a socket bind.
+    if bind_host and bind_host not in ("0.0.0.0", "::", ""):  # nosec B104
+        return bind_host
+    return request.url.hostname or bind_host
 
 
 def _get_registry() -> AgentRegistry:
@@ -165,17 +178,21 @@ async def list_agents() -> list[dict[str, Any]]:
 
 
 @router.get("/token", dependencies=[_admin_only])
-async def get_hub_token() -> dict[str, Any]:
+async def get_hub_token(request: Request) -> dict[str, Any]:
     registry = _get_registry()
     hub = registry.hub_server
     if hub is None:
         raise HTTPException(status_code=503, detail="Agent hub server not available")
     token = hub.auth_token or ""
-    return {"auth_token": token, "hub_host": hub.host, "hub_port": hub.port}
+    return {
+        "auth_token": token,
+        "hub_host": _advertised_hub_host(request, hub.host),
+        "hub_port": hub.port,
+    }
 
 
 @router.get("/bootstrap", dependencies=[_admin_only])
-async def create_bootstrap_token() -> dict[str, Any]:
+async def create_bootstrap_token(request: Request) -> dict[str, Any]:
     registry = _get_registry()
     hub = registry.hub_server
     if hub is None:
@@ -183,7 +200,7 @@ async def create_bootstrap_token() -> dict[str, Any]:
     token = await hub._token_store.create()
     return {
         "bootstrap_token": token,
-        "hub_host": hub.host,
+        "hub_host": _advertised_hub_host(request, hub.host),
         "hub_port": hub.port,
     }
 

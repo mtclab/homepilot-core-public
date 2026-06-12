@@ -524,9 +524,7 @@ from .tasks.router import router as tasks_router  # noqa: E402
 
 app.include_router(admin_router, prefix="/admin")
 app.include_router(auth_router, prefix="/auth")
-app.include_router(
-    agent_router, prefix="/api", tags=["agents"], dependencies=[Depends(require_token)]
-)
+app.include_router(agent_router, tags=["agents"], dependencies=[Depends(require_token)])
 app.include_router(
     audit_router, prefix="/audit", tags=["audit"], dependencies=[Depends(require_token)]
 )

@@ -299,6 +299,7 @@ class Repository:
                 ts,
             ),
         )
+        await self.db.conn.commit()
         return host_id
 
     async def list_hosts(
@@ -353,9 +354,11 @@ class Repository:
         sets, set_vals = _validated_set_clause(kwargs, _HOST_COLUMNS)
         vals = [*set_vals, now(), host_id]
         await self.db.execute(f"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?", vals)
+        await self.db.conn.commit()
 
     async def delete_host(self, host_id: str) -> None:
         await self.db.execute("DELETE FROM hosts WHERE id = ?", (host_id,))
+        await self.db.conn.commit()
 
     async def create_service(
         self,
@@ -376,6 +379,7 @@ class Repository:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (svc_id, host_id, name, runtime, version, status, managed_by, config, ts, ts),
         )
+        await self.db.conn.commit()
         return svc_id
 
     async def list_services(self, host_id: str | None = None) -> list[dict[str, Any]]:
@@ -395,9 +399,11 @@ class Repository:
         sets, set_vals = _validated_set_clause(kwargs, _SERVICE_COLUMNS)
         vals = [*set_vals, now(), service_id]
         await self.db.execute(f"UPDATE services SET {sets}, updated_at = ? WHERE id = ?", vals)
+        await self.db.conn.commit()
 
     async def delete_service(self, service_id: str) -> None:
         await self.db.execute("DELETE FROM services WHERE id = ?", (service_id,))
+        await self.db.conn.commit()
 
     async def log_audit(
         self,
@@ -432,6 +438,7 @@ class Repository:
                 details_json,
             ),
         )
+        await self.db.conn.commit()
 
     async def query_audit_log(
         self,

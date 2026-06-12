@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.3.8 (2026-06-12)
+
+### Bug Fixes
+
+- **Inventory adoptions no longer vanish on restart (#335)**: host/service/audit
+  writes were issued on the shared DB connection but never committed, so they
+  lived only in the connection's implicit transaction and were rolled back when
+  the connection closed on shutdown. An adopted guest reverted to
+  `discovered`/`pending` on the next container restart/update. `create_host`,
+  `update_host`, `delete_host`, `create_service`, `update_service`,
+  `delete_service`, and `log_audit` now commit.
+- **Agent enrollment works end-to-end (#336)**:
+  - `GET /agents/bootstrap` and `/agents/token` returned 404 — the agent router
+    was mounted under an extra `/api` prefix while the UI calls `/agents/*`.
+  - `install-agent.sh` rewritten to match the env-configured Go agent: parses
+    `--hub`/`--token`, writes `/etc/homepilot/agent.env`, installs a working
+    systemd unit, and starts it (previously it expected env vars and called
+    non-existent `hp-agent enroll`/`start` subcommands).
+  - `install-agent.sh` is now published as a release asset (the UI one-liner
+    fetched it from there).
+  - Enrollment responses advertise the request host instead of the `0.0.0.0`
+    bind address.
+  - The UI offers a reboot-safe install one-liner using the durable shared hub
+    token (the one-time bootstrap token cannot re-register after a restart).
+
 ## v2.3.7 (2026-06-12)
 
 ### Bug Fixes

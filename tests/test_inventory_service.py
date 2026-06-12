@@ -124,6 +124,36 @@ class TestQueryInventory:
         assert "media" in result[0]["hostname"]
 
 
+class TestWritesArePersisted:
+    """Regression for the adopt-revert bug: host writes must be committed to
+    disk, not left in the connection's implicit transaction (lost on restart).
+    A second connection to the same file must observe the write."""
+
+    async def _fresh_count(self, tmp_path: Path) -> list[dict]:
+        from homepilot.db.connection import Database
+
+        other = Database(str(tmp_path / "test.db"))
+        await other.connect()
+        rows = await other.fetchall("SELECT id, source, managed, import_state FROM hosts")
+        await other.close()
+        return rows
+
+    async def test_create_host_committed(self, repo, tmp_path):
+        await repo.create_host(hostname="ct-1", host_type="lxc", role="guest", proxmox_id=201)
+        rows = await self._fresh_count(tmp_path)
+        assert len(rows) == 1
+
+    async def test_adopt_update_committed(self, repo, tmp_path):
+        host_id = await repo.create_host(
+            hostname="ct-2", host_type="lxc", role="guest", proxmox_id=202, source="discovered"
+        )
+        await repo.update_host(host_id, managed=1, source="imported", import_state="adopted")
+        rows = await self._fresh_count(tmp_path)
+        assert rows[0]["source"] == "imported"
+        assert rows[0]["managed"] == 1
+        assert rows[0]["import_state"] == "adopted"
+
+
 # ── InventoryService.refresh_inventory ───────────────────────────────────────
 
 

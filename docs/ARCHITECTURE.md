@@ -262,7 +262,7 @@ The agent hub uses **length-prefixed JSON** over TCP:
 ### Authentication
 
 1. **Persistent token** (`HP_AGENT_AUTH_TOKEN`): Shared secret between hub and agent. Set once, works forever.
-2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `GET /api/agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
+2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `GET /agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
 
 ### Authorization
 
@@ -305,11 +305,11 @@ When `HP_ZABBIX_ENABLED=true`, the agent pushes these metrics to Zabbix via the 
 | `hp.agent.load.5m` | float | 5-minute load average |
 | `hp.agent.load.15m` | float | 15-minute load average |
 
-Items must exist on the Zabbix host as **Zabbix trapper** type. Push interval configured via `HP_ZABBIX_SEND_INTERVAL` (default 60s). On-demand push available via `POST /api/agents/{agent_id}/zabbix-push`.
+Items must exist on the Zabbix host as **Zabbix trapper** type. Push interval configured via `HP_ZABBIX_SEND_INTERVAL` (default 60s). On-demand push available via `POST /agents/{agent_id}/zabbix-push`.
 
 ### Audit logging
 
-All agent operations (exec, read_file, write_file) are logged to an in-memory rotating deque (max 1000 entries) and Python logging. Queryable via `GET /api/agents/audit` (admin scope).
+All agent operations (exec, read_file, write_file) are logged to an in-memory rotating deque (max 1000 entries) and Python logging. Queryable via `GET /agents/audit` (admin scope).
 
 ### Agent binary packaging
 
