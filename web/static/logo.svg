@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="HomePilot">
+  <defs>
+    <linearGradient id="hp-sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="hp-needle" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#bae6fd"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Badge -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="#0f172a"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="107.5" fill="none" stroke="#1e293b" stroke-width="3"/>
+
+  <!-- House: roof + body, rounded, sky gradient -->
+  <path fill="url(#hp-sky)" d="
+    M256 100
+    L412 236
+    a18 18 0 0 1 6 13.5
+    V392
+    a40 40 0 0 1 -40 40
+    H134
+    a40 40 0 0 1 -40 -40
+    V249.5
+    a18 18 0 0 1 6 -13.5
+    L256 100
+    Z"/>
+
+  <!-- Pilot navigation needle (compass) inside the house -->
+  <g transform="translate(256 300)">
+    <circle r="92" fill="#0f172a" opacity="0.92"/>
+    <circle r="92" fill="none" stroke="#1e293b" stroke-width="4"/>
+    <!-- north (active) -->
+    <path fill="url(#hp-needle)" d="M0 -70 L26 16 L0 -2 L-26 16 Z"/>
+    <!-- south (muted) -->
+    <path fill="#475569" d="M0 70 L26 -16 L0 2 L-26 -16 Z"/>
+    <circle r="9" fill="#38bdf8"/>
+  </g>
+</svg>
