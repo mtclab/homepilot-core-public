@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from ..config import get_settings
 from ..db.repository import Repository
-from .deps import get_db, require_scope, require_token
+from .deps import SCOPE_ENFORCER_ATTR, get_db, require_scope, require_token
 from .tokens import PREFIX_LENGTH, generate_api_token, normalize_scope, validate_token
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,10 @@ async def require_admin_or_secret(
     )
 
 
+# This is an explicit admin/secret gate; mark it so the startup route-scope
+# guard (main.py) counts it as satisfying a route's scope requirement.
+setattr(require_admin_or_secret, SCOPE_ENFORCER_ATTR, True)
+
 _require_admin_or_secret_dep = Depends(require_admin_or_secret)
 
 
@@ -147,11 +151,22 @@ async def me(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     row = await _validate_bearer(raw_token, db)
     label = row.get("label") or row.get("prefix", "")
+    # Expose the token prefix and a normalized capability list so the UI stops
+    # re-deriving scope logic (which it did incorrectly). normalize_scope maps
+    # scope+role to base capabilities and expands "*"/"full" to the full set.
+    normalized = normalize_scope(row.get("scope"), row.get("role"))
+    if "*" in normalized:
+        capabilities = ["read", "write", "admin"]
+    else:
+        order = {"read": 0, "write": 1, "admin": 2}
+        capabilities = sorted({c for c in normalized if c in order}, key=lambda c: order[c])
     return {
         "authenticated": True,
         "token_label": label,
+        "prefix": row.get("prefix"),
         "scope": row.get("scope"),
         "role": row.get("role"),
+        "capabilities": capabilities,
     }
 
 
@@ -228,26 +243,12 @@ async def login(
 
 
 @router.post("/logout")
-async def logout(
-    request: Request, response: Response, db: Repository = _get_db_dep
-) -> dict[str, str]:
-    raw_token: str | None = None
-    authorization = request.headers.get("authorization")
-    if authorization:
-        parts = authorization.split(" ", 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            raw_token = parts[1].strip()
-    if not raw_token:
-        raw_token = request.cookies.get(_COOKIE_HP_TOKEN)
-
-    if raw_token:
-        try:
-            row = await _validate_bearer(raw_token, db)
-            await db.delete_token(row["id"])
-            await db.db.conn.commit()
-        except HTTPException:
-            pass
-
+async def logout(request: Request, response: Response) -> dict[str, str]:
+    # Logout clears the session COOKIE only — it must NOT delete the API token
+    # (#389). A personal token is shared across the UI, the CLI, and any MCP/API
+    # client; hard-deleting it here logged the browser out AND silently killed
+    # every other holder of the same token. Token destruction stays behind the
+    # explicit Tokens -> Revoke path (DELETE /auth/tokens/{prefix}) only.
     response.delete_cookie(
         _COOKIE_HP_TOKEN, path="/", secure=_cookie_secure(request), samesite=_same_site_lax
     )

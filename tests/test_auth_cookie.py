@@ -101,6 +101,20 @@ class TestLogoutEndpoint:
         # After logout the cookie jar should not have hp_token
         assert "hp_token" not in client.cookies
 
+    def test_logout_does_not_delete_token(self, setup):
+        # Regression (#389): logout must clear the session COOKIE only and NOT
+        # hard-delete the API token — a personal token is shared with the CLI and
+        # MCP/API clients, and deleting it logged them ALL out. A request with the
+        # same bearer token must still authenticate after logout.
+        client, token = setup
+        client.post("/auth/login", json={"token": token})
+        logout = client.post("/auth/logout")
+        assert logout.status_code == 200
+        # The shared bearer token still works (it was not revoked).
+        fresh = TestClient(client.app, raise_server_exceptions=True)
+        resp = fresh.get("/protected", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+
 
 class TestCookieAuth:
     def test_cookie_auth_accepted_on_get(self, setup):
@@ -154,6 +168,29 @@ class TestMeEndpoint:
         data = resp.json()
         assert data["authenticated"] is True
         assert "token_label" in data
+
+    @pytest.mark.asyncio
+    async def test_me_includes_prefix_and_capabilities(self, setup):
+        # Regression (#390): /auth/me must expose the token prefix and a
+        # normalized capability list so the UI stops re-deriving scope logic.
+        client, _ = setup
+        repo = client.app.state.repo
+        rw_user = await repo.create_user("rw_user", "rw@test.com")
+        rw_token, rw_prefix, rw_hash = generate_api_token()
+        await repo.create_api_token(
+            user_id=rw_user,
+            token_type="api",
+            prefix=rw_prefix,
+            hash=rw_hash,
+            scope="read,write",
+        )
+        await repo.db.conn.commit()
+        fresh = TestClient(client.app, raise_server_exceptions=True)
+        resp = fresh.get("/auth/me", headers={"Authorization": f"Bearer {rw_token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["prefix"] == rw_prefix
+        assert data["capabilities"] == ["read", "write"]
 
     def test_me_with_cookie_only(self, setup):
         client, token = setup

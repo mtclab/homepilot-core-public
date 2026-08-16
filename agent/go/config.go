@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -27,6 +28,24 @@ type Config struct {
 	ZabbixPort        int
 	ZabbixHostname    string
 	ZabbixInterval    int
+	// HasPersistedToken is true when a durable per-agent token was loaded from
+	// HP_AGENT_TOKEN_FILE. Such a token is a shared secret usable as the replay
+	// MAC key, so the agent negotiates replay protection (#362 slice 3) on
+	// connect. An agent enrolling for the first time (env/bootstrap token only)
+	// has no per-agent key yet and does not negotiate.
+	HasPersistedToken bool
+}
+
+// tokenFileHasContent reports whether path exists and holds a non-empty token.
+func tokenFileHasContent(path string) bool {
+	if path == "" {
+		return false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b)) != ""
 }
 
 // resolveToken prefers a persisted token file (the durable credential adopted
@@ -86,6 +105,7 @@ func ConfigFromEnv() Config {
 		ZabbixPort:        envInt("HP_ZABBIX_PORT", 10051),
 		ZabbixHostname:    os.Getenv("HP_ZABBIX_HOSTNAME"),
 		ZabbixInterval:    envInt("HP_ZABBIX_SEND_INTERVAL", 60),
+		HasPersistedToken: tokenFileHasContent(os.Getenv("HP_AGENT_TOKEN_FILE")),
 	}
 }
 
@@ -96,6 +116,7 @@ func (c Config) tlsConfig() (*tls.Config, error) {
 	}
 	cfg := &tls.Config{}
 	if c.TLSCa != "" {
+		// Explicit CA: pin verification to this pool.
 		ca, err := os.ReadFile(c.TLSCa)
 		if err != nil {
 			return nil, err
@@ -103,8 +124,13 @@ func (c Config) tlsConfig() (*tls.Config, error) {
 		pool := x509.NewCertPool()
 		pool.AppendCertsFromPEM(ca)
 		cfg.RootCAs = pool
-	} else {
-		cfg.InsecureSkipVerify = true // mirrors Python CERT_NONE when no CA given
+	}
+	// No CA given: leave RootCAs nil so Go verifies against the system trust
+	// store. Verification stays ON by default. Only an explicit, truthy
+	// HP_AGENT_TLS_INSECURE disables it — and that path is loudly logged.
+	if envBool("HP_AGENT_TLS_INSECURE") {
+		cfg.InsecureSkipVerify = true
+		log.Printf("WARNING: TLS verification DISABLED via HP_AGENT_TLS_INSECURE")
 	}
 	if c.TLSCert != "" && c.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(c.TLSCert, c.TLSKey)

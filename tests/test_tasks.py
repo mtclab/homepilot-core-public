@@ -7,9 +7,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from homepilot.artifacts.lifecycle import ArtifactLifecycle, LifecycleError
+from homepilot.artifacts.lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
+from homepilot.executor.orchestrator import ExecutorError
 from homepilot.tasks.repository import TaskRepository
 from homepilot.tasks.runner import TaskRunner
 
@@ -209,10 +210,155 @@ class TestTaskRepository:
         count = await task_repo.fail_orphaned_tasks()
         assert count == 0
 
-    async def test_fail_orphaned_tasks_does_not_affect_pending(self, task_repo: TaskRepository):
-        await task_repo.create_task("2025-01-01-test-abc123", "apply")
+    async def test_fail_orphaned_tasks_sweeps_pending(self, task_repo: TaskRepository):
+        # #386: a restart between task creation ('pending') and the first status
+        # write ('running') must NOT strand the task — orphan recovery sweeps
+        # 'pending' too, otherwise every future apply returns 202 for a dead task.
+        tid = await task_repo.create_task("2025-01-01-test-abc123", "apply")
         count = await task_repo.fail_orphaned_tasks()
-        assert count == 0
+        assert count == 1
+        task = await task_repo.get_task(tid)
+        assert task["status"] == "failed"
+        assert task["error"] == "orphaned_after_restart"
+
+
+class TestTaskCancellation:
+    """#376: cancel a pending/running task; terminal tasks are a no-op."""
+
+    async def test_cancel_pending_task_marks_cancelled(self, task_repo: TaskRepository):
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        result = await task_repo.cancel_task(task_id)
+        assert result is not None
+        assert result["status"] == "cancelled"
+        assert result["finished_at"] is not None
+
+    async def test_cancel_running_task_marks_cancelled(self, task_repo: TaskRepository):
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        await task_repo.update_task_status(task_id, "running")
+        result = await task_repo.cancel_task(task_id)
+        assert result["status"] == "cancelled"
+
+    async def test_cancel_unblocks_future_apply(self, task_repo: TaskRepository):
+        # A cancelled task must stop counting as active so the next apply for the
+        # same artifact can start — otherwise a stuck task wedges the artifact.
+        aid = "2025-01-01-test-abc123"
+        task_id = await task_repo.create_task(aid, "apply")
+        assert await task_repo.has_active_task(aid) is True
+        await task_repo.cancel_task(task_id)
+        assert await task_repo.has_active_task(aid) is False
+        assert await task_repo.get_active_task(aid) is None
+        # A fresh apply is now admitted by the atomic guard.
+        new_id = await task_repo.create_task_if_no_active(aid, "apply")
+        assert new_id is not None
+
+    async def test_cancel_succeeded_task_is_noop(self, task_repo: TaskRepository):
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        await task_repo.update_task_status(task_id, "succeeded")
+        result = await task_repo.cancel_task(task_id)
+        assert result["status"] == "succeeded"
+
+    async def test_cancel_failed_task_is_noop(self, task_repo: TaskRepository):
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        await task_repo.update_task_status(task_id, "failed", error="boom")
+        result = await task_repo.cancel_task(task_id)
+        assert result["status"] == "failed"
+        assert result["error"] == "boom"
+
+    async def test_cancel_unknown_task_returns_none(self, task_repo: TaskRepository):
+        assert await task_repo.cancel_task("nonexistent-id") is None
+
+    async def test_cancelled_status_accepted_by_schema(self, task_repo: TaskRepository):
+        # Revert-guard for migration 14: the tasks.status CHECK must admit
+        # 'cancelled'. Before the widened constraint this write raises
+        # IntegrityError, so cancel could never persist.
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        result = await task_repo.cancel_task(task_id)
+        assert result["status"] == "cancelled"
+        # Round-trips through a fresh read (real column value, not in-memory).
+        reread = await task_repo.get_task(task_id)
+        assert reread["status"] == "cancelled"
+
+    async def test_runner_cancels_running_task_and_unblocks_apply(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        # End-to-end through the runner: a real in-flight apply is cancelled, its
+        # record becomes 'cancelled', and a new apply for the same artifact then
+        # starts (the cancelled task no longer blocks it).
+        _store_artifact(mock_store, status="approved")
+
+        hang = asyncio.Event()
+
+        async def _never_finishes(_artifact_id: str, _by: str) -> Any:
+            await hang.wait()  # blocks until cancelled
+            raise AssertionError("should have been cancelled")
+
+        mock_reconciler = MagicMock()
+        mock_reconciler.apply_single = _never_finishes
+
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=MagicMock(),
+            executor=None,
+            apply_reconciler=mock_reconciler,
+            store=mock_store,
+        )
+
+        first = await runner.start_apply("2025-01-01-test-abc123", approved_by="test")
+        task_id = first["task_id"]
+
+        # Let _run_apply reach 'running' and block inside the reconciler.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            t = await task_repo.get_task(task_id)
+            if t["status"] == "running":
+                break
+        assert (await task_repo.get_task(task_id))["status"] == "running"
+
+        cancelled = await runner.cancel_task(task_id)
+        assert cancelled["status"] == "cancelled"
+        await asyncio.sleep(0.05)  # let the CancelledError settle
+        assert (await task_repo.get_task(task_id))["status"] == "cancelled"
+
+        # The artifact is free again — a new apply starts a distinct task.
+        second = await runner.start_apply("2025-01-01-test-abc123", approved_by="test")
+        assert second["task_id"] != task_id
+        assert second["status"] == "pending"
+
+        for t in list(runner._running_tasks):
+            t.cancel()
+        await asyncio.sleep(0.05)
+
+    async def test_runner_cancel_finished_task_is_noop(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        # Cancelling an already-succeeded task through the runner returns its
+        # status unchanged (no error), even though the asyncio.Task is long gone.
+        _store_artifact(mock_store, status="approved")
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=MagicMock(),
+            executor=None,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        await task_repo.update_task_status(task_id, "succeeded")
+
+        result = await runner.cancel_task(task_id)
+        assert result["status"] == "succeeded"
+
+    async def test_runner_cancel_unknown_raises_value_error(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=MagicMock(),
+            executor=None,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+        with pytest.raises(ValueError, match="not found"):
+            await runner.cancel_task("nonexistent-id")
 
 
 class TestTaskRunner:
@@ -669,6 +815,63 @@ class TestTaskEndpoints:
         assert len(data["items"]) == 2
         assert data["total"] == 5
 
+    async def test_list_tasks_global_across_artifacts(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        # #376: GET /tasks with NO artifact_id is the system-wide view — it must
+        # return tasks from every artifact, not error on the missing filter.
+        await task_repo.create_task("2025-01-01-alpha-aaa111", "apply")
+        await task_repo.create_task("2025-01-02-beta-bbb222", "revoke")
+
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=ArtifactLifecycle(store=mock_store),
+            executor=None,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+        client = await _create_authenticated_client(task_repo.db, task_repo, runner)
+
+        resp = await client.get("/tasks/", headers=client._auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        artifacts = {t["artifact_id"] for t in data["items"]}
+        assert artifacts == {"2025-01-01-alpha-aaa111", "2025-01-02-beta-bbb222"}
+
+    async def test_cancel_endpoint_cancels_pending_task(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        task_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
+
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=MagicMock(),
+            executor=None,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+        client = await _create_authenticated_client(task_repo.db, task_repo, runner)
+
+        resp = await client.post(f"/tasks/{task_id}/cancel", headers=client._auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"
+
+    async def test_cancel_endpoint_unknown_task_404(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        runner = TaskRunner(
+            repo=task_repo,
+            lifecycle=MagicMock(),
+            executor=None,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+        client = await _create_authenticated_client(task_repo.db, task_repo, runner)
+
+        resp = await client.post("/tasks/nonexistent-id/cancel", headers=client._auth_headers)
+        assert resp.status_code == 404
+
 
 class TestArtifactEndpointsAsync:
     async def test_apply_returns_202(self, task_repo: TaskRepository, mock_store: MagicMock):
@@ -1020,6 +1223,75 @@ class TestTaskRunnerRevoke:
         for t in list(runner._running_tasks):
             t.cancel()
         await asyncio.sleep(0.05)
+
+
+class TestApplyOnAppliedRegression:
+    """#386: applying an already-APPLIED artifact must never strand a task."""
+
+    def _make_runner(
+        self,
+        task_repo: TaskRepository,
+        mock_store: MagicMock,
+        lifecycle: Any,
+        executor: Any = None,
+    ) -> TaskRunner:
+        return TaskRunner(
+            repo=task_repo,
+            lifecycle=lifecycle,
+            executor=executor,
+            apply_reconciler=None,
+            store=mock_store,
+        )
+
+    async def test_apply_on_applied_rejects_without_creating_task(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        _store_artifact(mock_store, status="applied")
+        runner = self._make_runner(task_repo, mock_store, lifecycle=MagicMock())
+
+        with pytest.raises(ConflictError, match="Invalid transition"):
+            await runner.start_apply("2025-01-01-test-abc123")
+
+        # No task was created — nothing left running to block future actions.
+        assert await task_repo.count_tasks("2025-01-01-test-abc123") == 0
+        assert await task_repo.get_active_task("2025-01-01-test-abc123") is None
+
+        # A later apply on a freshly-approved artifact still works.
+        _store_artifact(mock_store, status="approved")
+        result = await runner.start_apply("2025-01-01-test-abc123", approved_by="test")
+        assert result["status"] == "pending"
+        assert result["task_id"] is not None
+
+        for t in list(runner._running_tasks):
+            t.cancel()
+        await asyncio.sleep(0.05)
+
+    async def test_run_apply_marks_task_failed_even_when_mark_failed_raises(
+        self, task_repo: TaskRepository, mock_store: MagicMock
+    ):
+        # The executor errors, AND the artifact is in a state whose →failed
+        # transition is forbidden (mark_failed raises ConflictError). The TASK
+        # must still be recorded failed, never stranded in 'running'.
+        _store_artifact(mock_store, status="approved")
+
+        mock_lifecycle = MagicMock()
+        mock_lifecycle.mark_failed = AsyncMock(
+            side_effect=ConflictError("Invalid transition: applied → failed")
+        )
+        mock_executor = AsyncMock()
+        mock_executor.apply = AsyncMock(side_effect=ExecutorError("apply blew up"))
+
+        runner = self._make_runner(
+            task_repo, mock_store, lifecycle=mock_lifecycle, executor=mock_executor
+        )
+
+        result = await runner.start_apply("2025-01-01-test-abc123", approved_by="test")
+
+        await asyncio.sleep(0.3)
+
+        task = await task_repo.get_task(result["task_id"])
+        assert task["status"] == "failed"
+        assert "apply blew up" in task["error"]
 
 
 class TestTaskRunnerReconcilerLifecycle:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -38,6 +39,11 @@ class VaultManager:
         self._secrets_dir = self.data_dir / "secrets"
         self._secrets_dir.mkdir(parents=True, exist_ok=True)
         self._master_identity: str | None = None
+        # Cache of the UNWRAPPED master identity bytes. Deriving the wrapping key
+        # is PBKDF2-SHA256 at 600k iterations (~234ms) and previously ran on
+        # EVERY decrypt()/get_secret(); caching the unwrapped identity means we
+        # pay it at most once per process (#387).
+        self._master_identity_data: bytes | None = None
 
     def _derive_wrapping_key(self, salt: bytes) -> bytes:
         import hashlib
@@ -72,6 +78,20 @@ class VaultManager:
         except (ValueError, TypeError) as e:
             raise VaultError(f"Failed to decrypt identity (corrupted data): {e}") from e
 
+    def _load_master_identity_data(self) -> bytes:
+        """Return the unwrapped master identity, deriving the wrapping key at
+        most once per process. Raises VaultError if no master identity exists or
+        the passphrase is wrong (an InvalidTag surfaces from _unprotect_identity).
+        """
+        if self._master_identity_data is not None:
+            return self._master_identity_data
+        protected_file = self._identities_dir / "master.protected"
+        if not protected_file.exists():
+            raise VaultError("No master identity found")
+        identity_data = self._unprotect_identity(protected_file.read_bytes())
+        self._master_identity_data = identity_data
+        return identity_data
+
     async def ensure_master_identity(self) -> str:
         if self._master_identity is not None:
             return self._master_identity
@@ -80,8 +100,7 @@ class VaultManager:
         protected_file = self._identities_dir / "master.protected"
 
         if protected_file.exists():
-            protected_data = protected_file.read_bytes()
-            identity_data = self._unprotect_identity(protected_data)
+            identity_data = self._load_master_identity_data()
             self._master_identity = self._parse_public_key(identity_data)
             return self._master_identity
 
@@ -93,6 +112,7 @@ class VaultManager:
             protected_file.write_bytes(protected_data)
             os.chmod(str(protected_file), 0o600)
             identity_file.unlink()
+            self._master_identity_data = identity_data
             return self._master_identity
 
         identity_data = self._generate_identity()
@@ -101,6 +121,7 @@ class VaultManager:
         protected_file.write_bytes(protected_data)
         os.chmod(str(protected_file), 0o600)
         self._master_identity = self._parse_public_key(identity_data)
+        self._master_identity_data = identity_data
         return self._master_identity
 
     @staticmethod
@@ -139,11 +160,12 @@ class VaultManager:
         return result
 
     async def decrypt(self, ciphertext: bytes) -> str:
-        protected_file = self._identities_dir / "master.protected"
-        if not protected_file.exists():
-            raise VaultError("No master identity found")
-        protected_data = protected_file.read_bytes()
-        identity_data = self._unprotect_identity(protected_data)
+        if self._master_identity_data is not None:
+            identity_data = self._master_identity_data
+        else:
+            # Cold path: the ~234ms PBKDF2 derivation runs off the event loop so
+            # it doesn't block other coroutines; the result is then cached.
+            identity_data = await asyncio.to_thread(self._load_master_identity_data)
         private_key = self._extract_private_key(identity_data)
         try:
             identity = x25519.Identity.from_str(private_key)
@@ -201,5 +223,8 @@ class VaultManager:
 
         old_protected.write_bytes(new_protected_data)
         os.chmod(str(old_protected), 0o600)
+        # The identity bytes are unchanged by rotation (only the wrapping key
+        # changed), so refresh the cache directly rather than re-deriving.
         self._master_identity = None
+        self._master_identity_data = identity_data
         await self.ensure_master_identity()

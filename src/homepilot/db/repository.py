@@ -148,6 +148,7 @@ class Repository:
             "INSERT INTO users (id, display_name, auth_source, created_at) VALUES (?, ?, ?, ?)",
             (user_id, display_name, auth_source, now()),
         )
+        await self.db.conn.commit()
         return user_id
 
     async def get_user_by_id(self, user_id: str) -> dict[str, Any] | None:
@@ -190,6 +191,7 @@ class Repository:
             f"INSERT INTO api_tokens ({col_names}) VALUES ({placeholders})",
             vals,
         )
+        await self.db.conn.commit()
         return token_id
 
     async def list_tokens_for_user(self, user_id: str) -> list[dict[str, Any]]:
@@ -218,9 +220,11 @@ class Repository:
         await self.db.execute(
             "UPDATE api_tokens SET last_used_at = ? WHERE id = ?", (now(), token_id)
         )
+        await self.db.conn.commit()
 
     async def delete_token(self, token_id: str) -> None:
         await self.db.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+        await self.db.conn.commit()
 
     async def update_token_fingerprint(self, token_id: str, fingerprint: str) -> None:
         await self.db.execute(
@@ -287,6 +291,49 @@ class Repository:
         )
         await self.db.conn.commit()
 
+    async def set_agent_credential(
+        self, agent_id: str, hostname: str, credential_hash: str
+    ) -> None:
+        """Store (or replace) an agent's per-agent credential hash.
+
+        Upserts so a mint can run before the agent row exists (register
+        persistence is fire-and-forget). Re-minting on re-enrollment clears any
+        prior ``revoked_at`` — a bootstrap/shared re-enrollment restores access.
+        """
+        ts = now()
+        await self.db.execute(
+            """INSERT INTO agents
+                 (agent_id, hostname, credential_hash, credential_set_at, revoked_at)
+               VALUES (?, ?, ?, ?, NULL)
+               ON CONFLICT(agent_id) DO UPDATE SET
+                 hostname=excluded.hostname,
+                 credential_hash=excluded.credential_hash,
+                 credential_set_at=excluded.credential_set_at,
+                 revoked_at=NULL""",
+            (agent_id, hostname, credential_hash, ts),
+        )
+        await self.db.conn.commit()
+
+    async def get_agent_credential(self, agent_id: str) -> dict[str, Any] | None:
+        """Return the credential row for an agent (hostname, credential_hash,
+        credential_set_at, revoked_at) or ``None`` if unknown."""
+        return await self.db.fetchone(
+            "SELECT agent_id, hostname, credential_hash, credential_set_at, revoked_at "
+            "FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        )
+
+    async def revoke_agent_credential(self, agent_id: str) -> bool:
+        """Mark an agent's credential revoked. Returns ``True`` if a matching,
+        credentialed agent row was updated, ``False`` otherwise."""
+        cursor = await self.db.execute(
+            "UPDATE agents SET revoked_at = ? "
+            "WHERE agent_id = ? AND credential_hash IS NOT NULL AND revoked_at IS NULL",
+            (now(), agent_id),
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+
     async def list_agents(self) -> list[dict[str, Any]]:
         import json as _json
 
@@ -301,6 +348,64 @@ class Repository:
                     d[f] = {}
             out.append(d)
         return out
+
+    async def log_agent_audit(
+        self,
+        agent_id: str,
+        action: str,
+        target: str = "",
+        result: str = "success",
+        exit_code: int | None = None,
+        hostname: str | None = None,
+        caller: str | None = None,
+        ts: str | None = None,
+    ) -> None:
+        """Persist one agent-hub audit entry (#381).
+
+        Durable + attributable record of a fleet-root command/lifecycle event.
+        ``ts`` is accepted so the persisted timestamp matches the in-memory
+        AuditEntry the caller already stamped.
+        """
+        await self.db.execute(
+            """INSERT INTO agent_audit
+               (ts, agent_id, hostname, action, target, result, exit_code, caller)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                ts or now(),
+                agent_id,
+                hostname,
+                action,
+                _sanitize_audit_field(target),
+                result,
+                exit_code,
+                caller,
+            ),
+        )
+        await self.db.conn.commit()
+
+    async def query_agent_audit(
+        self,
+        limit: int = 100,
+        agent_id: str | None = None,
+        action: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return agent-hub audit rows, newest-first, capped at ``limit``."""
+        limit = max(min(limit, 10000), 1)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if agent_id is not None:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = await self.db.fetchall(
+            f"SELECT * FROM agent_audit{where} ORDER BY id DESC LIMIT ?",
+            params,
+        )
+        return [dict(r) for r in rows]
 
     async def create_host(
         self,
@@ -384,6 +489,7 @@ class Repository:
         source: str | None = None,
         import_state: str | None = None,
         pve_status: str | None = None,
+        status: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -394,6 +500,9 @@ class Repository:
         if managed is not None:
             clauses.append("managed = ?")
             params.append(int(managed))
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
         if role is not None:
             clauses.append("role = ?")
             params.append(role)
@@ -620,6 +729,7 @@ class Repository:
                 ts,
             ),
         )
+        await self.db.conn.commit()
         return id
 
     async def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
@@ -661,6 +771,7 @@ class Repository:
         vals.append(now())
         vals.append(artifact_id)
         await self.db.execute(f"UPDATE artifacts SET {', '.join(sets_parts)} WHERE id = ?", vals)
+        await self.db.conn.commit()
 
     async def upsert_artifact(
         self,
@@ -737,6 +848,7 @@ class Repository:
                 ts,
             ),
         )
+        await self.db.conn.commit()
 
     async def get_setting(self, key: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM settings WHERE key = ?", (key,))
@@ -749,6 +861,7 @@ class Repository:
                SET value=excluded.value, updated_at=excluded.updated_at""",
             (key, value, now()),
         )
+        await self.db.conn.commit()
 
     async def create_doc_metadata(
         self,
@@ -768,6 +881,7 @@ class Repository:
         )
         if cursor.lastrowid == 0 or cursor.rowcount == 0:
             return None
+        await self.db.conn.commit()
         return cursor.lastrowid
 
     async def get_doc_metadata(self, doc_id: int) -> dict[str, Any] | None:
@@ -815,6 +929,7 @@ class Repository:
                VALUES (?, ?, ?, ?, ?)""",
             (composite_id, sub_artifact_id, depends_on, on_error, step_order),
         )
+        await self.db.conn.commit()
 
     async def get_artifact_dependencies(self, composite_id: str) -> list[dict[str, Any]]:
         rows = await self.db.fetchall(
@@ -838,6 +953,7 @@ class Repository:
                    details_json = excluded.details_json""",
             (artifact_id, int(drifted), now(), details_json),
         )
+        await self.db.conn.commit()
 
     async def get_drift_checks(
         self,
@@ -881,6 +997,7 @@ class Repository:
                VALUES (?, ?, ?, 1, ?, ?)""",
             (url, json.dumps(sorted(event_types)), secret, max_retries, ts),
         )
+        await self.db.conn.commit()
         row = await self.db.fetchone("SELECT last_insert_rowid() as id")
         return row["id"] if row else 0
 
@@ -896,6 +1013,7 @@ class Repository:
         await self.db.execute("DELETE FROM webhook_deliveries WHERE webhook_id = ?", (config_id,))
         await self.db.execute("DELETE FROM webhook_configs WHERE id = ?", (config_id,))
         row = await self.db.fetchone("SELECT changes() as cnt")
+        await self.db.conn.commit()
         return bool(row and row["cnt"] > 0)
 
     async def get_webhook_configs_for_event(self, event_type: str) -> list[dict[str, Any]]:
@@ -927,6 +1045,7 @@ class Repository:
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (webhook_id, event_type, payload, status, attempts, ts, ts),
         )
+        await self.db.conn.commit()
         row = await self.db.fetchone("SELECT last_insert_rowid() as id")
         return row["id"] if row else 0
 
@@ -943,3 +1062,4 @@ class Repository:
                WHERE id = ?""",
             (status, attempts, ts, delivery_id),
         )
+        await self.db.conn.commit()

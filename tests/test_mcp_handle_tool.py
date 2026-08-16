@@ -337,6 +337,9 @@ class TestReadFileOnGuestTextOnly:
 
     @pytest.mark.asyncio
     async def test_read_error_propagates(self, ctx):
+        # Use an allowed path so the adapter is reached: this asserts that an error
+        # raised by read_file propagates (the read-prefix/secret guard is covered
+        # separately in test_mcp_read_guard.py).
         ctx["agent_adapter"].read_file = AsyncMock(side_effect=OSError("permission denied"))
         with pytest.raises(OSError, match="permission denied"):
-            await call("read_file_on_guest", {"host": "pve1", "path": "/etc/shadow"}, ctx)
+            await call("read_file_on_guest", {"host": "pve1", "path": "/etc/hosts"}, ctx)

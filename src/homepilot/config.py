@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -56,9 +56,6 @@ class Settings(BaseSettings):
     events_webhook_secret: str | None = None
     n8n_api_key: str = ""
 
-    auto_approve_nonmutating: bool = True
-    auto_apply_on_approve: bool = True
-
     embedding_service_url: str = "http://llm-embed:8081/v1/embeddings"
     embedding_model: str = "bge-m3"
     embedding_fallback_url: str = "http://localhost:11434/api/embeddings"
@@ -69,7 +66,6 @@ class Settings(BaseSettings):
     auto_apply_enabled: bool = False
     auto_apply_interval_seconds: int = 300
 
-    daemon_host: str = Field(default="0.0.0.0", validation_alias="HP_HOST")
     daemon_port: int = Field(default=8000, validation_alias="HP_PORT")
     log_level: str = "info"
     agent_hub_enabled: bool = False
@@ -81,11 +77,17 @@ class Settings(BaseSettings):
     # (optionally host:port) agents can reach the hub on.
     agent_hub_advertise_host: str = ""
     agent_hub_auth_token: str = ""
-    agent_hub_heartbeat_interval: int = 30
     agent_hub_tls: bool = False
     agent_hub_tls_cert: str = ""
     agent_hub_tls_key: str = ""
     agent_hub_tls_ca: str = ""
+    # Fail-closed override: allow the hub to run WITHOUT TLS on a non-loopback
+    # bind. Only for a trusted, isolated network — logs a loud warning. Accepts
+    # HP_HUB_ALLOW_INSECURE (spec name) or HP_AGENT_HUB_ALLOW_INSECURE.
+    agent_hub_allow_insecure: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("HP_HUB_ALLOW_INSECURE", "HP_AGENT_HUB_ALLOW_INSECURE"),
+    )
 
     # Base URL of the Zabbix UI for deep-linking host metrics from HomePilot
     # (HomePilot owns current state; historical telemetry lives in Zabbix).
@@ -102,7 +104,6 @@ class Settings(BaseSettings):
         "http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173"
     )
     cookie_secure: bool = True
-    rate_limit_backend: str = "memory"
 
     def _auto_generate_passphrase(self) -> str:
         import logging

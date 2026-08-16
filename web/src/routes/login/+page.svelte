@@ -5,6 +5,7 @@
 	import { base } from '$app/paths';
 	import { api, setToken, hasCookieSession, refreshSession } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import { safeReturnTo } from '$lib/nav';
 
 	let token = '';
 	let error = '';
@@ -15,8 +16,7 @@
 			try {
 				await api.me();
 				const params = new URLSearchParams(window.location.search);
-				const returnTo = params.get('returnTo') || `${base}/artifacts`;
-				goto(decodeURIComponent(returnTo));
+				goto(safeReturnTo(params.get('returnTo'), base, `${base}/artifacts`));
 			} catch {
 				// cookie stale, show login
 			}
@@ -32,8 +32,7 @@
 			await refreshSession();
 			notify('Connected');
 			const params = new URLSearchParams(window.location.search);
-			const returnTo = params.get('returnTo') || `${base}/artifacts`;
-			goto(decodeURIComponent(returnTo));
+			goto(safeReturnTo(params.get('returnTo'), base, `${base}/artifacts`));
 		} catch (e: any) {
 			error = e?.message || 'Connection failed — check your token';
 			setToken('');

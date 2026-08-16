@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, zabbixHostUrl, type AgentInfo } from '$lib/api';
+	import { api, ApiError, zabbixHostUrl, type AgentInfo } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import { isValidHubHost } from '$lib/hostValidation';
 
 	let agents: AgentInfo[] = [];
 	let zabbixUrl = '';
 	let loading = true;
 	let isAdmin = true;
+	let loadError = '';
 
 	let showBootstrap = false;
 	let bootstrapData: { bootstrap_token: string; hub_host: string; hub_port: number } | null = null;
@@ -20,15 +22,21 @@
 
 	async function load() {
 		loading = true;
+		loadError = '';
 		try {
 			agents = await api.listAgents();
 			isAdmin = true;
-		} catch (e: any) {
-			if (e?.message?.startsWith('403')) {
+		} catch (e) {
+			// Only a real 403 means "needs admin". Anything else (e.g. a 500) is a
+			// genuine error and must not be reported as a permission problem — the
+			// old `message.startsWith('403')` check could never match the humanized
+			// message, so every failure looked like a permission denial.
+			if (e instanceof ApiError && e.status === 403) {
 				isAdmin = false;
 				notify('Admin scope required to view agents', 'err');
 			} else {
-				notify(String(e), 'err');
+				loadError = e instanceof Error ? e.message : String(e);
+				notify(loadError, 'err');
 			}
 		} finally {
 			loading = false;
@@ -148,12 +156,19 @@
 						<p class="text-xs text-emerald-400 font-mono mb-1">Bootstrap token (copy now — shown once):</p>
 						<code class="text-xs text-slate-200 break-all select-all">{bootstrapData.bootstrap_token}</code>
 					</div>
-					<div class="bg-slate-900 border border-slate-600 rounded p-3">
-						<p class="text-xs text-slate-400 font-mono mb-1">One-liner install:</p>
-						<code class="text-xs text-slate-200 break-all select-all">
-							curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)} --token {bootstrapData.bootstrap_token}
-						</code>
-					</div>
+					{#if isValidHubHost(bootstrapData.hub_host)}
+						<div class="bg-slate-900 border border-slate-600 rounded p-3">
+							<p class="text-xs text-slate-400 font-mono mb-1">One-liner install:</p>
+							<code class="text-xs text-slate-200 break-all select-all">
+								curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)} --token {bootstrapData.bootstrap_token}
+							</code>
+						</div>
+					{:else}
+						<div class="bg-slate-900 border border-red-700/50 rounded p-3">
+							<p class="text-xs text-red-400 font-semibold mb-1">Install one-liner unavailable</p>
+							<p class="text-xs text-slate-400">The hub host reported by the server (<code class="text-slate-300 break-all">{bootstrapData.hub_host}</code>) is not a valid hostname or IP. Copying a root <code class="text-slate-300">curl … | bash</code> with it would be unsafe. Fix <code class="text-slate-300">HP_HUB_HOST</code> on the server and regenerate.</p>
+						</div>
+					{/if}
 					<button class="btn btn-ghost text-xs" on:click={generateBootstrap} disabled={generating}>
 						Regenerate
 					</button>
@@ -176,18 +191,31 @@
 					<p class="text-xs text-slate-400 mb-1">Hub: <code class="text-slate-200">{fmtHost(hubData.hub_host, hubData.hub_port)}</code></p>
 					<code class="text-xs text-slate-200 select-all">{hubData.auth_token}</code>
 				</div>
-				<div class="bg-slate-900 border border-slate-600 rounded p-3">
-					<p class="text-xs text-slate-400 font-mono mb-1">One-liner install (survives reboots):</p>
-					<code class="text-xs text-slate-200 break-all select-all">
-						curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(hubData.hub_host, hubData.hub_port)} --token {hubData.auth_token}
-					</code>
-				</div>
+				{#if isValidHubHost(hubData.hub_host)}
+					<div class="bg-slate-900 border border-slate-600 rounded p-3">
+						<p class="text-xs text-slate-400 font-mono mb-1">One-liner install (survives reboots):</p>
+						<code class="text-xs text-slate-200 break-all select-all">
+							curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(hubData.hub_host, hubData.hub_port)} --token {hubData.auth_token}
+						</code>
+					</div>
+				{:else}
+					<div class="bg-slate-900 border border-red-700/50 rounded p-3">
+						<p class="text-xs text-red-400 font-semibold mb-1">Install one-liner unavailable</p>
+						<p class="text-xs text-slate-400">The hub host reported by the server (<code class="text-slate-300 break-all">{hubData.hub_host}</code>) is not a valid hostname or IP, so a root <code class="text-slate-300">curl … | bash</code> cannot be safely generated. Fix <code class="text-slate-300">HP_HUB_HOST</code> on the server.</p>
+					</div>
+				{/if}
 			{/if}
 		</div>
 	{/if}
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load agents.</p>
+			<p class="text-xs text-slate-500">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+		</div>
 	{:else if !isAdmin}
 		<div class="card p-6 text-center">
 			<p class="text-slate-400">You need admin scope to view connected agents.</p>

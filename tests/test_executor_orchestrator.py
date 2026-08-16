@@ -371,7 +371,10 @@ class TestOrchestratorSnapshot:
         assert result.snapshot_id is None
         mock_proxmox.snapshot.assert_not_called()
 
-    async def test_snapshot_failure_does_not_block(self, tmp_artifacts_dir):
+    async def test_required_snapshot_failure_aborts_apply(self, tmp_artifacts_dir):
+        # Regression for #388: a required pre-apply snapshot that FAILS must
+        # abort the apply — never silently proceed to mutate the guest with no
+        # rollback. The guest command must not run and the artifact ends 'failed'.
         from homepilot.adapters.proxmox import ProxmoxError
 
         store = ArtifactStore(tmp_artifacts_dir)
@@ -397,13 +400,18 @@ class TestOrchestratorSnapshot:
             pve_nodes=["pve1"],
         )
 
+        # No requires_snapshot key => snapshot is required (default).
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
         aid = await lifecycle.propose(spec)
         await lifecycle.approve(aid, user="admin")
 
         result = await executor.apply(aid, approved_by="admin")
-        assert result.success
-        assert result.snapshot_id is None
+        assert not result.success
+        assert "snapshot" in (result.failure_reason or "").lower()
+        # The spec steps must NOT have executed without a snapshot.
+        mock_proxmox.call.assert_not_called()
+        fm, _ = store.read(aid)
+        assert fm["status"] == "failed"
 
     async def test_executor_failure_marks_failed(self, tmp_artifacts_dir):
         store = ArtifactStore(tmp_artifacts_dir)

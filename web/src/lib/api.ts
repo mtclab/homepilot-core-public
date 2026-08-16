@@ -1,4 +1,5 @@
 import { get, writable } from 'svelte/store';
+import { base } from '$app/paths';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 
@@ -12,7 +13,11 @@ export class ApiError extends Error {
 		let detail = body;
 		try {
 			const parsed = JSON.parse(body);
-			if (parsed && typeof parsed.detail === 'string') detail = parsed.detail;
+			if (parsed && parsed.detail !== undefined && parsed.detail !== null) {
+				// `detail` may be a string OR a structured object (e.g. a revoke
+				// conflict sends `{"reason": ...}`). Never let raw JSON reach a toast.
+				detail = ApiError.detailToString(parsed.detail);
+			}
 		} catch {
 			// non-JSON body: keep as-is
 		}
@@ -20,6 +25,22 @@ export class ApiError extends Error {
 		this.status = status;
 		this.detail = detail;
 		this.name = 'ApiError';
+	}
+	// Collapse a server `detail` (string or object) to a single human line.
+	static detailToString(d: unknown): string {
+		if (typeof d === 'string') return d;
+		if (d && typeof d === 'object') {
+			const o = d as Record<string, unknown>;
+			for (const k of ['reason', 'message', 'error', 'detail']) {
+				if (typeof o[k] === 'string') return o[k] as string;
+			}
+			try {
+				return JSON.stringify(d);
+			} catch {
+				return String(d);
+			}
+		}
+		return String(d);
 	}
 	static humanize(status: number, detail: string): string {
 		switch (status) {
@@ -29,6 +50,8 @@ export class ApiError extends Error {
 				return "You don't have permission for that.";
 			case 404:
 				return 'Not found.';
+			case 409:
+				return detail || 'That conflicts with the current state — refresh and try again.';
 			case 429:
 				return 'Too many requests — wait a moment and try again.';
 			default:
@@ -45,6 +68,25 @@ function getCsrfToken(): string {
 	if (typeof document === 'undefined') return '';
 	const m = document.cookie.match(/(?:^|;\s*)hp_csrf=([^;]+)/);
 	return m ? decodeURIComponent(m[1]) : '';
+}
+
+// Guards against firing several redirects while one is already in flight.
+let _redirectingToLogin = false;
+
+// A 401 mid-session means the credential is stale. Drop local session state so
+// the UI stops replaying a dead token, then bounce to login once (preserving
+// where the user was). Skipped for the auth probes themselves, which would
+// otherwise loop the login page.
+function handleUnauthorized(path: string): void {
+	_tokenStore.set('');
+	sessionStore.set(null);
+	if (typeof window === 'undefined') return;
+	if (path.startsWith('/auth/me') || path.startsWith('/auth/login')) return;
+	const loginPath = `${base}/login`;
+	if (window.location.pathname === loginPath || _redirectingToLogin) return;
+	_redirectingToLogin = true;
+	const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+	window.location.assign(`${loginPath}?returnTo=${returnTo}`);
 }
 
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -74,6 +116,7 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
 	});
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);
+		if (res.status === 401) handleUnauthorized(path);
 		throw new ApiError(res.status, text);
 	}
 	if (res.status === 204) return undefined as T;
@@ -102,11 +145,13 @@ export interface Artifact {
 	version?: string;
 }
 
+export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
 export interface Task {
 	id: string;
 	artifact_id: string;
 	action: 'apply' | 'revoke' | 'replay';
-	status: 'pending' | 'running' | 'succeeded' | 'failed';
+	status: TaskStatus;
 	result_json: string | null;
 	created_at: string;
 	finished_at: string | null;
@@ -259,7 +304,13 @@ export interface MeInfo {
 	token_label: string;
 	scope: string | null;
 	role: string | null;
-	prefix: string;
+	// Short token prefix, e.g. "hp_ab12". Optional: older servers omit it, so
+	// callers must fall back rather than render a literal "undefined".
+	prefix?: string;
+	// Normalized capability list, e.g. ["read","write"] or ["read","write","admin"].
+	// The UI gates write/admin controls off this — never off the raw `scope`
+	// string. Optional so older servers that omit it degrade gracefully.
+	capabilities?: string[];
 }
 
 export interface ProxmoxSettings {
@@ -318,8 +369,15 @@ export const api = {
 	getTask(taskId: string) {
 		return req<Task>(`/tasks/${taskId}`);
 	},
-	listTasks(artifactId: string, limit = 50, offset = 0) {
+	// Omit artifactId for the system-wide view (all tasks, newest first); pass it
+	// to scope to a single artifact.
+	listTasks(artifactId?: string, limit = 50, offset = 0) {
 		return req<{ items: Task[]; total: number }>('/tasks' + qs({ artifact_id: artifactId, limit, offset }));
+	},
+	// Cancels an in-flight apply/revoke; a no-op returning the current status for
+	// an already-finished task. Returns the task's post-cancel record.
+	cancelTask(taskId: string) {
+		return req<Task>(`/tasks/${taskId}/cancel`, { method: 'POST' });
 	},
 
 	// --- Drift ---
@@ -439,8 +497,16 @@ export const api = {
 	getAgent(agentId: string) {
 		return req<AgentDetail>(`/agents/${agentId}`);
 	},
-	getHealth() {
-		return req<HealthInfo>('/health');
+	async getHealth(): Promise<HealthInfo> {
+		// `/health` returns 503 when a dependency is degraded — exactly when the
+		// panel matters most. Fetch directly and parse the body regardless of
+		// status so the individual checks render instead of going blank. Only a
+		// hard network/JSON failure rejects.
+		const memToken = get(_tokenStore);
+		const headers: Record<string, string> = {};
+		if (memToken) headers['Authorization'] = `Bearer ${memToken}`;
+		const res = await fetch(`${API_BASE}/health`, { credentials: 'include', headers });
+		return res.json() as Promise<HealthInfo>;
 	},
 	getDashboard() {
 		return req<DashboardSummary>('/dashboard/summary');
@@ -453,7 +519,7 @@ export const api = {
 		return req<ProxmoxSettings>('/admin/settings/proxmox');
 	},
 	saveProxmoxSettings(data: ProxmoxConfigIn) {
-		return req<{ status: string; reloaded: string[]; host: string; port: number; verify_ssl: boolean; token_configured: boolean; write_token_configured: boolean }>('/admin/settings/proxmox', {
+		return req<{ status: string; message?: string; reloaded: string[]; host: string; port: number; verify_ssl: boolean; token_configured: boolean; write_token_configured: boolean }>('/admin/settings/proxmox', {
 			method: 'PUT',
 			body: JSON.stringify(data),
 		});

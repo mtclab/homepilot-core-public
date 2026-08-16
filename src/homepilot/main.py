@@ -14,14 +14,16 @@ from typing import Any, cast
 
 import httpx
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.dependencies.models import Dependant
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, generate_latest
 
 from . import __version__
 from .app_state import create_app_state
-from .auth.deps import require_token
+from .auth.deps import SCOPE_ENFORCER_ATTR, require_token
 from .auth.tokens import validate_token as _validate_token
 from .common import APIError
 from .config import get_settings
@@ -260,25 +262,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("HomePilot v2 started — data_dir=%s", settings.data_dir)
 
+    mcp_app: Any = None
+    app.state.mcp_app = None
+    app.state.mcp_running = False
     mcp_token = os.environ.get("HP_MCP_TOKEN", "").strip()
     if mcp_token:
         from .mcp.server import _server_context, create_http_app, create_server
 
         srv = create_server()
-        await _server_context.async_update(
-            {
-                "store": state.artifact_store,
-                "lifecycle": state.artifact_lifecycle,
-                "repo": state.repo,
-                "proxmox": state.proxmox,
-                "vault": state.vault,
-                "database": state.database,
-                "kb_service": state.kb_service,
-                "inventory_service": inventory_service,
-                "task_repo": task_repo,
-            }
-        )
-        if state.proxmox and state.vault:
+
+        # Best-effort PVE node list for host-targeted tools.
+        if state.proxmox is not None:
             try:
                 pve_data = await state.proxmox.read("/nodes")
                 pve_nodes = [
@@ -290,15 +284,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 state.artifact_lifecycle._pve_nodes_list = pve_nodes
             except (httpx.HTTPError, OSError, ConnectionError):
                 state.artifact_lifecycle._pve_nodes_list = []
-            from .adapters.agent import AgentAdapter
-            from .executor import ArtifactExecutor
 
-            mcp_agent = None
-            if state.agent_hub is not None:
-                mcp_agent = AgentAdapter(
-                    hub_server=state.agent_hub,
-                    pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
-                )
+        # Host ops (read_file_on_guest / exec_on_guest_readonly) route through the
+        # agent hub. Build the SAME adapter the stdio bootstrap uses so those tools
+        # resolve over the HTTP transport, not only over stdio (#385). The adapter
+        # depends only on the hub, independent of Proxmox/vault, so build it
+        # whenever a hub exists — not just inside the Proxmox+vault branch.
+        mcp_agent = None
+        if state.agent_hub is not None:
+            from .adapters.agent import AgentAdapter
+
+            mcp_agent = AgentAdapter(
+                hub_server=state.agent_hub,
+                pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
+            )
+
+        if state.proxmox and state.vault:
+            from .executor import ArtifactExecutor
 
             executor = ArtifactExecutor(
                 store=state.artifact_store,
@@ -306,11 +308,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 repo=state.repo,
                 proxmox=state.proxmox,
                 vault=state.vault,
-                pve_nodes=state.artifact_lifecycle._pve_nodes_list or [],
+                pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
                 agent=mcp_agent,
             )
             state.artifact_lifecycle._executor_ref = executor
+
+        # The HTTP tool context MUST carry the same keys the stdio bootstrap builds,
+        # or agent_adapter/drift_reconciler-backed tools error in every HTTP
+        # deployment (#385: read_file_on_guest, exec_on_guest_readonly,
+        # check_artifact_drift). drift_reconciler is the same instance the
+        # reconciler scheduler uses (built above).
+        await _server_context.async_update(
+            {
+                "store": state.artifact_store,
+                "lifecycle": state.artifact_lifecycle,
+                "repo": state.repo,
+                "proxmox": state.proxmox,
+                "vault": state.vault,
+                "database": state.database,
+                "kb_service": state.kb_service,
+                "inventory_service": inventory_service,
+                "task_repo": task_repo,
+                "agent_adapter": mcp_agent,
+                "drift_reconciler": drift_reconciler,
+            }
+        )
+
         mcp_app = create_http_app(srv)
+        app.state.mcp_app = mcp_app
         app.mount("/mcp", mcp_app)
         logger.info("MCP server mounted at /mcp")
     else:
@@ -329,32 +354,50 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except (OSError, ValueError):
         logger.debug("Could not register SIGTERM handler (ok in non-Docker env)")
 
-    yield
+    # Starlette does NOT run a mounted sub-app's lifespan, so the mounted MCP app's
+    # StreamableHTTPSessionManager (started inside create_http_app's own lifespan
+    # via session_manager.run()) would never initialize — every POST /mcp/ then
+    # 500s with "Task group is not initialized" (#382). Drive the mounted app's
+    # lifespan from here so its session manager runs for the whole server lifetime.
+    from contextlib import AsyncExitStack
 
-    logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+    mcp_lifespan_stack = AsyncExitStack()
+    if mcp_app is not None:
+        await mcp_lifespan_stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
+        app.state.mcp_running = True
 
-    agent_hub = getattr(app.state, "agent_hub", None)
-    if agent_hub is not None:
+    try:
+        yield
+    finally:
+        logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+
+        agent_hub = getattr(app.state, "agent_hub", None)
+        if agent_hub is not None:
+            try:
+                await asyncio.wait_for(agent_hub.stop(), timeout=10.0)
+                logger.info("Agent hub stopped")
+            except TimeoutError:
+                logger.warning("Agent hub stop timed out after 10s — proceeding")
+
         try:
-            await asyncio.wait_for(agent_hub.stop(), timeout=10.0)
-            logger.info("Agent hub stopped")
+            await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
         except TimeoutError:
-            logger.warning("Agent hub stop timed out after 10s — proceeding")
+            logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
+        try:
+            await asyncio.wait_for(state.database.close(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Database close timed out after 10s — proceeding")
+        except Exception as exc:
+            logger.warning("Database close error (ok on restart): %s", exc)
+        from .mcp.server import _server_context
 
-    try:
-        await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
-    except TimeoutError:
-        logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
-    try:
-        await asyncio.wait_for(state.database.close(), timeout=10.0)
-    except TimeoutError:
-        logger.warning("Database close timed out after 10s — proceeding")
-    except Exception as exc:
-        logger.warning("Database close error (ok on restart): %s", exc)
-    from .mcp.server import _server_context
-
-    _server_context.clear()
-    logger.info("HomePilot v2 shut down")
+        _server_context.clear()
+        app.state.mcp_running = False
+        # Tear down the mounted MCP session manager LAST — after the shared context
+        # is cleared — so create_http_app's lifespan cleanup finds nothing to close
+        # and cannot double-close the DB/Proxmox handles already closed above.
+        await mcp_lifespan_stack.aclose()
+        logger.info("HomePilot v2 shut down")
 
 
 def validate_cors_config(settings: Any) -> dict[str, Any]:
@@ -465,6 +508,19 @@ def _metric_path(request: Request) -> str:
     return "<unmatched>"
 
 
+def _mcp_health_status(app: FastAPI) -> str:
+    """MCP transport health for /health.
+
+    Returns "ok" only when the mounted MCP app's StreamableHTTPSessionManager is
+    ACTUALLY running (its anyio task group is live). A mounted /mcp route alone is
+    NOT proof the transport works — #382 had the route present while the session
+    manager was never started, so every request 500'd yet /health claimed "ok".
+    """
+    mcp_app = getattr(app.state, "mcp_app", None)
+    session_manager = getattr(getattr(mcp_app, "state", None), "session_manager", None)
+    return "ok" if getattr(session_manager, "_task_group", None) is not None else "error"
+
+
 async def _is_authenticated(request: Request) -> bool:
     raw_token: str | None = None
     using_cookie = False
@@ -542,6 +598,78 @@ app.include_router(kb_router, prefix="/kb", tags=["kb"], dependencies=[Depends(r
 app.include_router(dashboard_router, dependencies=[Depends(require_token)])
 
 
+# ── Startup route-scope guard ────────────────────────────────────────────────
+# Every non-public API route must carry a scope dependency (require_scope(...) or
+# an explicit admin/secret gate). require_token alone ("any valid token") is not
+# enough. These routes are the genuinely public surface and are exempt by an
+# explicit (method, path-template) allowlist — health/metrics/root, the auth
+# entry flow, and the static UI. The /mcp mount is a Starlette Mount (not an
+# APIRoute) and so is skipped structurally; likewise FastAPI's own docs routes.
+_PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/health"),
+        ("GET", "/metrics"),
+        ("GET", "/"),
+        ("GET", "/ui/_app/{path:path}"),
+        ("GET", "/ui/{path:path}"),
+        # Auth entry flow: these authenticate by their own means (a bearer token
+        # validated in-body, the admin secret, or a session cookie) rather than a
+        # FastAPI scope dependency, so they carry no require_scope.
+        ("GET", "/auth/me"),  # self-identity: must work for any valid token
+        ("POST", "/auth/login"),
+        ("POST", "/auth/logout"),
+        ("POST", "/auth/tokens"),  # gated by the admin secret in the request body
+    }
+)
+
+
+def _iter_sub_dependants(dependant: Dependant) -> list[Dependant]:
+    """Flatten a Dependant's whole sub-dependency tree (FastAPI's
+    get_flat_dependant collapses params but drops the sub-dependant callables we
+    need, so walk it ourselves)."""
+    collected: list[Dependant] = []
+    for sub in dependant.dependencies:
+        collected.append(sub)
+        collected.extend(_iter_sub_dependants(sub))
+    return collected
+
+
+def _route_has_scope_dep(route: APIRoute) -> bool:
+    for sub in _iter_sub_dependants(route.dependant):
+        if getattr(sub.call, SCOPE_ENFORCER_ATTR, False):
+            return True
+    return False
+
+
+def find_unscoped_routes(target_app: FastAPI) -> list[tuple[str, str]]:
+    """Return (method, path) for every non-public APIRoute lacking a scope dep."""
+    missing: list[tuple[str, str]] = []
+    for route in target_app.routes:
+        if not isinstance(route, APIRoute):
+            continue  # Mounts (/mcp), static files, framework docs — not scope-checkable
+        for method in route.methods or set():
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            if (method, route.path) in _PUBLIC_ROUTES:
+                continue
+            if not _route_has_scope_dep(route):
+                missing.append((method, route.path))
+    return sorted(missing)
+
+
+def assert_all_routes_scoped(target_app: FastAPI) -> None:
+    """Fail fast at construction if any non-public route ships without a scope
+    dependency, so a future unscoped route can't silently reach production."""
+    missing = find_unscoped_routes(target_app)
+    if missing:
+        formatted = ", ".join(f"{m} {p}" for m, p in missing)
+        raise RuntimeError(
+            "Route scope guard: these API routes have no scope dependency and are "
+            f"not in the public allowlist: {formatted}. Add require_scope(...) / an "
+            "admin dep, or add the route to _PUBLIC_ROUTES if it is genuinely public."
+        )
+
+
 @app.get("/health")
 async def health(request: Request) -> JSONResponse:
     checks: dict[str, str] = {}
@@ -609,10 +737,13 @@ async def health(request: Request) -> JSONResponse:
     mcp_status: str = "not_configured"
     mcp_token = os.environ.get("HP_MCP_TOKEN", "").strip()
     if mcp_token:
-        # /mcp is mounted during startup if HP_MCP_TOKEN is set
+        # Report "ok" only when the mounted MCP app's session manager is ACTUALLY
+        # running. A mounted route alone is not proof the transport works: #382 had
+        # the mount present while its session manager was never started, so every
+        # request 500'd yet /health still claimed "ok". Inspect the live session
+        # manager task group instead of merely checking a route exists.
         try:
-            mcp_routes = [r for r in request.app.routes if getattr(r, "path", "") == "/mcp"]
-            mcp_status = "ok" if mcp_routes else "error"
+            mcp_status = _mcp_health_status(request.app)
         except Exception as exc:
             logger.debug("mcp health check failed: %s", exc)
             mcp_status = "error"
@@ -667,3 +798,8 @@ if _UI_DIR is not None:
         if full.exists() and full.is_file():
             return await _ui_static.get_response(path, request.scope)
         return FileResponse(_ui_dir / "index.html")
+
+
+# Enforce scope coverage once the full route table (routers + app-level routes +
+# optional UI routes) is assembled. Raises at import/construction on any gap.
+assert_all_routes_scoped(app)

@@ -49,9 +49,19 @@ class TestInventoryRouter:
             source="discovered",
             import_state="pending",
             pve_status="running",
+            status=None,
             limit=100,
             offset=0,
         )
+
+    def test_list_inventory_status_filter_passed_through(self, client):
+        # Regression (#390): the router accepted ?status= but silently dropped it,
+        # so filtering by status returned everything. It must reach list_hosts.
+        client.app.state.repo.list_hosts = AsyncMock(return_value=[])
+        resp = client.get("/inventory?status=running")
+        assert resp.status_code == 200
+        _, kwargs = client.app.state.repo.list_hosts.await_args
+        assert kwargs["status"] == "running"
 
     def test_patch_host_sets_role_source(self, client):
         client.app.state.repo.get_host = AsyncMock(
@@ -85,6 +95,38 @@ class TestInventoryRouter:
         client.app.state.repo.update_host.assert_awaited_once_with(
             "h1", ip_address="10.0.0.5", ip_source="user"
         )
+
+    def test_patch_host_unignore_sets_import_state(self, client):
+        # Regression (#390): the UI "Unignore" PATCHes {import_state: 'pending'};
+        # before the fix HostPatchRequest dropped the key and the endpoint 400'd
+        # "No valid fields to update".
+        client.app.state.repo.get_host = AsyncMock(
+            return_value={"id": "h1", "hostname": "vm1", "import_state": "ignored"}
+        )
+        client.app.state.repo.update_host = AsyncMock(return_value=None)
+        resp = client.patch("/inventory/h1", json={"import_state": "pending"})
+        assert resp.status_code == 200
+        client.app.state.repo.update_host.assert_awaited_once_with("h1", import_state="pending")
+
+    def test_patch_host_sets_status(self, client):
+        client.app.state.repo.get_host = AsyncMock(
+            return_value={"id": "h1", "hostname": "vm1", "status": "stopped"}
+        )
+        client.app.state.repo.update_host = AsyncMock(return_value=None)
+        resp = client.patch("/inventory/h1", json={"status": "running"})
+        assert resp.status_code == 200
+        client.app.state.repo.update_host.assert_awaited_once_with("h1", status="running")
+
+    def test_patch_host_invalid_import_state_rejected(self, client):
+        # Regression (#390): an invalid import_state must be rejected, not written
+        # through to the DB (where it would violate the CHECK constraint / 500).
+        client.app.state.repo.get_host = AsyncMock(
+            return_value={"id": "h1", "hostname": "vm1", "import_state": "ignored"}
+        )
+        client.app.state.repo.update_host = AsyncMock(return_value=None)
+        resp = client.patch("/inventory/h1", json={"import_state": "bogus"})
+        assert resp.status_code == 422
+        client.app.state.repo.update_host.assert_not_awaited()
 
     def test_adopt_host(self, client):
         client.app.state.repo.get_host = AsyncMock(

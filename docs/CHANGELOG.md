@@ -1,5 +1,55 @@
 # Changelog
 
+## v2.6.0 (2026-08-16)
+
+Large hardening + upgrade batch from the 2026-08-15 code audit.
+
+### Security (Agent Hub)
+
+- **TLS fail-closed** by default in the shipped Go agent; verification only
+  disabled via an explicit `HP_AGENT_TLS_INSECURE` (#377).
+- **Per-agent credentials** (#362): each agent gets a minted, hashed-at-rest
+  credential bound to `(agent_id, hostname)`; the shared fleet token is now
+  enrollment-only and never handed back. Revoke with `hp agent revoke <id>`.
+- **Replay protection** (#362): per-frame HMAC + sequence keyed by the per-agent
+  credential, plus register nonce/timestamp freshness (defense-in-depth for
+  insecure-transport deployments), feature-gated so old agents still work.
+- **Identity/robustness**: reject hostname/agent_id hijack from a live
+  connection, compare-and-delete unregister, oversize-frame survival, auth-flood
+  ban, sudo arg-regex bypass closed, unrestricted `read_file` given an allowlist
+  + secret denylist, symlink-safe atomic writes.
+- **Durable, attributable audit**: the fleet-root command audit now persists to
+  the DB with caller attribution and lifecycle events.
+
+### Backend
+
+- **HTTP MCP transport fixed** (#382): it was dead (`Task group is not
+  initialized`); the mounted app's session manager now runs. Migrated to the
+  **mcp 2.x SDK** and lifted the version pin.
+- **Data integrity** (#383): every repository write now commits (a whole class of
+  silently-rolled-back writes, incl. token creation, is closed) + a static gate.
+- `hp init` no longer destroys the vault on re-run; task lifecycle strandings
+  fixed + **task cancellation** (`POST /tasks/{id}/cancel`) and a global Tasks
+  view; SSRF IPv6 gaps closed; vault key derivation off the event loop.
+- **Scopes enforced to the edges**: a startup guard requires a scope dependency
+  on every non-public route.
+- **Observability**: real PVE node state (no longer hardcoded), drift now emits
+  `artifact_drifted` events, SSE-driven live UI.
+- **Reproducible builds**: the image installs from `uv.lock`; `make gate` /
+  `make gate-image` local gate runner added.
+- **Manage imported hosts, Phase A** (#397): adopting a host runs a read-only
+  introspection and records observed state (services + an as-found KB note) —
+  never as artifacts.
+
+### Web
+
+- Logout no longer deletes the shared API token; live session state; global 401
+  handling; honest save/health states; the Tasks view; clickable artifact links.
+
+### Removed
+
+- The orphaned `mscp` module and the removed Python agent's remnants.
+
 ## v2.5.0 (2026-06-12)
 
 ### Features

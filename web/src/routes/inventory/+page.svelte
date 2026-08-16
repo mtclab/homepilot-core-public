@@ -7,6 +7,7 @@
 	let zabbixUrl = '';
 	let items: Host[] = [];
 	let loading = true;
+	let loadError = '';
 	let syncing = false;
 	let enriching = false;
 	let filterRole = '';
@@ -17,6 +18,7 @@
 
 	async function load() {
 		loading = true;
+		loadError = '';
 		try {
 			const res = await api.listInventory({
 				role: filterRole || undefined,
@@ -26,7 +28,8 @@
 			});
 			items = res.items;
 		} catch (e) {
-			notify(String(e), 'err');
+			loadError = e instanceof Error ? e.message : String(e);
+			notify(loadError, 'err');
 		} finally {
 			loading = false;
 		}
@@ -56,6 +59,17 @@
 		} finally {
 			enriching = false;
 		}
+	}
+
+	$: hasActiveFilters =
+		filterRole !== '' || filterStatus !== '' || filterSource !== '' || filterImportState !== '';
+
+	function clearFilters() {
+		filterRole = '';
+		filterStatus = '';
+		filterSource = '';
+		filterImportState = '';
+		load();
 	}
 
 	function statusColor(s?: string): string {
@@ -178,6 +192,9 @@
 			<option value="adopted">Adopted</option>
 			<option value="ignored">Ignored</option>
 		</select>
+		{#if hasActiveFilters}
+			<button class="btn btn-ghost text-xs self-center" on:click={clearFilters}>Clear filters</button>
+		{/if}
 		<span class="text-slate-500 text-xs self-center">{items.length} hosts</span>
 	</div>
 
@@ -193,8 +210,22 @@
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load inventory.</p>
+			<p class="text-xs text-slate-500">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+		</div>
+	{:else if items.length === 0 && hasActiveFilters}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-slate-400 text-sm">No hosts match the current filters.</p>
+			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
+		</div>
 	{:else if items.length === 0}
-		<p class="text-slate-500 text-sm">No hosts in inventory.</p>
+		<div class="card p-6 text-center space-y-1">
+			<p class="text-slate-400 text-sm">No hosts in inventory yet.</p>
+			<p class="text-xs text-slate-500">Sync from Proxmox to discover hosts.</p>
+		</div>
 	{:else}
 		<div class="card overflow-x-auto">
 			<table class="w-full text-xs">

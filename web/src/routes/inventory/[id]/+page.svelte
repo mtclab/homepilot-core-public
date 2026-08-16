@@ -7,8 +7,11 @@
 
 	let doc: HostDoc | null = null;
 	let loading = true;
-	let editingRole = false;
-	let editingIp = false;
+	let loadError = '';
+	// The doc view can list several LIKE-matched hosts. Edit state is scoped to a
+	// specific host id so an edit/action never lands on the wrong row.
+	let editRoleHostId: string | null = null;
+	let editIpHostId: string | null = null;
 	let editRole = '';
 	let editIp = '';
 
@@ -16,40 +19,52 @@
 
 	async function load() {
 		loading = true;
+		loadError = '';
 		try {
 			doc = await api.getHostDoc(id);
 		} catch (e) {
-			notify(String(e), 'err');
+			loadError = e instanceof Error ? e.message : String(e);
+			notify(loadError, 'err');
 		} finally {
 			loading = false;
 		}
 	}
 
-	async function saveRole() {
+	function startEditRole(h: { id: string; role?: string }) {
+		editRole = h.role || '';
+		editRoleHostId = h.id;
+	}
+
+	function startEditIp(h: { id: string; ip_address?: string }) {
+		editIp = h.ip_address || '';
+		editIpHostId = h.id;
+	}
+
+	async function saveRole(hostId: string) {
 		try {
-			await api.updateHost(id, { role: editRole });
+			await api.updateHost(hostId, { role: editRole });
 			notify('Role saved', 'ok');
-			editingRole = false;
+			editRoleHostId = null;
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
 		}
 	}
 
-	async function saveIp() {
+	async function saveIp(hostId: string) {
 		try {
-			await api.updateHost(id, { ip_address: editIp });
+			await api.updateHost(hostId, { ip_address: editIp });
 			notify('IP saved', 'ok');
-			editingIp = false;
+			editIpHostId = null;
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
 		}
 	}
 
-	async function adopt() {
+	async function adopt(hostId: string) {
 		try {
-			await api.adoptHost(id);
+			await api.adoptHost(hostId);
 			notify('Adopted', 'ok');
 			await load();
 		} catch (e) {
@@ -57,9 +72,9 @@
 		}
 	}
 
-	async function ignore() {
+	async function ignore(hostId: string) {
 		try {
-			await api.ignoreHost(id);
+			await api.ignoreHost(hostId);
 			notify('Ignored', 'ok');
 			await load();
 		} catch (e) {
@@ -67,9 +82,9 @@
 		}
 	}
 
-	async function unignore() {
+	async function unignore(hostId: string) {
 		try {
-			await api.updateHost(id, { import_state: 'pending' });
+			await api.updateHost(hostId, { import_state: 'pending' });
 			notify('Unignored', 'ok');
 			await load();
 		} catch (e) {
@@ -77,9 +92,9 @@
 		}
 	}
 
-	async function reenrich() {
+	async function reenrich(hostId: string) {
 		try {
-			const res = await api.enrichInventory([id]);
+			const res = await api.enrichInventory([hostId]);
 			notify(`Enriched ${res.enriched}, failed ${res.failed}`, 'ok');
 			await load();
 		} catch (e) {
@@ -118,6 +133,12 @@
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load this host.</p>
+			<p class="text-xs text-slate-500">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+		</div>
 	{:else if !doc}
 		<p class="text-red-400 text-sm">Not found.</p>
 	{:else}
@@ -127,36 +148,36 @@
 					<h2 class="text-sm font-semibold text-slate-200">{h.hostname}</h2>
 					<div class="flex gap-2">
 						{#if h.source === 'discovered' && h.import_state !== 'ignored'}
-							<button class="btn btn-sm text-xs" on:click={adopt}>Adopt</button>
-							<button class="btn btn-sm text-xs" on:click={ignore}>Ignore</button>
+							<button class="btn btn-sm text-xs" on:click={() => adopt(h.id)}>Adopt</button>
+							<button class="btn btn-sm text-xs" on:click={() => ignore(h.id)}>Ignore</button>
 						{:else if h.import_state === 'ignored'}
-							<button class="btn btn-sm text-xs" on:click={unignore}>Unignore</button>
+							<button class="btn btn-sm text-xs" on:click={() => unignore(h.id)}>Unignore</button>
 						{/if}
-						<button class="btn btn-sm btn-ghost text-xs" on:click={reenrich}>Re-enrich</button>
+						<button class="btn btn-sm btn-ghost text-xs" on:click={() => reenrich(h.id)}>Re-enrich</button>
 					</div>
 				</div>
 				<dl class="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 text-xs">
 					<dt class="text-slate-500">IP</dt>
 					<dd class="text-slate-300 font-mono">
-						{#if editingIp}
+						{#if editIpHostId === h.id}
 							<input type="text" class="input text-xs w-40" bind:value={editIp} />
-							<button class="text-sky-400 text-xs" on:click={saveIp}>Save</button>
-							<button class="text-slate-400 text-xs" on:click={() => (editingIp = false)}>Cancel</button>
+							<button class="text-sky-400 text-xs" on:click={() => saveIp(h.id)}>Save</button>
+							<button class="text-slate-400 text-xs" on:click={() => (editIpHostId = null)}>Cancel</button>
 						{:else}
 							{(h.ip_address || '—') + (h.ip_source ? ` (${h.ip_source})` : '')}
-							<button class="text-slate-400 text-xs ml-1" on:click={() => { editIp = h.ip_address || ''; editingIp = true; }}>Edit</button>
+							<button class="text-slate-400 text-xs ml-1" on:click={() => startEditIp(h)}>Edit</button>
 						{/if}
 					</dd>
 					<dt class="text-slate-500">Role</dt>
 					<dd class="text-slate-300">
-						{#if editingRole}
+						{#if editRoleHostId === h.id}
 							<input type="text" class="input text-xs w-40" bind:value={editRole} />
-							<button class="text-sky-400 text-xs" on:click={saveRole}>Save</button>
-							<button class="text-slate-400 text-xs" on:click={() => (editingRole = false)}>Cancel</button>
+							<button class="text-sky-400 text-xs" on:click={() => saveRole(h.id)}>Save</button>
+							<button class="text-slate-400 text-xs" on:click={() => (editRoleHostId = null)}>Cancel</button>
 						{:else}
 							{h.role ?? '—'}
 							{#if h.role_source === 'inferred'}<span class="text-amber-400" title="Inferred">?</span>{/if}
-							<button class="text-slate-400 text-xs ml-1" on:click={() => { editRole = h.role || ''; editingRole = true; }}>Edit</button>
+							<button class="text-slate-400 text-xs ml-1" on:click={() => startEditRole(h)}>Edit</button>
 						{/if}
 					</dd>
 					<dt class="text-slate-500">Status</dt> <dd class="text-slate-300">{h.status ?? '—'}</dd>

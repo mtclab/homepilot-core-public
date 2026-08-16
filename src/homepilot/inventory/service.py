@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import socket
@@ -12,7 +13,15 @@ from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
 
+from .introspect import introspect_host
+
 logger = logging.getLogger(__name__)
+
+# ``services.managed_by`` value marking a row as OBSERVED (found by adoption-time
+# introspection), never authored intent. Observed rows are namespaced by name
+# (``observed:...``) and cleared-then-rewritten on every re-adopt so the record
+# is idempotent and can never collide with an operator-authored service.
+OBSERVED_MARKER = "observed"
 
 ROLE_PATTERNS = [
     (
@@ -95,6 +104,24 @@ def derive_status(pve_status: str, ip: str | None) -> str:
         return "offline"
     if pve_status == "running" and ip:
         return "online"
+    return "unknown"
+
+
+def node_pve_status(raw_status: str | None) -> str:
+    """Map a Proxmox ``/nodes`` node status onto the pve_status vocabulary the
+    rest of the inventory uses (``running``/``stopped``/``unknown``).
+
+    Proxmox reports node liveness as ``online``/``offline``. Only a confirmed
+    ``online`` node is recorded as ``running`` — an ``offline`` node maps to
+    ``stopped`` (so ``derive_status`` yields ``offline``) and any absent or
+    unrecognized value maps to ``unknown``. A node whose liveness is not
+    confirmed online must never be stored as running.
+    """
+    normalized = (raw_status or "").strip().lower()
+    if normalized == "online":
+        return "running"
+    if normalized == "offline":
+        return "stopped"
     return "unknown"
 
 
@@ -276,12 +303,16 @@ class InventoryService:
                     or ""
                 )
                 existing = await self.repo.get_host_by_hostname(node_name)
+                # Observe the node's real liveness from /nodes rather than
+                # assuming every node is up: an offline/unknown node must not be
+                # recorded as running.
+                node_status = node_pve_status(node_info.get("status"))
                 data = {
                     "host_type": "node",
                     "role": "node",
                     "ip_address": node_ip,
-                    "pve_status": "running",
-                    "status": derive_status("running", node_ip),
+                    "pve_status": node_status,
+                    "status": derive_status(node_status, node_ip),
                     "source": "hp_created",
                     "role_source": "user",
                     "ip_source": "pve",
@@ -295,8 +326,8 @@ class InventoryService:
                         host_type="node",
                         role="node",
                         ip_address=node_ip,
-                        pve_status="running",
-                        status=derive_status("running", node_ip),
+                        pve_status=node_status,
+                        status=derive_status(node_status, node_ip),
                         source="hp_created",
                         role_source="user",
                         ip_source="pve",
@@ -440,6 +471,78 @@ class InventoryService:
 
         if updates:
             await self.repo.update_host(host_id, **updates)
+
+    async def introspect_and_record(self, host: dict[str, Any], adapter: Any) -> dict[str, Any]:
+        """Run best-effort read-only introspection of an adopted host and record
+        the OBSERVED state (services rows + an as-found KB note).
+
+        Descriptive only: nothing recorded here is authored intent and nothing is
+        ever re-applied. Idempotent — re-adopting clears and rewrites the observed
+        rows/note rather than duplicating them. Never creates an artifact.
+        """
+        hostname = host.get("hostname") or host.get("id", "")
+        result = await introspect_host(hostname, adapter)
+        if not result.skipped:
+            await self._persist_observation(host, result)
+        return result.summary()
+
+    async def _persist_observation(self, host: dict[str, Any], result: Any) -> None:
+        host_id = host["id"]
+        hostname = host.get("hostname") or host_id
+
+        # Idempotence: drop any prior observed rows for this host before writing
+        # the fresh snapshot. Only OBSERVED rows are touched — operator-authored
+        # services are left untouched.
+        existing = await self.repo.list_services(host_id=host_id)
+        for svc in existing:
+            if svc.get("managed_by") == OBSERVED_MARKER:
+                await self.repo.delete_service(svc["id"])
+
+        # Build the observed service rows, namespaced + de-duplicated by name so
+        # the UNIQUE(host_id, name) constraint can never be violated.
+        seen: set[str] = set()
+        for port in result.listening_ports:
+            name = f"observed:listen:{port.get('local', '')}"
+            if name in seen:
+                continue
+            seen.add(name)
+            await self.repo.create_service(
+                host_id=host_id,
+                name=name,
+                runtime="socket",
+                status="unknown",
+                managed_by=OBSERVED_MARKER,
+                config=json.dumps({"observed": True, "kind": "listening_port", **port}),
+            )
+        for container in result.docker_containers:
+            name = f"observed:container:{container.get('name', '')}"
+            if name in seen:
+                continue
+            seen.add(name)
+            await self.repo.create_service(
+                host_id=host_id,
+                name=name,
+                runtime="docker",
+                version=container.get("image") or None,
+                status="unknown",
+                managed_by=OBSERVED_MARKER,
+                config=json.dumps({"observed": True, "kind": "container", **container}),
+            )
+
+        # As-found KB note. Written directly to doc_metadata (NOT via the KB
+        # artifact lifecycle) so introspection never produces an artifact. Keyed
+        # by host so re-adoption replaces the prior note instead of duplicating.
+        source = f"introspect:{host_id}"
+        prior = await self.repo.search_docs_by_source(source)
+        for doc in prior:
+            await self.repo.delete_doc_metadata(doc["id"])
+        await self.repo.create_doc_metadata(
+            source=source,
+            title=f"As-found observation: {hostname}",
+            content=result.as_found_note(),
+            kind="observed-state",
+            target=hostname,
+        )
 
     async def get_environment_doc(self, target: str) -> dict[str, Any]:
         doc: dict[str, Any] = {

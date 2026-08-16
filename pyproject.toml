@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "2.5.0"
+version = "2.6.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -19,7 +19,11 @@ dependencies = [
     "typer>=0.15",
     "rich>=13.0",
     "pyyaml>=6.0",
-    "mcp>=1.0",
+    # Bounded to the 2.x line: the code is migrated to the mcp 2.x server API
+    # (on_list_tools/on_call_tool + streamable_http_app). Keep an upper bound so a
+    # future 3.0 can't silently break a fresh build (see the build-reproducibility
+    # lesson) — bump deliberately.
+    "mcp>=2.0,<3",
     "cryptography>=44.0",
     "pyrage>=0.4",
     "jinja2>=3.1",
@@ -41,6 +45,8 @@ dev = [
     "types-PyYAML>=6.0",
     "respx>=0.22",
     "playwright>=1.40",
+    "pytest-playwright>=0.5",
+    "pytest-order>=1.2",
     "pytest-timeout>=2.3",
 ]
 

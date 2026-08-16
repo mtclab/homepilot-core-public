@@ -9,10 +9,23 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from homepilot.artifacts.router import router as artifacts_router
+from homepilot.auth.deps import require_token
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
 from homepilot.reconciler import DriftReconciler
+
+
+def _read_token() -> dict:
+    # The drift-status read routes require the 'read' scope (#376); supply a
+    # read-scoped token so these tests exercise the endpoint, not the auth wall.
+    return {
+        "user_id": "1",
+        "token_id": "1",
+        "scope": "read",
+        "role": None,
+        "display_name": "t",
+    }
 
 
 @pytest.fixture
@@ -73,6 +86,7 @@ def api_client(repo, mock_store, mock_executor):
     reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
     app.state.drift_reconciler = reconciler
 
+    app.dependency_overrides[require_token] = _read_token
     client = TestClient(app, raise_server_exceptions=True)
     return client
 
@@ -146,6 +160,7 @@ class TestGetDriftEndpointCachedRead:
         app.state.artifact_store = mock_store
         app.state.drift_reconciler = None
 
+        app.dependency_overrides[require_token] = _read_token
         client = TestClient(app, raise_server_exceptions=True)
         resp = client.get("/artifacts/drift", params={"refresh": "true"})
         assert resp.status_code == 501

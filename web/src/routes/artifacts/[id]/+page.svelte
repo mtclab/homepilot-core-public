@@ -4,6 +4,7 @@
 	import { api, type ArtifactDetail, type Task } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
+	import { onArtifactEvent } from '$lib/events';
 
 	let detail: ArtifactDetail | null = null;
 	let loading = true;
@@ -64,15 +65,17 @@
 		}
 	}
 
-	async function load() {
-		loading = true;
+	// `initial` shows the loading skeleton; a live SSE-driven refresh stays silent
+	// so the panel doesn't flicker when an event lands.
+	async function load(initial = true) {
+		if (initial) loading = true;
 		try {
 			detail = await api.getArtifact(id);
 			if (detail?.active_task) {
 				startPolling(detail.active_task.id);
 			}
 		} catch (e) {
-			notify(String(e), 'err');
+			if (initial) notify(String(e), 'err');
 		} finally {
 			loading = false;
 		}
@@ -178,7 +181,16 @@
 	}
 
 	onMount(load);
-	onDestroy(stopPolling);
+	// Refresh this artifact when an event for IT arrives (drift, or a status
+	// change made elsewhere). Other artifacts' events are ignored. The active-task
+	// poller above still drives fine-grained apply/revoke progress.
+	const unsub = onArtifactEvent((e) => {
+		if (e.data?.id === id) load(false);
+	});
+	onDestroy(() => {
+		stopPolling();
+		unsub();
+	});
 </script>
 
 <div class="space-y-5">

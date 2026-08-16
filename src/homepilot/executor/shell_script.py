@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-import secrets
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -34,12 +33,23 @@ def _validate_idempotence_preamble(body: str) -> str | None:
     return None
 
 
-def _escape_for_heredoc(script: str) -> tuple[str, str]:
-    while True:
-        marker = f"HPEOF_{secrets.token_hex(8)}"
-        if marker not in script:
-            break
-    return marker, f"cat <<'{marker}' | bash -s\n{script}\n{marker}"
+_SCRIPT_DIR = "/opt/homepilot"
+
+
+def _remote_script_path(artifact_id: str, rollback: bool) -> str:
+    """Metachar-free destination under the HP-controlled write prefix.
+
+    A piped heredoc (``cat <<EOF | bash``) is rejected by the agent allowlist's
+    shell-metacharacter filter, so a shell-script can never reach a managed host
+    that way. Instead the body is shipped as a file under ``/opt/homepilot`` and
+    run with a metachar-free ``bash <path>`` (allowlisted, privileged-only). The
+    path is stable per (artifact, mode) so a re-apply overwrites rather than
+    accumulates; concurrent applies of one artifact are already serialised by the
+    task lifecycle. The id is sanitised to the allowlist's ``[a-zA-Z0-9_./-]``.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", artifact_id) or "artifact"
+    suffix = "rollback" if rollback else "apply"
+    return f"{_SCRIPT_DIR}/hp-{safe}-{suffix}.sh"
 
 
 async def execute(
@@ -100,14 +110,31 @@ async def execute(
     log_lines: list[str] = []
     start = time.monotonic()
 
-    _marker, command = _escape_for_heredoc(script)
     label = "rollback" if rollback else "script"
-    log_lines.append(f"$ {command[:120]}...  # {label} via heredoc")
+    remote_path = _remote_script_path(str(frontmatter.get("id", "artifact")), rollback)
 
+    # Ship the body as a file under the HP write prefix, then run it with a
+    # metachar-free `bash <path>` the agent allowlist accepts (privileged-only).
+    try:
+        await ssh_adapter.write_file(host, remote_path, script)
+    except Exception as e:
+        return {
+            "success": False,
+            "execution_log": f"host write error: {e}",
+            "failure_reason": str(e),
+        }
+    log_lines.append(f"$ write {remote_path}  # {label}")
+
+    command = f"bash {remote_path}"
+    log_lines.append(f"$ {command}")
     try:
         rc, stdout, stderr = await ssh_adapter.exec(host, command, timeout=300)
     except Exception as e:
-        return {"success": False, "execution_log": f"SSH exec error: {e}", "failure_reason": str(e)}
+        return {
+            "success": False,
+            "execution_log": f"host exec error: {e}",
+            "failure_reason": str(e),
+        }
 
     log_lines.append(f"exit={rc}")
     log_lines.append(f"stdout:\n{stdout}")

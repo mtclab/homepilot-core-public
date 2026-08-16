@@ -13,7 +13,7 @@ pip install -e ".[dev]"
 pytest tests/ --ignore=tests/test_e2e.py
 ```
 
-Full check (what CI runs):
+Full check (what `make gate` runs — the local gate; this private repo has no push-triggered CI):
 
 ```bash
 ruff check src/
@@ -52,7 +52,7 @@ playwright install chromium
 
 ```bash
 export HP_TEST_URL=http://homepilot:8000
-export HP_TEST_TOKEN=hp_60709341b3d8c1b602b5d82eb5429344375debdcc3c5f83a14dfaed645c89c66
+export HP_TEST_TOKEN=hp_REDACTED_TEST_TOKEN
 export HP_TEST_ADMIN_SECRET=your-admin-secret  # required for token CRUD tests
 
 pytest tests/test_e2e.py -v
@@ -101,7 +101,7 @@ The e2e tests skip automatically when `HP_TEST_TOKEN` is not set:
 pytest tests/  # safe — e2e tests self-skip without the env var
 ```
 
-CI explicitly ignores them too (see `.github/workflows/ci.yml`).
+The local gate (`make gate`) ignores them too.
 
 ---
 

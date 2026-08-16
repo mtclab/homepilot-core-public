@@ -41,25 +41,25 @@
 ║   │  AgentAdapter          │  │    (one file per artifact)         │ ║
 ║   │  AgentHubServer        │  │                                    │ ║
 ║   └───────────┬────────────┘  │    (one file per artifact)         │ ║
-║              │               │                                    │ ║
-║   ┌──────────┼───────────┐   │  Vault — age-encrypted secrets     │ ║
-║   │          │           │   │    (Proxmox token, service creds)  │ ║
-║   ▼          ▼           ▼   └────────────────────────────────────┘ ║
-║  Proxmox   SSH Jump   Agent Hub                                      ║
-║  REST API  Server     :8443                                           ║
-║  :8006     :50051    (TCP relay)                                      ║
-║           (TCP relay  ┌──────────────────────────┐                    ║
-║            length-    │  Managed Hosts           │                    ║
-║            prefixed   │                          │                    ║
-║            JSON       │  hp-agent daemon ────────┼──► outbound TCP   ║
-║            protocol)  │  (exec, read/write file, │    to hub :8443    ║
-║                       │   heartbeat, zabbix push)│                    ║
-║                       └──────────────────────────┘                    ║
-║          ┌───▼───────────────────┐                                   ║
-║          │  Guest VMs / LXC      │                                   ║
-║          │  (SSH fallback when   │                                   ║
-║          │   no agent connected) │                                   ║
-║          └───────────────────────┘                                   ║
+║              │               │                                    │  ║
+║   ┌──────────┴──────────┐    │  Vault — age-encrypted secrets     │  ║
+║   │                     │    │    (Proxmox token, service creds)  │  ║
+║   ▼                     ▼    └────────────────────────────────────┘  ║
+║  Proxmox            Agent Hub                                        ║
+║  REST API           :8443                                            ║
+║  :8006              (TCP relay, length-prefixed JSON)                ║
+║                        ┌──────────────────────────┐                  ║
+║                        │  Managed Hosts           │                  ║
+║                        │                          │                  ║
+║                        │  hp-agent daemon ────────┼──► outbound TCP  ║
+║                        │  (exec, read/write file, │    to hub :8443  ║
+║                        │   heartbeat, zabbix push)│                  ║
+║                        └──────────────────────────┘                  ║
+║   ┌───────────────────────┐                                          ║
+║   │  Guest VMs / LXC      │                                          ║
+║   │  (SSH fallback when   │                                          ║
+║   │   no agent connected) │                                          ║
+║   └───────────────────────┘                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 

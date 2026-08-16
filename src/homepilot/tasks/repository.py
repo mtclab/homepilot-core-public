@@ -74,6 +74,26 @@ class TaskRepository:
         )
         await self.db.conn.commit()
 
+    async def cancel_task(self, task_id: str) -> dict[str, Any] | None:
+        # Cancel is only valid from a live state (pending/running → cancelled).
+        # A task in any terminal state (succeeded/failed/cancelled) is a no-op:
+        # we return its unchanged record rather than error. The status guard in
+        # the UPDATE's WHERE clause makes the transition atomic — a task that
+        # finishes between our read and our write is NOT clobbered to cancelled.
+        task = await self.get_task(task_id)
+        if task is None:
+            return None
+        if task["status"] not in ("pending", "running"):
+            return task
+        ts = _now()
+        await self.db.execute(
+            """UPDATE tasks SET status = 'cancelled', finished_at = ?
+               WHERE id = ? AND status IN ('pending', 'running')""",
+            (ts, task_id),
+        )
+        await self.db.conn.commit()
+        return await self.get_task(task_id)
+
     async def get_active_task(self, artifact_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone(
             """SELECT id, status, action FROM tasks
@@ -112,10 +132,14 @@ class TaskRepository:
         return row["cnt"] if row else 0
 
     async def fail_orphaned_tasks(self) -> int:
+        # Sweep BOTH 'running' and 'pending' (#386). A restart between task
+        # creation (status 'pending') and the first status write ('running')
+        # would otherwise strand the pending task forever, and every future
+        # apply would keep returning 202 pointing at that dead task.
         ts = _now()
         cursor = await self.db.execute(
             """UPDATE tasks SET status = 'failed', error = 'orphaned_after_restart', finished_at = ?
-               WHERE status = 'running'""",
+               WHERE status IN ('running', 'pending')""",
             (ts,),
         )
         await self.db.conn.commit()

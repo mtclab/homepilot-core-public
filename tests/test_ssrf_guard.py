@@ -42,9 +42,28 @@ class TestIsPrivateIP:
     def test_private_ipv6(self, ip_str: str) -> None:
         assert _is_private_ip(ipaddress.ip_address(ip_str))
 
-    @pytest.mark.parametrize("ip_str", ["8.8.8.8", "1.1.1.1", "203.0.113.1"])
+    @pytest.mark.parametrize("ip_str", ["8.8.8.8", "1.1.1.1", "93.184.216.34"])
     def test_public_ips_ok(self, ip_str: str) -> None:
         assert not _is_private_ip(ipaddress.ip_address(ip_str))
+
+    def test_documentation_range_blocked(self) -> None:
+        # 203.0.113.0/24 (TEST-NET-3, RFC 5737) is not a routable destination;
+        # the property-based catch-all now treats it as forbidden (#387).
+        assert _is_private_ip(ipaddress.ip_address("203.0.113.1"))
+
+    @pytest.mark.parametrize(
+        "ip_str",
+        [
+            "fe80::1",  # link-local
+            "::",  # unspecified
+            "64:ff9b::a9fe:a9fe",  # NAT64-embedded 169.254.169.254
+            "2002:a9fe:a9fe::1",  # 6to4-embedded 169.254.169.254
+        ],
+    )
+    def test_ipv6_special_ranges_blocked(self, ip_str: str) -> None:
+        # Regression for #387: these IPv6 forms bypassed the old network list
+        # (only ::1/128, fc00::/7, ff00::/8 were present).
+        assert _is_private_ip(ipaddress.ip_address(ip_str))
 
     def test_cloud_metadata_blocked(self) -> None:
         assert _is_private_ip(ipaddress.ip_address("169.254.169.254"))

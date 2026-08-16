@@ -9,6 +9,11 @@ import (
 
 const maxMessageSize = 1 << 20 // 1 MiB, matches the hub
 
+// protocolVersion is sent as "v" in the register frame so the hub can negotiate
+// features (e.g. per-agent credentials). The hub still accepts a frame without
+// "v" from older agents, so this is advisory, not a handshake gate.
+const protocolVersion = 1
+
 type msg map[string]any
 
 // encodeMessage frames a message as a 4-byte big-endian length prefix + JSON,

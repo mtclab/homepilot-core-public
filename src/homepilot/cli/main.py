@@ -85,6 +85,15 @@ def init(
             "auto-generate any that are blank. Proxmox host is left to .env."
         ),
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Reinitialize even if HomePilot is already set up. The existing .env "
+            "and master vault identity are backed up to timestamped .bak files "
+            "first, but a fresh vault passphrase orphans the OLD vault secrets."
+        ),
+    ),
 ) -> None:
     """Interactive setup: configure PVE, vault, and create ~/.hp/ structure."""
     import secrets as _secrets
@@ -95,6 +104,44 @@ def init(
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     console.print("[bold]HomePilot Init[/bold]\n")
+
+    # Re-run guard (#384): `hp init` generates a fresh vault passphrase and
+    # rewrites .env — the ONLY place the old passphrase lives. Running it a
+    # second time would orphan every existing vault secret
+    # (vault/identities/master.protected). Refuse unless --force, and even then
+    # back up the .env + master identity before overwriting so the data is
+    # recoverable.
+    env_path = data_dir / ".env"
+    master_identity_path = data_dir / "vault" / "identities" / "master.protected"
+    already_initialized = env_path.exists() or master_identity_path.exists()
+    if already_initialized and not force:
+        err_console.print(
+            f"[red]HomePilot is already initialized at {data_dir}.[/red]\n"
+            "[yellow]Your existing configuration and vault are intact — nothing "
+            "was changed.[/yellow]\n"
+            "Re-running `hp init` would generate a new vault passphrase and "
+            "overwrite .env, orphaning the current vault secrets.\n"
+            "Pass [bold]--force[/bold] to reinitialize (the old .env and master "
+            "identity are backed up first)."
+        )
+        raise typer.Exit(1)
+    if already_initialized and force:
+        import shutil
+
+        backup_ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        if env_path.exists():
+            env_backup = env_path.with_name(f".env.{backup_ts}.bak")
+            shutil.copy2(str(env_path), str(env_backup))
+            console.print(f"[dim]Backed up existing .env to {env_backup}[/dim]")
+        if master_identity_path.exists():
+            identity_backup = master_identity_path.with_name(f"master.protected.{backup_ts}.bak")
+            shutil.copy2(str(master_identity_path), str(identity_backup))
+            # The old identity is wrapped with the OLD passphrase; the fresh
+            # passphrase generated below cannot unwrap it. Remove it (the .bak
+            # preserves it) so a new identity is generated under the new
+            # passphrase instead of failing to decrypt.
+            master_identity_path.unlink()
+            console.print(f"[dim]Backed up existing master identity to {identity_backup}[/dim]")
 
     if non_interactive:
         # Headless bootstrap: secrets come from the environment (the same .env
@@ -131,7 +178,6 @@ def init(
 
     secret_key = _secrets.token_urlsafe(32)
 
-    env_path = data_dir / ".env"
     env_lines = [
         f"HP_VAULT_PASSPHRASE={passphrase}",
         f"HP_DATA_DIR={data_dir}",
@@ -1548,49 +1594,6 @@ agent_app = typer.Typer(help="Agent hub management")
 app.add_typer(agent_app, name="agent")
 
 
-@agent_app.command("bootstrap")
-def agent_bootstrap(
-    hub_host: str = typer.Option("localhost", help="Agent hub host"),
-    hub_port: int = typer.Option(8443, help="Agent hub port"),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
-) -> None:
-    """Generate a bootstrap token for agent enrollment."""
-    from homepilot.agent_hub.tokens import generate_bootstrap_token
-
-    token = generate_bootstrap_token()
-    get_settings()
-
-    if json_output:
-        console.print_json(
-            data={
-                "token": token,
-                "hub_host": hub_host,
-                "hub_port": hub_port,
-                "command": (
-                    f"HP_AGENT_HUB_HOST={hub_host} "
-                    f"HP_AGENT_HUB_PORT={hub_port} "
-                    f"HP_AGENT_AUTH_TOKEN={token} "
-                    f"hp-agent"
-                ),
-            }
-        )
-    else:
-        console.print(
-            Panel(token, title="Bootstrap Token", subtitle="One-time use, expires in 24h")
-        )
-        cmd = (
-            f"HP_AGENT_HUB_HOST={hub_host} "
-            f"HP_AGENT_HUB_PORT={hub_port} "
-            f"HP_AGENT_AUTH_TOKEN={token} "
-            f"hp-agent"
-        )
-        console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
-        console.print(
-            "\n[dim]Store the token hash in HP_AGENT_HUB_AUTH_TOKEN for hub verification.[/dim]"
-        )
-        console.print(f"[dim]Token hash: {token[:8]}...[/dim]")
-
-
 @agent_app.command("list")
 def agent_list() -> None:
     """List connected agents."""
@@ -1733,3 +1736,41 @@ def agent_zabbix_push(
     except TimeoutError:
         err_console.print("[red]Zabbix push timed out[/red]")
         raise typer.Exit(1) from None
+
+
+@agent_app.command("revoke")
+def agent_revoke(
+    agent_id: str = typer.Argument(..., help="Agent ID whose per-agent credential to revoke"),
+) -> None:
+    """Revoke an agent's per-agent credential.
+
+    A revoked credential can no longer authenticate to the hub, so the agent
+    cannot reconnect until it is re-enrolled with a fresh bootstrap/shared token.
+    """
+
+    async def _revoke() -> bool:
+        from homepilot.db.connection import Database
+        from homepilot.db.migrations import run_migrations
+        from homepilot.db.repository import Repository
+
+        settings = get_settings()
+        db_path = Path(settings.data_dir) / "homepilot.db"
+        if not db_path.exists():
+            err_console.print(f"[red]Database not found at {db_path}[/red]")
+            raise typer.Exit(1)
+        db = Database(str(db_path))
+        await db.connect()
+        try:
+            await run_migrations(db)
+            repo = Repository(db)
+            return await repo.revoke_agent_credential(agent_id)
+        finally:
+            await db.close()
+
+    revoked = asyncio.run(_revoke())
+    if revoked:
+        console.print(f"[green]Revoked per-agent credential for {agent_id}[/green]")
+        console.print("[dim]The agent must re-enroll (bootstrap/shared token) to reconnect.[/dim]")
+    else:
+        err_console.print(f"[yellow]No active credential to revoke for agent '{agent_id}'[/yellow]")
+        raise typer.Exit(1)
