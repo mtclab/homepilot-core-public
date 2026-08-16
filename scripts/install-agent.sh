@@ -97,20 +97,60 @@ fi
 
 # ─── Write the agent environment file ───
 echo "=== Configuring agent → hub $HUB_HOST:$HUB_PORT ==="
-$SUDO mkdir -p /etc/homepilot
-$SUDO tee /etc/homepilot/agent.env >/dev/null <<EOF
+# CONF_DIR is overridable so the identity+env block below can be exercised in a
+# sandbox by tests/test_install_agent_identity.py; production always uses the
+# default and the systemd unit points at that path.
+CONF_DIR="${CONF_DIR:-/etc/homepilot}"
+$SUDO mkdir -p "$CONF_DIR"
+
+# >>> agent-identity block (executed verbatim by tests/test_install_agent_identity.py)
+# The agent id must be STABLE for the lifetime of the host: the hub issues a
+# per-agent credential bound to it, so an id that changes between restarts
+# invalidates the stored token and locks the agent out (2.6.0 fleet regression).
+# Reuse an existing id (from agent.env or agent.id) so re-running the installer
+# is idempotent, and only generate one for a genuinely new host.
+new_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+    else
+        od -xN20 /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}'
+    fi
+}
+AGENT_ID=""
+if [ -f "$CONF_DIR/agent.env" ]; then
+    AGENT_ID=$($SUDO sed -n 's/^HP_AGENT_ID=//p' "$CONF_DIR/agent.env" | head -1 || true)
+fi
+if [ -z "$AGENT_ID" ] && [ -f "$CONF_DIR/agent.id" ]; then
+    AGENT_ID=$($SUDO cat "$CONF_DIR/agent.id" 2>/dev/null | tr -d '[:space:]' || true)
+fi
+if [ -z "$AGENT_ID" ]; then
+    AGENT_ID=$(new_uuid)
+    echo "Assigned agent id $AGENT_ID"
+else
+    echo "Keeping existing agent id $AGENT_ID"
+fi
+printf '%s' "$AGENT_ID" | $SUDO tee "$CONF_DIR/agent.id" >/dev/null
+$SUDO chmod 600 "$CONF_DIR/agent.id"
+
+$SUDO tee "$CONF_DIR/agent.env" >/dev/null <<EOF
 HP_AGENT_HUB_HOST=$HUB_HOST
 HP_AGENT_HUB_PORT=$HUB_PORT
 HP_AGENT_AUTH_TOKEN=$TOKEN
-HP_AGENT_TOKEN_FILE=/etc/homepilot/agent.token
+HP_AGENT_TOKEN_FILE=$CONF_DIR/agent.token
+HP_AGENT_ID=$AGENT_ID
+HP_AGENT_ID_FILE=$CONF_DIR/agent.id
 HP_AGENT_TLS=$USE_TLS
 HP_AGENT_PRIVILEGED=$PRIVILEGED
 HP_AGENT_LOG_LEVEL=INFO
 EOF
-$SUDO chmod 600 /etc/homepilot/agent.env
+$SUDO chmod 600 "$CONF_DIR/agent.env"
+# <<< end agent-identity block
 # The agent persists the durable token it's handed at enrollment to agent.token,
 # so it reconnects across hub restarts even if enrolled with a one-time bootstrap.
-$SUDO chown -R hp-agent:hp-agent /etc/homepilot 2>/dev/null || true
+# agent.id keeps the identity that token is bound to stable across restarts.
+$SUDO chown -R hp-agent:hp-agent "$CONF_DIR" 2>/dev/null || true
 
 # ─── Install the systemd unit ───
 $SUDO tee /etc/systemd/system/hp-agent.service >/dev/null <<'EOF'

@@ -934,8 +934,10 @@ class TestVerifyAuthPerAgent:
         await db.close()
 
     async def test_per_agent_token_bound_to_identity(self, repo_srv):
-        """(c) A per-agent token is rejected when presented with a different
-        agent_id or a different hostname than it was issued to.
+        """(c) A per-agent token is rejected when presented from a different
+        hostname than it was issued to — with either the right or a wrong
+        agent_id. (An id change on the SAME host is a legitimate reconnect and is
+        covered by TestCredentialRebindOnIdChange.)
 
         Revert-check: drop the hostname bind check in _verify_auth and the
         wrong-hostname case wrongly authenticates -> fails."""
@@ -948,11 +950,10 @@ class TestVerifyAuthPerAgent:
         assert ok.kind == "per-agent"
         assert ok.agent_id == "a1"
 
-        # Wrong agent_id: no credential under that id, falls through to
-        # shared/bootstrap (no match) -> rejected.
+        # Wrong agent_id AND a different hostname: nothing to match -> rejected.
         assert (
             await srv._verify_auth(
-                {"auth_token": minted, "agent_id": "attacker", "hostname": "host1"}
+                {"auth_token": minted, "agent_id": "attacker", "hostname": "evil-host"}
             )
             is None
         )
@@ -993,6 +994,145 @@ class TestVerifyAuthPerAgent:
         assert (
             await srv._verify_auth({"auth_token": minted2, "agent_id": "a1", "hostname": "host1"})
         ).kind == "per-agent"
+
+
+class TestCredentialRebindOnIdChange:
+    """A host that comes back with a DIFFERENT agent_id but the same per-agent
+    token must reconnect (and have its credential rebound) instead of failing
+    auth until the peer is banned.
+
+    This is the fleet-wide 2.6.0 regression: an agent with no HP_AGENT_ID
+    generated a new id on every start, so its persisted per-agent token no longer
+    matched any credential for the id it claimed -> permanent lockout.
+    """
+
+    @pytest.fixture
+    async def repo_srv(self, tmp_path):
+        from homepilot.db.connection import Database
+        from homepilot.db.migrations import run_migrations
+        from homepilot.db.repository import Repository
+
+        db = Database(str(tmp_path / "rebind.db"))
+        await db.connect()
+        await run_migrations(db)
+        repo = Repository(db)
+        reg = AgentRegistry(repo=repo)
+        srv = AgentHubServer(auth_token=AUTH, registry=reg)
+        yield srv, repo
+        await db.close()
+
+    async def test_same_host_new_id_authenticates_and_rebinds(self, repo_srv):
+        """(a) Same hostname, new agent_id, same token -> authenticates as
+        per-agent AND the stored credential is rebound to the new id (the hash is
+        unchanged, so the agent keeps using the token it already has).
+
+        Revert-check: remove the _rebind_by_hostname call in _verify_auth and this
+        fails (auth returns None — the exact production lockout)."""
+        srv, repo = repo_srv
+        minted = await srv._mint_agent_credential("old-id", "host1")
+        before = await repo.get_agent_credential("old-id")
+
+        res = await srv._verify_auth(
+            {"auth_token": minted, "agent_id": "new-id", "hostname": "host1"}
+        )
+        assert res is not None, "a host presenting its own credential must not be locked out"
+        assert res.kind == "per-agent"
+        assert res.agent_id == "new-id"
+
+        after = await repo.get_agent_credential("new-id")
+        assert after is not None
+        assert after["credential_hash"] == before["credential_hash"]
+        assert after["hostname"] == "host1"
+        assert after["revoked_at"] is None
+        # The retired identity keeps no usable credential.
+        old_row = await repo.get_agent_credential("old-id")
+        assert old_row is None or old_row.get("credential_hash") is None
+
+        # And the next connect under the new id is a plain per-agent match.
+        again = await srv._verify_auth(
+            {"auth_token": minted, "agent_id": "new-id", "hostname": "host1"}
+        )
+        assert again is not None and again.kind == "per-agent"
+
+    async def test_rebind_rejected_for_a_different_hostname(self, repo_srv):
+        """(b) The same token presented for a DIFFERENT hostname is still rejected
+        — the rebind proves possession of a credential issued to THAT host, it
+        does not turn a per-agent token into a fleet-wide one.
+
+        Revert-check: drop the hostname filter in
+        get_agent_credentials_by_hostname (match any host) and this fails."""
+        srv, repo = repo_srv
+        minted = await srv._mint_agent_credential("old-id", "host1")
+
+        assert (
+            await srv._verify_auth(
+                {"auth_token": minted, "agent_id": "new-id", "hostname": "other-host"}
+            )
+            is None
+        )
+        # Nothing was rebound: the credential still belongs to the original id.
+        assert (await repo.get_agent_credential("old-id"))["credential_hash"] == hash_token(minted)
+        assert await repo.get_agent_credential("new-id") is None
+
+    async def test_revoked_credential_never_rebinds(self, repo_srv):
+        """(c) A revoked credential must not be laundered back in by claiming a
+        new agent_id on the same host.
+
+        Revert-check: drop `revoked_at IS NULL` from
+        get_agent_credentials_by_hostname and this fails."""
+        srv, repo = repo_srv
+        minted = await srv._mint_agent_credential("old-id", "host1")
+        assert await repo.revoke_agent_credential("old-id") is True
+
+        assert (
+            await srv._verify_auth(
+                {"auth_token": minted, "agent_id": "new-id", "hostname": "host1"}
+            )
+            is None
+        )
+        assert await repo.get_agent_credential("new-id") is None
+        assert (await repo.get_agent_credential("old-id"))["revoked_at"] is not None
+
+    async def test_matching_id_path_unchanged_and_not_reminted(self, repo_srv, tmp_path):
+        """(d) The ordinary per-agent path (token matches the claimed id) still
+        authenticates without touching the stored credential — no rebind, no
+        re-mint, hash and set-time unchanged."""
+        srv, repo = repo_srv
+        minted = await srv._mint_agent_credential("a1", "host1")
+        before = await repo.get_agent_credential("a1")
+
+        res = await srv._verify_auth({"auth_token": minted, "agent_id": "a1", "hostname": "host1"})
+        assert res is not None and res.kind == "per-agent" and res.agent_id == "a1"
+
+        after = await repo.get_agent_credential("a1")
+        assert after["credential_hash"] == before["credential_hash"]
+        assert after["credential_set_at"] == before["credential_set_at"]
+        assert len(await repo.get_agent_credentials_by_hostname("host1")) == 1
+
+    async def test_rebind_e2e_over_the_socket(self, tmp_path):
+        """The whole journey on the shipped path: enroll, then reconnect over a
+        real socket with a NEW agent_id and the persisted token — the hub must
+        accept the register and the agent must end up connected under its new id.
+
+        Revert-check: remove the rebind lookup and the reconnect gets
+        'invalid auth_token' instead of a register_ack."""
+        async with _repo_hub(tmp_path) as (hub, repo):
+            _r1, w1, ack1 = await _register_get_ack(hub, "boot-id", "host9", AUTH)
+            minted = ack1["auth_token"]
+            w1.close()
+            await w1.wait_closed()
+            await asyncio.sleep(0.05)
+
+            # Restart with a freshly generated id (the 2.6.0 regression) but the
+            # persisted per-agent token.
+            _r2, _w2, ack2 = await _register_get_ack(hub, "restart-id", "host9", minted)
+            assert "error" not in ack2, f"reconnect was rejected: {ack2}"
+            assert ack2["action"] == "register_ack"
+            assert ack2["agent_id"] == "restart-id"
+            # Re-enrolled per-agent: no fresh mint, the credential simply moved.
+            assert "auth_token" not in ack2
+            row = await repo.get_agent_credential("restart-id")
+            assert row is not None and row["credential_hash"] == hash_token(minted)
 
 
 # --------------------------------------------------------------------------

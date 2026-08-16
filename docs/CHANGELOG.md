@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.7.1 (2026-08-16)
+
+### Fixed
+
+- **P0 regression: agents could not reconnect after 2.6.0 (#417).** The agent
+  generated a NEW random `agent_id` on every restart (`HP_AGENT_ID` unset, and the
+  installer never set it). Harmless before, but per-agent credentials (2.6.0) bind
+  a credential to the agent_id it was issued to — so after a restart the agent
+  presented its persisted per-agent token under a brand-new id, the hub found no
+  matching credential, auth was rejected, and the retry loop tripped the
+  auth-failure ban. Fleet-wide lockout on any agent restart or backend update.
+  Fixed in three layers: the agent now persists its id (`HP_AGENT_ID_FILE`,
+  default `/etc/homepilot/agent.id`) so it is stable across restarts; the agent
+  self-heals by falling back to the enrollment token if the stored credential is
+  rejected; and the hub accepts a credential presented under a changed id when it
+  matches a non-revoked credential issued to the SAME hostname, rebinding it (a
+  token presented for a different hostname, or a revoked one, is still rejected).
+  `install-agent.sh` now pins a stable id for new installs (idempotent).
+
+  **Upgrading the backend alone recovers bricked agents** — they rebind on the
+  next dial (the auth ban clears itself within a minute). Agents on the old binary
+  that had already stored a credential recover the same way; if a host's *hostname*
+  also changed, revoke its credential so it re-enrolls.
+
+
 ## v2.7.0 (2026-08-16)
 
 Manage imported hosts, end to end — plus deployment robustness.
