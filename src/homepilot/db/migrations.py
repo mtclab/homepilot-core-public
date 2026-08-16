@@ -281,6 +281,65 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         "CREATE INDEX IF NOT EXISTS idx_agents_hostname ON agents(hostname)",
         "CREATE INDEX IF NOT EXISTS idx_agents_connected ON agents(connected)",
     ],
+    12: [
+        # Per-agent credentials (#362 slice 2): each agent is issued a unique
+        # durable token whose sha256 hash is stored here (never the raw token),
+        # bound to its agent_id. Replaces the shared fleet token as the
+        # steady-state per-connection credential. `revoked_at` fails a
+        # credential so a compromised/retired agent cannot reconnect until it is
+        # re-enrolled with a bootstrap/shared token.
+        ("ALTER TABLE agents ADD COLUMN credential_hash TEXT", "agents", "credential_hash"),
+        ("ALTER TABLE agents ADD COLUMN credential_set_at TEXT", "agents", "credential_set_at"),
+        ("ALTER TABLE agents ADD COLUMN revoked_at TEXT", "agents", "revoked_at"),
+    ],
+    13: [
+        # Durable, attributable agent-hub audit trail (#381). The agent hub is a
+        # fleet-root command channel; its audit must survive a backend restart and
+        # record WHO issued each command/lifecycle event — the in-memory deque in
+        # AuditLog evaporated on restart and carried no caller attribution.
+        """CREATE TABLE IF NOT EXISTS agent_audit (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts         TEXT,
+            agent_id   TEXT,
+            hostname   TEXT,
+            action     TEXT,
+            target     TEXT,
+            result     TEXT,
+            exit_code  INTEGER,
+            caller     TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_agent_audit_ts ON agent_audit(ts)",
+    ],
+    14: [
+        # Task cancellation (#376): widen the tasks.status CHECK to admit
+        # 'cancelled'. SQLite can't ALTER a CHECK constraint, so rebuild the
+        # table (rename → recreate → copy → drop). Indexes ride the rename onto
+        # the old table and are dropped with it, so recreate them AFTER the drop
+        # (a CREATE INDEX IF NOT EXISTS while the old-named index still exists
+        # would be a silent no-op and leave the new table unindexed).
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT NOT NULL, "
+            "action TEXT NOT NULL CHECK(action IN ('apply', 'revoke', 'replay')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    ],
 }
 
 

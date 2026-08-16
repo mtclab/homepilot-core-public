@@ -24,9 +24,13 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("198.18.0.0/15"),
     ipaddress.ip_network("224.0.0.0/4"),
     ipaddress.ip_network("240.0.0.0/4"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("ff00::/8"),
+    ipaddress.ip_network("::/128"),  # IPv6 unspecified
+    ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique-local
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+    ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 (embeds IPv4, incl. metadata)
+    ipaddress.ip_network("2002::/16"),  # 6to4 (embeds IPv4, incl. metadata)
 ]
 
 _CLOUD_METADATA_IP = ipaddress.ip_address("169.254.169.254")
@@ -53,6 +57,16 @@ def _is_private_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     if addr == _CLOUD_METADATA_IP:
+        return True
+    # Property-based catch-all — covers IPv6 forms the explicit network list may
+    # miss (link-local fe80::, unspecified ::, reserved ranges, etc.).
+    if (
+        addr.is_private
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_loopback
+        or addr.is_unspecified
+    ):
         return True
     return any(addr in net for net in _PRIVATE_NETWORKS)
 

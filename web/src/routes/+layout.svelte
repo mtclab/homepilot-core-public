@@ -1,11 +1,12 @@
 <script lang="ts">
 	import '../app.css';
-	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { onMount, onDestroy } from 'svelte';
+	import { goto, afterNavigate } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { base } from '$app/paths';
 	import { toast } from '$lib/stores';
-	import { hasCookieSession, api, sessionStore, refreshSession, type MeInfo } from '$lib/api';
+	import { hasCookieSession, api, sessionStore, refreshSession, setToken } from '$lib/api';
+	import { startEventStream, stopEventStream } from '$lib/events';
 
 	const nav = [
 		{ href: '/',          label: 'Overview' },
@@ -16,6 +17,7 @@
 		{ href: '/agents',    label: 'Agents' },
 		{ href: '/tokens',    label: 'Tokens' },
 		{ href: '/drift',     label: 'Drift' },
+		{ href: '/tasks',     label: 'Tasks' },
 		{ href: '/journal',   label: 'Journal' },
 		{ href: '/settings',  label: 'Settings' },
 	];
@@ -24,23 +26,44 @@
 
 	$: isLoginRoute = $page.url.pathname === base + '/login';
 
-	let me: MeInfo | null = null;
+	// Derive the sidebar session straight from the reactive store so it tracks
+	// login/logout without a full remount (the layout persists across the
+	// login → app navigation, so a mount-only read went permanently stale).
+	$: me = $sessionStore;
 	let sessionLoading = true;
 
-	onMount(async () => {
+	async function syncSession() {
 		if (!hasCookieSession() && !isLoginRoute) {
 			const returnTo = encodeURIComponent($page.url.pathname + $page.url.search);
 			goto(`${base}/login?returnTo=${returnTo}`, { replaceState: true });
 			return;
 		}
-		me = await refreshSession();
+		const me = await refreshSession();
 		sessionLoading = false;
+		// Open the shared SSE stream once a session exists so live artifact/drift
+		// updates flow to every page. Idempotent — safe to call on each re-sync.
+		if (me) startEventStream();
+	}
+
+	onMount(syncSession);
+	onDestroy(stopEventStream);
+	// Re-check after client-side navigations (e.g. login → app) so the session
+	// panel updates. Skip the initial 'enter' — onMount already covers it.
+	afterNavigate((nav) => {
+		if (nav.type === 'enter') return;
+		syncSession();
 	});
 
 	async function handleLogout() {
-		try { await api.logout(); } catch { /* ignore */ }
+		if (typeof window !== 'undefined' && !window.confirm('Log out of this browser session?')) return;
+		// Cookie-only sign-out: clears the session cookie server-side but does NOT
+		// revoke the API token, so the same token still works for CLI/MCP and for
+		// logging back in. Clear local state and return to the login screen.
+		try { await api.logout(); } catch { /* ignore network errors */ }
+		stopEventStream();
+		setToken('');
 		sessionStore.set(null);
-		me = null;
+		sessionLoading = false;
 		goto(`${base}/login`);
 	}
 
@@ -79,7 +102,7 @@
 			{#if me}
 				<div class="flex items-center gap-2 mb-1">
 					<span class="w-2 h-2 rounded-full bg-emerald-400 inline-block"></span>
-					<span class="text-xs text-slate-300 font-mono truncate">{me.token_label || me.prefix}</span>
+					<span class="text-xs text-slate-300 font-mono truncate">{me.token_label || me.prefix || 'session'}</span>
 				</div>
 				{#if me.scope || me.role}
 					<span class="text-[10px] font-mono {scopeBadge(me.scope ?? me.role)}">

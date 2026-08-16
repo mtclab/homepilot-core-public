@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json as _json
+import logging
 import sqlite3
 from typing import Any
 
@@ -9,10 +11,58 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 
+from ..adapters.agent import AgentAdapter
 from ..auth.deps import require_scope
 from .service import InventoryService
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Cap on how long adoption-time introspection may block the adopt response. It is
+# awaited so the caller gets an immediate summary, but a slow/hung host must
+# never make adopt itself slow or fail — the whole run is best-effort.
+_INTROSPECT_TIMEOUT = 12.0
+
+
+def _resolve_agent_adapter(request: Request) -> AgentAdapter | None:
+    """Build a read-only agent adapter from app state, or None if the agent hub
+    is not enabled. Mirrors how the agent-hub endpoints construct their adapter."""
+    hub = getattr(request.app.state, "agent_hub", None)
+    if hub is None:
+        return None
+    pve_nodes: list[str] = []
+    lifecycle = getattr(request.app.state, "artifact_lifecycle", None)
+    if lifecycle is not None and hasattr(lifecycle, "_pve_nodes_list"):
+        pve_nodes = lifecycle._pve_nodes_list or []
+    return AgentAdapter(hub_server=hub, pve_nodes=pve_nodes)
+
+
+async def _introspect_on_adopt(
+    request: Request, svc: InventoryService, host: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Best-effort adoption-time introspection. Never raises and never fails the
+    adopt: any error/timeout/absent-agent is caught and logged, returning None."""
+    try:
+        adapter = _resolve_agent_adapter(request)
+        return await asyncio.wait_for(
+            svc.introspect_and_record(host, adapter),
+            timeout=_INTROSPECT_TIMEOUT,
+        )
+    except Exception:
+        logger.warning(
+            "Adoption introspection failed for host %s (adopt still succeeds)",
+            host.get("id"),
+            exc_info=True,
+        )
+        return None
+
+
+# Canonical import_state values, matching the DB CHECK constraint on
+# hosts.import_state (migration 10: IN ('pending','adopted','ignored')).
+# "discovered" is a hosts.source value, not an import_state, so it is not
+# accepted here — allowing it would pass validation but fail the DB CHECK.
+_VALID_IMPORT_STATES = frozenset({"pending", "adopted", "ignored"})
 
 
 class HostPatchRequest(BaseModel):
@@ -21,6 +71,8 @@ class HostPatchRequest(BaseModel):
     role: str | None = None
     ip_address: str | None = None
     description: str | None = None
+    import_state: str | None = None
+    status: str | None = None
 
     @field_validator("tags")
     @classmethod
@@ -30,6 +82,16 @@ class HostPatchRequest(BaseModel):
         if isinstance(v, str):
             return v
         return _json.dumps(v)
+
+    @field_validator("import_state")
+    @classmethod
+    def validate_import_state(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _VALID_IMPORT_STATES:
+            allowed = ", ".join(sorted(_VALID_IMPORT_STATES))
+            raise ValueError(f"import_state must be one of: {allowed}")
+        return v
 
 
 def _get_service(request: Request) -> InventoryService:
@@ -42,7 +104,7 @@ class BulkRequest(BaseModel):
     host_ids: list[str]
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(require_scope("read"))])
 async def list_inventory(
     request: Request,
     role: str | None = Query(None),
@@ -61,13 +123,14 @@ async def list_inventory(
         source=source,
         import_state=import_state,
         pve_status=pve_status,
+        status=status,
         limit=limit,
         offset=offset,
     )
     return {"items": hosts, "total": len(hosts)}
 
 
-@router.get("/{host_id}")
+@router.get("/{host_id}", dependencies=[Depends(require_scope("read"))])
 async def get_host(request: Request, host_id: str) -> dict[str, Any]:
     repo = request.app.state.repo
     host = await repo.get_host(host_id)
@@ -90,7 +153,7 @@ async def refresh_inventory(request: Request) -> Any:
     return result
 
 
-@router.get("/{host_id}/doc")
+@router.get("/{host_id}/doc", dependencies=[Depends(require_scope("read"))])
 async def get_host_doc(request: Request, host_id: str) -> dict[str, Any]:
     repo = request.app.state.repo
     host = await repo.get_host(host_id)
@@ -121,6 +184,10 @@ async def update_host(request: Request, host_id: str, body: HostPatchRequest) ->
         updates["ip_source"] = "user"
     if body.description is not None:
         updates["description"] = body.description
+    if body.import_state is not None:
+        updates["import_state"] = body.import_state
+    if body.status is not None:
+        updates["status"] = body.status
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     await repo.update_host(host_id, **updates)
@@ -154,7 +221,11 @@ async def adopt_host(request: Request, host_id: str) -> dict[str, Any]:
     }
     await repo.update_host(host_id, **updates)
     updated = await repo.get_host(host_id)
-    return dict(updated)
+    result = dict(updated)
+    summary = await _introspect_on_adopt(request, _get_service(request), result)
+    if summary is not None:
+        result["introspection"] = summary
+    return result
 
 
 @router.post("/{host_id}/ignore", dependencies=[Depends(require_scope("write"))])
@@ -187,6 +258,8 @@ async def bulk_inventory(request: Request, body: BulkRequest) -> dict[str, Any]:
                     source="imported",
                     import_state="adopted",
                 )
+                # Best-effort observed-state capture; never affects adopt success.
+                await _introspect_on_adopt(request, svc, dict(host))
             elif body.action == "ignore":
                 await repo.update_host(host_id, import_state="ignored")
             elif body.action == "enrich":

@@ -47,18 +47,19 @@ var privilegedCommands = map[string]*regexp.Regexp{
 	"chmod": regexp.MustCompile(`^chmod\s+[0-7]{3,4}\s+[a-zA-Z0-9_./-]+$`),
 	"cp":    regexp.MustCompile(`^cp\s+[a-zA-Z0-9_./-]+\s+[a-zA-Z0-9_./-]+$`),
 	"mv":    regexp.MustCompile(`^mv\s+[a-zA-Z0-9_./-]+\s+[a-zA-Z0-9_./-]+$`),
+	// Run a script HomePilot itself wrote under its own /opt/homepilot prefix.
+	// Privileged-only and path-locked: a shell-script artifact is arbitrary code
+	// by definition, so it requires privileged mode (like apt/systemctl) and may
+	// only execute a .sh under the HP-controlled write prefix — never an
+	// arbitrary path. The metachar filter still applies, so no chaining.
+	// No '.' in the mid-path class so `..` traversal (e.g.
+	// /opt/homepilot/../etc/x.sh) cannot match; only the final `.sh` has a dot.
+	"bash": regexp.MustCompile(`^bash\s+/opt/homepilot/[a-zA-Z0-9_/-]+\.sh$`),
 }
 
 var catAllowedPrefixes = []string{
 	"/var/log/", "/etc/homepilot/", "/etc/hostname", "/etc/os-release",
 	"/etc/resolv.conf", "/etc/hosts", "/etc/systemd/", "/opt/",
-}
-
-var allowedSudoCommands = []string{
-	"systemctl start", "systemctl stop", "systemctl restart",
-	"systemctl enable", "systemctl disable",
-	"apt-get install", "apt-get update", "apt install", "apt update",
-	"docker pull", "docker run", "docker compose", "docker stop", "docker rm",
 }
 
 type Allowlist struct{ privileged bool }
@@ -71,6 +72,35 @@ func firstField(s string) string {
 	return f[0]
 }
 
+// sudoArgTaking are sudo options that consume the following token as their
+// value (so it must be skipped when finding the wrapped command).
+var sudoArgTaking = map[string]bool{
+	"-u": true, "-g": true, "-p": true, "-U": true, "-C": true,
+	"-h": true, "-r": true, "-t": true, "-R": true, "-T": true,
+	"--user": true, "--group": true, "--prompt": true, "--host": true,
+}
+
+// stripSudo removes a leading "sudo" token and any leading sudo options
+// (flags and their arguments) and returns the wrapped command. E.g.
+// "sudo -n -u root systemctl restart nginx" -> "systemctl restart nginx".
+func stripSudo(actual string) string {
+	fields := strings.Fields(actual)
+	i := 1 // fields[0] == "sudo"
+	for i < len(fields) {
+		tok := fields[i]
+		if !strings.HasPrefix(tok, "-") {
+			break
+		}
+		i++
+		// "-u root" style options consume the next token as their value,
+		// but only when the value is not glued on with "=" (e.g. "-u=root").
+		if sudoArgTaking[tok] && i < len(fields) {
+			i++
+		}
+	}
+	return strings.Join(fields[i:], " ")
+}
+
 // IsAllowed mirrors CommandAllowlist.is_allowed → (allowed, reason).
 func (a Allowlist) IsAllowed(command string) (bool, string) {
 	stripped := strings.TrimSpace(command)
@@ -81,24 +111,30 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 		return false, "shell metacharacters forbidden: " + command
 	}
 
-	usesSudo := strings.HasPrefix(stripped, "sudo ")
-	actual := stripped
-	if usesSudo {
-		actual = strings.TrimSpace(stripped[5:])
-	}
+	usesSudo := stripped == "sudo" || strings.HasPrefix(stripped, "sudo ")
 
 	if usesSudo {
 		if !a.privileged {
 			return false, "sudo requires privileged mode: " + command
 		}
-		for _, p := range allowedSudoCommands {
-			if strings.HasPrefix(actual, p) {
-				return true, ""
-			}
+		// Re-run the FULL allowlist against the wrapped command so the sudo
+		// path enforces every check (metachars + per-command arg regexes) the
+		// non-sudo path enforces. Prevents e.g. `sudo docker run --volume /:/mnt`
+		// from bypassing the docker/apt argument constraints (#381).
+		inner := stripSudo(stripped)
+		if inner == "" {
+			return false, "sudo requires a command: " + command
 		}
-		return false, "sudo command not in allowlist: " + actual
+		if inner == "sudo" || strings.HasPrefix(inner, "sudo ") {
+			return false, "nested sudo forbidden: " + command
+		}
+		if ok, reason := a.IsAllowed(inner); !ok {
+			return false, "sudo: " + reason
+		}
+		return true, ""
 	}
 
+	actual := stripped
 	base := firstField(actual)
 
 	if a.privileged {

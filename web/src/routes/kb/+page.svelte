@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api, type KBEntry, sessionStore } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 
 	let query = '';
 	let filterKind = '';
@@ -26,8 +27,11 @@
 
 	let deleteConfirmId: number | null = null;
 
-	$: isAdmin = $sessionStore?.scope === '*' || $sessionStore?.scope === 'admin' || $sessionStore?.scope === 'full' || $sessionStore?.role === 'admin';
-	$: canWrite = isAdmin || $sessionStore?.scope === 'write' || $sessionStore?.scope === '*' || $sessionStore?.scope === 'full';
+	// Gate write/admin controls off the server's normalized capability list, not
+	// the raw scope string (a plain `read,write` token was wrongly read-only).
+	$: capabilities = $sessionStore?.capabilities;
+	$: isAdmin = capIsAdmin(capabilities);
+	$: canWrite = capCanWrite(capabilities);
 
 	async function search() {
 		loading = true;
@@ -119,6 +123,14 @@
 		} catch (e) {
 			notify(String(e), 'err');
 		}
+	}
+
+	$: hasActiveFilters = query.trim() !== '' || filterKind !== '';
+
+	function clearFilters() {
+		query = '';
+		filterKind = '';
+		search();
 	}
 
 	function kindColor(kind: string): string {
@@ -245,8 +257,18 @@
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if items.length === 0 && searched && hasActiveFilters}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-slate-400 text-sm">No entries match the current search / filter.</p>
+			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
+		</div>
 	{:else if items.length === 0 && searched}
-		<p class="text-slate-500 text-sm">No entries found.</p>
+		<div class="card p-6 text-center space-y-1">
+			<p class="text-slate-400 text-sm">No knowledge base entries yet.</p>
+			{#if canWrite}
+				<p class="text-xs text-slate-500">Create the first one with “+ New Note”.</p>
+			{/if}
+		</div>
 	{:else}
 		<div class="space-y-2">
 			{#each items as entry}

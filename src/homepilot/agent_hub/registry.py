@@ -7,11 +7,20 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .audit import AuditLog
+from .replay import ReplaySession
 
 if TYPE_CHECKING:
     from .server import AgentHubServer
 
 logger = logging.getLogger(__name__)
+
+
+def _conn_is_live(writer: asyncio.StreamWriter | None) -> bool:
+    """True when a stored connection is still usable.
+
+    A ``None`` writer (persisted/last-known entry, or a test registration) is not
+    a live connection. ``is_closing()`` catches sockets that have begun teardown."""
+    return writer is not None and not writer.is_closing()
 
 
 @dataclass
@@ -23,6 +32,14 @@ class ConnectedAgent:
     connected_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_heartbeat: datetime = field(default_factory=lambda: datetime.now(UTC))
     writer: asyncio.StreamWriter | None = None
+    # Per-connection identity: a fresh id is minted for every accepted socket so
+    # teardown of a stale/half-open connection can be told apart from the live
+    # one that replaced it (compare-and-delete on unregister).
+    conn_id: str | None = None
+    # Per-connection replay session, set only when the connection negotiated
+    # app-layer replay protection (#362 slice 3). Command dispatch reads it to
+    # stamp outbound frames with a seq+MAC; None on unprotected connections.
+    replay: ReplaySession | None = None
     _result_futures: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
 
 
@@ -31,7 +48,9 @@ class AgentRegistry:
         self._agents: dict[str, ConnectedAgent] = {}
         self._hostname_index: dict[str, str] = {}
         self.hub_server: AgentHubServer | None = None
-        self.audit_log: AuditLog = AuditLog()
+        # Share the persistence repo with the audit log so the fleet-root command
+        # trail is durable + attributable (#381), not just an in-memory deque.
+        self.audit_log: AuditLog = AuditLog(repo=repo)
         # Optional Repository for persistence so agents survive a backend restart
         # (Agents view + coverage show last-known agents instead of flapping to
         # empty). Best-effort: never blocks or fails the hub.
@@ -60,12 +79,62 @@ class AgentRegistry:
         hostname: str,
         system_info: dict[str, Any] | None = None,
         writer: asyncio.StreamWriter | None = None,
-    ) -> None:
+        conn_id: str | None = None,
+    ) -> bool:
+        """Register (or replace) an agent connection.
+
+        Returns ``False`` and leaves the existing registration untouched when the
+        registration would hijack another LIVE agent's identity:
+
+        * the claimed ``hostname`` already maps to a *different* live agent, or
+        * the ``agent_id`` is live on a different host (a stolen id replayed
+          from elsewhere).
+
+        A re-register with the same ``agent_id`` from the same ``hostname`` is a
+        legitimate reconnect and replaces the prior (now stale) entry."""
+        holder_id = self._hostname_index.get(hostname)
+        if holder_id is not None and holder_id != agent_id:
+            holder = self._agents.get(holder_id)
+            if holder is not None and _conn_is_live(holder.writer):
+                logger.warning(
+                    "register rejected: hostname %s held by live agent %s, refusing "
+                    "claim from agent %s",
+                    hostname,
+                    holder_id,
+                    agent_id,
+                )
+                return False
+
+        existing = self._agents.get(agent_id)
+        if (
+            existing is not None
+            and existing.hostname != hostname
+            and _conn_is_live(existing.writer)
+        ):
+            logger.warning(
+                "register rejected: agent_id %s live on host %s, refusing claim from host %s",
+                agent_id,
+                existing.hostname,
+                hostname,
+            )
+            return False
+
+        # A reconnect replaces a prior entry for the same agent_id; make sure a
+        # now-orphaned hostname index entry from that prior registration is not
+        # left dangling if the hostname changed.
+        if (
+            existing is not None
+            and existing.hostname != hostname
+            and self._hostname_index.get(existing.hostname) == agent_id
+        ):
+            self._hostname_index.pop(existing.hostname, None)
+
         agent = ConnectedAgent(
             agent_id=agent_id,
             hostname=hostname,
             system_info=system_info or {},
             writer=writer,
+            conn_id=conn_id,
         )
         self._agents[agent_id] = agent
         self._hostname_index[hostname] = agent_id
@@ -74,8 +143,25 @@ class AgentRegistry:
             self._persist(
                 self._repo.upsert_agent(agent_id, hostname, system_info or {}, {}, connected=True)
             )
+        return True
 
-    def unregister(self, agent_id: str) -> None:
+    def unregister(self, agent_id: str, conn_id: str | None = None) -> None:
+        """Remove an agent, but only if the caller owns the current connection.
+
+        Compare-and-delete: when ``conn_id`` is supplied it must match the id
+        stored on the current registration. A stale/half-open socket closing must
+        not evict an agent that has already reconnected under a new connection."""
+        current = self._agents.get(agent_id)
+        if current is None:
+            return
+        if conn_id is not None and current.conn_id is not None and current.conn_id != conn_id:
+            logger.info(
+                "unregister skipped for %s: stale connection %s (current %s)",
+                agent_id,
+                conn_id,
+                current.conn_id,
+            )
+            return
         agent = self._agents.pop(agent_id, None)
         if agent:
             # Only clear the hostname index if it still points at THIS agent —

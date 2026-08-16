@@ -24,6 +24,16 @@ type Agent struct {
 
 	conn    net.Conn
 	writeMu sync.Mutex
+
+	// Replay-protection state (#362 slice 3). hasPerAgent is durable across the
+	// process (set once a per-agent token is held/adopted); the rest are
+	// per-connection and reset in register(). When replayOn is set, every frame
+	// in both directions carries a monotonic seq + HMAC keyed by replayKey.
+	hasPerAgent  bool
+	replayOn     bool
+	replayKey    []byte
+	sendSeq      uint64
+	recvExpected uint64
 }
 
 func newUUID() string {
@@ -35,14 +45,41 @@ func newUUID() string {
 }
 
 func (a *Agent) send(m msg) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	// On a replay-protected connection, stamp a monotonic seq + MAC under the
+	// write lock so the on-wire order matches the assigned sequence.
+	if a.replayOn {
+		a.sendSeq++
+		m["seq"] = a.sendSeq
+		mac, err := computeMAC(a.replayKey, m)
+		if err != nil {
+			return err
+		}
+		m["mac"] = mac
+	}
 	b, err := encodeMessage(m)
 	if err != nil {
 		return err
 	}
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
 	_, err = a.conn.Write(b)
 	return err
+}
+
+// verifyInbound checks a frame's seq + MAC on a replay-protected connection and
+// advances the expected sequence on success. Any failure is returned so the
+// caller closes the connection (fail-closed).
+func (a *Agent) verifyInbound(m msg) error {
+	seqf, ok := m["seq"].(float64)
+	if !ok || uint64(seqf) != a.recvExpected {
+		return fmt.Errorf("replay: bad seq (expected %d, got %v)", a.recvExpected, m["seq"])
+	}
+	mac, ok := m["mac"].(string)
+	if !ok || !verifyMAC(a.replayKey, m, mac) {
+		return fmt.Errorf("replay: bad mac")
+	}
+	a.recvExpected++
+	return nil
 }
 
 func (a *Agent) connect() error {
@@ -68,6 +105,10 @@ func (a *Agent) connect() error {
 }
 
 func (a *Agent) register() error {
+	// This connection's register frame is never seq/MAC framed (freshness is
+	// carried by nonce+ts instead); framing starts only after a successful ack.
+	a.replayOn = false
+
 	m := msg{
 		"action":      "register",
 		"agent_id":    a.agentID,
@@ -75,7 +116,23 @@ func (a *Agent) register() error {
 		"system_info": collectSystemInfo(),
 		"auth_token":  a.cfg.AuthToken,
 		"request_id":  newUUID(),
+		"v":           protocolVersion,
 	}
+	// Negotiate replay protection when we hold a per-agent token (a durable
+	// shared secret usable as the MAC key). The register frame gains a fresh
+	// nonce + timestamp so it cannot itself be replayed.
+	negotiateReplay := a.hasPerAgent
+	if negotiateReplay {
+		nonce, err := newNonceHex()
+		if err != nil {
+			return err
+		}
+		m["replay"] = 1
+		m["nonce"] = nonce
+		m["ts"] = time.Now().Unix()
+		a.replayKey = []byte(a.cfg.AuthToken)
+	}
+
 	if err := a.send(m); err != nil {
 		return err
 	}
@@ -92,9 +149,11 @@ func (a *Agent) register() error {
 	}
 	// Durable-credential handback: if the hub returns a durable token (we may
 	// have enrolled with a one-time bootstrap token), adopt + persist it so we
-	// reconnect across hub restarts without manual re-enrollment.
+	// reconnect across hub restarts without manual re-enrollment. Holding a
+	// per-agent token means the NEXT connection can negotiate replay protection.
 	if dt := str(resp, "auth_token"); dt != "" && dt != a.cfg.AuthToken {
 		a.cfg.AuthToken = dt
+		a.hasPerAgent = true
 		if a.cfg.AuthTokenFile != "" {
 			if err := os.WriteFile(a.cfg.AuthTokenFile, []byte(dt), 0o600); err != nil {
 				log.Printf("warning: could not persist durable token to %s: %v", a.cfg.AuthTokenFile, err)
@@ -103,8 +162,30 @@ func (a *Agent) register() error {
 			}
 		}
 	}
+	// Enable per-frame framing for this connection only when we asked for it AND
+	// the hub advertises the replay-v1 feature (so an older hub stays compatible).
+	if negotiateReplay && featuresContain(resp, "replay-v1") {
+		a.sendSeq = 0
+		a.recvExpected = 1
+		a.replayOn = true
+		log.Printf("replay protection enabled for this connection")
+	}
 	log.Printf("registered as agent %s", a.agentID)
 	return nil
+}
+
+// featuresContain reports whether a register_ack advertises the named feature.
+func featuresContain(resp msg, want string) bool {
+	feats, ok := resp["features"].([]any)
+	if !ok {
+		return false
+	}
+	for _, f := range feats {
+		if s, ok := f.(string); ok && s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func hostnameOrUnknown() string {
@@ -198,6 +279,13 @@ func (a *Agent) serve() error {
 		if err != nil {
 			return err
 		}
+		// Fail-closed replay check on every inbound frame (heartbeat_ack and other
+		// acks included) before acting on it.
+		if a.replayOn {
+			if err := a.verifyInbound(m); err != nil {
+				return err
+			}
+		}
 		reqID := str(m, "request_id")
 		switch str(m, "action") {
 		case "exec":
@@ -276,9 +364,10 @@ func main() {
 	log.SetPrefix("[hp-agent] ")
 	cfg := ConfigFromEnv()
 	agent := &Agent{
-		cfg:     cfg,
-		exec:    Executor{allow: Allowlist{privileged: cfg.Privileged}},
-		agentID: cfg.AgentID,
+		cfg:         cfg,
+		exec:        Executor{allow: Allowlist{privileged: cfg.Privileged}},
+		agentID:     cfg.AgentID,
+		hasPerAgent: cfg.HasPersistedToken,
 	}
 	if agent.agentID == "" {
 		agent.agentID = newUUID()

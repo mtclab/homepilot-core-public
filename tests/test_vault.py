@@ -126,3 +126,42 @@ class TestEncryptionRoundTrip:
         await vm.rotate_passphrase("new-passphrase")
         result = await vm.get_secret("cred")
         assert result == {"token": "abc"}
+
+
+class TestWrappingKeyCaching:
+    """#387: PBKDF2 (600k iters, ~234ms) must not re-run on every get_secret."""
+
+    async def test_repeated_get_secret_derives_key_once(self, tmp_path):
+        # Seed a vault, then load it in a FRESH manager (cold cache, mimicking a
+        # new process) and read two secrets.
+        seed = VaultManager(tmp_path, "cache-pass")
+        await seed.store_secret("one", {"v": 1})
+        await seed.store_secret("two", {"v": 2})
+
+        vm = VaultManager(tmp_path, "cache-pass")
+        calls = 0
+        real_derive = vm._derive_wrapping_key
+
+        def _counting_derive(salt: bytes) -> bytes:
+            nonlocal calls
+            calls += 1
+            return real_derive(salt)
+
+        vm._derive_wrapping_key = _counting_derive  # type: ignore[method-assign]
+
+        assert (await vm.get_secret("one")) == {"v": 1}
+        assert (await vm.get_secret("two")) == {"v": 2}
+
+        # Without caching this would be 2 (once per decrypt); with caching the
+        # master identity is unwrapped exactly once.
+        assert calls == 1
+
+    async def test_wrong_passphrase_still_fails(self, tmp_path):
+        seed = VaultManager(tmp_path, "right-pass")
+        await seed.store_secret("cred", {"token": "abc"})
+
+        vm = VaultManager(tmp_path, "wrong-pass")
+        with pytest.raises(VaultError):
+            await vm.get_secret("cred")
+        # A cold cache must not have been poisoned by the failed attempt.
+        assert vm._master_identity_data is None

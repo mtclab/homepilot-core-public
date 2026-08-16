@@ -576,6 +576,79 @@ class TestDriftReconcilerCheckSingle:
         assert rows[0]["artifact_id"] == "art-1"
 
 
+class TestDriftEventEmission:
+    """Drift must be actionable: a detected drift emits exactly one
+    artifact_drifted event (SSE + webhook fan-out); an in-spec artifact emits
+    none."""
+
+    def _proxmox_drift_fm_body(self):
+        fm = _make_artifact_fm(
+            artifact_id="art-drift", kind="proxmox-api-sequence", status="applied"
+        )
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: step1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/lxc/100/config\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /nodes/pve1/lxc/100/config\n"
+            "      skip_if: \"response['status'] == 'running'\"\n"
+            "```\n"
+        )
+        return fm, body
+
+    async def test_detected_drift_emits_one_event(self, repo, mock_store, mock_executor):
+        fm, body = self._proxmox_drift_fm_body()
+        mock_store.read.return_value = (fm, body)
+        # precheck returns 'stopped' != 'running' → drift
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "stopped", "data": {}})
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor)
+        with patch("homepilot.reconciler.drift.emit_event", new_callable=AsyncMock) as mock_emit:
+            result = await reconciler.check_single("art-drift")
+
+        assert result.drifted is True
+        assert mock_emit.await_count == 1
+        (event_type, payload), _kwargs = mock_emit.await_args
+        assert event_type == "artifact_drifted"
+        assert payload["id"] == "art-drift"
+        assert payload["drifted"] is True
+        assert "drift_summary" in payload
+
+    async def test_no_drift_emits_no_event(self, repo, mock_store, mock_executor):
+        fm, body = self._proxmox_drift_fm_body()
+        mock_store.read.return_value = (fm, body)
+        # precheck returns 'running' == 'running' → no drift
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "running", "data": {}})
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor)
+        with patch("homepilot.reconciler.drift.emit_event", new_callable=AsyncMock) as mock_emit:
+            result = await reconciler.check_single("art-drift")
+
+        assert result.drifted is False
+        assert mock_emit.await_count == 0
+
+    async def test_emit_failure_does_not_break_cycle(self, repo, mock_store, mock_executor):
+        # Emission is best-effort: a failing emit must not fail the drift check.
+        fm, body = self._proxmox_drift_fm_body()
+        mock_store.read.return_value = (fm, body)
+        mock_executor.proxmox.call = AsyncMock(return_value={"status": "stopped", "data": {}})
+
+        reconciler = DriftReconciler(mock_store, repo, executor=mock_executor)
+        with patch(
+            "homepilot.reconciler.drift.emit_event",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("bus down"),
+        ):
+            result = await reconciler.check_single("art-drift")
+
+        assert result.drifted is True
+        row = await repo.get_drift_check("art-drift")
+        assert row["drifted"] == 1
+
+
 class TestRepositoryDriftMethods:
     async def test_upsert_drift_check_insert(self, repo):
         await repo.upsert_drift_check("art-1", drifted=False)

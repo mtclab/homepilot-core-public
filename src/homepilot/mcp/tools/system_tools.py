@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 from typing import Any
 
 import httpx
@@ -34,6 +35,53 @@ def _proxmox_path_allowed(path: str) -> bool:
         if p == pre or p.startswith(pre + "/"):
             return True
     return False
+
+
+# Defense-in-depth allowlist for guest file reads at the MCP boundary. The host
+# agent (hp_agent.file_ops) is the real enforcement point; this mirrors its read
+# prefixes and adds a hard secret denylist so the control plane cannot even ask an
+# agent to hand back the sensitive files the agent itself refuses.
+_ALLOWED_READ_PREFIXES = (
+    "/var/log/",
+    "/etc/",
+    "/opt/homepilot/",
+    "/proc/",
+    "/sys/",
+    "/tmp/homepilot/",
+    "/home/",
+    "/usr/local/bin/",
+)
+
+# Secrets that are blocked regardless of prefix (some, like /etc/shadow, live
+# under an allowed prefix).
+_DENIED_READ_PATHS = ("/etc/shadow", "/etc/gshadow")
+_DENIED_READ_BASENAMES = ("id_rsa", "id_ed25519")
+_DENIED_READ_SUFFIXES = (".key", ".pem")
+
+
+def _check_guest_read_path(path: str) -> None:
+    """Raise ``ValueError`` if a guest file-read path is outside the read
+    allowlist or hits the secret denylist (private keys, shadow files, process
+    environments). Mirrors the Go/Python host agent's protections."""
+    if ".." in path.split("/"):
+        raise ValueError(f"path '{path}' contains parent traversal")
+    norm = posixpath.normpath(path)
+    if not norm.startswith("/"):
+        raise ValueError(f"path '{path}' must be an absolute path")
+
+    # Secret denylist — enforced regardless of the allowed prefix.
+    base = posixpath.basename(norm)
+    if norm in _DENIED_READ_PATHS:
+        raise ValueError(f"path '{path}' is denied (sensitive file)")
+    if base in _DENIED_READ_BASENAMES or norm.endswith(_DENIED_READ_SUFFIXES):
+        raise ValueError(f"path '{path}' is denied (private key material)")
+    parts = norm.split("/")
+    if len(parts) >= 4 and parts[1] == "proc" and parts[-1] == "environ":
+        raise ValueError(f"path '{path}' is denied (process environment)")
+
+    if not norm.startswith(_ALLOWED_READ_PREFIXES):
+        allowed = ", ".join(_ALLOWED_READ_PREFIXES)
+        raise ValueError(f"path '{path}' not under an allowed read prefix ({allowed})")
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -223,6 +271,7 @@ async def handle_read_file_on_guest(
         raise RuntimeError("no agent hub — host operations unavailable")
     host = arguments["host"]
     path = arguments["path"]
+    _check_guest_read_path(path)
     content = await agent_adapter.read_file(host, path)
     return [TextContent(type="text", text=content)]
 

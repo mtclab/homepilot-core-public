@@ -45,6 +45,34 @@ class TestShellScriptExecutor:
         result = await shell_script_execute(fm, SHELL_BODY, fm["target"], mock_ssh)
         assert result["success"] is True
 
+    async def test_ships_script_via_write_file_and_metachar_free_exec(
+        self, mock_ssh, make_frontmatter
+    ):
+        # #388: the executor must NOT send a piped heredoc (rejected by the agent
+        # allowlist's shell-metachar filter). It ships the body via write_file to
+        # /opt/homepilot and runs a metachar-free `bash <path>`.
+        mock_ssh.exec = AsyncMock(return_value=(0, "", ""))
+        fm = make_frontmatter(
+            kind="shell-script",
+            target={"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"},
+        )
+        result = await shell_script_execute(fm, SHELL_BODY, fm["target"], mock_ssh)
+        assert result["success"] is True
+
+        # script was written to the HP write prefix, content = the raw script body
+        assert mock_ssh.write_file.await_count == 1
+        w_host, w_path, w_content = mock_ssh.write_file.await_args.args
+        assert w_host == "web1"
+        assert w_path.startswith("/opt/homepilot/")
+        assert w_path.endswith(".sh")
+        assert "if [ ! -f /etc/foo ]" in w_content
+
+        # exec ran `bash <that path>` with no shell metacharacters
+        exec_cmd = mock_ssh.exec.await_args.args[1]
+        assert exec_cmd == f"bash {w_path}"
+        for meta in ("|", "<", ">", ";", "&", "$", "`"):
+            assert meta not in exec_cmd
+
     async def test_nonzero_exit(self, mock_ssh, make_frontmatter):
         mock_ssh.exec = AsyncMock(return_value=(1, "", "fail"))
         fm = make_frontmatter(
@@ -138,39 +166,17 @@ echo hi
         )
         assert result["success"] is True
 
-    async def test_heredoc_escaping(self, mock_ssh, make_frontmatter):
-        mock_ssh.exec = AsyncMock(return_value=(0, "", ""))
-        body = """\
-## Plan
-Test heredoc
+    async def test_rollback_and_apply_use_distinct_stable_paths(self, mock_ssh, make_frontmatter):
+        # Apply and rollback write to distinct, stable (token-free) paths so a
+        # re-apply overwrites rather than accumulating orphaned scripts.
+        from homepilot.executor.shell_script import _remote_script_path
 
-## Idempotence preamble
-Checks before writing.
-
-## Spec
-
-```bash shell-spec
-#!/bin/bash
-echo "HPEOF"
-```
-"""
-        fm = make_frontmatter(
-            kind="shell-script", target={"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"}
-        )
-        result = await shell_script_execute(fm, body, fm["target"], mock_ssh)
-        assert result["success"] is True
-        call_args = mock_ssh.exec.call_args
-        command = call_args[0][1]
-        # Random marker must start with HPEOF_ and not appear literally in the script
-        assert "HPEOF_" in command
-
-    async def test_heredoc_marker_not_in_script(self, mock_ssh, make_frontmatter):
-        """Marker chosen must not appear in the script body."""
-        mock_ssh.exec = AsyncMock(return_value=(0, "", ""))
-        from homepilot.executor.shell_script import _escape_for_heredoc
-
-        script = "echo 'hello world'"
-        marker, command = _escape_for_heredoc(script)
-        assert marker not in script
-        assert command.startswith(f"cat <<'{marker}'")
-        assert command.endswith(marker)
+        apply_path = _remote_script_path("art-123", rollback=False)
+        rollback_path = _remote_script_path("art-123", rollback=True)
+        assert apply_path != rollback_path
+        assert apply_path == _remote_script_path("art-123", rollback=False)  # stable
+        assert apply_path.startswith("/opt/homepilot/") and apply_path.endswith(".sh")
+        # id is sanitised to the allowlist character class (no metachars leak in)
+        assert _remote_script_path("a/b;c$d", rollback=False).count(".sh") == 1
+        for meta in ("|", "<", ">", ";", "&", "$", "`", ".."):
+            assert meta not in _remote_script_path("a;b|c$d..e", rollback=False)

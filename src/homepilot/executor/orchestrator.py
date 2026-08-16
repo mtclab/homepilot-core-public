@@ -93,10 +93,9 @@ class ArtifactExecutor:
         target_data = fm.get("target", {})
         target_kind = target_data.get("kind", "")
 
-        if mutating and target_kind in ("vm", "lxc"):
-            snapshot_id = await self._maybe_snapshot(fm, target_data)
-
         try:
+            if mutating and target_kind in ("vm", "lxc"):
+                snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
             logger.exception("Executor failed for %s", artifact_id)
@@ -158,10 +157,9 @@ class ArtifactExecutor:
         snapshot_id: str | None = None
         mutating = fm.get("mutating", True)
 
-        if mutating and target_kind in ("vm", "lxc"):
-            snapshot_id = await self._maybe_snapshot(fm, target_data)
-
         try:
+            if mutating and target_kind in ("vm", "lxc"):
+                snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
             logger.exception("Replay failed for %s", artifact_id)
@@ -232,7 +230,8 @@ class ArtifactExecutor:
         )
 
     async def _maybe_snapshot(self, fm: dict[str, Any], target: dict[str, Any]) -> str | None:
-        if fm.get("requires_snapshot") is False:
+        requires_snapshot = fm.get("requires_snapshot") is not False
+        if not requires_snapshot:
             return None
         vmid = target.get("vmid")
         node = target.get("node")
@@ -244,8 +243,13 @@ class ArtifactExecutor:
             snap_result: Any = result.get("data", snap_name)
             return str(snap_result) if snap_result is not None else snap_name
         except (ProxmoxError, httpx.RequestError, httpx.TimeoutException) as exc:
-            logger.warning("Snapshot failed for vmid=%s node=%s: %s", vmid, node, exc)
-            return None
+            # A requested pre-apply snapshot is the rollback safety net. If it
+            # fails we must NOT silently proceed to mutate the guest with no way
+            # back — abort the apply instead (#388).
+            logger.error("Required snapshot failed for vmid=%s node=%s: %s", vmid, node, exc)
+            raise ExecutorError(
+                f"Pre-apply snapshot required for {fm.get('id')} but failed: {exc}"
+            ) from exc
 
     async def _run_rollback(self, kind: ArtifactKind, fm: dict[str, Any], body: str) -> None:
         target = fm.get("target", {})

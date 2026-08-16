@@ -244,6 +244,45 @@ HP_AGENT_HUB_ENABLED=true
 HP_AGENT_HUB_AUTH_TOKEN=<shared-secret>
 ```
 
+### Transport security (TLS) — fail closed
+
+The Agent Hub carries authentication tokens and privileged command/file traffic.
+As of the #362 hardening it **fails closed** on an exposed plaintext transport:
+
+- **Loopback bind** (`127.0.0.1`, `localhost`, `::1`) with no TLS is allowed for
+  local development.
+- **Any routable bind** (e.g. `0.0.0.0`, a LAN IP) with **no TLS** is a **hard
+  startup error** — the backend refuses to start.
+
+To run a non-loopback hub you must either enable TLS:
+
+```env
+HP_AGENT_HUB_TLS=true
+HP_AGENT_HUB_TLS_CERT=/path/server.crt
+HP_AGENT_HUB_TLS_KEY=/path/server.key
+# Optional: enable mutual TLS by verifying agent client certs against a CA
+HP_AGENT_HUB_TLS_CA=/path/ca.crt
+```
+
+…or, **only on a trusted, isolated network**, explicitly opt into plaintext:
+
+```env
+HP_HUB_ALLOW_INSECURE=1   # logs a loud warning on every start
+```
+
+On the agent (`hp-agent`) side, TLS now **verifies the hub certificate and
+hostname by default** (using the provided `HP_AGENT_TLS_CA` or the system trust
+store). The previous silent `CERT_NONE` downgrade is gone. To skip verification
+for **testing only** — which exposes the connection to man-in-the-middle
+interception — set `HP_AGENT_TLS_INSECURE=1` (logs a loud test-only warning).
+
+> **Migration note.** Existing deployments running the hub on plain TCP over a
+> routable interface will now fail to start. Either configure TLS (recommended)
+> or set `HP_HUB_ALLOW_INSECURE=1` as a temporary, trusted-network-only measure.
+> Per the P0 finding, also plan to rotate the shared `HP_AGENT_HUB_AUTH_TOKEN`;
+> per-agent credentials, replay resistance, and protocol negotiation are tracked
+> as follow-ups to #362.
+
 ### Enroll a managed host
 
 Install the `hp-agent` binary on each managed host, then:
@@ -431,7 +470,7 @@ Client config (e.g. in a Kasm workspace):
 ### Deploy
 
 ```bash
-HP_IMAGE_TAG=2.3.4 docker compose up -d backend
+HP_IMAGE_TAG=2.5.0 docker compose up -d backend
 ```
 
 Migrations run automatically on startup.
@@ -460,7 +499,7 @@ curl -H "Authorization: Bearer <token>" http://localhost:8000/inventory
 docker compose exec backend hp inventory refresh
 ```
 
-CI runs on push to `dev` and `main` branches, and on PRs targeting `dev`.
+There is no push-triggered CI (this is a private repo — Actions minutes are billed). Verification runs locally via `make gate` before any push; see [`docs/testing.md`](testing.md).
 
 ---
 
@@ -468,22 +507,35 @@ CI runs on push to `dev` and `main` branches, and on PRs targeting `dev`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `2.3.4` | Docker image tag for the backend container |
-| `HP_DAEMON_PORT` | `8000` | Host port mapped to the backend |
+| `HP_IMAGE_TAG` | `2.5.0` | Docker image tag for the backend container |
+| `HP_ENV` | — | Set to `production` to forbid auto-generated secret keys (fail closed) |
+| `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, SSH keys, artifacts) inside the container |
+| `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
 | `HP_SECRET_KEY` | — | Signs API tokens (required in production; auto-generated in dev if not set) |
+| `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred; must be non-empty to mint tokens) |
 | `HP_VAULT_PASSPHRASE` | — | Vault encryption passphrase (auto-generated if not set) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to file containing vault passphrase (overrides `HP_VAULT_PASSPHRASE`) |
+| `HP_VAULT_AUTO_INIT` | — | Set `1`/`true` to auto-generate + persist a vault passphrase when none is set |
 | `HP_PROXMOX_HOST` | — | Proxmox VE hostname or IP |
 | `PVE_API_TOKEN` | — | Proxmox read API token (use vault `pve-token` instead) |
 | `HP_PROXMOX_VERIFY_SSL` | `true` | Set `false` for self-signed Proxmox certs |
 | `HP_AGENT_HUB_ENABLED` | `false` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
+| `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |
 | `HP_AGENT_HUB_AUTH_TOKEN` | — | Shared secret for agent authentication |
+| `HP_AGENT_HUB_TLS` | `false` | Enable TLS on the hub (required for non-loopback binds) |
+| `HP_AGENT_HUB_TLS_CERT` / `_KEY` | — | Hub server certificate and private key |
+| `HP_AGENT_HUB_TLS_CA` | — | CA to verify agent client certs (enables mutual TLS) |
+| `HP_HUB_ALLOW_INSECURE` | `false` | Override fail-closed check: allow plaintext on a non-loopback bind (trusted networks only; logs a loud warning) |
+| `HP_AGENT_TLS_INSECURE` | `false` | **Agent side, test-only:** skip hub cert/hostname verification (`CERT_NONE`); exposes MITM. Never in production |
 | `HP_ARTIFACTS_REMOTE` | — | Git remote URL for artifact backup |
 | `HP_ARTIFACTS_SSH_KEY` | — | Path to SSH deploy key for artifact push |
 | `HP_MCP_TOKEN` | — | Auth token for MCP HTTP endpoint |
 | `HP_RATE_LIMIT` | `60` | Max requests per IP per minute |
-| `HP_CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
+| `HP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173` | Comma-separated allowed CORS origins (the four localhost dev origins by default) |
+| `HP_COOKIE_SECURE` | `true` | Set `false` only for plain-HTTP local dev |
+| `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs trusted for `X-Forwarded-For` |
+| `HP_ZABBIX_URL` | `/zabbix` | Browser-reachable Zabbix UI base for metric deep-links (empty to hide) |
 | `HP_INVENTORY_INTERVAL_SECONDS` | `300` | Inventory reconciler interval |
 | `HP_DRIFT_INTERVAL_SECONDS` | `1800` | Drift reconciler interval |
 | `HP_AUTO_APPLY_ENABLED` | `false` | Enable auto-apply reconciler |
@@ -504,4 +556,5 @@ CI runs on push to `dev` and `main` branches, and on PRs targeting `dev`.
 | Inventory shows 0 hosts | Proxmox not configured or refresh not run | Set `HP_PROXMOX_HOST` + token; run `hp inventory refresh` |
 | Vault errors on start | Passphrase not set | Auto-generated in v2.2+; for manual setup, set `HP_VAULT_PASSPHRASE` or `HP_VAULT_PASSPHRASE_FILE` |
 | Agent not connecting | Hub not enabled or token mismatch | Set `HP_AGENT_HUB_ENABLED=true` and ensure token matches on both sides |
+| Backend won't start: "Agent Hub refusing to start" | Non-loopback hub bind with no TLS | Enable TLS (`HP_AGENT_HUB_TLS=1` + cert/key) or, on a trusted isolated network only, set `HP_HUB_ALLOW_INSECURE=1` |
 | Artifact push fails | Deploy key permissions or network | Check key has write access; push failures are non-fatal |

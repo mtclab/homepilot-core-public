@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
+
+from ..auth.deps import require_scope
 
 router = APIRouter()
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(require_scope("read"))])
 async def list_audit(
     request: Request,
     action: str | None = Query(None),

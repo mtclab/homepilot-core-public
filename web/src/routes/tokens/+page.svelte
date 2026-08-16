@@ -1,12 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, type TokenInfo } from '$lib/api';
+	import { api, ApiError, sessionStore, type TokenInfo } from '$lib/api';
 	import { notify } from '$lib/stores';
 
 	let tokens: TokenInfo[] = [];
 	let total = 0;
 	let loading = true;
 	let isAdmin = false;
+	let loadError = '';
 
 	let showCreate = false;
 	let newLabel = '';
@@ -16,19 +17,29 @@
 	let creating = false;
 	let revoking: string | null = null;
 
+	// Prefix of the token backing the current session (once the server reports
+	// it), used to warn on self-revoke.
+	$: currentPrefix = $sessionStore?.prefix ?? '';
+
 	async function load() {
 		loading = true;
+		loadError = '';
 		try {
 			const res = await api.listTokens();
 			tokens = res.items;
 			total = res.total;
 			isAdmin = true;
-		} catch (e: any) {
-			if (e?.message?.startsWith('403')) {
+		} catch (e) {
+			// Only an actual 403 means "needs admin". A 500 (or anything else) is a
+			// real error and must not masquerade as a permission problem — the old
+			// `message.startsWith('403')` check could never be true (message is
+			// humanized text), so every failure looked like a permission denial.
+			if (e instanceof ApiError && e.status === 403) {
 				isAdmin = false;
 				notify('Admin scope required to manage tokens', 'err');
 			} else {
-				notify(String(e), 'err');
+				loadError = e instanceof Error ? e.message : String(e);
+				notify(loadError, 'err');
 			}
 		} finally {
 			loading = false;
@@ -58,6 +69,11 @@
 	}
 
 	async function revokeToken(prefix: string) {
+		const isSelf = !!currentPrefix && prefix === currentPrefix;
+		const msg = isSelf
+			? `"${prefix}" backs your CURRENT session. Revoking it will log you out and break any CLI/MCP using it. Continue?`
+			: `Revoke token "${prefix}"? Any CLI, MCP, or agent using it will immediately stop working.`;
+		if (typeof window !== 'undefined' && !window.confirm(msg)) return;
 		revoking = prefix;
 		try {
 			await api.revokeToken(prefix);
@@ -150,6 +166,12 @@
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load tokens.</p>
+			<p class="text-xs text-slate-500">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+		</div>
 	{:else if !isAdmin}
 		<div class="card p-6 text-center">
 			<p class="text-slate-400">You need admin scope to manage API tokens.</p>
@@ -173,7 +195,12 @@
 				<tbody>
 					{#each tokens as t}
 						<tr class="border-b border-slate-700/50">
-							<td class="py-2 pr-4 font-mono text-sky-400">{t.prefix}</td>
+							<td class="py-2 pr-4 font-mono text-sky-400">
+								{t.prefix}
+								{#if currentPrefix && t.prefix === currentPrefix}
+									<span class="ml-1 text-[10px] text-amber-400" title="This token backs your current session">(current)</span>
+								{/if}
+							</td>
 							<td class="py-2 pr-4 text-slate-300">{t.label || '—'}</td>
 							<td class="py-2 pr-4">
 								<span class="badge {t.scope === '*' || t.scope === 'full' ? 'badge-applied' : t.scope === 'read_only' ? 'badge-proposed' : 'badge-failed'}">

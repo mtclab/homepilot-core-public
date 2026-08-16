@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { base } from '$app/paths';
 	import { api, type DashboardSummary } from '$lib/api';
+	import { onArtifactEvent } from '$lib/events';
 	import Donut from '$lib/components/Donut.svelte';
 	import StatCard from '$lib/components/StatCard.svelte';
 
@@ -40,6 +41,10 @@
 		}
 	}
 	onMount(load);
+	// The dashboard summary rolls up artifact + drift counts, so refresh it live
+	// on any lifecycle/drift event. Silent (no skeleton) — keep the last-good view.
+	const unsub = onArtifactEvent(() => load());
+	onDestroy(unsub);
 
 	$: statusSegments = d ? toSegments(d.inventory.by_status, STATUS_COLORS) : [];
 	$: roleSegments = d ? toSegments(d.inventory.by_role) : [];

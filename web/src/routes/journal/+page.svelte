@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api, type AuditEntry } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import { base } from '$app/paths';
 
 	let entries: AuditEntry[] = [];
 	let loading = true;
@@ -69,6 +70,13 @@
 		return id.length > 8 ? id.slice(-8) : id;
 	}
 
+	// Populate the artifact-id filter box from a row and reload from page 1.
+	function filterByArtifact(id: string) {
+		filterArtifactId = id;
+		page = 0;
+		load();
+	}
+
 	function parseDetails(json: string | null): string {
 		if (!json) return '';
 		try {
@@ -77,6 +85,16 @@
 		} catch {
 			return json;
 		}
+	}
+
+	$: hasActiveFilters = filterAction !== '' || filterSource !== '' || filterArtifactId !== '';
+
+	function clearFilters() {
+		filterAction = '';
+		filterSource = '';
+		filterArtifactId = '';
+		page = 0;
+		load();
 	}
 
 	$: totalPages = Math.ceil(total / PAGE_SIZE);
@@ -109,13 +127,24 @@
 			bind:value={filterArtifactId}
 			on:change={() => { page = 0; load(); }}
 		/>
+		{#if hasActiveFilters}
+			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
+		{/if}
 		<span class="text-slate-500 text-xs">{total} entries</span>
 	</div>
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if entries.length === 0 && hasActiveFilters}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-slate-400 text-sm">No journal entries match the current filters.</p>
+			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
+		</div>
 	{:else if entries.length === 0}
-		<p class="text-slate-500 text-sm">No audit entries.</p>
+		<div class="card p-6 text-center space-y-1">
+			<p class="text-slate-400 text-sm">No journal entries yet.</p>
+			<p class="text-xs text-slate-500">Actions across the system will be recorded here.</p>
+		</div>
 	{:else}
 		<div class="card overflow-x-auto">
 			<table class="w-full text-xs">
@@ -137,7 +166,22 @@
 							<td class="py-1.5 pr-4"><span class="badge {actionClass(e.action)}">{e.action}</span></td>
 							<td class="py-1.5 pr-4 {sourceClass(e.source)} font-mono">{e.source}</td>
 							<td class="py-1.5 pr-4 text-slate-300">{e.user_id || '—'}</td>
-							<td class="py-1.5 pr-4 text-sky-400 font-mono">{fmtShortId(e.artifact_id)}</td>
+							<td class="py-1.5 pr-4 font-mono whitespace-nowrap">
+								{#if e.artifact_id}
+									<a
+										href="{base}/artifacts/{e.artifact_id}"
+										class="text-sky-400 hover:text-sky-300"
+										title={e.artifact_id}
+									>{fmtShortId(e.artifact_id)}</a>
+									<button
+										class="text-slate-500 hover:text-sky-300 ml-1"
+										title="Filter journal by this artifact"
+										on:click={() => filterByArtifact(e.artifact_id ?? '')}
+									>⊃</button>
+								{:else}
+									<span class="text-slate-600">—</span>
+								{/if}
+							</td>
 							<td class="py-1.5 pr-4 text-slate-400 font-mono">{e.target_host || '—'}</td>
 							<td class="py-1.5 text-slate-500 truncate max-w-xs">{parseDetails(e.details_json)}</td>
 						</tr>

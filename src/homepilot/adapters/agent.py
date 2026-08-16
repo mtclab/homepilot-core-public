@@ -20,11 +20,21 @@ _SAFE_READONLY_COMMANDS = {
     "uptime": re.compile(r"^uptime$"),
     "ip": re.compile(r"^ip\s+(addr|link|route|neigh)(\s+[a-zA-Z0-9_./-]+)*$"),
     "ss": re.compile(r"^ss(\s+-[a-zA-Z0-9]+)*(\s+[a-zA-Z0-9_./-]+)?$"),
-    "systemctl": re.compile(r"^systemctl\s+status\s+[a-zA-Z0-9_.-]+(\.service)?$"),
+    # Kept in lockstep with agent/go/allowlist.go safeCommands["systemctl"] — the
+    # adapter must not reject a read-only subcommand (is-active/is-enabled/
+    # daemon-reload) the agent itself allows. Parity is gated by
+    # tests/test_allowlist_parity.py.
+    "systemctl": re.compile(
+        r"^systemctl\s+(status|is-active|is-enabled|daemon-reload)"
+        r"(\s+[a-zA-Z0-9_.-]+(\.service)?)?$"
+    ),
     "journalctl": re.compile(r"^journalctl(\s+-[a-zA-Z0-9]+(\s+\S+)?)*$"),
     "dpkg": re.compile(r"^dpkg\s+-[lSs](\s+[a-zA-Z0-9_.+-]+)*$"),
 }
 
+# Kept in lockstep with agent/go/allowlist.go catAllowedPrefixes — gated by
+# tests/test_allowlist_parity.py so the adapter never permits a cat path the
+# agent would reject (subset), and does not reject one the agent allows.
 _CAT_ALLOWED_PREFIXES = (
     "/var/log/",
     "/etc/homepilot/",
@@ -32,6 +42,8 @@ _CAT_ALLOWED_PREFIXES = (
     "/etc/os-release",
     "/etc/resolv.conf",
     "/etc/hosts",
+    "/etc/systemd/",
+    "/opt/",
 )
 
 

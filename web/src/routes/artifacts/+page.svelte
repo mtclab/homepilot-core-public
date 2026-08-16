@@ -1,8 +1,9 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
 	import { api, type Artifact } from '$lib/api';
+	import { onArtifactEvent } from '$lib/events';
 
 	let items: Artifact[] = [];
 	let allItems: Artifact[] = [];
@@ -45,18 +46,26 @@
 
 	$: counts = buildCounts(allItems);
 
-	async function loadAll() {
-		loading = true;
+	// `initial` shows the loading skeleton; a live SSE-driven refresh stays silent
+	// and keeps the last-good rows on screen.
+	async function loadAll(initial = true) {
+		if (initial) loading = true;
 		error = '';
 		try {
 			const res = await api.listArtifacts({ limit: 1000 });
 			allItems = res.items;
 			applyFilter();
 		} catch (e) {
-			error = String(e);
+			if (initial || allItems.length === 0) error = String(e);
 		} finally {
 			loading = false;
 		}
+	}
+
+	function clearFilters() {
+		activeTab = 'all';
+		filterKind = '';
+		applyFilter();
 	}
 
 	function applyFilter() {
@@ -90,13 +99,17 @@
 		return s ? new Date(s).toLocaleDateString() : '—';
 	}
 
-	onMount(loadAll);
+	onMount(() => loadAll(true));
+	// Live-refresh the list on any artifact lifecycle event, preserving the
+	// current tab/kind filter (applyFilter re-runs inside loadAll).
+	const unsub = onArtifactEvent(() => loadAll(false));
+	onDestroy(unsub);
 </script>
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
 		<h1 class="text-lg font-bold text-slate-100">Artifacts</h1>
-		<button class="btn btn-ghost text-xs" on:click={loadAll}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}>↻ Refresh</button>
 	</div>
 
 	<div class="flex gap-1 flex-wrap border-b border-slate-700 pb-px">
@@ -126,9 +139,21 @@
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
 	{:else if error}
-		<p class="text-red-400 text-sm">{error}</p>
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load artifacts.</p>
+			<p class="text-xs text-slate-500">{error}</p>
+			<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}>↻ Retry</button>
+		</div>
+	{:else if allItems.length === 0}
+		<div class="card p-6 text-center space-y-1">
+			<p class="text-slate-400 text-sm">No artifacts yet.</p>
+			<p class="text-xs text-slate-500">Proposed changes will appear here once created.</p>
+		</div>
 	{:else if items.length === 0}
-		<p class="text-slate-500 text-sm">No artifacts.</p>
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-slate-400 text-sm">No artifacts match the current filters.</p>
+			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
+		</div>
 	{:else}
 		<div class="card overflow-x-auto">
 			<table class="w-full text-xs">

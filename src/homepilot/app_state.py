@@ -305,11 +305,22 @@ async def create_app_state(settings: Any | None = None) -> AppState:
                     keyfile=settings.agent_hub_tls_key,
                 )
             if settings.agent_hub_tls_ca:
+                # Mutual TLS: verify each connecting agent's client certificate
+                # against the configured CA.
                 ssl_ctx.load_verify_locations(settings.agent_hub_tls_ca)
                 ssl_ctx.verify_mode = _ssl.CERT_REQUIRED
+                logger.info("Agent hub TLS enabled with mutual client-cert verification")
             else:
+                # Server-authenticated TLS only: agents verify THIS server's
+                # certificate, but we do not require a client certificate because
+                # per-agent identity / client mTLS is a follow-up (see #362). This
+                # is NOT the silent CERT_NONE MITM downgrade — that was the AGENT
+                # (client) side, which now verifies the server by default. Here
+                # CERT_NONE only means "no client cert demanded", stated explicitly.
                 ssl_ctx.verify_mode = _ssl.CERT_NONE
-            logger.info("Agent hub TLS enabled (cert_required=%s)", bool(settings.agent_hub_tls_ca))
+                logger.info(
+                    "Agent hub TLS enabled (server-authenticated; client mTLS pending #362)"
+                )
         else:
             logger.warning("Agent hub running without TLS — enable HP_AGENT_HUB_TLS for production")
 
@@ -320,7 +331,12 @@ async def create_app_state(settings: Any | None = None) -> AppState:
             registry=agent_registry,
             ssl_context=ssl_ctx,
             token_store=_token_store,
+            allow_insecure=settings.agent_hub_allow_insecure,
         )
+        # Fail closed early (before serving) on an exposed plaintext transport,
+        # so misconfiguration surfaces as a clear startup error rather than a
+        # swallowed exception inside the background serve task.
+        agent_hub.check_transport_security()
         agent_registry.hub_server = agent_hub
         logger.info(
             "Agent hub initialized on %s:%s",

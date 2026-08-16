@@ -1,13 +1,15 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { api, type Artifact, type Host, type DriftCheck } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
+	import { onArtifactEvent } from '$lib/events';
 
 	let artifacts: Artifact[] = [];
 	let hosts: Host[] = [];
 	let driftChecks: DriftCheck[] = [];
 	let loading = true;
+	let loadError = '';
 	let rechecking = false;
 	let recheckingId = '';
 
@@ -22,8 +24,9 @@
 	let rows: DriftRow[] = [];
 	let unmanagedHosts: Host[] = [];
 
-	async function load() {
-		loading = true;
+	async function load(initial = true) {
+		if (initial) loading = true;
+		loadError = '';
 		try {
 			const [aRes, hRes, dRes] = await Promise.all([
 				api.listArtifacts({ limit: 500 }),
@@ -35,7 +38,13 @@
 			driftChecks = dRes.items;
 			compute();
 		} catch (e) {
-			notify(String(e), 'err');
+			const msg = e instanceof Error ? e.message : String(e);
+			// On a silent live refresh, keep the last-good tables rather than
+			// replacing them with the error card / a toast.
+			if (initial || rows.length === 0) {
+				loadError = msg;
+				notify(msg, 'err');
+			}
 		} finally {
 			loading = false;
 		}
@@ -124,12 +133,16 @@
 	}
 
 	onMount(load);
+	// Live-refresh on drift + lifecycle events (an apply/revoke changes what's
+	// covered; artifact_drifted changes a row's status).
+	const unsub = onArtifactEvent(() => load(false));
+	onDestroy(unsub);
 </script>
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
 		<h1 class="text-lg font-bold text-slate-100">Drift</h1>
-		<button class="btn btn-ghost text-xs" on:click={load}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Refresh</button>
 	</div>
 
 	<div class="flex gap-3 flex-wrap text-xs">
@@ -158,6 +171,12 @@
 
 	{#if loading}
 		<p class="text-slate-500 text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-red-400">Could not load drift data.</p>
+			<p class="text-xs text-slate-500">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Retry</button>
+		</div>
 	{:else}
 		{#if showOrphans && orphanRows.length}
 			<div class="card space-y-2">

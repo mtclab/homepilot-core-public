@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { base } from '$app/paths';
 	import { api, setToken, getToken, hasCookieSession, type HealthInfo } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { validateApiBase } from '$lib/urlValidation';
+	import { safeReturnTo } from '$lib/nav';
 
 	let tokenVal = '';
 	let apiBase = '';
@@ -66,6 +68,15 @@
 			if (pveToken) data.token = pveToken;
 			if (pveWriteToken) data.write_token = pveWriteToken;
 			const result = await api.saveProxmoxSettings(data);
+			// The backend can report a failure as HTTP 200 with status !== 'ok'.
+			// Surface the message and KEEP the entered values so the user can fix
+			// and retry — do not wipe the token fields or claim success.
+			if (result.status && result.status !== 'ok') {
+				pveStatus = result.status;
+				pveTestResult = { status: 'error', message: result.message || result.status };
+				notify('Failed to save Proxmox settings: ' + (result.message || result.status), 'err');
+				return;
+			}
 			pveTokenConfigured = result.token_configured ?? !!pveToken;
 			pveWriteTokenConfigured = result.write_token_configured ?? !!pveWriteToken;
 			pveWriteTokenIsSeparate = !!(pveWriteToken && pveWriteToken !== pveToken);
@@ -147,8 +158,8 @@
 				} catch {}
 				notify('Settings saved — session cookie set');
 				const params = new URLSearchParams(window.location.search);
-				const returnTo = params.get('returnTo');
-				if (returnTo) goto(decodeURIComponent(returnTo));
+				const dest = safeReturnTo(params.get('returnTo'), base, '');
+				if (dest) goto(dest);
 			} catch {
 				cookieSession = false;
 				notify('Settings saved (cookie session failed — using in-memory token)');

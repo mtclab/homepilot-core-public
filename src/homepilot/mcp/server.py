@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -11,7 +12,7 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
 from homepilot.app_state import create_app_state
 from homepilot.config import get_settings
@@ -72,6 +73,15 @@ _MUTATING_TOOLS = frozenset(
         "record_fact",
     }
 )
+
+# approve_artifact is deliberately unreachable over the MCP transport. The MCP
+# credential is a single shared token, so letting it approve would collapse the
+# propose -> human-approve model: the LLM would both propose AND approve its own
+# mutations (#385). Approval must come from an operator via the CLI or web UI,
+# never an MCP tool call. Enforced in two places below — the tool is delisted
+# from list_tools() (never advertised) and hard-refused in the call_tool()
+# transport dispatch (defense in depth).
+_MCP_FORBIDDEN_TOOLS = frozenset({"approve_artifact"})
 
 _READ_ONLY_TOOLS = frozenset(
     {
@@ -200,29 +210,63 @@ async def _handle_tool(
     return result
 
 
-def create_server() -> Server:
-    server = Server("homepilot-mcp")
-
-    @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
-    async def list_tools() -> list[Tool]:
-        return [
+async def _on_list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
+    # mcp 2.x handler: registered via the Server(on_list_tools=...) constructor
+    # kwarg instead of the removed @server.list_tools() decorator.
+    return ListToolsResult(
+        tools=[
             Tool(
                 name=t["name"],
                 description=t["description"],
-                inputSchema=t["inputSchema"],
-                outputSchema=t.get("outputSchema"),
+                input_schema=t["inputSchema"],
+                output_schema=t.get("outputSchema"),
             )
             for t in _TOOL_DEFINITIONS
+            if t["name"] not in _MCP_FORBIDDEN_TOOLS
         ]
+    )
 
-    @server.call_tool()  # type: ignore[untyped-decorator]
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | dict[str, Any]:
-        ctx = await _server_context.snapshot()
-        ctx["_mcp_token_scope"] = _mcp_token_scope_var.get()
-        ctx["_mcp_caller_id"] = _mcp_caller_id_var.get()
-        return await _handle_tool(name, arguments, ctx)
 
-    return server
+async def _on_call_tool(_ctx: Any, params: Any) -> CallToolResult:
+    # mcp 2.x handler (Server(on_call_tool=...)). `params` is a
+    # CallToolRequestParams; results are wrapped in a CallToolResult, and errors
+    # surface as is_error=True (the 1.x server did this wrapping for us).
+    name = params.name
+    arguments = params.arguments or {}
+    if name in _MCP_FORBIDDEN_TOOLS:
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Tool '{name}' is not available over the MCP transport — approval "
+                        "requires an operator via the CLI or web UI (#385)"
+                    ),
+                )
+            ],
+            is_error=True,
+        )
+    ctx = await _server_context.snapshot()
+    ctx["_mcp_token_scope"] = _mcp_token_scope_var.get()
+    ctx["_mcp_caller_id"] = _mcp_caller_id_var.get()
+    try:
+        result = await _handle_tool(name, arguments, ctx)
+    except ValueError as exc:
+        return CallToolResult(content=[TextContent(type="text", text=str(exc))], is_error=True)
+    if isinstance(result, dict):
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result))],
+            structured_content=result,
+        )
+    return CallToolResult(content=list(result))
+
+
+def create_server() -> Server:
+    return Server(
+        "homepilot-mcp",
+        on_list_tools=_on_list_tools,
+        on_call_tool=_on_call_tool,
+    )
 
 
 class _ServerContext:
@@ -346,6 +390,11 @@ def create_http_app(srv: Server) -> Any:
         routes=[Mount("/", app=session_manager.handle_request)],
         lifespan=lifespan,
     )
+    # Exposed so a host that MOUNTS this app (main.py) can (a) drive this app's
+    # lifespan — Starlette does not run a mounted sub-app's lifespan, so without
+    # this the session manager never starts (#382) — and (b) report real MCP
+    # health by inspecting whether the session manager task group is running.
+    starlette_app.state.session_manager = session_manager
 
     if mcp_token:
 
@@ -408,6 +457,16 @@ def create_http_app(srv: Server) -> Any:
 
 async def run_server_http(host: str = "0.0.0.0", port: int = 8000) -> None:
     import uvicorn
+
+    # Hard startup guard (#385): the HTTP transport binds a network port
+    # (0.0.0.0 by default). Auth is only attached when HP_MCP_TOKEN is set, so
+    # binding without it would expose the full MCP tool surface unauthenticated.
+    # Refuse to start rather than serve an open control plane.
+    if not os.environ.get("HP_MCP_TOKEN", "").strip():
+        raise RuntimeError(
+            "Refusing to start the HTTP MCP transport without HP_MCP_TOKEN: the "
+            "bind would be unauthenticated. Set HP_MCP_TOKEN and restart."
+        )
 
     ctx = await _bootstrap()
     await _server_context.async_update(ctx)

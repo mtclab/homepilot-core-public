@@ -32,7 +32,7 @@ def _get_lifecycle(request: Request) -> ArtifactLifecycle:
     return lifecycle
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(require_scope("read"))])
 async def list_artifacts(
     request: Request,
     status: str | None = Query(None),
@@ -44,7 +44,7 @@ async def list_artifacts(
     return {"items": items[:limit], "total": len(items)}
 
 
-@router.get("/drift")
+@router.get("/drift", dependencies=[Depends(require_scope("read"))])
 async def get_drift_status(
     request: Request,
     refresh: bool = Query(False),
@@ -96,7 +96,7 @@ async def get_drift_status(
     return {"items": items, "total": len(items)}
 
 
-@router.get("/{artifact_id}")
+@router.get("/{artifact_id}", dependencies=[Depends(require_scope("read"))])
 async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     store = _get_store(request)
     try:

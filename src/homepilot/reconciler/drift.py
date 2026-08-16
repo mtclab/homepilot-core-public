@@ -10,6 +10,7 @@ import httpx
 from homepilot.artifacts.models import ArtifactKind, ArtifactStatus
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
+from homepilot.events import emit_event
 from homepilot.executor.orchestrator import ArtifactExecutor
 
 from .base import Reconciler, ReconcilerResult
@@ -160,6 +161,12 @@ class DriftReconciler(Reconciler):
             except (OSError, RuntimeError, ValueError):
                 logger.exception("Drift audit log failed for %s", artifact_id)
 
+            # Drift is only actionable if something is told about it. Emit an
+            # artifact_drifted event (SSE + outbound webhook fan-out) exactly
+            # when the artifact has actually drifted — never for in-spec ones.
+            if result.drifted:
+                await self._emit_drift_event(artifact_id, result)
+
             return result
 
         except FileNotFoundError:
@@ -167,3 +174,33 @@ class DriftReconciler(Reconciler):
         except Exception:  # re-raises after logging — intentional broad catch
             logger.exception("Single drift check failed for %s", artifact_id)
             raise
+
+    async def _emit_drift_event(self, artifact_id: str, result: VerifyResult) -> None:
+        """Emit an ``artifact_drifted`` event, best-effort.
+
+        An emit failure (SSE bus, webhook fan-out, etc.) must never fail the
+        drift cycle — drift has already been detected and persisted by the time
+        we get here, so the observation stands regardless of delivery.
+        """
+        try:
+            summary = (result.verification_log or "").strip()[:500] or "drift detected"
+            payload: dict[str, Any] = {
+                "id": artifact_id,
+                "status": "drifted",
+                "drifted": True,
+                "drift_summary": summary,
+            }
+            if result.details:
+                payload["details"] = result.details
+            try:
+                fm, _ = self.store.read(artifact_id)
+                payload["kind"] = fm.get("kind", "")
+                payload["intent"] = fm.get("intent", "")
+                target = fm.get("target")
+                if target:
+                    payload["target"] = target
+            except (FileNotFoundError, OSError):
+                logger.debug("Could not enrich artifact_drifted payload for %s", artifact_id)
+            await emit_event("artifact_drifted", payload, repo=self.repo)
+        except Exception:  # best-effort: emission must not break the drift cycle
+            logger.warning("artifact_drifted emit failed for %s", artifact_id, exc_info=True)

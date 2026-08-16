@@ -11,6 +11,7 @@ from homepilot.inventory.service import (
     _guess_ip,
     _infer_role,
     derive_status,
+    node_pve_status,
     verify_connectivity,
 )
 
@@ -248,6 +249,56 @@ class TestRefreshInventory:
         host = await repo.get_host_by_hostname("pve1")
         assert host["ip_address"] == "10.0.0.1"
 
+    async def test_refresh_records_offline_node_as_not_running(self, repo):
+        # Regression: node refresh must observe the REAL /nodes status. A node
+        # Proxmox reports offline must never be stored as running/online, even
+        # when it resolves to an IP.
+        def _proxmox_read(path):
+            if path == "/nodes":
+                return {"data": [{"node": "pve-down", "ip": "10.0.0.9", "status": "offline"}]}
+            return {"data": []}
+
+        mock_proxmox = AsyncMock()
+        mock_proxmox.read = AsyncMock(side_effect=_proxmox_read)
+        svc = InventoryService(repo=repo, proxmox=mock_proxmox)
+        await svc.refresh_inventory()
+        node = await repo.get_host_by_hostname("pve-down")
+        assert node is not None
+        assert node["pve_status"] != "running"
+        assert node["pve_status"] == "stopped"
+        assert node["status"] == "offline"
+
+    async def test_refresh_records_online_node_as_running(self, repo):
+        def _proxmox_read(path):
+            if path == "/nodes":
+                return {"data": [{"node": "pve-up", "ip": "10.0.0.1", "status": "online"}]}
+            return {"data": []}
+
+        mock_proxmox = AsyncMock()
+        mock_proxmox.read = AsyncMock(side_effect=_proxmox_read)
+        svc = InventoryService(repo=repo, proxmox=mock_proxmox)
+        await svc.refresh_inventory()
+        node = await repo.get_host_by_hostname("pve-up")
+        assert node["pve_status"] == "running"
+        assert node["status"] == "online"
+
+    async def test_refresh_updates_existing_node_to_offline(self, repo):
+        # An existing node that goes offline must be updated, not left "running".
+        await repo.create_host(hostname="pve1", host_type="node", role="node", pve_status="running")
+
+        def _proxmox_read(path):
+            if path == "/nodes":
+                return {"data": [{"node": "pve1", "ip": "10.0.0.1", "status": "offline"}]}
+            return {"data": []}
+
+        mock_proxmox = AsyncMock()
+        mock_proxmox.read = AsyncMock(side_effect=_proxmox_read)
+        svc = InventoryService(repo=repo, proxmox=mock_proxmox)
+        await svc.refresh_inventory()
+        node = await repo.get_host_by_hostname("pve1")
+        assert node["pve_status"] == "stopped"
+        assert node["status"] == "offline"
+
     async def test_refresh_scope_filters_nodes(self, repo):
         call_log: list[str] = []
 
@@ -390,6 +441,23 @@ class TestDeriveStatus:
 
     async def test_unknown_pve_status_is_unknown(self):
         assert derive_status("unknown", None) == "unknown"
+
+
+class TestNodePveStatus:
+    async def test_online_maps_to_running(self):
+        assert node_pve_status("online") == "running"
+
+    async def test_offline_maps_to_stopped(self):
+        assert node_pve_status("offline") == "stopped"
+
+    async def test_missing_maps_to_unknown(self):
+        assert node_pve_status(None) == "unknown"
+
+    async def test_unrecognized_maps_to_unknown(self):
+        assert node_pve_status("weird") == "unknown"
+
+    async def test_case_insensitive(self):
+        assert node_pve_status("ONLINE") == "running"
 
 
 class TestEnrichment:

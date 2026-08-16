@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api, type Artifact } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import { base } from '$app/paths';
 
 	let items: Artifact[] = [];
 	let loading = true;
@@ -114,7 +115,11 @@
 							{expanded === a.id ? '▼' : '▶'}
 						</button>
 						<div class="flex-1 min-w-0">
-							<p class="text-xs text-slate-400 font-mono">{a.id}</p>
+							<a
+								href="{base}/artifacts/{a.id}"
+								class="text-xs text-sky-400 hover:text-sky-300 font-mono"
+								title="Open artifact detail"
+							>{a.id}</a>
 							<p class="text-sm text-slate-100 font-medium mt-0.5 truncate">{a.intent}</p>
 							<div class="flex gap-2 mt-1 flex-wrap text-xs text-slate-400">
 								<span>{a.kind}</span>

@@ -41,11 +41,11 @@ Web UI: **http://localhost:8000/ui**
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=2.3.6 docker compose pull
+HP_IMAGE_TAG=2.5.0 docker compose pull
 docker compose up -d
 ```
 
-Available tags: `latest`, `2.3.6`, `2.3`, `2` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
+Available tags: `latest`, `2.5.0`, `2.5`, `2` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
 
 ## Services
 
@@ -118,17 +118,18 @@ HomePilot can manage remote hosts through a lightweight agent daemon instead of 
 
 ### Agent deployment
 
-```bash
-# Option 1: Standalone binary (recommended, no Python needed on target)
-cd agent/
-pip install pyinstaller
-pyinstaller hp-agent.spec
-scp dist/hp-agent target:/usr/local/bin/
-ssh target 'chmod +x /usr/local/bin/hp-agent'
+The host agent is a single static Go binary (`hp-agent`) — no Python runtime on
+the target. Use a release binary or build from source:
 
-# Option 2: Pip install (for development)
-pip install "git+https://github.com/mtclab/homepilot-core-public.git#subdirectory=agent"
-# or, from a checkout: pip install ./agent
+```bash
+# Option 1: download the release binary (recommended)
+curl -LO https://github.com/mtclab/homepilot-core-public/releases/latest/download/hp-agent-linux-amd64
+chmod +x hp-agent-linux-amd64
+sudo mv hp-agent-linux-amd64 /usr/local/bin/hp-agent
+
+# Option 2: build from source (Go 1.23+)
+cd agent/go && CGO_ENABLED=0 go build -o hp-agent .
+scp hp-agent target:/usr/local/bin/
 
 # Configure via environment variables
 export HP_AGENT_HUB_HOST=homelab.local
@@ -277,16 +278,19 @@ HP_VAULT_PASSPHRASE_FILE=/run/secrets/hp_vault_passphrase
 
 ## Releases
 
-Tags follow semver (`v2.0.0`). Pushing a tag triggers the release workflow:
+Releases are cut by **manual workflow dispatch** on the public mirror — there is
+no tag-push trigger, and the release pipeline runs **no test/lint/type gate**
+(verification is the local `make gate`, run before promotion).
 
-1. Tests + lint + type check
-2. Multi-arch Docker build (`linux/amd64`, `linux/arm64`)
-3. Push to `ghcr.io/mtclab/homepilot-core-public`
-4. GitHub Release with auto-generated notes
+The chain: sync the reviewed change to the public mirror's `main`, then dispatch
+`auto-tag.yml`. If `pyproject.toml`'s version has no matching tag, it creates and
+pushes `v<version>` and dispatches `release.yml`, which:
 
-```bash
-git tag v2.2.0 && git push origin v2.2.0
-```
+1. Builds and pushes the Docker image (**`linux/amd64` only**) to `ghcr.io/mtclab/homepilot-core-public`
+2. Cross-compiles the `hp-agent` Go binary for `linux/amd64` **and** `linux/arm64`
+3. Publishes a GitHub Release with auto-generated notes and the agent binaries
+
+Do not `git tag` by hand — `auto-tag.yml` owns tagging.
 
 ## Development
 

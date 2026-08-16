@@ -10,6 +10,12 @@ from .tokens import PREFIX_LENGTH, normalize_scope, validate_token
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+# Marker attribute set on any dependency callable that enforces a scope (or an
+# explicit admin/secret gate). The startup route-scope guard (see main.py) walks
+# each route's dependency tree looking for this marker, so a new non-public route
+# that ships without a scope dependency fails fast at app construction.
+SCOPE_ENFORCER_ATTR = "_hp_enforces_scope"
+
 
 def get_db(request: Request) -> Repository:
     repo: Repository = request.app.state.repo
@@ -110,4 +116,5 @@ def require_scope(scope: str) -> Any:
             detail=f"Insufficient scope: requires '{scope}', has '{token_scope}'",
         )
 
+    setattr(_check, SCOPE_ENFORCER_ATTR, True)
     return _check

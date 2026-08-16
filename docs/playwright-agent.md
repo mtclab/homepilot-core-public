@@ -40,7 +40,7 @@ from playwright.sync_api import sync_playwright
 
 os.environ["DISPLAY"] = ":1.0"  # omit for headless
 
-TOKEN = "hp_60709341b3d8c1b602b5d82eb5429344375debdcc3c5f83a14dfaed645c89c66"
+TOKEN = "hp_REDACTED_TEST_TOKEN"
 BASE_URL = "http://homepilot:8000"
 UI = BASE_URL + "/ui"
 
@@ -339,7 +339,7 @@ resp = page.request.post(
 cd $HOME/repot/homepilot-v2
 
 # All e2e tests
-HP_TEST_TOKEN=hp_60709341b3d8c1b602b5d82eb5429344375debdcc3c5f83a14dfaed645c89c66 \
+HP_TEST_TOKEN=hp_REDACTED_TEST_TOKEN \
   .venv/bin/pytest tests/test_e2e.py -v
 
 # Single test class

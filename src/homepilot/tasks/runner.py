@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from typing import Any
 
 from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError
@@ -29,12 +28,38 @@ class TaskRunner:
         self.apply_reconciler = apply_reconciler
         self.store = store
         self._running_tasks: set[asyncio.Task[Any]] = set()
+        # task_id → in-flight asyncio.Task, so cancel() can reach the coroutine
+        # that is actually executing an apply/revoke. Cleared on completion.
+        self._task_by_id: dict[str, asyncio.Task[Any]] = {}
 
-    def _track_task(self, task: asyncio.Task[Any]) -> None:
+    def _track_task(self, task: asyncio.Task[Any], task_id: str) -> None:
         self._running_tasks.add(task)
-        task.add_done_callback(self._running_tasks.discard)
+        self._task_by_id[task_id] = task
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            self._running_tasks.discard(t)
+            # Only drop the mapping if it still points at THIS task — a fresh
+            # task for a reused id (shouldn't happen: ids are uuid4) must win.
+            if self._task_by_id.get(task_id) is t:
+                del self._task_by_id[task_id]
+
+        task.add_done_callback(_done)
 
     async def start_apply(self, artifact_id: str, approved_by: str = "system") -> dict[str, Any]:
+        # Validate the artifact BEFORE creating a task (#386). An already-APPLIED
+        # (or otherwise non-approved) artifact must be rejected cleanly here: if
+        # we created the task first and then rejected, that task would be stranded
+        # (executor.apply raises, the APPLIED→FAILED transition also raises, and
+        # the task never leaves 'running'), blocking all future apply/revoke.
+        try:
+            fm, _body = self.store.read(artifact_id)
+        except FileNotFoundError:
+            raise ValueError(f"Artifact not found: {artifact_id}") from None
+
+        status = ArtifactStatus(fm["status"])
+        if status != ArtifactStatus.APPROVED:
+            raise ConflictError(f"Invalid transition: {status.value} → apply")
+
         task_id = await self.repo.create_task_if_no_active(artifact_id, "apply")
         if task_id is None:
             active = await self.repo.get_active_task(artifact_id)
@@ -48,21 +73,12 @@ class TaskRunner:
                     "status": t["status"],
                 }
 
-        try:
-            fm, _body = self.store.read(artifact_id)
-        except FileNotFoundError:
-            raise ValueError(f"Artifact not found: {artifact_id}") from None
-
-        status = ArtifactStatus(fm["status"])
-        if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED):
-            raise ConflictError(f"Invalid transition: {status.value} → apply")
-
         # task_id is non-None here (the None branch returned above); guard
         # explicitly so it survives `python -O` (which strips asserts).
         if task_id is None:  # pragma: no cover - defensive
             raise RuntimeError("task_id unexpectedly None after creation")
         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
-        self._track_task(task)
+        self._track_task(task, task_id)
 
         return {
             "task_id": task_id,
@@ -89,7 +105,7 @@ class TaskRunner:
 
         task_id = await self.repo.create_task(artifact_id, "revoke")
         task = asyncio.create_task(self._run_revoke(task_id, artifact_id, user, reason))
-        self._track_task(task)
+        self._track_task(task, task_id)
 
         return {
             "task_id": task_id,
@@ -97,6 +113,22 @@ class TaskRunner:
             "action": "revoke",
             "status": "pending",
         }
+
+    async def cancel_task(self, task_id: str) -> dict[str, Any]:
+        # Best-effort stop-then-mark. If we still hold the in-flight asyncio.Task
+        # (same process, still running) cancel it — the CancelledError raised into
+        # _run_apply/_run_revoke is a BaseException, so their `except Exception`
+        # never fires and never overwrites the record we mark below. If the task
+        # is gone (a different process, or after a restart) we STILL mark the
+        # record cancelled so it stops blocking future applies for the artifact.
+        # Cancelling an already-finished task is a no-op returning its status.
+        at = self._task_by_id.get(task_id)
+        if at is not None and not at.done():
+            at.cancel()
+        result = await self.repo.cancel_task(task_id)
+        if result is None:
+            raise ValueError(f"Task not found: {task_id}")
+        return result
 
     async def await_task(self, task_id: str, timeout: float = 300.0) -> dict[str, Any]:
         interval = 1.0
@@ -151,10 +183,15 @@ class TaskRunner:
         except Exception as exc:
             logger.exception("Apply task %s failed for artifact %s", task_id, artifact_id)
             error_msg = str(exc)
+            # Marking the artifact failed is best-effort: it may already be in a
+            # terminal state that forbids the →failed transition (e.g. an
+            # apply-on-APPLIED raises ConflictError). That must NEVER prevent the
+            # task itself from being marked failed — otherwise the task is stranded
+            # in 'running' forever and blocks all future apply/revoke (#386).
             try:
                 await self.lifecycle.mark_failed(artifact_id, error_msg)
-            except (OSError, sqlite3.OperationalError):
-                logger.warning("Could not mark artifact %s as failed", artifact_id)
+            except Exception:
+                logger.warning("Could not mark artifact %s as failed", artifact_id, exc_info=True)
             await self.repo.update_task_status(task_id, "failed", error=error_msg)
 
     async def _run_revoke(
