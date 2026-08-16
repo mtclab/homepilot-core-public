@@ -25,6 +25,9 @@ go vet ./... && go test ./...
 | `HP_AGENT_HUB_HOST` | `localhost` | Hub host |
 | `HP_AGENT_HUB_PORT` | `8443` | Hub port |
 | `HP_AGENT_AUTH_TOKEN` | — | Shared/bootstrap enrollment token |
+| `HP_AGENT_TOKEN_FILE` | — | Where the durable per-agent credential handed back at enrollment is persisted |
+| `HP_AGENT_ID` | persisted id | Explicit agent identity; wins over the id file |
+| `HP_AGENT_ID_FILE` | `agent.id` beside `HP_AGENT_TOKEN_FILE`, else `/etc/homepilot/agent.id` | Where a generated agent id is persisted. The identity MUST be stable: the hub's per-agent credential is bound to it, so a new id per start would orphan the stored token |
 | `HP_AGENT_PRIVILEGED` | `false` | Allow docker/systemctl/apt/file management commands |
 | `HP_AGENT_HEARTBEAT_INTERVAL` | `30` | Heartbeat seconds |
 | `HP_AGENT_TLS` / `_TLS_CA` / `_TLS_CERT` / `_TLS_KEY` | off | TLS to the hub |

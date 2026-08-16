@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +25,12 @@ type Agent struct {
 
 	conn    net.Conn
 	writeMu sync.Mutex
+
+	// usingFileToken is true while cfg.AuthToken is the durable token loaded from
+	// (or persisted to) HP_AGENT_TOKEN_FILE, rather than the env enrollment
+	// token. It drives the self-heal in register(): a stored credential the hub
+	// rejects must not be retried forever.
+	usingFileToken bool
 
 	// Replay-protection state (#362 slice 3). hasPerAgent is durable across the
 	// process (set once a per-agent token is held/adopted); the rest are
@@ -142,6 +149,9 @@ func (a *Agent) register() error {
 		return err
 	}
 	if e := str(resp, "error"); e != "" {
+		if isAuthError(e) {
+			a.rotateTokenSource()
+		}
 		return fmt.Errorf("registration failed: %s", e)
 	}
 	if id := str(resp, "agent_id"); id != "" {
@@ -154,6 +164,9 @@ func (a *Agent) register() error {
 	if dt := str(resp, "auth_token"); dt != "" && dt != a.cfg.AuthToken {
 		a.cfg.AuthToken = dt
 		a.hasPerAgent = true
+		// The live credential is now the durable per-agent one; a later rejection
+		// of it may fall back to the env enrollment token again.
+		a.usingFileToken = true
 		if a.cfg.AuthTokenFile != "" {
 			if err := os.WriteFile(a.cfg.AuthTokenFile, []byte(dt), 0o600); err != nil {
 				log.Printf("warning: could not persist durable token to %s: %v", a.cfg.AuthTokenFile, err)
@@ -172,6 +185,48 @@ func (a *Agent) register() error {
 	}
 	log.Printf("registered as agent %s", a.agentID)
 	return nil
+}
+
+// isAuthError reports whether a hub error reply means "your credential was not
+// accepted" (as opposed to e.g. a duplicate-identity or freshness rejection,
+// which changing credentials would not fix).
+func isAuthError(e string) bool {
+	return strings.Contains(strings.ToLower(e), "auth")
+}
+
+// rotateTokenSource self-heals a rejected credential by ALTERNATING between the
+// two credentials the agent may hold: the durable per-agent token persisted in
+// HP_AGENT_TOKEN_FILE and the configured enrollment token (HP_AGENT_AUTH_TOKEN,
+// shared or bootstrap).
+//
+// Without this, an agent whose stored per-agent token the hub can no longer
+// match (a rebuilt hub database, a revoked-then-reissued credential, an id that
+// drifted) retries the same dead token forever and is banned after the hub's
+// consecutive-auth-failure limit. Alternating (never hammering one source)
+// guarantees the agent can always re-enroll; the caller keeps its existing
+// exponential backoff, so this adds no extra connection pressure.
+func (a *Agent) rotateTokenSource() {
+	if a.usingFileToken {
+		env := a.cfg.EnvAuthToken
+		if env == "" || env == a.cfg.AuthToken {
+			return // nothing else to try
+		}
+		a.cfg.AuthToken = env
+		a.usingFileToken = false
+		// A shared/bootstrap token is not a per-agent MAC key: don't negotiate
+		// replay protection with it (the hub would refuse anyway).
+		a.hasPerAgent = false
+		log.Printf("hub rejected the stored per-agent credential; retrying with the configured enrollment token")
+		return
+	}
+	stored := resolveToken(a.cfg.AuthTokenFile, "")
+	if stored == "" || stored == a.cfg.AuthToken {
+		return // nothing else to try
+	}
+	a.cfg.AuthToken = stored
+	a.usingFileToken = true
+	a.hasPerAgent = true
+	log.Printf("hub rejected the enrollment token; retrying with the stored per-agent credential")
 }
 
 // featuresContain reports whether a register_ack advertises the named feature.
@@ -407,13 +462,13 @@ func main() {
 	log.SetPrefix("[hp-agent] ")
 	cfg := ConfigFromEnv()
 	agent := &Agent{
-		cfg:         cfg,
-		exec:        Executor{allow: Allowlist{privileged: cfg.Privileged}},
-		agentID:     cfg.AgentID,
-		hasPerAgent: cfg.HasPersistedToken,
-	}
-	if agent.agentID == "" {
-		agent.agentID = newUUID()
+		cfg:  cfg,
+		exec: Executor{allow: Allowlist{privileged: cfg.Privileged}},
+		// A STABLE id across restarts: HP_AGENT_ID, else the persisted id file,
+		// else a freshly generated id that is written to that file.
+		agentID:        resolveAgentID(cfg.AgentID, cfg.AgentIDFile),
+		hasPerAgent:    cfg.HasPersistedToken,
+		usingFileToken: cfg.HasPersistedToken,
 	}
 	if cfg.ZabbixEnabled {
 		host := cfg.ZabbixHostname

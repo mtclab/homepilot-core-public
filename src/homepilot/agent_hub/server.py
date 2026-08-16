@@ -255,6 +255,45 @@ class AgentHubServer:
         logger.info("minted per-agent credential for %s (host=%s)", agent_id, hostname)
         return token
 
+    async def _rebind_by_hostname(
+        self, token: str, claimed_agent_id: str, claimed_hostname: str
+    ) -> AuthResult | None:
+        """Recognise a host that came back under a NEW ``agent_id``.
+
+        An agent that loses its persisted identity (or is reinstalled) still holds
+        the per-agent token it was issued. Without this the token authenticates
+        against nothing, the agent retries, and the peer is banned after
+        ``MAX_AUTH_FAILURES`` — a permanent lockout for a host that holds a
+        perfectly valid credential.
+
+        Acceptance still requires POSSESSION: the token must match the hash of a
+        non-revoked credential issued to this exact hostname. On a match the
+        credential is rebound to the newly claimed id (the hash is unchanged, so
+        the agent keeps using the same token). Returns ``None`` — i.e. falls
+        through to the shared/bootstrap paths — when nothing matches.
+        """
+        repo = self._repo
+        if repo is None or not claimed_hostname or not claimed_agent_id:
+            return None
+        presented = hash_token(token)
+        for row in await repo.get_agent_credentials_by_hostname(claimed_hostname):
+            stored = row.get("credential_hash")
+            prior_id = row.get("agent_id")
+            if not stored or prior_id == claimed_agent_id:
+                continue
+            if not hmac.compare_digest(presented, stored):
+                continue
+            if await repo.rebind_agent_credential(prior_id, claimed_agent_id):
+                logger.warning(
+                    "rebinding per-agent credential on host %s: %s -> %s "
+                    "(agent returned with a new agent_id)",
+                    claimed_hostname,
+                    prior_id,
+                    claimed_agent_id,
+                )
+                return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
+        return None
+
     async def _verify_auth(self, request: dict[str, Any]) -> AuthResult | None:
         """Authenticate a register frame. Returns an :class:`AuthResult` or
         ``None`` on failure.
@@ -264,9 +303,16 @@ class AgentHubServer:
              stored, non-revoked credential for the frame's claimed ``agent_id``
              AND the claimed ``hostname`` matches the one the credential was
              issued to. A per-agent token presented with a different
-             ``agent_id``/``hostname`` will not match here and falls through (and,
-             finding no other valid credential, is rejected). A REVOKED credential
-             whose token does match is rejected outright (``None``).
+             ``hostname`` than it was issued to is rejected outright. A REVOKED
+             credential whose token does match is rejected outright (``None``).
+          1b. ``"per-agent"`` (rebind) — no credential matches the claimed
+             ``agent_id``, but the token matches a non-revoked credential issued
+             to the SAME ``hostname``. The host proves possession of a credential
+             issued to it, so it is accepted and the credential is REBOUND to the
+             newly claimed ``agent_id``. This is what lets a host whose id changed
+             (e.g. an agent that lost its persisted id) reconnect instead of
+             bricking; the token still has to match a credential issued to that
+             exact hostname, so nothing is accepted on hostname alone.
           2. ``"shared"`` — the fleet-wide shared token (enrollment only).
           3. ``"bootstrap"`` — a consumed one-time enrollment token.
         """
@@ -298,6 +344,15 @@ class AgentHubServer:
                     )
                     return None
                 return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
+
+            # Reaching here means no credential is stored under the claimed id (or
+            # the stored one does not match this token) — the host may have come
+            # back with a different agent_id. Accept it only if the token matches
+            # a live credential issued to the SAME hostname, then rebind that
+            # credential to the id now being claimed.
+            rebound = await self._rebind_by_hostname(token, claimed_agent_id, claimed_hostname)
+            if rebound is not None:
+                return rebound
 
         if self.auth_token and hmac.compare_digest(token, self.auth_token):
             return AuthResult(kind="shared")

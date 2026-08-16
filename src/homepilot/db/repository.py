@@ -323,6 +323,72 @@ class Repository:
             (agent_id,),
         )
 
+    async def get_agent_credentials_by_hostname(self, hostname: str) -> list[dict[str, Any]]:
+        """Return the live (non-revoked, credentialed) rows issued to ``hostname``,
+        newest credential first.
+
+        Used to recognise a host whose ``agent_id`` changed between restarts: the
+        presented token still has to match one of these hashes, so this identifies
+        the host by POSSESSION of a credential issued to it, never by hostname
+        alone. Revoked rows are excluded so a revoked credential can never be
+        laundered back in through this path.
+        """
+        if not hostname:
+            return []
+        return await self.db.fetchall(
+            "SELECT agent_id, hostname, credential_hash, credential_set_at, revoked_at "
+            "FROM agents "
+            "WHERE hostname = ? AND credential_hash IS NOT NULL AND revoked_at IS NULL "
+            "ORDER BY credential_set_at DESC",
+            (hostname,),
+        )
+
+    async def rebind_agent_credential(self, old_agent_id: str, new_agent_id: str) -> bool:
+        """Move a per-agent credential from ``old_agent_id`` to ``new_agent_id``,
+        keeping the same hash so the agent's token stays valid. Returns ``True``
+        when a credential was moved.
+
+        The credential follows the agent identity that presented it: the old id
+        is left with no credential, so exactly one identity can authenticate with
+        that token afterwards.
+        """
+        if not old_agent_id or not new_agent_id or old_agent_id == new_agent_id:
+            return False
+        old = await self.get_agent_credential(old_agent_id)
+        if not old or not old.get("credential_hash"):
+            return False
+        existing = await self.db.fetchone(
+            "SELECT agent_id FROM agents WHERE agent_id = ?", (new_agent_id,)
+        )
+        if existing is None:
+            # No row under the new id: carry the whole agent row across (history,
+            # system_info and all) by renaming its primary key.
+            await self.db.execute(
+                "UPDATE agents SET agent_id = ? WHERE agent_id = ?",
+                (new_agent_id, old_agent_id),
+            )
+        else:
+            # A row already exists under the new id (the agent re-registered
+            # before): copy the credential onto it and strip it from the old one
+            # so the retired identity cannot authenticate.
+            await self.db.execute(
+                "UPDATE agents SET hostname = ?, credential_hash = ?, "
+                "credential_set_at = ?, revoked_at = NULL WHERE agent_id = ?",
+                (
+                    old.get("hostname"),
+                    old["credential_hash"],
+                    old.get("credential_set_at"),
+                    new_agent_id,
+                ),
+            )
+            await self.db.execute(
+                "UPDATE agents SET credential_hash = NULL, credential_set_at = NULL "
+                "WHERE agent_id = ?",
+                (old_agent_id,),
+            )
+        await self.db.conn.commit()
+        return True
+
     async def revoke_agent_credential(self, agent_id: str) -> bool:
         """Mark an agent's credential revoked. Returns ``True`` if a matching,
         credentialed agent row was updated, ``False`` otherwise."""
