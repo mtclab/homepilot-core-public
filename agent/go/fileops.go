@@ -162,26 +162,41 @@ func writeFile(path, content string) error {
 	return writeFileMode(path, content, 0o644)
 }
 
+// resolveWritePath rejects lexical traversal, makes the path absolute, resolves
+// the destination DIRECTORY through symlinks (so a symlinked parent cannot
+// smuggle the target elsewhere), rejoins the base name, and enforces the write
+// allowlist on the resolved result. It returns the resolved destination path and
+// the resolved parent directory. This is the single write-side gate reused by
+// both writeFileMode and the provisioning write_config action — keep it in one
+// place so neither path can weaken it.
+func resolveWritePath(path string) (resolved, resolvedDir string, err error) {
+	if strings.Contains(path, "..") {
+		return "", "", fmt.Errorf("path traversal forbidden: %s", path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	dir := filepath.Dir(abs)
+	resolvedDir = dir
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		resolvedDir = r
+	}
+	resolved = filepath.Join(resolvedDir, filepath.Base(abs))
+	if !underAnyPrefix(resolved, writeAllowedPrefixes()) {
+		return "", "", fmt.Errorf("path not in allowed write prefixes (%s): %s",
+			strings.Join(writeAllowedPrefixes(), ", "), path)
+	}
+	return resolved, resolvedDir, nil
+}
+
 // writeFileMode resolves the destination directory through symlinks, re-checks
 // the write allowlist on the resolved path (symlink defense), then writes
 // atomically: temp file in the destination dir -> chmod -> Sync -> Rename.
 func writeFileMode(path, content string, mode os.FileMode) error {
-	if strings.Contains(path, "..") {
-		return fmt.Errorf("path traversal forbidden: %s", path)
-	}
-	abs, err := filepath.Abs(path)
+	resolved, resolvedDir, err := resolveWritePath(path)
 	if err != nil {
 		return err
-	}
-	dir := filepath.Dir(abs)
-	resolvedDir := dir
-	if r, err := filepath.EvalSymlinks(dir); err == nil {
-		resolvedDir = r
-	}
-	resolved := filepath.Join(resolvedDir, filepath.Base(abs))
-	if !underAnyPrefix(resolved, writeAllowedPrefixes()) {
-		return fmt.Errorf("path not in allowed write prefixes (%s): %s",
-			strings.Join(writeAllowedPrefixes(), ", "), path)
 	}
 	if err := os.MkdirAll(resolvedDir, 0o755); err != nil {
 		return err

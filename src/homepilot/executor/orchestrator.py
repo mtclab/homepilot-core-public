@@ -21,6 +21,7 @@ from homepilot.vault.manager import VaultManager
 
 from .ansible import execute as ansible_execute
 from .composite import execute as composite_execute
+from .host_provision import execute as host_provision_execute
 from .http_sequence import execute as http_sequence_execute
 from .kb_note import execute as kb_note_execute
 from .proxmox_api import execute as proxmox_api_execute
@@ -218,6 +219,10 @@ class ArtifactExecutor:
             result = await composite_execute(fm, body, self.lifecycle, self)
         elif kind == ArtifactKind.SHELL_SCRIPT:
             result = await shell_script_execute(fm, body, target, self.host_adapter, self.pve_nodes)
+        elif kind == ArtifactKind.HOST_PROVISION:
+            result = await host_provision_execute(
+                fm, body, target, self.host_adapter, self.pve_nodes
+            )
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:

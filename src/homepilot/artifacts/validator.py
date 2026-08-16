@@ -12,6 +12,7 @@ from .models import (
     Target,
     compute_body_hash,
     extract_composite_steps,
+    parse_host_provision_spec,
     utcnow_iso,
     validate_artifact_id,
 )
@@ -36,6 +37,13 @@ def validate_composite_spec(body: str) -> None:
         seen_ids.add(step_id)
         if not step.get("artifact"):
             raise LifecycleError(f"step '{step_id}' must have an 'artifact' reference")
+
+
+def validate_host_provision_spec(body: str) -> None:
+    try:
+        parse_host_provision_spec(body)
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from exc
 
 
 def validate_transition(current: ArtifactStatus, target: ArtifactStatus) -> None:
@@ -94,6 +102,9 @@ def validate_propose_spec(spec: dict[str, Any], store: ArtifactStore) -> tuple[d
 
     if kind == ArtifactKind.COMPOSITE:
         validate_composite_spec(body)
+
+    if kind == ArtifactKind.HOST_PROVISION:
+        validate_host_provision_spec(body)
 
     body_hash = compute_body_hash(body)
 

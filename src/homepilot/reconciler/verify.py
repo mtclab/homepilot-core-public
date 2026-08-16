@@ -114,6 +114,8 @@ async def verify_artifact(
             verification_log="shell-script: unverifiable",
             details={"reason": "shell_script_unverifiable"},
         )
+    elif kind == ArtifactKind.HOST_PROVISION:
+        return await _verify_host_provision(artifact_id, fm, body, executor)
     else:
         return VerifyResult(
             artifact_id=artifact_id,
@@ -462,6 +464,60 @@ async def _verify_http_sequence(
         drifted=drifted,
         verification_log=verification_log[:2000],
         details={"drifted_steps": drifted_steps, "skipped_steps": skipped_steps},
+    )
+
+
+async def _verify_host_provision(
+    artifact_id: str,
+    fm: dict[str, Any],
+    body: str,
+    executor: Any,
+) -> VerifyResult:
+    from homepilot.artifacts.models import parse_host_provision_spec
+    from homepilot.executor.host_provision import check_drift
+
+    try:
+        spec = parse_host_provision_spec(body)
+    except ValueError as exc:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            drifted=False,
+            verification_log=f"no valid host-provision-spec: {exc}",
+            details={"reason": "no_spec"},
+        )
+
+    host = _resolve_host(fm)
+    if not host:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            drifted=False,
+            verification_log="no target host resolved",
+            details={"reason": "no_host"},
+        )
+    if not _HOSTNAME_RE.match(host):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            drifted=False,
+            verification_log=f"invalid hostname: {host!r}",
+            details={"reason": "invalid_host"},
+        )
+
+    pve_nodes: list[str] = getattr(executor, "pve_nodes", []) or []
+    if any(host.lower().strip() == n.lower().strip() for n in pve_nodes):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            drifted=False,
+            verification_log=f"host-provision forbidden for PVE node '{host}'",
+            details={"reason": "forbidden_host"},
+        )
+
+    result = await check_drift(executor.host_adapter, host, spec)
+    drifted_items: list[str] = result["drifted_items"]
+    return VerifyResult(
+        artifact_id=artifact_id,
+        drifted=bool(result["drifted"]),
+        verification_log=(result["log"] or "all items in desired state")[:2000],
+        details={"drifted_items": drifted_items},
     )
 
 

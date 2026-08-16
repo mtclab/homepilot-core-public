@@ -17,6 +17,10 @@ ActionType = Literal[
     "register",
     "disconnect",
     "zabbix_push",
+    # #397 phase-B1 native provisioning actions.
+    "install_package",
+    "manage_service",
+    "write_config",
 ]
 ResultType = Literal["success", "blocked", "error"]
 

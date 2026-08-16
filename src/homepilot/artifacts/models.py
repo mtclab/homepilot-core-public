@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LifecycleError(Exception):
@@ -25,6 +25,7 @@ class ArtifactKind(StrEnum):
     HTTP_SEQUENCE = "http-sequence"
     COMPOSITE = "composite"
     SHELL_SCRIPT = "shell-script"
+    HOST_PROVISION = "host-provision"
     KB_NOTE = "kb-note"
 
 
@@ -179,6 +180,107 @@ def extract_composite_steps(body: str) -> list[dict[str, Any]]:
         return []
     steps_raw: list[dict[str, Any]] = parsed["steps"]
     return steps_raw
+
+
+class ServiceState(StrEnum):
+    STARTED = "started"
+    STOPPED = "stopped"
+    RESTARTED = "restarted"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+
+
+# Metachar-free identifier/path patterns. The agent re-validates on its side,
+# but rejecting early gives a clear, host-round-trip-free error and keeps a
+# metachar-y name (`nginx; rm -rf /`) from ever leaving the control plane.
+_PACKAGE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9+._-]*$")
+_SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9@][a-zA-Z0-9@._-]*$")
+_CONFIG_PATH_RE = re.compile(r"^/[a-zA-Z0-9_./-]+$")
+_FILE_MODE_RE = re.compile(r"^[0-7]{3,4}$")
+
+
+class HostProvisionService(BaseModel):
+    name: str
+    state: ServiceState
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not _SERVICE_NAME_RE.match(v):
+            raise ValueError(f"invalid service name: {v!r}")
+        return v
+
+
+class HostProvisionConfigFile(BaseModel):
+    path: str
+    content: str
+    mode: str = "0644"
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        if ".." in v or not _CONFIG_PATH_RE.match(v):
+            raise ValueError(f"invalid config_file path: {v!r}")
+        return v
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, v: str) -> str:
+        if not _FILE_MODE_RE.match(v):
+            raise ValueError(f"invalid config_file mode: {v!r}")
+        return v
+
+
+class HostProvisionSpec(BaseModel):
+    packages: list[str] = Field(default_factory=list)
+    services: list[HostProvisionService] = Field(default_factory=list)
+    config_files: list[HostProvisionConfigFile] = Field(default_factory=list)
+
+    @field_validator("packages")
+    @classmethod
+    def _validate_packages(cls, v: list[str]) -> list[str]:
+        for name in v:
+            if not isinstance(name, str) or not _PACKAGE_NAME_RE.match(name):
+                raise ValueError(f"invalid package name: {name!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_nonempty(self) -> HostProvisionSpec:
+        if not self.packages and not self.services and not self.config_files:
+            raise ValueError(
+                "host-provision spec must declare at least one of "
+                "packages / services / config_files"
+            )
+        return self
+
+
+_HOST_PROVISION_FENCE = "host-provision-spec"
+
+
+def parse_host_provision_spec(body: str) -> HostProvisionSpec:
+    """Parse + validate the ```yaml host-provision-spec``` block from an artifact
+    body into a :class:`HostProvisionSpec`.
+
+    Raises ``ValueError`` with a clear message when the fenced block is missing,
+    is not a mapping, carries an unknown service state, is missing a required
+    field, or contains a metachar-y package/service name or config path."""
+    import yaml as _yaml
+    from pydantic import ValidationError
+
+    pattern = re.compile(rf"```yaml\s+{_HOST_PROVISION_FENCE}\s*\n(.*?)```", re.DOTALL)
+    m = pattern.search(body)
+    if not m:
+        raise ValueError(f"missing ```yaml {_HOST_PROVISION_FENCE}``` block")
+    try:
+        parsed = _yaml.safe_load(m.group(1).strip())
+    except _yaml.YAMLError as exc:
+        raise ValueError(f"host-provision spec is not valid YAML: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("host-provision spec must be a YAML mapping")
+    try:
+        return HostProvisionSpec.model_validate(parsed)
+    except ValidationError as exc:
+        raise ValueError(f"invalid host-provision spec: {exc}") from exc
 
 
 VALID_TRANSITIONS: dict[ArtifactStatus, set[ArtifactStatus]] = {
