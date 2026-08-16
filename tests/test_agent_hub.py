@@ -555,6 +555,74 @@ class TestHubIntegration:
             # Reconnected agent is still registered.
             assert h.srv.registry.get("A") is not None
 
+    async def test_send_action_round_trips_params_and_result(self):
+        """#397 phase-B1: send_action frames the action+params on the wire and
+        returns the agent's structured {changed, detail} result."""
+        async with _hub() as h:
+            r, w = await h.register("A", "web01")
+            assert (await _recv(r))["action"] == "register_ack"
+
+            task = asyncio.create_task(
+                h.srv.send_action("A", "install_package", {"name": "nginx"}, timeout=5)
+            )
+            frame = await _recv(r)
+            assert frame["action"] == "install_package"
+            assert frame["name"] == "nginx"
+
+            w.write(
+                _encode(
+                    {
+                        "action": "command_result",
+                        "request_id": frame["request_id"],
+                        "changed": True,
+                        "detail": "nginx installed",
+                    }
+                )
+            )
+            await w.drain()
+
+            result = await task
+            assert result["changed"] is True
+            assert result["detail"] == "nginx installed"
+
+    async def test_send_action_error_result_raises(self):
+        """An agent-reported error (e.g. path not in allowlist) surfaces as
+        AgentCommandError instead of a silent success."""
+        async with _hub() as h:
+            r, w = await h.register("A", "web01")
+            assert (await _recv(r))["action"] == "register_ack"
+
+            task = asyncio.create_task(
+                h.srv.send_action(
+                    "A",
+                    "write_config",
+                    {"path": "/nope", "content": "x", "mode": "0644"},
+                    timeout=5,
+                )
+            )
+            frame = await _recv(r)
+            assert frame["action"] == "write_config"
+
+            w.write(
+                _encode(
+                    {
+                        "action": "command_result",
+                        "request_id": frame["request_id"],
+                        "error": "path not in allowed write prefixes",
+                    }
+                )
+            )
+            await w.drain()
+
+            with pytest.raises(AgentCommandError, match="not in allowed write prefixes"):
+                await task
+
+    async def test_send_action_no_agent_raises(self):
+        """send_action to an unknown agent raises ConnectionError (not a hang)."""
+        async with _hub() as h:
+            with pytest.raises(ConnectionError):
+                await h.srv.send_action("ghost", "install_package", {"name": "nginx"}, timeout=1)
+
     async def test_second_connection_claiming_live_hostname_rejected(self):
         """#379(b): a second connection claiming a live agent's hostname is
         rejected and the original stays registered."""

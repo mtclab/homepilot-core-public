@@ -294,6 +294,12 @@ func (a *Agent) serve() error {
 			a.handleReadFile(m, reqID)
 		case "write_file":
 			a.handleWriteFile(m, reqID)
+		case "install_package":
+			a.handleInstallPackage(m, reqID)
+		case "manage_service":
+			a.handleManageService(m, reqID)
+		case "write_config":
+			a.handleWriteConfig(m, reqID)
 		case "zabbix_push":
 			a.handleZabbixPush(m, reqID)
 		default:
@@ -331,6 +337,43 @@ func (a *Agent) handleWriteFile(m msg, reqID string) {
 		return
 	}
 	_ = a.send(msg{"action": "command_result", "status": "ok", "request_id": reqID})
+}
+
+// handleInstallPackage / handleManageService / handleWriteConfig dispatch the
+// #397 phase-B1 provisioning actions. Each parses its args, runs the idempotent
+// action through the agent's own allowlist-checked exec / write path, and
+// returns a structured {changed, detail} result (or an error frame). The
+// existing send() path stamps replay framing.
+func (a *Agent) handleInstallPackage(m msg, reqID string) {
+	res, err := installPackage(a.exec.Exec, a.exec.allow.privileged, str(m, "name"))
+	a.sendProvisionResult(res, err, reqID)
+}
+
+func (a *Agent) handleManageService(m msg, reqID string) {
+	res, err := manageService(a.exec.Exec, a.exec.allow.privileged, str(m, "name"), str(m, "state"))
+	a.sendProvisionResult(res, err, reqID)
+}
+
+func (a *Agent) handleWriteConfig(m msg, reqID string) {
+	mode := str(m, "mode")
+	if mode == "" {
+		mode = "0644"
+	}
+	res, err := writeConfig(a.exec.allow.privileged, str(m, "path"), str(m, "content"), mode)
+	a.sendProvisionResult(res, err, reqID)
+}
+
+// sendProvisionResult frames a provisioning outcome as a command_result: an
+// error frame on failure, else a structured {changed, detail} success.
+func (a *Agent) sendProvisionResult(res provisionResult, err error, reqID string) {
+	if err != nil {
+		_ = a.send(msg{"action": "command_result", "error": err.Error(), "request_id": reqID})
+		return
+	}
+	_ = a.send(msg{
+		"action": "command_result", "status": "ok",
+		"changed": res.Changed, "detail": res.Detail, "request_id": reqID,
+	})
 }
 
 func (a *Agent) handleZabbixPush(m msg, reqID string) {

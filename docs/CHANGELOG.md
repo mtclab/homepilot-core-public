@@ -1,8 +1,47 @@
 # Changelog
 
+## v2.7.0 (2026-08-16)
+
+Manage imported hosts, end to end — plus deployment robustness.
+
+### Features
+
+- **Provision managed hosts (epic #397 Phase B).** Native, idempotent agent
+  actions — `install_package`, `manage_service`, `write_config` — that stay
+  inside the command allowlist (no target shell, no ansible; the spike showed
+  ansible needs a full shell that breaks containment). A new **`host-provision`
+  artifact kind** describes a host's desired state declaratively (packages
+  installed, services in a state, config files written) and applies it through
+  the propose → approve → apply lifecycle, with read-only drift detection. Paired
+  with Phase A (introspect-on-adopt, in 2.6.0), HomePilot can now observe and
+  provision an imported host without reverse-engineering it.
+
+### Deployment
+
+- **The optional agent stack (n8n, SearXNG, Radicale, Whisper, Piper) is gated
+  behind the `agents` compose profile.** `docker compose up -d` now starts only
+  the backend; use `docker compose --profile agents up -d` for the extras. A
+  stale optional-image tag can no longer abort a core backend update. Corrected
+  the Piper image tag (`2.4.2`, no `v` prefix) and refreshed the optional-service
+  tags.
+
 ## v2.6.0 (2026-08-16)
 
 Large hardening + upgrade batch from the 2026-08-15 code audit.
+
+### ⚠️ Upgrade notes (read before updating an existing deployment)
+
+- **The Agent Hub now FAILS CLOSED without TLS on a non-loopback bind.** If you
+  run the hub (`HP_AGENT_HUB_ENABLED=true`) on `0.0.0.0`/a routable address and
+  it previously started plaintext with only a warning, 2.6.0 will **refuse to
+  start** (`RuntimeError: Agent Hub refusing to start: … TLS is not configured`).
+  To upgrade, either configure TLS (`HP_AGENT_HUB_TLS=1` + `HP_AGENT_HUB_CERT`/
+  `HP_AGENT_HUB_KEY`), or, on a trusted isolated network (LAN/VPN), set
+  `HP_HUB_ALLOW_INSECURE=1` to keep plaintext explicitly. The wire risk on a
+  trusted network is further mitigated by the new per-agent credentials + replay
+  protection.
+- Agents already enrolled with the shared token keep working; on first reconnect
+  they are handed a per-agent credential automatically (no manual migration).
 
 ### Security (Agent Hub)
 

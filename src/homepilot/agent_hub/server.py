@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, cast
 
+from .audit import ActionType
 from .registry import AgentRegistry
 from .replay import (
     NONCE_MIN_HEX_LEN,
@@ -763,6 +764,46 @@ class AgentHubServer:
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, "exec", command, result)
+
+    async def send_action(
+        self,
+        agent_id: str,
+        action: ActionType,
+        params: dict[str, Any],
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Dispatch a native provisioning action (#397 phase-B1) to an agent and
+        await its structured result.
+
+        Reuses the same request/future plumbing as send_command / send_write_file:
+        the outbound frame is stamped via ``_emit`` (replay framing preserved), the
+        wait honours the caller timeout plus ``RESULT_WAIT_MARGIN``, and the result
+        is routed through ``_finalize_result`` so an agent-reported error surfaces
+        as :class:`AgentCommandError` instead of a silent success. ``params`` are
+        merged into the frame (e.g. ``{"name": ...}`` / ``{"path", "content",
+        "mode"}``)."""
+        target = str(params.get("name") or params.get("path") or "")
+        agent = self.registry.get(agent_id)
+        if not agent or not agent.writer:
+            self.registry.audit_log.log(
+                agent_id=agent_id,
+                action=action,
+                command_or_path=target,
+                result="error",
+                exit_code=None,
+                hostname=agent.hostname if agent else None,
+            )
+            raise ConnectionError(f"agent {agent_id} not connected")
+
+        request_id = str(uuid.uuid4())
+        msg = {"action": action, "request_id": request_id, **params}
+        await self._emit(agent.writer, agent.replay, msg)
+
+        result = await asyncio.wait_for(
+            self.registry.wait_for_result(agent_id, request_id),
+            timeout=timeout + RESULT_WAIT_MARGIN,
+        )
+        return self._finalize_result(agent_id, action, target, result)
 
     async def send_zabbix_push(self, agent_id: str, timeout: int = 30) -> dict[str, Any]:
         agent = self.registry.get(agent_id)

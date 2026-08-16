@@ -69,13 +69,22 @@ For production, put the vault passphrase in a file and use `HP_VAULT_PASSPHRASE_
 
 ## 2. Start the Stack
 
-### Default (backend + agent services, no LLM)
+### Default (backend only)
 
 ```bash
 docker compose up -d
 ```
 
-The backend starts at **http://localhost:8000** (UI at `/ui`). This starts n8n, SearXNG, Radicale, Whisper, and Piper alongside the backend.
+The backend starts at **http://localhost:8000** (UI at `/ui`). Only the HomePilot
+backend runs — the optional agent services (n8n, SearXNG, Radicale, Whisper,
+Piper) are gated behind the `agents` profile so a stale extras image can never
+block a core backend update.
+
+### With agent services (n8n, SearXNG, Radicale, Whisper, Piper)
+
+```bash
+docker compose --profile agents up -d
+```
 
 ### With LLM (GPU)
 

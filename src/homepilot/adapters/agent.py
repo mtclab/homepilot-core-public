@@ -143,6 +143,45 @@ class AgentAdapter:
         changed = before_hash != after_hash
         return {"before_hash": before_hash, "after_hash": after_hash, "changed": changed}
 
+    async def _provision(self, host: str, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Shared dispatch for the #397 phase-B1 provisioning actions.
+
+        Resolves the agent by host (with the PVE-node guard), sends the action via
+        the hub, and returns the parsed ``{changed, detail}`` structure. A missing
+        agent or transport failure raises :class:`AgentAdapterError`."""
+        self._check_guest_only(host)
+        agent_id = self._resolve_agent_id(host)
+        if not agent_id:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        try:
+            result = await self._hub.send_action(agent_id, action, params)
+        except (TimeoutError, ConnectionError) as exc:
+            raise AgentAdapterError(f"agent {action} failed for {host}: {exc}") from exc
+        return {
+            "changed": bool(result.get("changed", False)),
+            "detail": str(result.get("detail", "")),
+        }
+
+    async def install_package(self, host: str, name: str) -> dict[str, Any]:
+        """Idempotently install an apt package on ``host`` via the agent."""
+        return await self._provision(host, "install_package", {"name": name})
+
+    async def manage_service(self, host: str, name: str, state: str) -> dict[str, Any]:
+        """Bring a systemd unit on ``host`` to ``state`` (started/stopped/
+        restarted/enabled/disabled) idempotently via the agent."""
+        return await self._provision(host, "manage_service", {"name": name, "state": state})
+
+    async def write_config(
+        self, host: str, path: str, content: str, mode: str = "0644"
+    ) -> dict[str, Any]:
+        """Idempotently write a config file on ``host`` at ``mode`` via the agent.
+
+        The agent enforces the same write allowlist + symlink safety as
+        write_file; identical content is a no-op (``changed: False``)."""
+        return await self._provision(
+            host, "write_config", {"path": path, "content": content, "mode": mode}
+        )
+
     async def exec_readonly(self, host: str, command: str) -> tuple[int, str, str]:
         if not self._validate_readonly_command(command):
             raise ReadOnlyCommandError(f"command not in read-only whitelist: {command}")

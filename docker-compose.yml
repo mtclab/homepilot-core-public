@@ -4,7 +4,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.6.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.7.0}
     build:
       context: .
       dockerfile: Dockerfile
@@ -35,7 +35,8 @@ services:
 
   # ── n8n (workflow automation) ────────────────────────────────────────────
   n8n:
-    image: n8nio/n8n:1.98.0
+    image: n8nio/n8n:2.35.3
+    profiles: ["agents"]
     container_name: n8n
     environment:
       N8N_HOST: ${N8N_HOST:-localhost}
@@ -71,6 +72,7 @@ services:
   # ── SearXNG (meta search) ──────────────────────────────────────────────
   searxng:
     image: searxng/searxng:latest
+    profiles: ["agents"]
     container_name: searxng
     volumes:
       - ./agent/searxng/settings.yml:/etc/searxng/settings.yml:ro
@@ -88,7 +90,8 @@ services:
 
   # ── Radicale (CalDAV/CardDAV) ───────────────────────────────────────────
   radicale:
-    image: tomsquest/docker-radicale:3.3.2.0
+    image: tomsquest/docker-radicale:3.7.6.0
+    profiles: ["agents"]
     container_name: radicale
     volumes:
       - ./agent/radicale/config:/config/config:ro
@@ -109,6 +112,7 @@ services:
   # ── Whisper (speech-to-text) ────────────────────────────────────────────
   whisper:
     image: fedirz/faster-whisper-server:latest-cpu
+    profiles: ["agents"]
     container_name: whisper
     environment:
       WHISPER__MODEL: base
@@ -128,7 +132,8 @@ services:
 
   # ── Piper (text-to-speech) ─────────────────────────────────────────────
   piper:
-    image: rhasspy/wyoming-piper:v2.4.0
+    image: rhasspy/wyoming-piper:2.4.2
+    profiles: ["agents"]
     container_name: piper
     environment:
       PIPER_VOICE: en_US-lessac-medium

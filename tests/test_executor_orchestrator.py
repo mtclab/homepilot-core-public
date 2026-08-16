@@ -181,6 +181,63 @@ class TestFullLifecycleShellScript:
         mock_ssh.exec.assert_called()
 
 
+HOST_PROVISION_SPEC_BODY = """\
+## Plan
+Ensure nginx installed, running, configured.
+
+```yaml host-provision-spec
+packages:
+  - nginx
+services:
+  - name: nginx
+    state: started
+config_files:
+  - path: /etc/nginx/conf.d/app.conf
+    content: |
+      server { listen 80; }
+    mode: "0644"
+```
+"""
+
+
+class TestFullLifecycleHostProvision:
+    async def test_full_lifecycle_host_provision(self, tmp_artifacts_dir):
+        store = ArtifactStore(tmp_artifacts_dir)
+        lifecycle = ArtifactLifecycle(store=store)
+        mock_agent = AsyncMock()
+        mock_agent.install_package = AsyncMock(return_value={"changed": True, "detail": "ok"})
+        mock_agent.manage_service = AsyncMock(return_value={"changed": True, "detail": "ok"})
+        mock_agent.write_config = AsyncMock(return_value={"changed": False, "detail": "same"})
+        mock_proxmox = AsyncMock()
+        mock_proxmox.snapshot = AsyncMock(return_value={"data": "snap1"})
+        mock_repo = AsyncMock()
+        mock_vault = AsyncMock()
+
+        executor = ArtifactExecutor(
+            store=store,
+            lifecycle=lifecycle,
+            repo=mock_repo,
+            proxmox=mock_proxmox,
+            agent=mock_agent,
+            vault=mock_vault,
+            pve_nodes=["pve1"],
+        )
+
+        spec = _make_spec(kind="host-provision", body=HOST_PROVISION_SPEC_BODY)
+        aid = await lifecycle.propose(spec)
+        await lifecycle.approve(aid, user="admin")
+
+        result = await executor.apply(aid, approved_by="admin")
+        assert result.success
+        # the orchestrator routed host-provision to the native B1 actions
+        mock_agent.install_package.assert_awaited_once_with("web1", "nginx")
+        mock_agent.manage_service.assert_awaited_once_with("web1", "nginx", "started")
+        mock_agent.write_config.assert_awaited_once()
+
+        fm, _ = store.read(aid)
+        assert fm["status"] == "applied"
+
+
 class TestOrchestratorValidation:
     async def test_apply_non_approved_raises_executor_error(self, tmp_artifacts_dir):
         store = ArtifactStore(tmp_artifacts_dir)
