@@ -14,7 +14,17 @@
 # (see #399); only building the real image can.
 
 VENV := .venv/bin
-GO_ENV := GOCACHE=/tmp/gocache GOPATH=/home/kasm-user/go PATH=$$PATH:/home/kasm-user/go-toolchain/go/bin
+
+# The Go toolchain comes from PATH. Point GO_BIN at a specific one when it is
+# installed outside the system path, e.g.
+#   make gate-go GO_BIN=$HOME/go-toolchain/go/bin/go
+# rather than editing this file: a hardcoded /home/<someone>/ here ships to the
+# public mirror and tells the world the maintainer's account name and workspace
+# layout. The leak canary on that repo rejects exactly this, and it caught this
+# line rather than any of our own checks.
+GO_BIN ?= go
+GOCACHE ?= /tmp/gocache
+GO_ENV := GOCACHE=$(GOCACHE)
 
 .PHONY: gate gate-py gate-web gate-go gate-image
 
@@ -31,7 +41,7 @@ gate-web:
 	cd web && npm run build && npx svelte-check && npx vitest run
 
 gate-go:
-	cd agent/go && $(GO_ENV) go vet ./... && $(GO_ENV) go test ./...
+	cd agent/go && $(GO_ENV) $(GO_BIN) vet ./... && $(GO_ENV) $(GO_BIN) test ./...
 
 gate-image:
 	bash scripts/smoke-image.sh
