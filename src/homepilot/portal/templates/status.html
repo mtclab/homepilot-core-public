@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Your machine{% endblock %}
+{% block head %}
+{% if not finished %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+{% endblock %}
+{% block content %}
+<h1>Your machine</h1>
+<hr class="rule">
+
+{% if state == "running" %}
+<p><span class="status status-running">Building</span></p>
+<p class="lede">Cloning the template, sizing the disk and booting. This page refreshes itself
+every five seconds; it takes a couple of minutes.</p>
+
+{% elif state == "ok" %}
+<p><span class="status status-ok">Ready</span></p>
+<p class="lede">The machine is up. Here is how to reach it.</p>
+<div class="card">
+  <dl class="spec">
+    <dt>Name</dt><dd>{{ result.name }}</dd>
+    <dt>VM id</dt><dd>{{ result.vmid }}</dd>
+    <dt>Address</dt><dd>{{ result.ip or "not reported yet" }}</dd>
+    <dt>Username</dt><dd>{{ username }}</dd>
+    {% if result.tailnet %}
+    <dt>Tailnet</dt><dd>{{ "joined" if result.tailnet == "joined" else "join failed - run tailscale up yourself" }}</dd>
+    {% endif %}
+  </dl>
+</div>
+{% if result.ip %}
+<h2>Connect</h2>
+<pre class="connect">ssh {{ username }}@{{ result.ip }}</pre>
+{% else %}
+<p class="notice">No address has been reported yet. Refresh in a minute; if it stays empty, ask
+the operator.</p>
+{% endif %}
+
+{% else %}
+<p><span class="status status-bad">Did not finish</span></p>
+<p class="lede">The build did not complete. Nothing was left half-made that you need to clean
+up. Tell the operator you saw this page and they can look at the details.</p>
+{% endif %}
+{% endblock %}

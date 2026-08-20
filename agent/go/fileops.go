@@ -23,7 +23,7 @@ import (
 // (and constrained deployments) via HP_AGENT_WRITE_PREFIXES (colon-separated).
 var defaultWritePrefixes = []string{
 	"/etc/homepilot/", "/opt/homepilot/", "/tmp/homepilot/",
-	"/etc/systemd/system/", "/etc/docker/", "/etc/nginx/", "/etc/zabbix/",
+	"/etc/systemd/system/", "/etc/docker/", "/etc/nginx/",
 }
 
 // defaultReadPrefixes is the built-in read allowlist base. The effective read

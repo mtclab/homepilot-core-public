@@ -54,6 +54,10 @@ class AppState:
     n8n_key_source: str = ""
     agent_hub: Any = None
     agent_registry: Any = None
+    metrics_repo: Any = None
+    # Why the hub is not running despite being enabled, in the operator's words.
+    # Empty when the hub is off by configuration or running normally.
+    agent_hub_disabled_reason: str = ""
 
 
 async def create_app_state(settings: Any | None = None) -> AppState:
@@ -80,6 +84,10 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         logger.info("Vault unlocked")
     else:
         logger.warning("Vault passphrase not set — secrets unavailable until configured")
+
+    from .metrics.repository import MetricsRepository
+
+    metrics_repo = MetricsRepository(database)
 
     proxmox: Any = None
 
@@ -282,28 +290,70 @@ async def create_app_state(settings: Any | None = None) -> AppState:
 
     agent_hub = None
     agent_registry = None
+    agent_hub_disabled_reason = ""
     if settings.agent_hub_enabled:
         from .agent_hub.registry import AgentRegistry
         from .agent_hub.server import AgentHubServer
         from .agent_hub.tokens import BootstrapTokenStore
 
-        agent_registry = AgentRegistry(repo=repo)
+        agent_registry = AgentRegistry(repo=repo, metrics_repo=metrics_repo)
         global _agent_registry
         _agent_registry = agent_registry
 
         _token_store = BootstrapTokenStore(db=database)
         await _token_store.load_from_db()
 
+        # An install that explicitly opted into plaintext keeps plaintext: the
+        # TLS-by-default change must not silently break a fleet whose agents
+        # dial the hub without TLS. Only an operator who never touched
+        # HP_AGENT_HUB_TLS gets the new default.
+        _tls_set_explicitly = "agent_hub_tls" in settings.model_fields_set
+        _tls_wanted = settings.agent_hub_tls and not (
+            settings.agent_hub_allow_insecure and not _tls_set_explicitly
+        )
+
+        # ...and neither may the default itself. TLS-by-default belongs to a NEW
+        # install; an install that already had a fleet when it first met this
+        # code keeps the transport those agents enrolled with, decided once and
+        # remembered (#468). A legacy install therefore also carries the plaintext
+        # allowance the fail-closed check demands - it is not a downgrade, it is
+        # the transport that install was already running.
+        _hub_legacy_plaintext = False
+        if _tls_wanted:
+            from .agent_hub.tls_mode import MODE_LEGACY_PLAINTEXT, resolve_hub_tls_mode
+
+            _hub_legacy_plaintext = (
+                await resolve_hub_tls_mode(
+                    repo,
+                    tls_set_explicitly=_tls_set_explicitly,
+                    bind=f"{settings.agent_hub_host}:{settings.agent_hub_port}",
+                )
+                == MODE_LEGACY_PLAINTEXT
+            )
+            if _hub_legacy_plaintext:
+                _tls_wanted = False
+
         ssl_ctx = None
-        if settings.agent_hub_tls:
+        hub_cert_fingerprint = ""
+        if _tls_wanted:
             import ssl as _ssl
 
-            ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-            if settings.agent_hub_tls_cert and settings.agent_hub_tls_key:
-                ssl_ctx.load_cert_chain(
-                    certfile=settings.agent_hub_tls_cert,
-                    keyfile=settings.agent_hub_tls_key,
+            from .agent_hub.selfconfig import certificate_fingerprint, ensure_hub_certificate
+
+            cert_file = settings.agent_hub_tls_cert
+            key_file = settings.agent_hub_tls_key
+            if not (cert_file and key_file):
+                # No operator-supplied material: generate once and reuse, so the
+                # fail-closed transport check passes on its own merits rather
+                # than being weakened or overridden (ADR-004 S3).
+                _cert_path, _key_path = ensure_hub_certificate(
+                    data_dir,
+                    extra_hosts=(settings.agent_hub_advertise_host, settings.agent_hub_host),
                 )
+                cert_file, key_file = str(_cert_path), str(_key_path)
+            ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            hub_cert_fingerprint = certificate_fingerprint(Path(cert_file))
             if settings.agent_hub_tls_ca:
                 # Mutual TLS: verify each connecting agent's client certificate
                 # against the configured CA.
@@ -331,18 +381,36 @@ async def create_app_state(settings: Any | None = None) -> AppState:
             registry=agent_registry,
             ssl_context=ssl_ctx,
             token_store=_token_store,
-            allow_insecure=settings.agent_hub_allow_insecure,
+            allow_insecure=settings.agent_hub_allow_insecure or _hub_legacy_plaintext,
+            cert_fingerprint=hub_cert_fingerprint,
         )
         # Fail closed early (before serving) on an exposed plaintext transport,
-        # so misconfiguration surfaces as a clear startup error rather than a
-        # swallowed exception inside the background serve task.
-        agent_hub.check_transport_security()
-        agent_registry.hub_server = agent_hub
-        logger.info(
-            "Agent hub initialized on %s:%s",
-            settings.agent_hub_host,
-            settings.agent_hub_port,
-        )
+        # so misconfiguration surfaces before any credential crosses the wire
+        # rather than as a swallowed exception inside the background serve task.
+        #
+        # Closing the HUB is the whole point; killing the CONTROL PLANE is not.
+        # Raising here took the API, the UI, inventory and provisioning down with
+        # it and left the container restart-looping, which is the worst available
+        # answer to "your TLS setting is unusual" - and it is what an existing
+        # install with HP_AGENT_HUB_TLS=false does on upgrade (#468). The hub is
+        # one optional subsystem; it goes dark, says why, and everything else
+        # keeps serving so the operator can read the reason and act on it.
+        try:
+            agent_hub.check_transport_security()
+        except RuntimeError as exc:
+            agent_hub_disabled_reason = str(exc)
+            agent_hub = None
+            logger.error(
+                "Agent hub DISABLED - the control plane continues without it. %s",
+                agent_hub_disabled_reason,
+            )
+        else:
+            agent_registry.hub_server = agent_hub
+            logger.info(
+                "Agent hub initialized on %s:%s",
+                settings.agent_hub_host,
+                settings.agent_hub_port,
+            )
 
     return AppState(
         settings=settings,
@@ -360,4 +428,6 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         n8n_key_source=n8n_key_source,
         agent_hub=agent_hub,
         agent_registry=agent_registry,
+        metrics_repo=metrics_repo,
+        agent_hub_disabled_reason=agent_hub_disabled_reason,
     )

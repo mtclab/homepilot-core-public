@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, cast
 
+from ..metrics.repository import MAX_METRIC_NAME_LEN, METRIC_NAME_RE
 from .audit import ActionType
 from .registry import AgentRegistry
 from .replay import (
@@ -55,6 +56,18 @@ PREAUTH_READ_TIMEOUT = 10  # seconds to send a valid handshake before disconnect
 # Extra grace added to a caller's requested timeout when waiting for the agent
 # to return a result, so the transport wait outlives the on-host deadline.
 RESULT_WAIT_MARGIN = 5
+
+# ── Metric ingest bounds (ADR-004 S5) ────────────────────────────────────────
+# One frame is bounded independently of MAX_MESSAGE_SIZE: an agent flushing a
+# long backlog sends several frames, and a single frame must never be able to
+# commit an unbounded batch. The agent's own cap is 500.
+MAX_SAMPLES_PER_FRAME = 2000
+# A sample may be this far in the past (a long-buffered backlog) or this far in
+# the future (clock skew). Anything outside is rejected rather than stored: a
+# point dated next year would sit in the table until it fell out of retention,
+# and one dated 1970 pollutes every window query in between.
+MAX_SAMPLE_AGE_SECONDS = 7 * 86400
+MAX_SAMPLE_SKEW_SECONDS = 300
 
 _LOOPBACK_HOST_NAMES = {"localhost", "localhost.localdomain"}
 
@@ -146,6 +159,33 @@ async def _drain_oversize(reader: asyncio.StreamReader, length: int) -> bytes | 
     return await _read_exact(reader, length)
 
 
+def parse_metric_sample(item: Any, now: float) -> tuple[str, int, float] | None:
+    """Validate one ``{metric, value, clock}`` entry into a storable row.
+
+    Returns ``None`` for anything malformed. The hub is the trust boundary for
+    metric names: they become storage keys and alert-rule join keys, so a frame
+    can only create series the agent's own vocabulary allows."""
+    if not isinstance(item, dict):
+        return None
+    metric = item.get("metric")
+    if not isinstance(metric, str) or len(metric) > MAX_METRIC_NAME_LEN:
+        return None
+    if not METRIC_NAME_RE.match(metric):
+        return None
+    value = item.get("value")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / +-inf
+        return None
+    clock = item.get("clock")
+    if isinstance(clock, bool) or not isinstance(clock, int):
+        return None
+    if clock < now - MAX_SAMPLE_AGE_SECONDS or clock > now + MAX_SAMPLE_SKEW_SECONDS:
+        return None
+    return metric, clock, value
+
+
 class AgentCommandError(Exception):
     """An agent executed the request but returned an application-level error
     (e.g. path not in allowlist, file not found). Distinct from a transport
@@ -162,6 +202,7 @@ class AgentHubServer:
         ssl_context: ssl.SSLContext | None = None,
         token_store: BootstrapTokenStore | None = None,
         allow_insecure: bool = False,
+        cert_fingerprint: str = "",
     ) -> None:
         self.host = host
         self.port = port
@@ -170,6 +211,10 @@ class AgentHubServer:
         self._ssl_context = ssl_context
         self._token_store = token_store or BootstrapTokenStore()
         self.allow_insecure = allow_insecure
+        # sha256 of the DER form of the certificate this hub serves. Handed out
+        # at enrollment so an agent can pin THIS hub rather than trusting a
+        # self-signed certificate on sight. Empty when TLS is off.
+        self.cert_fingerprint = cert_fingerprint
         self._server: asyncio.Server | None = None
         # Auth-flood protection state (in-memory, per remote host).
         self._auth_failures: dict[str, int] = {}
@@ -177,6 +222,10 @@ class AgentHubServer:
         self._preauth_count = 0
         # Register-frame freshness state for replay-protected connections.
         self._nonce_cache = NonceCache()
+
+    @property
+    def tls_enabled(self) -> bool:
+        return self._ssl_context is not None
 
     def check_transport_security(self) -> None:
         """Fail closed on an exposed plaintext transport.
@@ -697,14 +746,18 @@ class AgentHubServer:
                     self.registry.store_command_result(agent_id, msg)
                     ack = {"action": "result_ack", "request_id": request_id}
                     await self._emit(writer, replay_session, ack)
-                elif msg_action == "report_state":
-                    self.registry.update_state(agent_id, msg.get("state", {}))
-                    ack = {"action": "state_ack", "request_id": request_id}
-                    await self._emit(writer, replay_session, ack)
-                elif msg_action == "zabbix_push_result":
-                    self.registry.store_command_result(agent_id, msg)
-                    ack = {"action": "zabbix_ack", "request_id": request_id}
-                    await self._emit(writer, replay_session, ack)
+                elif msg_action == "metrics":
+                    stored, rejected = await self._ingest_metrics(agent_id, msg)
+                    # The ack is what lets the agent free its buffer, so it is
+                    # sent only AFTER the samples are committed. An agent that
+                    # gets no ack re-sends rather than losing the batch.
+                    metrics_ack: dict[str, Any] = {
+                        "action": "metrics_ack",
+                        "request_id": request_id,
+                        "accepted": stored,
+                        "rejected": rejected,
+                    }
+                    await self._emit(writer, replay_session, metrics_ack)
                 else:
                     await self._emit(
                         writer,
@@ -735,6 +788,60 @@ class AgentHubServer:
             writer.close()
             await writer.wait_closed()
 
+    async def _ingest_metrics(self, agent_id: str, msg: dict[str, Any]) -> tuple[int, int]:
+        """Store one metrics frame and refresh this agent's live state.
+
+        The metrics frame is the agent's ONLY state channel (ADR-004 S5): it
+        carries the fresh values AND doubles as the periodic touch that keeps the
+        persisted ``last_heartbeat`` moving. The former ``report_state`` action
+        was a second, dead channel - no agent ever sent it, which is why the
+        Agents view showed an empty state and a frozen heartbeat (#430).
+
+        Returns ``(accepted, rejected)``. A frame with unusable entries is never
+        a reason to fail the whole batch: the good samples are stored and the bad
+        ones are counted back to the agent."""
+        agent = self.registry.get(agent_id)
+        hostname = agent.hostname if agent else ""
+        raw = msg.get("samples")
+        if not isinstance(raw, list):
+            logger.warning("metrics frame from %s carried no sample list", agent_id)
+            return 0, 0
+
+        rejected = max(0, len(raw) - MAX_SAMPLES_PER_FRAME)
+        rows: list[tuple[str, int, float]] = []
+        for item in raw[:MAX_SAMPLES_PER_FRAME]:
+            parsed = parse_metric_sample(item, time.time())
+            if parsed is None:
+                rejected += 1
+                continue
+            rows.append(parsed)
+
+        if rejected:
+            logger.warning(
+                "metrics frame from %s (host=%s): %d of %d samples rejected as malformed "
+                "or out of range",
+                agent_id,
+                hostname,
+                rejected,
+                len(raw),
+            )
+
+        metrics_repo = getattr(self.registry, "metrics_repo", None)
+        if metrics_repo is not None and rows and hostname:
+            await metrics_repo.insert_samples(hostname, agent_id, rows)
+
+        # Newest value per metric becomes the agent's live state, so the Agents
+        # view shows real numbers instead of an empty object.
+        if rows:
+            latest: dict[str, Any] = {}
+            newest_ts: dict[str, int] = {}
+            for metric, ts, value in rows:
+                if ts >= newest_ts.get(metric, -1):
+                    newest_ts[metric] = ts
+                    latest[metric] = value
+            self.registry.update_state(agent_id, latest)
+        return len(rows), rejected
+
     async def start(self) -> None:
         self.check_transport_security()
         if self._ssl_context:
@@ -745,6 +852,14 @@ class AgentHubServer:
         else:
             self._server = await asyncio.start_server(self._handle_agent, self.host, self.port)
             logger.info("agent hub listening on %s:%s", self.host, self.port)
+
+    def is_listening(self) -> bool:
+        """Whether the hub is actually accepting connections.
+
+        A constructed AgentHubServer is not a serving one - start() binds the
+        socket in a background task - so the startup self-check must ask the
+        socket, not the object's existence."""
+        return self._server is not None and self._server.is_serving()
 
     async def serve_forever(self) -> None:
         await self.start()
@@ -859,23 +974,6 @@ class AgentHubServer:
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, action, target, result)
-
-    async def send_zabbix_push(self, agent_id: str, timeout: int = 30) -> dict[str, Any]:
-        agent = self.registry.get(agent_id)
-        if not agent or not agent.writer:
-            raise ConnectionError(f"agent {agent_id} not connected")
-
-        request_id = str(uuid.uuid4())
-        msg = {"action": "zabbix_push", "request_id": request_id}
-        await self._emit(agent.writer, agent.replay, msg)
-
-        result = await asyncio.wait_for(
-            self.registry.wait_for_result(agent_id, request_id),
-            timeout=timeout + RESULT_WAIT_MARGIN,
-        )
-        # Route through the outcome check so an agent-reported zabbix error
-        # surfaces as a failure instead of a silent success.
-        return self._finalize_result(agent_id, "zabbix_push", "", result)
 
     async def send_read_file(self, agent_id: str, path: str, timeout: int = 30) -> dict[str, Any]:
         agent = self.registry.get(agent_id)

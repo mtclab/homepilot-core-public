@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import os
@@ -28,6 +29,7 @@ from .auth.tokens import validate_token as _validate_token
 from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
+from .selfcheck import mcp_transport_running, schedule_boot_selfcheck
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +122,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         cidr = cidr.strip()
         if cidr:
             _trusted_proxy_networks.append(ipaddress.ip_network(cidr, strict=False))
+    # Published so routes that make their own source-address decision (the
+    # first-run claim) read the SAME list as the rate-limit middleware instead
+    # of parsing HP_TRUSTED_PROXIES a second time.
+    app.state.trusted_proxy_networks = _trusted_proxy_networks
 
     app.state.db = state.database
     app.state.repo = state.repo
@@ -153,6 +159,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.inventory_service = inventory_service
     app.state.kb_service = state.kb_service
     app.state.sse_bus = state.sse_bus
+    app.state.metrics_repo = state.metrics_repo
 
     if state.agent_hub is not None:
         app.state.agent_hub = state.agent_hub
@@ -221,6 +228,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         interval=float(settings.drift_interval_seconds),
         startup_delay=30.0,
     )
+    # Native metrics upkeep (ADR-004 S5): retention and alert evaluation are
+    # scheduled work, so they ride the reconciler scheduler rather than growing a
+    # second timer mechanism. Both are unconditional — metrics are part of the
+    # product, and a pruner that only runs when something else is configured is
+    # how an unbounded table happens.
+    from .metrics.alerts import AlertEvaluator
+    from .metrics.retention import MetricsPruner
+
+    metrics_pruner = MetricsPruner(state.metrics_repo, settings.metrics_retention_days)
+    reconciler_scheduler.register(
+        metrics_pruner,
+        interval=float(settings.metrics_prune_interval_seconds),
+        startup_delay=60.0,
+    )
+    app.state.metrics_pruner = metrics_pruner
+    alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo)
+    reconciler_scheduler.register(
+        alert_evaluator,
+        interval=float(settings.metrics_alert_interval_seconds),
+        startup_delay=45.0,
+    )
+    app.state.alert_evaluator = alert_evaluator
+
     apply_reconciler = None
     if app.state.artifact_executor is not None:
         apply_reconciler = ApplyReconciler(
@@ -251,6 +281,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.task_runner = task_runner
 
+    from .provision.service import ProvisionService
+
+    # Always constructed, even without Proxmox: the adapter can be configured
+    # later through the admin settings UI, and _do_reload rebinds .proxmox onto
+    # this same instance. The router 503s while .proxmox is None.
+    app.state.provision_service = ProvisionService(
+        proxmox=state.proxmox,
+        task_repo=task_repo,
+        repo=state.repo,
+    )
+
+    from .agent_hub.enroll import AgentEnrollService
+
+    # Always constructed, like ProvisionService: Proxmox can be configured later
+    # through the admin settings UI (_do_reload rebinds .proxmox onto this same
+    # instance), and the preconditions refuse with a reason until it is.
+    app.state.agent_enroll_service = AgentEnrollService(
+        proxmox=state.proxmox,
+        task_repo=task_repo,
+        repo=state.repo,
+        registry=state.agent_registry,
+    )
+
+    from .portal.repository import InviteRepository
+
+    app.state.invite_repo = InviteRepository(state.database)
+
+    from .claim.repository import ClaimRepository
+
+    app.state.claim_repo = ClaimRepository(state.database)
+
     await reconciler_scheduler.start()
     app.state.reconciler_scheduler = reconciler_scheduler
     app.state.drift_reconciler = drift_reconciler
@@ -261,6 +322,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.warning("KB startup reindex check failed", exc_info=True)
 
     logger.info("HomePilot v2 started — data_dir=%s", settings.data_dir)
+
+    # Last thing before the optional subsystems, so the claim box is the final
+    # block an operator sees in `docker compose logs` rather than being buried.
+    from .claim.startup import ensure_claim_code
+
+    await ensure_claim_code(
+        app.state.claim_repo,
+        Path(settings.data_dir),
+        url_hint=f"http://<this-host>:{settings.daemon_port}/ui",
+    )
 
     mcp_app: Any = None
     app.state.mcp_app = None
@@ -366,10 +437,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await mcp_lifespan_stack.enter_async_context(mcp_app.router.lifespan_context(mcp_app))
         app.state.mcp_running = True
 
+    # Scheduled, never awaited (ADR-004 S6): the report tells an operator what is
+    # off and what is broken, and diagnostics must not add a single millisecond to
+    # the time the app takes to start serving. It runs last so the MCP transport
+    # it reports on is already up.
+    selfcheck_task = schedule_boot_selfcheck(app.state, settings)
+
     try:
         yield
     finally:
         logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+
+        if not selfcheck_task.done():
+            selfcheck_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await selfcheck_task
 
         agent_hub = getattr(app.state, "agent_hub", None)
         if agent_hub is not None:
@@ -515,10 +597,10 @@ def _mcp_health_status(app: FastAPI) -> str:
     ACTUALLY running (its anyio task group is live). A mounted /mcp route alone is
     NOT proof the transport works — #382 had the route present while the session
     manager was never started, so every request 500'd yet /health claimed "ok".
+    The predicate lives in selfcheck so /health and the self-check report cannot
+    drift into judging MCP differently.
     """
-    mcp_app = getattr(app.state, "mcp_app", None)
-    session_manager = getattr(getattr(mcp_app, "state", None), "session_manager", None)
-    return "ok" if getattr(session_manager, "_task_group", None) is not None else "error"
+    return "ok" if mcp_transport_running(getattr(app.state, "mcp_app", None)) else "error"
 
 
 async def _is_authenticated(request: Request) -> bool:
@@ -574,9 +656,13 @@ from .agent_hub.router import router as agent_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
 from .audit.router import router as audit_router  # noqa: E402
 from .auth.router import router as auth_router  # noqa: E402
+from .claim.router import router as claim_router  # noqa: E402
 from .dashboard.router import router as dashboard_router  # noqa: E402
 from .inventory.router import router as inventory_router  # noqa: E402
 from .kb.router import router as kb_router  # noqa: E402
+from .metrics.router import router as metrics_router  # noqa: E402
+from .portal.router import router as portal_router  # noqa: E402
+from .provision.router import router as provision_router  # noqa: E402
 from .tasks.router import router as tasks_router  # noqa: E402
 
 app.include_router(admin_router, prefix="/admin")
@@ -595,7 +681,21 @@ app.include_router(
     tasks_router, prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_token)]
 )
 app.include_router(kb_router, prefix="/kb", tags=["kb"], dependencies=[Depends(require_token)])
+app.include_router(
+    provision_router, prefix="/guests", tags=["guests"], dependencies=[Depends(require_token)]
+)
 app.include_router(dashboard_router, dependencies=[Depends(require_token)])
+app.include_router(metrics_router, dependencies=[Depends(require_token)])
+# The invite portal carries NO token dependency by design: it is authenticated
+# by a client certificate the reverse proxy verified, re-checked inside every
+# route (source address + shared secret + verify header + CN binding). nginx
+# publishes only this prefix on the public mTLS vhost - see docs/portal.md.
+app.include_router(portal_router, prefix="/invite", tags=["invite"])
+# The first-run claim carries NO token dependency by design: it is the path by
+# which the FIRST token comes into existence, so requiring one is a deadlock.
+# Its own credential is the claim code (constant-time compared, rate limited),
+# and it refuses everything once the instance is claimed - see _PUBLIC_ROUTES.
+app.include_router(claim_router)
 
 
 # ── Startup route-scope guard ────────────────────────────────────────────────
@@ -619,6 +719,20 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/auth/login"),
         ("POST", "/auth/logout"),
         ("POST", "/auth/tokens"),  # gated by the admin secret in the request body
+        # Invite portal: authenticated by the mTLS client certificate the proxy
+        # verified, not by an API token. Each route re-derives the CN through
+        # portal.trust (trusted source + shared secret + verify header) and
+        # refuses everything else, so require_scope has nothing to add here.
+        ("GET", "/invite/{token}"),
+        ("POST", "/invite/{token}"),
+        ("GET", "/invite/{token}/status"),
+        # First-run claim: the route that MINTS the first admin token cannot
+        # require one. Its gate is the claim code - generated at first boot,
+        # stored only as a sha256, constant-time compared and rate limited - and
+        # it is permanently closed (410) the moment an admin credential exists,
+        # so this is a public surface for exactly one instance-lifetime moment.
+        ("GET", "/claim/status"),
+        ("POST", "/claim"),
     }
 )
 
@@ -749,10 +863,28 @@ async def health(request: Request) -> JSONResponse:
             mcp_status = "error"
     checks["mcp"] = mcp_status
 
-    degraded_statuses = {"error", "unreachable", "locked", "misconfigured"}
-    has_down = any(v in degraded_statuses for v in checks.values())
-    if has_down:
+    # This endpoint is the LIVENESS probe: the compose healthcheck calls it every
+    # 30s, and anything reading it (a `depends_on: service_healthy`, an
+    # orchestrator's restart policy, an uptime monitor) acts on the answer by
+    # restarting or pulling traffic. So it answers one question - can this process
+    # serve requests - and only the database failing means no.
+    #
+    # It used to answer "is every subsystem happy", which is a different question
+    # with a worse consequence: a vault that needs unlocking, an unreachable
+    # embedding service or a hub that refused its transport (#468) each made a
+    # perfectly serving instance report `down` and 503, so the container was
+    # marked unhealthy over something no restart can repair - a restart loop
+    # chasing a config file. Subsystem trouble is real and stays visible as
+    # `degraded` here, in the per-check map, and in full at /admin/selfcheck,
+    # which exists to draw exactly these distinctions (#470).
+    #
+    # The check map is unchanged, so the UI contract that reads it is untouched.
+    subsystem_trouble = {"error", "unreachable", "locked", "misconfigured"}
+    database_failed = checks.get("database") != "ok"
+    if database_failed:
         overall = "down"
+    elif any(v in subsystem_trouble for v in checks.values()):
+        overall = "degraded"
     elif all(v == "ok" or v == "not_configured" for v in checks.values()):
         overall = "ok"
     else:

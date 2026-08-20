@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
-from homepilot.adapters.ssh import GuestHostError
+from homepilot.adapters.agent import is_pve_node
 
 if TYPE_CHECKING:
     from homepilot.adapters import HostAdapter
@@ -72,11 +72,18 @@ async def execute(
             "failure_reason": "missing host",
         }
 
-    if pve_nodes and hasattr(ssh_adapter, "_validate_guest_only"):
-        try:
-            ssh_adapter._validate_guest_only(host, pve_nodes)
-        except GuestHostError as e:
-            return {"success": False, "execution_log": str(e), "failure_reason": "forbidden target"}
+    # Refuse to run a playbook against a Proxmox hypervisor node. This was
+    # `hasattr(ssh_adapter, "_validate_guest_only")` guarding a call to a method
+    # that no longer exists (it is `_check_guest_only` now), so the hasattr was
+    # always False and the guard NEVER RAN - a dead safety check, not dead code.
+    # It also caught GuestHostError from adapters.ssh while the agent adapter
+    # raises the one from adapters.agent (#388).
+    if pve_nodes and is_pve_node(host, pve_nodes):
+        return {
+            "success": False,
+            "execution_log": f"PVE node '{host}' - use the Proxmox API instead",
+            "failure_reason": "forbidden target",
+        }
 
     if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$", host):
         return {
@@ -87,8 +94,13 @@ async def execute(
 
     inventory_content = (
         f"[target]\n"
-        f"{host} ansible_connection=ssh "
-        f"ansible_ssh_common_args='-o ProxyCommand=jump-server-internal'\n"
+        # The jump server was decommissioned in #327; the ProxyCommand here
+        # pointed at a host that no longer resolves (#388). NOTE: this does
+        # not make the ansible path work - it is structurally dead (temp
+        # inventory written on the control plane, ansible-playbook run on the
+        # remote host where neither the files nor ansible exist). That is the
+        # first item of #388 and needs a real transport design.
+        f"{host} ansible_connection=ssh\n"
     )
 
     variables_section = _extract_variables(body)

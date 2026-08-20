@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, zabbixHostUrl, type Host } from '$lib/api';
+	import { api, hostMetricsUrl, sessionStore, type Host } from '$lib/api';
+	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
+	import { pruneSelection } from '$lib/selection';
 	import { base } from '$app/paths';
 
-	let zabbixUrl = '';
 	let items: Host[] = [];
 	let loading = true;
 	let loadError = '';
@@ -15,6 +16,9 @@
 	let filterSource = '';
 	let filterImportState = '';
 	let selectedIds: Set<string> = new Set();
+	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
+	// them to a read-only session only produces 403s. Default-deny while loading.
+	$: canWrite = capCanWrite($sessionStore?.capabilities);
 
 	async function load() {
 		loading = true;
@@ -27,6 +31,10 @@
 				import_state: filterImportState || undefined,
 			});
 			items = res.items;
+			// The selection must never outlive the rows it was made on: a filter
+			// change used to leave off-screen hosts selected, so "3 selected →
+			// Adopt" acted on hosts the user could not see.
+			selectedIds = pruneSelection(selectedIds, items);
 		} catch (e) {
 			loadError = e instanceof Error ? e.message : String(e);
 			notify(loadError, 'err');
@@ -73,9 +81,9 @@
 	}
 
 	function statusColor(s?: string): string {
-		if (s === 'online') return 'text-green-400';
-		if (s === 'offline') return 'text-red-400';
-		return 'text-slate-400';
+		if (s === 'online') return 'text-ok';
+		if (s === 'offline') return 'text-danger';
+		return 'text-muted';
 	}
 
 	function sourceBadge(source?: string): string {
@@ -86,10 +94,10 @@
 	}
 
 	function sourceClass(source?: string): string {
-		if (source === 'hp_created') return 'bg-sky-600/20 text-sky-300';
-		if (source === 'imported') return 'bg-emerald-600/20 text-emerald-300';
-		if (source === 'discovered') return 'bg-amber-600/20 text-amber-300';
-		return 'bg-slate-600/20 text-slate-300';
+		if (source === 'hp_created') return 'bg-accent-tint text-accent-strong';
+		if (source === 'imported') return 'bg-ok-tint text-ok';
+		if (source === 'discovered') return 'bg-warn-tint text-warn';
+		return 'bg-raised text-ink';
 	}
 
 	function toggleSelect(id: string) {
@@ -108,9 +116,12 @@
 	}
 
 	async function bulk(action: string) {
-		if (selectedIds.size === 0) return;
+		// Belt and braces: act only on rows that are on screen right now, whatever
+		// happened to `items` since the selection was made.
+		const ids = Array.from(pruneSelection(selectedIds, items));
+		if (ids.length === 0) return;
 		try {
-			const res = await api.bulkInventory(action, Array.from(selectedIds));
+			const res = await api.bulkInventory(action, ids);
 			notify(`${action}: ${res.succeeded} succeeded, ${res.failed} failed`, 'ok');
 			selectedIds = new Set();
 			await load();
@@ -140,23 +151,20 @@
 	}
 
 	onMount(async () => {
-		try {
-			zabbixUrl = (await api.getUiConfig()).zabbix_url;
-		} catch {
-			zabbixUrl = '';
-		}
 		await load();
 	});
 </script>
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
-		<h1 class="text-lg font-bold text-slate-100">Inventory</h1>
+		<h1 class="page-title">Inventory</h1>
 		<div class="flex gap-2">
 			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}>↻ Reload</button>
-			<button class="btn btn-ghost text-xs" on:click={sync} disabled={syncing}>
-				{syncing ? 'Syncing…' : '⟳ Sync from Proxmox'}
-			</button>
+			{#if canWrite}
+				<button class="btn btn-ghost text-xs" on:click={sync} disabled={syncing}>
+					{syncing ? 'Syncing…' : '⟳ Sync from Proxmox'}
+				</button>
+			{/if}
 		</div>
 	</div>
 
@@ -195,42 +203,44 @@
 		{#if hasActiveFilters}
 			<button class="btn btn-ghost text-xs self-center" on:click={clearFilters}>Clear filters</button>
 		{/if}
-		<span class="text-slate-500 text-xs self-center">{items.length} hosts</span>
+		<span class="text-muted text-xs self-center">{items.length} hosts</span>
 	</div>
 
 	{#if selectedIds.size > 0}
 		<div class="flex gap-2 items-center">
-			<span class="text-xs text-slate-300">{selectedIds.size} selected</span>
-			<button class="btn btn-sm text-xs" on:click={() => bulk('adopt')}>Adopt</button>
-			<button class="btn btn-sm text-xs" on:click={() => bulk('ignore')}>Ignore</button>
-			<button class="btn btn-sm text-xs" on:click={() => bulk('enrich')}>Enrich</button>
+			<span class="text-xs text-ink">{selectedIds.size} selected</span>
+			{#if canWrite}
+				<button class="btn btn-sm text-xs" on:click={() => bulk('adopt')}>Adopt</button>
+				<button class="btn btn-sm text-xs" on:click={() => bulk('ignore')}>Ignore</button>
+				<button class="btn btn-sm text-xs" on:click={() => bulk('enrich')}>Enrich</button>
+			{/if}
 			<button class="btn btn-sm btn-ghost text-xs" on:click={() => (selectedIds = new Set())}>Clear</button>
 		</div>
 	{/if}
 
 	{#if loading}
-		<p class="text-slate-500 text-sm">Loading…</p>
+		<p class="text-muted text-sm">Loading…</p>
 	{:else if loadError}
 		<div class="card p-6 text-center space-y-3">
-			<p class="text-red-400">Could not load inventory.</p>
-			<p class="text-xs text-slate-500">{loadError}</p>
+			<p class="text-danger">Could not load inventory.</p>
+			<p class="text-xs text-muted">{loadError}</p>
 			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
 		</div>
 	{:else if items.length === 0 && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
-			<p class="text-slate-400 text-sm">No hosts match the current filters.</p>
+			<p class="prose-note text-sm">No hosts match the current filters.</p>
 			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
 		</div>
 	{:else if items.length === 0}
 		<div class="card p-6 text-center space-y-1">
-			<p class="text-slate-400 text-sm">No hosts in inventory yet.</p>
-			<p class="text-xs text-slate-500">Sync from Proxmox to discover hosts.</p>
+			<p class="prose-note text-sm">No hosts in inventory yet.</p>
+			<p class="prose-note text-xs">Sync from Proxmox to discover hosts.</p>
 		</div>
 	{:else}
 		<div class="card overflow-x-auto">
-			<table class="w-full text-xs">
+			<table class="data-table text-xs">
 				<thead>
-					<tr class="text-slate-400 border-b border-slate-700">
+					<tr>
 						<th class="text-left pb-2 pr-2"><input type="checkbox" on:change={toggleSelectAll} checked={selectedIds.size > 0 && selectedIds.size === items.length} /></th>
 						<th class="text-left pb-2 pr-4">Hostname</th>
 						<th class="text-left pb-2 pr-4">IP</th>
@@ -243,47 +253,45 @@
 				</thead>
 				<tbody>
 					{#each items as h}
-						<tr class="border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors">
+						<tr class="border-b border-divider hover:bg-raised transition-colors">
 							<td class="py-2 pr-2"><input type="checkbox" checked={selectedIds.has(h.id)} on:change={() => toggleSelect(h.id)} /></td>
 							<td class="py-2 pr-4">
 								<a
 									href="{base}/inventory/{h.id}"
-									class="text-sky-400 hover:text-sky-300 font-mono"
+									class="text-accent hover:text-accent-strong font-mono"
 								>{h.hostname}</a>
 							</td>
-							<td class="py-2 pr-4 text-slate-400 font-mono">{h.ip_address || '—'}</td>
-							<td class="py-2 pr-4 text-slate-300">
+							<td class="py-2 pr-4 text-muted font-mono">{h.ip_address || '—'}</td>
+							<td class="py-2 pr-4 text-ink">
 								{h.role ?? '—'}
-								{#if h.role_source === 'inferred'}<span class="text-amber-400" title="Inferred">?</span>{/if}
+								{#if h.role_source === 'inferred'}<span class="text-warn" title="Inferred">?</span>{/if}
 							</td>
 							<td class="py-2 pr-4 {statusColor(h.status)}">{h.status ?? 'unknown'}</td>
 							<td class="py-2 pr-4">
 								{#if h.source}
 									<span class="px-1.5 py-0.5 rounded text-[10px] font-medium {sourceClass(h.source)}">{sourceBadge(h.source)}</span>
 								{:else}
-									<span class="text-slate-600">—</span>
+									<span class="text-muted">—</span>
 								{/if}
 							</td>
 							<td class="py-2 pr-4">
-								{#if h.source === 'discovered' && h.import_state !== 'ignored'}
+								{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored'}
 									<button class="btn btn-xs text-[10px]" on:click={() => adoptOne(h)}>Adopt</button>
 									<button class="btn btn-xs text-[10px]" on:click={() => ignoreOne(h)}>Ignore</button>
 								{:else if h.import_state === 'ignored'}
-									<span class="text-slate-500">Ignored</span>
+									<span class="text-muted">Ignored</span>
 								{:else}
-									<span class="text-slate-600">—</span>
+									<span class="text-muted">—</span>
 								{/if}
-								{#if zabbixUrl}
+								{#if h.hostname}
 									<a
-										class="text-sky-400 hover:text-sky-300 text-[10px] ml-1"
-										href={zabbixHostUrl(zabbixUrl, h.hostname)}
-										target="_blank"
-										rel="noopener"
-										title="Open this host's metrics in Zabbix">Metrics ↗</a
+										class="text-accent hover:text-accent-strong text-[10px] ml-1"
+										href={hostMetricsUrl(base, h.hostname)}
+										title="Open this host's recent metrics">Metrics</a
 									>
 								{/if}
 							</td>
-							<td class="py-2 text-slate-400">{h.node ?? '—'}</td>
+							<td class="py-2 text-muted">{h.node ?? '—'}</td>
 						</tr>
 					{/each}
 				</tbody>

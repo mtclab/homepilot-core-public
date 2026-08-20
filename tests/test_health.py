@@ -84,7 +84,10 @@ class TestHealthEndpoint:
         resp = client.get("/health")
         data = resp.json()
         assert data["checks"]["proxmox"] == "unreachable"
-        assert data["status"] == "down"
+        # Proxmox being unreachable is worth surfacing, but HomePilot is serving
+        # and a restart would not bring the hypervisor back (#470).
+        assert data["status"] == "degraded"
+        assert resp.status_code == 200
 
     def test_proxmox_unreachable_raises(self, client):
         mock_db = MagicMock()
@@ -102,7 +105,10 @@ class TestHealthEndpoint:
         resp = client.get("/health")
         data = resp.json()
         assert data["checks"]["proxmox"] == "unreachable"
-        assert data["status"] == "down"
+        # Proxmox being unreachable is worth surfacing, but HomePilot is serving
+        # and a restart would not bring the hypervisor back (#470).
+        assert data["status"] == "degraded"
+        assert resp.status_code == 200
 
     def test_proxmox_ok(self, client):
         mock_db = MagicMock()
@@ -134,10 +140,12 @@ class TestHealthEndpoint:
 
         _setup_state(client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings)
         resp = client.get("/health")
-        assert resp.status_code == 503
+        # A locked vault is real trouble and stays visible - but the process is
+        # serving, and killing it does not unlock anything (#470).
+        assert resp.status_code == 200
         data = resp.json()
         assert data["checks"]["vault"] == "locked"
-        assert data["status"] == "down"
+        assert data["status"] == "degraded"
 
     def test_vault_not_configured(self, client):
         mock_db = MagicMock()
@@ -201,7 +209,12 @@ class TestHealthEndpoint:
         assert data["checks"]["vault"] == "locked"
         assert data["checks"]["proxmox"] == "not_configured"
 
-    def test_degraded_returns_503(self, client):
+    def test_degraded_still_serves_200(self, client):
+        """Degraded is not dead.
+
+        This test used to assert 503 and was the contract that made a serving
+        instance look unhealthy to everything reading the probe (#470).
+        """
         from homepilot.vault import VaultError
 
         mock_db = MagicMock()
@@ -213,7 +226,8 @@ class TestHealthEndpoint:
 
         _setup_state(client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings)
         resp = client.get("/health")
-        assert resp.status_code == 503
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "degraded"
 
 
 class TestMetricsEndpoint:
@@ -284,3 +298,73 @@ class TestMetricPathTemplating:
         req = MagicMock()
         req.scope = {}
         assert _metric_path(req) == "<unmatched>"
+
+
+class TestLivenessMeansServing:
+    """/health is the liveness probe, so it answers one question: can this
+    process serve requests (#470).
+
+    The bug these gates forbid: any check in {error, unreachable, locked,
+    misconfigured} made the whole instance report `down` with HTTP 503. The
+    compose healthcheck calls this endpoint every 30s, so a fully serving
+    HomePilot was advertised as unhealthy over a subsystem no restart can
+    repair - a vault waiting to be unlocked, an unreachable embedding service,
+    or a hub that refused its transport. #468 stopped the control plane dying;
+    this stopped it looking dead to everything that reads the probe.
+
+    Teeth: restore `has_down = any(v in degraded_statuses ...)` in main.health
+    and every test here fails with 503.
+    """
+
+    def _serving_but_unhappy(self, client, **checks):
+        from homepilot.vault import VaultError
+
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=None)
+        mock_vault = MagicMock()
+        mock_vault.list_secrets = AsyncMock(side_effect=VaultError("locked"))
+        mock_settings = MagicMock(
+            agent_hub_enabled=checks.get("hub_enabled", False),
+            cors_origins="http://localhost:5173",
+        )
+        mock_settings.proxmox_host = ""
+        _setup_state(client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings)
+        return client.get("/health")
+
+    def test_a_subsystem_failure_never_fails_the_probe(self, client):
+        """The OUTCOME: whatever else is wrong, a serving process answers 200."""
+        resp = self._serving_but_unhappy(client)
+        assert resp.status_code == 200, (
+            "a serving instance reported unhealthy to the liveness probe - "
+            "orchestrators restart on this, and a restart fixes none of it"
+        )
+        assert resp.json()["status"] == "degraded"
+
+    def test_a_refused_agent_hub_does_not_fail_the_probe(self, client):
+        """The #468 case specifically: the hub refused its transport, the rest of
+        the product is fine. That is degraded, not dead."""
+        resp = self._serving_but_unhappy(client, hub_enabled=True)
+        data = resp.json()
+        assert data["checks"]["agent_hub"] == "error"
+        assert resp.status_code == 200
+        assert data["status"] == "degraded"
+
+    def test_the_database_is_still_fatal(self, client):
+        """The one thing that genuinely means "cannot serve" must still say so,
+        or this change would have traded a false alarm for a missing one."""
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(side_effect=Exception("connection lost"))
+        mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
+        mock_settings.proxmox_host = ""
+        _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=mock_settings)
+
+        resp = client.get("/health")
+        assert resp.status_code == 503
+        assert resp.json()["status"] == "down"
+
+    def test_trouble_is_still_reported_not_hidden(self, client):
+        """Degraded must not become a synonym for fine: the per-check map still
+        names what is wrong, which is what the UI and /admin/selfcheck read."""
+        data = self._serving_but_unhappy(client).json()
+        assert data["checks"]["vault"] == "locked"
+        assert data["status"] != "ok"

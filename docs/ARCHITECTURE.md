@@ -53,12 +53,12 @@
 ║                        │                          │                  ║
 ║                        │  hp-agent daemon ────────┼──► outbound TCP  ║
 ║                        │  (exec, read/write file, │    to hub :8443  ║
-║                        │   heartbeat, zabbix push)│                  ║
+║                        │   heartbeat, metrics)    │                  ║
 ║                        └──────────────────────────┘                  ║
 ║   ┌───────────────────────┐                                          ║
 ║   │  Guest VMs / LXC      │                                          ║
-║   │  (SSH fallback when   │                                          ║
-║   │   no agent connected) │                                          ║
+║   │  (hp-agent required;  │                                          ║
+║   │   no SSH fallback)    │                                          ║
 ║   └───────────────────────┘                                          ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
@@ -201,21 +201,21 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | Tool | Mutates? | Scope | Description |
 |------|----------|-------|-------------|
 | `query_inventory` | no | read | List hosts/services/networks from DB; optional JSON filter |
-| `refresh_inventory` | no | read | Re-pull inventory from Proxmox API + SSH guests |
+| `refresh_inventory` | no | read | Re-pull inventory from the Proxmox REST API + connected agents |
 | `get_environment_doc` | no | read | Fused doc for a target: inventory + KB + artifact history |
 | `query_artifacts` | no | read | Find artifacts by status, kind, target, or date |
 | `get_artifact_status` | no | read | Detailed status of one artifact: id, kind, status, intent, target, last_updated |
 | `search_kb` | no | read | Vector + keyword search over KB notes/policies/decisions |
 | `proxmox_api_read` | no | read | GET-only Proxmox REST call; allowlisted paths only |
 | `http_call_read` | no | read | GET-only call to an adopted service; vault-resolved creds |
-| `read_file_on_guest` | no | read | File read from guest via agent hub or SSH fallback |
+| `read_file_on_guest` | no | read | File read from a guest via the agent hub |
 | `exec_on_guest_readonly` | no | read | Read-only exec on guest via agent hub or SSH (cat, ls, ps…) |
 | `check_artifact_drift` | no | read | Check whether an applied artifact has drifted from desired state |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
-| `approve_artifact` | yes | write | Approve a proposed artifact; rate-limited 10/min per caller |
+| `approve_artifact` | n/a | n/a | **Not exposed over MCP.** Delisted from `list_tools()` and hard-refused in dispatch (#385) - approval must come from an operator via CLI or web UI |
 
-`propose_artifact` initiates a change (requires write scope). `approve_artifact` advances it (also write scope, rate-limited). All other tools are read-only and require only read scope. Agents with read-only tokens cannot call write-scoped tools.
+`propose_artifact` initiates a change (requires write scope). Approval is deliberately NOT available over MCP: the MCP credential is a single shared token, so an LLM able to approve would both propose and approve its own mutations (#385). All other tools are read-only and require only read scope. Agents with read-only tokens cannot call write-scoped tools.
 
 ---
 
@@ -247,7 +247,7 @@ The agent hub reduces SSH dependency by ~90%. Instead of SSH-ing into every host
               ┌─────────┐ ┌─────────┐ ┌─────────┐
               │hp-agent │ │hp-agent │ │hp-agent │
               │ hp-core │ │hp-monitor│ │  host3  │
-              │(Zabbix) │ │(Zabbix) │ │(Zabbix) │
+              │(metrics)│ │(metrics)│ │(metrics)│
               └─────────┘ └─────────┘ └─────────┘
 ```
 
@@ -264,20 +264,42 @@ The agent hub uses **length-prefixed JSON** over TCP:
 1. **Persistent token** (`HP_AGENT_AUTH_TOKEN`): Shared secret between hub and agent. Set once, works forever.
 2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `GET /agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
 
+### Enrolment without touching the host (ADR-004 S4)
+
+`POST /agents/install` installs and enrols the agent inside a Proxmox guest over
+qemu-guest-agent — the same channel provisioning uses to join a tailnet — and
+tracks it as an artifactless `install_agent` task (migration 18).
+
+- Preconditions are checked before any task exists, each with its own reason
+  (`GET /agents/install/{host_id}` returns the same answer for the UI): hub up
+  and advertising a dialable address, Proxmox configured, the host a QEMU guest
+  with a known node+VMID, no agent already live on it, the guest **running**, and
+  qemu-guest-agent **answering**.
+- The bootstrap token and the hub's certificate pin are written to a tmpfs file
+  the guest's shell sources and deletes; they never appear in an argv.
+- The task succeeds only when that agent is **connected in the registry** — the
+  installer's exit code is a step, not the outcome.
+- `scripts/install-agent.sh` remains the path for everything else (bare metal,
+  containers, privileged installs).
+
 ### Authorization
 
 Agent API endpoints use scope-based access control:
 - **read scope**: List agents, check connectivity
-- **admin scope**: Hub auth token, bootstrap tokens, audit log, exec/read/write on agents, Zabbix push
+- **admin scope**: Hub auth token, bootstrap tokens, audit log, exec/read/write on agents, agent install
 
 ### Agent allowlist
 
-Two tiers:
+Three tiers:
 
 | Tier | Commands | Requirement |
 |------|----------|-------------|
 | Safe | `ls`, `cat`, `ps`, `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl status`, `journalctl`, `dpkg -l` | Always allowed |
-| Privileged | `docker pull/compose/run/stop/rm/restart`, `apt-get install`, `systemctl start/stop/restart/enable/disable/daemon-reload`, `mkdir`, `chmod`, `cp`, `mv` | Requires `HP_AGENT_PRIVILEGED=true` |
+| Privileged | `docker pull/compose/run/stop/rm/restart`, `systemctl start/stop/restart/enable/disable/daemon-reload`, `mkdir`, `chmod`, `cp`, `mv`, `bash /opt/homepilot/*.sh` | Requires `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit |
+| Package management | `apt`/`apt-get install/update/upgrade` | Additionally requires `HP_AGENT_ALLOW_PACKAGE_INSTALL=true` (the unit must drop `ProtectSystem`) |
+
+`sudo` is not allowlisted in any tier: a privileged agent is already root, and an
+unprivileged one runs under `NoNewPrivileges=yes`, where sudo cannot escalate.
 
 Blocked commands return `exit_code=-1` with stderr `"command blocked: ..."`.
 
@@ -285,27 +307,56 @@ Blocked commands return `exit_code=-1` with stderr `"command blocked: ..."`.
 
 **Read prefixes**: `/var/log/`, `/etc/`, `/opt/homepilot/`, `/proc/`, `/sys/`, `/tmp/homepilot/`, `/home/`, `/usr/local/bin/`
 
-**Write prefixes**: `/etc/homepilot/`, `/opt/homepilot/`, `/tmp/homepilot/`, `/etc/systemd/system/`, `/etc/docker/`, `/etc/nginx/`, `/etc/zabbix/`
+**Write prefixes** (`HP_AGENT_WRITE_PREFIXES`, privileged default): `/etc/homepilot/`, `/opt/homepilot/`, `/tmp/homepilot/`, `/etc/systemd/system/`, `/etc/docker/`, `/etc/nginx/`. An unprivileged install grants only HomePilot's own three directories.
 
 Write attempts outside allowed prefixes return an error.
 
-### Zabbix trapper integration
+### Grant ↔ runtime coherence (#422)
 
-When `HP_ZABBIX_ENABLED=true`, the agent pushes these metrics to Zabbix via the sender protocol (TCP 10051):
+The allowlist says what the agent may be asked to do; the systemd unit decides
+what it can actually do. `scripts/install-agent.sh` derives `User=`,
+`ProtectSystem=` and `ReadWritePaths=` from the same grant it writes into
+`/etc/homepilot/agent.env`, so the two cannot drift, and the agent runs a startup
+self-check that refuses privileged mode when it is not root or a configured write
+prefix is not writable. `agent/go/unit_matrix_test.go` gates every entry of
+`privilegedCommands` and every write prefix against the generated unit.
 
-| Item key | Type | Description |
-|----------|------|-------------|
-| `hp.agent.status` | unsigned | 1=online |
-| `hp.agent.cpu.count` | unsigned | CPU core count |
-| `hp.agent.disk.total_gb` | float | Total disk GB |
-| `hp.agent.disk.free_gb` | float | Free disk GB |
-| `hp.agent.memory.total_gb` | float | Total memory GB |
-| `hp.agent.memory.free_gb` | float | Free memory GB |
-| `hp.agent.load.1m` | float | 1-minute load average |
-| `hp.agent.load.5m` | float | 5-minute load average |
-| `hp.agent.load.15m` | float | 15-minute load average |
+### Native metrics (ADR-004 S5)
 
-Items must exist on the Zabbix host as **Zabbix trapper** type. Push interval configured via `HP_ZABBIX_SEND_INTERVAL` (default 60s). On-demand push available via `POST /agents/{agent_id}/zabbix-push`.
+Every agent sends a `metrics` frame over the hub connection every
+`HP_AGENT_METRICS_INTERVAL` seconds (default 60). Nothing installs, imports or
+configures; monitoring is part of the product.
+
+| Metric | Description |
+|--------|-------------|
+| `cpu.count` | CPU core count |
+| `disk.total_gb` / `disk.free_gb` | Root filesystem size and free space |
+| `memory.total_gb` / `memory.free_gb` | Total and available memory |
+| `load.1m` / `load.5m` / `load.15m` | Load averages |
+
+**Delivery.** Samples are buffered on the agent while the hub is unreachable
+(`HP_AGENT_METRICS_BUFFER`, default 1440 samples) and flushed on reconnect. A
+batch leaves the buffer only when the hub has acked it, so a connection that
+dies mid-write is re-sent instead of lost. Past the bound the OLDEST samples are
+dropped first and each drop is logged with a running total.
+
+**State.** The `metrics` frame is also the agent's only state channel: the hub
+folds the freshest values into the agent record and persists `last_heartbeat`
+with them. The former `report_state` action was removed — no agent ever sent it,
+which is why the Agents view used to show an empty state and a frozen heartbeat.
+
+**Storage.** One table, `metrics(hostname, metric, ts, value, agent_id)`,
+`WITHOUT ROWID` with primary key `(hostname, metric, ts)` — the read pattern
+("this host, this metric, this window") is a range scan over the key prefix, and
+that key doubles as the dedupe identity for a re-sent batch. `idx_metrics_ts`
+serves the retention pruner, which deletes raw samples older than
+`HP_METRICS_RETENTION_DAYS` (default 7). There are deliberately no rollups.
+
+**Alerting.** A rule is `(host filter, metric, comparison, threshold,
+for_seconds)` and fires only when the condition held for that whole span, so a
+single spike cannot page anyone. Firing and recovery both go out as
+`alert_firing` / `alert_resolved` through the existing SSE + webhook event
+machinery. See `/monitoring/*` in the README for the API.
 
 ### Audit logging
 
@@ -331,9 +382,9 @@ The binary bundles Python 3.10+ stdlib and all dependencies (asyncio, ssl, json,
 
 Source code also available for `pip install` into a venv during development: `pip install -e agent/`.
 
-### AgentAdapter with SSH fallback
+### AgentAdapter (the only host transport)
 
-The `AgentAdapter` class implements the `HostAdapter` protocol alongside `SSHAdapter`. When the orchestrator needs to run a command on a host:
+The `AgentAdapter` class is the sole implementation of the `HostAdapter` protocol - the SSH/jump-server transport was removed in #327. When the orchestrator needs to run a command on a host:
 
 1. Check if an agent is connected for that hostname → route through hub
 2. No agent → raise `AgentAdapterError`
@@ -385,4 +436,4 @@ GPU 1  →  BGE-M3 embeddings (llama.cpp, port 8081)  — KB semantic search (ov
 GPU 2  →  (reserved for future use)
 ```
 
-The embedding service runs in the LLM overlay pinned to GPU 1. When the overlay is not started, HomePilot falls back to a remote/Ollama endpoint (`HP_EMBEDDING_FALLBACK_URL`) or keyword-only KB search. By default, HomePilot uses a **remote LLM** (configured via `HP_EMBEDDING_FALLBACK_URL` / Ollama / OpenAI-compatible) — no local GPU required.
+The embedding service runs in the LLM overlay pinned to GPU 1, and the overlay points `HP_EMBEDDING_SERVICE_URL` at it. **By default neither URL is set, so KB search is keyword-only** — it works, and the startup self-check says so rather than letting it degrade quietly (ADR-004 S6). Point `HP_EMBEDDING_SERVICE_URL` (OpenAI-compatible) or `HP_EMBEDDING_FALLBACK_URL` (Ollama-compatible) at any embedding endpoint you already run to get vector search without a local GPU.

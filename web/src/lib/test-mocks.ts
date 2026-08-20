@@ -37,6 +37,10 @@ vi.mock('$lib/api', async () => {
 			me: vi.fn().mockResolvedValue({ authenticated: true, token_label: 'test' }),
 			login: vi.fn().mockResolvedValue({ status: 'ok' }),
 			logout: vi.fn().mockResolvedValue({ status: 'ok' }),
+			// Default to a claimed instance: that is what every page other than
+			// the first-run screen is looking at.
+			claimStatus: vi.fn().mockResolvedValue({ state: 'claimed' }),
+			claimInstance: vi.fn(),
 			listArtifacts: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			getArtifact: vi.fn(),
 			approveArtifact: vi.fn(),
@@ -45,7 +49,6 @@ vi.mock('$lib/api', async () => {
 			revokeArtifact: vi.fn(),
 			listInventory: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			refreshInventory: vi.fn(),
-			getHost: vi.fn(),
 			getHostDoc: vi.fn(),
 			searchKB: vi.fn().mockResolvedValue({ results: [], total: 0 }),
 			listKB: vi.fn().mockResolvedValue({ items: [], total: 0 }),
@@ -53,7 +56,7 @@ vi.mock('$lib/api', async () => {
 		setToken: vi.fn((t: string) => _tokenStore.set(t)),
 		getToken: vi.fn(() => ''),
 		hasCookieSession: vi.fn(() => false),
-		hasSession: vi.fn(() => Promise.resolve(false)),
+		refreshSession: vi.fn().mockResolvedValue(null),
 	};
 });
 

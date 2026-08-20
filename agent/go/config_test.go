@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,4 +138,59 @@ func TestConfigFromEnvCarriesIDFileAndEnvToken(t *testing.T) {
 	if cfg.EnvAuthToken != "enrollment-token" {
 		t.Fatalf("EnvAuthToken = %q, want %q", cfg.EnvAuthToken, "enrollment-token")
 	}
+}
+
+// A hub-pushed transport must survive a restart, and a corrupted one must never
+// take the agent off the transport that still works (#468).
+func TestPersistedTransport(t *testing.T) {
+	t.Run("round trips", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "agent.transport")
+		pin := strings.Repeat("ab", 32)
+		if err := writeTransportFile(path, persistedTransport{TLS: true, Pin: pin}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		stored, ok := readTransportFile(path)
+		if !ok || !stored.TLS || stored.Pin != pin {
+			t.Fatalf("round trip lost the transport: %+v ok=%v", stored, ok)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		// It carries a credential-shaped secret; it gets credential permissions.
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("transport file mode = %v, want 0600", perm)
+		}
+	})
+
+	t.Run("a corrupt file is treated as absent, not fatal", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "agent.transport")
+		if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		// The agent must still come up on its configured transport and let the
+		// hub push again. Refusing to start over a file it wrote itself would
+		// strand the host with no way back.
+		if _, ok := readTransportFile(path); ok {
+			t.Fatal("a malformed transport file was accepted")
+		}
+	})
+
+	t.Run("missing file is simply absent", func(t *testing.T) {
+		if _, ok := readTransportFile(filepath.Join(t.TempDir(), "nope")); ok {
+			t.Fatal("a missing transport file reported as present")
+		}
+	})
+
+	t.Run("path derives from the token file", func(t *testing.T) {
+		got := transportFilePath("", "/etc/homepilot/agent.token")
+		if want := "/etc/homepilot/agent.transport"; got != want {
+			t.Fatalf("transportFilePath = %q, want %q", got, want)
+		}
+		if got := transportFilePath("/custom/t", "/etc/homepilot/agent.token"); got != "/custom/t" {
+			t.Fatalf("explicit HP_AGENT_TRANSPORT_FILE was not honoured: %q", got)
+		}
+	})
 }

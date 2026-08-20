@@ -4,6 +4,7 @@
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import { onArtifactEvent } from '$lib/events';
+	import { debounce } from '$lib/debounce';
 
 	let artifacts: Artifact[] = [];
 	let hosts: Host[] = [];
@@ -123,9 +124,9 @@
 	function statusClass(s: string): string { return STATUS_CLASSES[s] ?? 'badge-proposed'; }
 
 	const DRIFT_COLORS: Record<string, string> = {
-		drifted: 'text-red-400 bg-red-900/40 border-red-700',
-		'not-drifted': 'text-green-400 bg-green-900/40 border-green-700',
-		unchecked: 'text-slate-400 bg-slate-800 border-slate-600',
+		drifted: 'text-danger bg-danger-tint border-danger-border',
+		'not-drifted': 'text-ok bg-ok-tint border-ok-border',
+		unchecked: 'text-muted bg-raised border-border-strong',
 	};
 
 	function fmtDate(s: string): string {
@@ -134,35 +135,41 @@
 
 	onMount(load);
 	// Live-refresh on drift + lifecycle events (an apply/revoke changes what's
-	// covered; artifact_drifted changes a row's status).
-	const unsub = onArtifactEvent(() => load(false));
-	onDestroy(unsub);
+	// covered; artifact_drifted changes a row's status). Debounced hard: EVERY
+	// event here fired three parallel calls (500 artifacts + full inventory +
+	// 500 drift rows), so a burst of events was a burst of full reloads.
+	const refresh = debounce(() => load(false), 400);
+	const unsub = onArtifactEvent(refresh);
+	onDestroy(() => {
+		unsub();
+		refresh.cancel();
+	});
 </script>
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
-		<h1 class="text-lg font-bold text-slate-100">Drift</h1>
+		<h1 class="page-title">Drift</h1>
 		<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Refresh</button>
 	</div>
 
 	<div class="flex gap-3 flex-wrap text-xs">
 		<button
 			class="px-3 py-1 rounded-full border transition-colors
-			       {showCovered ? 'bg-green-900 border-green-700 text-green-300' : 'border-slate-600 text-slate-500'}"
+			       {showCovered ? 'bg-ok-tint border-ok-border text-ok' : 'border-border-strong text-muted'}"
 			on:click={() => (showCovered = !showCovered)}
 		>
 			✓ {coveredRows.length} covered
 		</button>
 		<button
 			class="px-3 py-1 rounded-full border transition-colors
-			       {showOrphans ? 'bg-orange-900 border-orange-700 text-orange-300' : 'border-slate-600 text-slate-500'}"
+			       {showOrphans ? 'bg-warn-tint border-warn-border text-warn' : 'border-border-strong text-muted'}"
 			on:click={() => (showOrphans = !showOrphans)}
 		>
 			⚠ {orphanRows.length} orphaned artifacts
 		</button>
 		<button
 			class="px-3 py-1 rounded-full border transition-colors
-			       {showUnmanaged ? 'bg-slate-700 border-slate-600 text-slate-300' : 'border-slate-600 text-slate-500'}"
+			       {showUnmanaged ? 'bg-raised border-border-strong text-ink' : 'border-border-strong text-muted'}"
 			on:click={() => (showUnmanaged = !showUnmanaged)}
 		>
 			○ {unmanagedHosts.length} uncovered hosts
@@ -170,21 +177,21 @@
 	</div>
 
 	{#if loading}
-		<p class="text-slate-500 text-sm">Loading…</p>
+		<p class="text-muted text-sm">Loading…</p>
 	{:else if loadError}
 		<div class="card p-6 text-center space-y-3">
-			<p class="text-red-400">Could not load drift data.</p>
-			<p class="text-xs text-slate-500">{loadError}</p>
+			<p class="text-danger">Could not load drift data.</p>
+			<p class="text-xs text-muted">{loadError}</p>
 			<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Retry</button>
 		</div>
 	{:else}
 		{#if showOrphans && orphanRows.length}
 			<div class="card space-y-2">
-				<h2 class="text-sm font-semibold text-orange-400">⚠ Orphaned Artifacts</h2>
-				<p class="text-xs text-slate-500">Active artifacts whose target is absent from inventory.</p>
-				<table class="w-full text-xs">
+				<h2 class="section-title text-warn">⚠ Orphaned Artifacts</h2>
+				<p class="prose-note text-xs">Active artifacts whose target is absent from inventory.</p>
+				<table class="data-table text-xs">
 					<thead>
-						<tr class="text-slate-400 border-b border-slate-700">
+						<tr>
 							<th class="text-left pb-1 pr-4">Intent</th>
 							<th class="text-left pb-1 pr-4">Kind</th>
 							<th class="text-left pb-1 pr-4">Status</th>
@@ -195,25 +202,25 @@
 					</thead>
 					<tbody>
 						{#each orphanRows as r}
-							<tr class="border-b border-slate-700/40">
-								<td class="py-1.5 pr-4 text-slate-200 truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1.5 pr-4 text-slate-400">{r.artifact.kind}</td>
+							<tr class="border-b border-divider">
+								<td class="py-1.5 pr-4 text-ink truncate max-w-xs">{r.artifact.intent}</td>
+								<td class="py-1.5 pr-4 text-muted">{r.artifact.kind}</td>
 								<td class="py-1.5 pr-4"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
-								<td class="py-1.5 pr-4 text-orange-400 font-mono">{r.target || '(global)'}</td>
+								<td class="py-1.5 pr-4 text-warn font-mono">{r.target || '(global)'}</td>
 								<td class="py-1.5 pr-4">
 									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
 										{r.driftStatus === 'drifted' ? '⚠ drifted' : r.driftStatus === 'not-drifted' ? '✓ ok' : '— unchecked'}
 									</span>
 									{#if rechecking && recheckingId === r.artifact.id}
-										<span class="text-slate-500 ml-1 animate-pulse">checking…</span>
+										<span class="text-muted ml-1 animate-pulse">checking…</span>
 									{:else}
 										<button
-											class="text-sky-400 hover:text-sky-300 ml-1"
+											class="text-accent hover:text-accent-strong ml-1"
 											on:click={() => recheck(r.artifact.id)}
 										>↻</button>
 									{/if}
 								</td>
-								<td class="py-1.5 text-slate-500">{fmtDate(r.artifact.created_at)}</td>
+								<td class="py-1.5 text-muted">{fmtDate(r.artifact.created_at)}</td>
 							</tr>
 						{/each}
 					</tbody>
@@ -223,10 +230,10 @@
 
 		{#if showCovered && coveredRows.length}
 			<div class="card space-y-2">
-				<h2 class="text-sm font-semibold text-green-400">✓ Covered</h2>
-				<table class="w-full text-xs">
+				<h2 class="section-title text-ok">✓ Covered</h2>
+				<table class="data-table text-xs">
 					<thead>
-						<tr class="text-slate-400 border-b border-slate-700">
+						<tr>
 							<th class="text-left pb-1 pr-4">Intent</th>
 							<th class="text-left pb-1 pr-4">Kind</th>
 							<th class="text-left pb-1 pr-4">Status</th>
@@ -236,26 +243,26 @@
 					</thead>
 					<tbody>
 						{#each coveredRows as r}
-							<tr class="border-b border-slate-700/40">
-								<td class="py-1 pr-4 text-slate-200 truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1 pr-4 text-slate-400">{r.artifact.kind}</td>
+							<tr class="border-b border-divider">
+								<td class="py-1 pr-4 text-ink truncate max-w-xs">{r.artifact.intent}</td>
+								<td class="py-1 pr-4 text-muted">{r.artifact.kind}</td>
 								<td class="py-1 pr-4"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
 								<td class="py-1 pr-4">
 									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
 										{r.driftStatus === 'drifted' ? '⚠ drifted' : r.driftStatus === 'not-drifted' ? '✓ ok' : '— unchecked'}
 									</span>
 									{#if rechecking && recheckingId === r.artifact.id}
-										<span class="text-slate-500 ml-1 animate-pulse">checking…</span>
+										<span class="text-muted ml-1 animate-pulse">checking…</span>
 									{:else}
 										<button
-											class="text-sky-400 hover:text-sky-300 ml-1"
+											class="text-accent hover:text-accent-strong ml-1"
 											on:click={() => recheck(r.artifact.id)}
 										>↻</button>
 									{/if}
 								</td>
 								<td class="py-1">
 									{#if r.matchedHost}
-										<a href="{base}/inventory/{r.matchedHost.id}" class="text-sky-400 hover:text-sky-300 font-mono">
+										<a href="{base}/inventory/{r.matchedHost.id}" class="text-accent hover:text-accent-strong font-mono">
 											{r.matchedHost.hostname}
 										</a>
 									{/if}
@@ -269,8 +276,8 @@
 
 		{#if showUnmanaged && unmanagedHosts.length}
 			<div class="card space-y-2">
-				<h2 class="text-sm font-semibold text-slate-400">○ Uncovered Hosts</h2>
-				<p class="text-xs text-slate-500">
+				<h2 class="section-title text-muted">○ Uncovered Hosts</h2>
+				<p class="prose-note text-xs">
 					In inventory but not targeted by any applied artifact — config drift can't be
 					tracked for them. Adopting a host in inventory does not cover it; an artifact must
 					target it. Not related to the inventory "managed" flag.
@@ -279,7 +286,7 @@
 					{#each unmanagedHosts as h}
 						<a
 							href="{base}/inventory/{h.id}"
-							class="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs font-mono text-slate-300 transition-colors"
+							class="px-2 py-1 bg-raised hover:bg-border rounded text-xs font-mono text-ink transition-colors"
 						>
 							{h.hostname}
 						</a>
@@ -289,7 +296,7 @@
 		{/if}
 
 		{#if rows.length === 0 && unmanagedHosts.length === 0}
-			<p class="text-slate-500 text-sm">No data — no artifacts or inventory yet.</p>
+			<p class="prose-note text-sm">No data — no artifacts or inventory yet.</p>
 		{/if}
 	{/if}
 </div>

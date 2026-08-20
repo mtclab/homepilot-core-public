@@ -10,13 +10,48 @@ from homepilot.config import Settings
 
 
 class TestSettingsDefaults:
-    def test_vault_passphrase_not_auto_generated_without_env(self, tmp_path):
+    def test_vault_passphrase_is_generated_by_default(self, tmp_path):
+        """ADR-004: a stock install must have a vault without being told to.
+
+        The Proxmox token an operator supplies has nowhere to live otherwise, so
+        the one input the install asks for would fail on a default config.
+        """
         data_dir = tmp_path / "hp"
         data_dir.mkdir(parents=True, exist_ok=True)
         with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": ""}, clear=False):
             s = Settings(
                 secret_key="testkey",
                 vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
+        assert s.vault_passphrase != ""
+
+    def test_vault_passphrase_not_generated_when_opted_out(self, tmp_path):
+        data_dir = tmp_path / "hp"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "0"}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                data_dir=str(data_dir),
+                artifacts_dir=str(data_dir / "artifacts"),
+            )
+        assert s.vault_passphrase == ""
+
+    def test_production_refuses_to_invent_a_passphrase(self, tmp_path):
+        """Same rule HP_SECRET_KEY already follows.
+
+        A passphrase that exists only on one host is not a credential anyone can
+        restore from, so production must be handed one deliberately.
+        """
+        data_dir = tmp_path / "hp"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with patch.dict(os.environ, {"HP_VAULT_AUTO_INIT": "1"}, clear=False):
+            s = Settings(
+                secret_key="testkey",
+                vault_passphrase="",
+                env="production",
                 data_dir=str(data_dir),
                 artifacts_dir=str(data_dir / "artifacts"),
             )

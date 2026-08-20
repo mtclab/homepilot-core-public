@@ -16,11 +16,14 @@ ActionType = Literal[
     "write_file",
     "register",
     "disconnect",
-    "zabbix_push",
     # #397 phase-B1 native provisioning actions.
     "install_package",
     "manage_service",
     "write_config",
+    # #468: move an already-enrolled agent onto TLS without touching its host.
+    # Audited like any other fleet-wide instruction - it changes how a machine
+    # authenticates its control plane, which is worth a record of who asked.
+    "set_transport",
 ]
 ResultType = Literal["success", "blocked", "error"]
 

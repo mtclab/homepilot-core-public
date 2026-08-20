@@ -134,11 +134,11 @@
 	}
 
 	function kindColor(kind: string): string {
-		if (kind === 'note') return 'text-sky-400';
-		if (kind === 'doc') return 'text-violet-400';
-		if (kind === 'fact') return 'text-emerald-400';
-		if (kind === 'policy') return 'text-amber-400';
-		return 'text-slate-400';
+		if (kind === 'note') return 'text-accent';
+		if (kind === 'doc') return 'text-note';
+		if (kind === 'fact') return 'text-ok';
+		if (kind === 'policy') return 'text-warn';
+		return 'text-muted';
 	}
 
 	onMount(search);
@@ -146,9 +146,9 @@
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
-		<h1 class="text-lg font-bold text-slate-100">Knowledge Base</h1>
+		<h1 class="page-title">Knowledge Base</h1>
 		<div class="flex gap-2 items-center">
-			<span class="text-slate-500 text-xs">{total} entries</span>
+			<span class="text-muted text-xs">{total} entries</span>
 			{#if canWrite}
 				<button class="btn btn-primary text-xs" on:click={() => (showForm = !showForm)}>
 					{showForm ? 'Cancel' : '+ New Note'}
@@ -161,7 +161,7 @@
 		<form class="card p-4 space-y-3" on:submit|preventDefault={createNote}>
 			<div class="flex gap-3">
 				<div class="flex-1">
-					<label class="block text-xs text-slate-400 mb-1">Target</label>
+					<label class="field-label block mb-1">Target</label>
 					<input
 						class="input text-sm w-full"
 						placeholder="e.g. nginx, haproxy"
@@ -169,7 +169,7 @@
 					/>
 				</div>
 				<div>
-					<label class="block text-xs text-slate-400 mb-1">Kind</label>
+					<label class="field-label block mb-1">Kind</label>
 					<select class="input text-sm" bind:value={formKind}>
 						<option value="note">note</option>
 						<option value="policy">policy</option>
@@ -178,9 +178,9 @@
 				</div>
 			</div>
 			<div>
-				<label class="block text-xs text-slate-400 mb-1">Content</label>
+				<label class="field-label block mb-1">Content</label>
 				<textarea
-					class="input text-sm w-full font-mono"
+					class="input text-sm w-full font-serif"
 					rows="5"
 					placeholder="Enter knowledge base note content…"
 					bind:value={formContent}
@@ -188,7 +188,7 @@
 				></textarea>
 			</div>
 			<div>
-				<label class="block text-xs text-slate-400 mb-1">Supersedes (comma-separated IDs, optional)</label>
+				<label class="field-label block mb-1">Supersedes (comma-separated IDs, optional)</label>
 				<input
 					class="input text-sm w-full"
 					placeholder="artifact-id-1, artifact-id-2"
@@ -204,11 +204,11 @@
 	{/if}
 
 	{#if editEntry}
-		<form class="card p-4 space-y-3 border-sky-700" on:submit|preventDefault={saveEdit}>
-			<h2 class="text-sm font-semibold text-slate-300">Edit KB Entry #{editEntry.id}</h2>
+		<form class="card p-4 space-y-3 border-accent-border" on:submit|preventDefault={saveEdit}>
+			<h2 class="section-title">Edit KB Entry #{editEntry.id}</h2>
 			<div class="flex gap-3">
 				<div>
-					<label class="block text-xs text-slate-400 mb-1">Kind</label>
+					<label class="field-label block mb-1">Kind</label>
 					<select class="input text-sm" bind:value={editKind}>
 						<option value="note">note</option>
 						<option value="policy">policy</option>
@@ -217,17 +217,17 @@
 					</select>
 				</div>
 				<div class="flex-1">
-					<label class="block text-xs text-slate-400 mb-1">Target</label>
+					<label class="field-label block mb-1">Target</label>
 					<input class="input text-sm w-full" bind:value={editTarget} />
 				</div>
 			</div>
 			<div>
-				<label class="block text-xs text-slate-400 mb-1">Title</label>
+				<label class="field-label block mb-1">Title</label>
 				<input class="input text-sm w-full" bind:value={editTitle} />
 			</div>
 			<div>
-				<label class="block text-xs text-slate-400 mb-1">Content</label>
-				<textarea class="input text-sm w-full font-mono" rows="6" bind:value={editContent}></textarea>
+				<label class="field-label block mb-1">Content</label>
+				<textarea class="input text-sm w-full font-serif" rows="6" bind:value={editContent}></textarea>
 			</div>
 			<div class="flex justify-end gap-2">
 				<button class="btn btn-ghost text-xs" type="button" on:click={() => (editEntry = null)}>Cancel</button>
@@ -256,17 +256,17 @@
 	</div>
 
 	{#if loading}
-		<p class="text-slate-500 text-sm">Loading…</p>
+		<p class="text-muted text-sm">Loading…</p>
 	{:else if items.length === 0 && searched && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
-			<p class="text-slate-400 text-sm">No entries match the current search / filter.</p>
+			<p class="prose-note text-sm">No entries match the current search / filter.</p>
 			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
 		</div>
 	{:else if items.length === 0 && searched}
 		<div class="card p-6 text-center space-y-1">
-			<p class="text-slate-400 text-sm">No knowledge base entries yet.</p>
+			<p class="prose-note text-sm">No knowledge base entries yet.</p>
 			{#if canWrite}
-				<p class="text-xs text-slate-500">Create the first one with “+ New Note”.</p>
+				<p class="prose-note text-xs">Create the first one with “+ New Note”.</p>
 			{/if}
 		</div>
 	{:else}
@@ -274,12 +274,12 @@
 			{#each items as entry}
 				<div class="card p-4 space-y-1">
 					<div class="flex items-center gap-3">
-						<span class="text-xs font-mono {kindColor(entry.kind)}">{entry.kind}</span>
+						<span class="text-xs font-medium {kindColor(entry.kind)}">{entry.kind}</span>
 						{#if entry.target}
-							<span class="text-xs text-slate-500 font-mono">{entry.target}</span>
+							<span class="text-xs text-muted font-mono">{entry.target}</span>
 						{/if}
 						{#if entry.title}
-							<span class="text-sm text-slate-200 font-medium">{entry.title}</span>
+							<span class="text-sm text-ink font-medium">{entry.title}</span>
 						{/if}
 						<div class="ml-auto flex gap-1">
 							{#if canWrite}
@@ -295,8 +295,8 @@
 							{/if}
 						</div>
 					</div>
-					<p class="text-xs text-slate-400 line-clamp-3 font-mono whitespace-pre-wrap">{entry.content}</p>
-					<div class="text-xs text-slate-600">{entry.source}</div>
+					<p class="prose-body text-xs line-clamp-3 whitespace-pre-wrap">{entry.content}</p>
+					<div class="text-xs text-muted">{entry.source}</div>
 				</div>
 			{/each}
 		</div>

@@ -1,0 +1,13 @@
+{
+	"hostname": "web01",
+	"metric": "load.1m",
+	"since": 1787200000,
+	"points": [
+		{ "ts": 1787200060, "value": 0.41 },
+		{ "ts": 1787200120, "value": 0.55 },
+		{ "ts": 1787200180, "value": 0.48 },
+		{ "ts": 1787200240, "value": 0.72 }
+	],
+	"truncated": false,
+	"max_points": 2000
+}

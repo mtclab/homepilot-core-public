@@ -1,10 +1,10 @@
-import { writable } from 'svelte/store';
+import { getApiBase } from './apiBase';
 
 // The API lives at the origin root (see api.ts) — NOT under the UI `base`
-// (`/ui`). VITE_API_BASE is empty in every shipped build, so the stream is
+// (`/ui`). The base is empty in every default build, so the stream is
 // same-origin and the browser EventSource sends the session cookie
-// automatically. We mirror api.ts's base rather than `$app/paths` on purpose.
-const API_BASE = import.meta.env.VITE_API_BASE || '';
+// automatically. It resolves through the SAME accessor api.ts uses, so an
+// operator's Settings override moves the stream with the requests.
 
 // Artifact-lifecycle + drift event names emitted by the backend SSE bus
 // (src/homepilot/artifacts/lifecycle.py + reconciler/drift.py). `ping` frames
@@ -32,7 +32,7 @@ export interface ArtifactEvent {
 // at prefix `/artifacts`).
 export const STREAM_PATH = '/artifacts/events/stream';
 
-export function streamUrl(apiBase: string = API_BASE): string {
+export function streamUrl(apiBase: string = getApiBase()): string {
 	return `${apiBase}${STREAM_PATH}`;
 }
 
@@ -49,11 +49,6 @@ export function nextBackoffMs(attempt: number): number {
 export function isArtifactEventType(t: string): t is ArtifactEventType {
 	return (ARTIFACT_EVENT_TYPES as readonly string[]).includes(t);
 }
-
-// Latest artifact-lifecycle/drift event, or null before any has arrived. A page
-// may drive a reactive `$:` off this, but note it replays its current value to
-// new subscribers — use `onArtifactEvent` when you only want future events.
-export const lastArtifactEvent = writable<ArtifactEvent | null>(null);
 
 type Handler = (e: ArtifactEvent) => void;
 const handlers = new Set<Handler>();
@@ -81,7 +76,6 @@ function dispatch(type: ArtifactEventType, raw: string): void {
 		data = {};
 	}
 	const evt: ArtifactEvent = { type, data, at: Date.now() };
-	lastArtifactEvent.set(evt);
 	// Copy the set so a handler that unsubscribes mid-dispatch can't disturb the
 	// iteration, and isolate handler errors so one bad page can't wedge the bus.
 	for (const h of [...handlers]) {

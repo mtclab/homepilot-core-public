@@ -1,26 +1,28 @@
 <script lang="ts">
-	// A headline metric: big number + label, optional sub and accent color.
+	// A headline metric: big number + label, optional sub and status tone.
+	// The tone names say what the number MEANS, not which swatch it uses — the
+	// swatch lives in the token layer (src/app.css).
 	export let label: string;
 	export let value: string | number;
 	export let sub = '';
-	export let accent: 'emerald' | 'sky' | 'yellow' | 'red' | 'slate' = 'slate';
+	export let accent: 'ok' | 'warn' | 'danger' | 'accent' | 'neutral' = 'neutral';
 	export let href = '';
 
-	const ring: Record<string, string> = {
-		emerald: 'text-emerald-400',
-		sky: 'text-sky-400',
-		yellow: 'text-yellow-400',
-		red: 'text-red-400',
-		slate: 'text-slate-200'
+	const tone: Record<string, string> = {
+		ok: 'text-ok',
+		warn: 'text-warn',
+		danger: 'text-danger',
+		accent: 'text-accent',
+		neutral: 'text-ink-strong'
 	};
 </script>
 
 <svelte:element
 	this={href ? 'a' : 'div'}
 	href={href || undefined}
-	class="card flex flex-col gap-1 {href ? 'hover:border-slate-500 transition-colors' : ''}"
+	class="card flex flex-col gap-1 {href ? 'hover:border-accent transition-colors' : ''}"
 >
-	<span class="text-xs text-slate-400">{label}</span>
-	<span class="text-3xl font-bold font-mono {ring[accent]}">{value}</span>
-	{#if sub}<span class="text-xs text-slate-500">{sub}</span>{/if}
+	<span class="field-label">{label}</span>
+	<span class="metric text-3xl {tone[accent]}">{value}</span>
+	{#if sub}<span class="prose-note text-xs">{sub}</span>{/if}
 </svelte:element>

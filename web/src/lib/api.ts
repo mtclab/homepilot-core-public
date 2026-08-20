@@ -1,7 +1,6 @@
 import { get, writable } from 'svelte/store';
 import { base } from '$app/paths';
-
-const API_BASE = import.meta.env.VITE_API_BASE || '';
+import { getApiBase } from './apiBase';
 
 // A failed request carries its HTTP status and a human-readable message —
 // never the raw `401: {"detail":...}` JSON the API returns. `.detail` keeps
@@ -109,7 +108,9 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
 		}
 	}
 
-	const res = await fetch(`${API_BASE}${path}`, {
+	// Resolved per request: the operator can change the base in Settings without
+	// a page reload.
+	const res = await fetch(`${getApiBase()}${path}`, {
 		...init,
 		credentials: 'include',
 		headers,
@@ -149,8 +150,9 @@ export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cance
 
 export interface Task {
 	id: string;
-	artifact_id: string;
-	action: 'apply' | 'revoke' | 'replay';
+	// null for artifactless tasks (provision creates infrastructure, not intent)
+	artifact_id: string | null;
+	action: 'apply' | 'revoke' | 'replay' | 'provision' | 'install_agent';
 	status: TaskStatus;
 	result_json: string | null;
 	created_at: string;
@@ -176,16 +178,15 @@ export interface AgentInfo {
 	disconnected_at?: string | null;
 }
 
-export interface AgentDetail {
-	agent_id: string;
-	hostname: string;
-	system_info: Record<string, unknown>;
-	state: Record<string, unknown>;
-	connected_at: string;
-	last_heartbeat: string;
-	stale_seconds?: number;
-	connected?: boolean;
-	disconnected_at?: string | null;
+export interface AgentInstallEligibility {
+	host_id: string;
+	hostname: string | null;
+	eligible: boolean;
+	// A stable code (no_guest_agent, not_running, already_enrolled, …) plus the
+	// message that says what to do about it.
+	reason: string | null;
+	message: string;
+	in_flight: boolean;
 }
 
 export interface DashboardSummary {
@@ -202,7 +203,59 @@ export interface DashboardSummary {
 	artifacts: Record<string, number>;
 	tasks: Record<string, number>;
 	agents: { known: number; connected: number };
-	zabbix_url: string;
+	metrics: { firing_alerts: number; retention_days: number };
+}
+
+// --- Native metrics (ADR-004 S5) ---
+export interface MetricPoint {
+	ts: number;
+	value: number;
+}
+
+export interface MetricSeries {
+	hostname: string;
+	metric: string;
+	since: number;
+	points: MetricPoint[];
+	// True when the window held more points than `max_points`; the OLDEST were
+	// left out. Nothing is averaged - every point returned was really reported.
+	truncated: boolean;
+	max_points: number;
+}
+
+export interface LatestMetric {
+	metric: string;
+	ts: number;
+	value: number;
+}
+
+export type AlertComparison = 'gt' | 'gte' | 'lt' | 'lte';
+
+export interface AlertRule {
+	id: string;
+	name: string;
+	host_filter: string;
+	metric: string;
+	comparison: AlertComparison;
+	threshold: number;
+	// The duration condition: the rule fires only when it held this long.
+	for_seconds: number;
+	enabled: number;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface FiringAlert {
+	rule_id: string;
+	hostname: string;
+	firing_since: string;
+	last_value: number;
+	last_eval: string;
+	name: string;
+	metric: string;
+	comparison: AlertComparison;
+	threshold: number;
+	for_seconds: number;
 }
 
 export interface HealthInfo {
@@ -210,6 +263,25 @@ export interface HealthInfo {
 	version?: string;
 	checks?: { [key: string]: string };
 	[key: string]: string | { [key: string]: string } | undefined;
+}
+
+// One optional subsystem in the startup self-check (ADR-004 S6). `state` splits
+// "off by choice" from "configured but unreachable" because those need opposite
+// actions from an operator; `consequence` says what it costs in plain words.
+export type SelfcheckState = 'off' | 'ok' | 'unreachable' | 'unknown';
+
+export interface SelfcheckSubsystem {
+	name: string;
+	configured: boolean;
+	state: SelfcheckState;
+	target: string;
+	consequence: string;
+}
+
+export interface SelfcheckReport {
+	timeout_seconds: number;
+	counts: Record<SelfcheckState, number>;
+	subsystems: SelfcheckSubsystem[];
 }
 
 export interface ArtifactDetail {
@@ -325,6 +397,33 @@ export interface ProxmoxSettings {
 	connection_status: string;
 }
 
+// First-run claim (#458). `/claim/status` says whether the instance has ever
+// been claimed and — only while it is unclaimed — whether THIS caller needs the
+// claim code. `code_required` describes the caller's own source address (it is
+// false on the local network, true when the instance is reached from outside),
+// so it discloses nothing about the instance itself.
+export interface ClaimStatus {
+	state: 'unclaimed' | 'claimed';
+	code_required?: boolean;
+}
+
+export interface ClaimIn {
+	// Omitted on the local network; required when `code_required` is true.
+	code?: string;
+	label?: string;
+	proxmox_host?: string;
+	proxmox_port?: number;
+	proxmox_token?: string;
+	proxmox_verify_ssl?: boolean;
+}
+
+export interface ClaimResult {
+	// The admin token, returned exactly once. Nothing re-issues it.
+	token: string;
+	scope: string;
+	proxmox_configured: boolean;
+}
+
 export interface ProxmoxConfigIn {
 	host?: string | null;
 	port?: number | null;
@@ -418,9 +517,6 @@ export const api = {
 			body: JSON.stringify({ action, host_ids: hostIds }),
 		});
 	},
-	getHost(id: string) {
-		return req<Host & { services: Service[] }>(`/inventory/${id}`);
-	},
 	getHostDoc(id: string) {
 		return req<HostDoc>(`/inventory/${id}/doc`);
 	},
@@ -470,6 +566,14 @@ export const api = {
 	logout() {
 		return req<{ status: string }>('/auth/logout', { method: 'POST' });
 	},
+
+	// --- First-run claim ---
+	claimStatus() {
+		return req<ClaimStatus>('/claim/status');
+	},
+	claimInstance(body: ClaimIn) {
+		return req<ClaimResult>('/claim', { method: 'POST', body: JSON.stringify(body) });
+	},
 	listTokens() {
 		return req<{ items: TokenInfo[]; total: number }>('/auth/tokens');
 	},
@@ -489,13 +593,34 @@ export const api = {
 		return req<AgentInfo[]>('/agents/');
 	},
 	getBootstrapToken() {
-		return req<{ bootstrap_token: string; hub_host: string; hub_port: number }>('/agents/bootstrap');
+		return req<{
+			bootstrap_token: string;
+			hub_host: string;
+			hub_port: number;
+			hub_tls: boolean;
+			hub_cert_sha256: string;
+		}>('/agents/bootstrap');
 	},
 	getHubToken() {
-		return req<{ auth_token: string; hub_host: string; hub_port: number }>('/agents/token');
+		return req<{
+			auth_token: string;
+			hub_host: string;
+			hub_port: number;
+			hub_tls: boolean;
+			hub_cert_sha256: string;
+		}>('/agents/token');
 	},
-	getAgent(agentId: string) {
-		return req<AgentDetail>(`/agents/${agentId}`);
+	// Whether HomePilot can install the agent into this guest over
+	// qemu-guest-agent, and when it cannot, the reason to show instead of the
+	// button.
+	agentInstallEligibility(hostId: string) {
+		return req<AgentInstallEligibility>(`/agents/install/${hostId}`);
+	},
+	installAgent(hostId: string) {
+		return req<{ task_id: string; status: string; host_id: string }>('/agents/install', {
+			method: 'POST',
+			body: JSON.stringify({ host_id: hostId }),
+		});
 	},
 	async getHealth(): Promise<HealthInfo> {
 		// `/health` returns 503 when a dependency is degraded — exactly when the
@@ -505,14 +630,50 @@ export const api = {
 		const memToken = get(_tokenStore);
 		const headers: Record<string, string> = {};
 		if (memToken) headers['Authorization'] = `Bearer ${memToken}`;
-		const res = await fetch(`${API_BASE}/health`, { credentials: 'include', headers });
+		const res = await fetch(`${getApiBase()}/health`, { credentials: 'include', headers });
 		return res.json() as Promise<HealthInfo>;
+	},
+	getSelfcheck() {
+		return req<SelfcheckReport>('/admin/selfcheck');
 	},
 	getDashboard() {
 		return req<DashboardSummary>('/dashboard/summary');
 	},
 	getUiConfig() {
-		return req<{ zabbix_url: string }>('/dashboard/config');
+		return req<{ metrics_retention_days: number }>('/dashboard/config');
+	},
+
+	// --- Metrics ---
+	getHostSeries(hostname: string, metric: string, hours = 1) {
+		return req<MetricSeries>(`/monitoring/hosts/${encodeURIComponent(hostname)}/series` + qs({ metric, hours }));
+	},
+	getHostLatest(hostname: string) {
+		return req<{ hostname: string; metrics: LatestMetric[] }>(`/monitoring/hosts/${encodeURIComponent(hostname)}/latest`);
+	},
+	listAlertRules() {
+		return req<{ items: AlertRule[]; total: number }>('/monitoring/rules');
+	},
+	createAlertRule(rule: {
+		name: string;
+		metric: string;
+		comparison: AlertComparison;
+		threshold: number;
+		for_seconds?: number;
+		host_filter?: string;
+	}) {
+		return req<AlertRule>('/monitoring/rules', { method: 'POST', body: JSON.stringify(rule) });
+	},
+	setAlertRuleEnabled(ruleId: string, enabled: boolean) {
+		return req<AlertRule>(`/monitoring/rules/${encodeURIComponent(ruleId)}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ enabled }),
+		});
+	},
+	deleteAlertRule(ruleId: string) {
+		return req<{ id: string; deleted: boolean }>(`/monitoring/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
+	},
+	listFiringAlerts() {
+		return req<{ items: FiringAlert[]; total: number }>('/monitoring/alerts');
 	},
 
 	getProxmoxSettings() {
@@ -530,9 +691,6 @@ export const api = {
 			body: JSON.stringify(data),
 		});
 	},
-	reloadSecrets() {
-		return req<{ status: string; reloaded: string[]; timestamp: string }>('/admin/reload-secrets', { method: 'POST' });
-	},
 };
 
 export function setToken(t: string) {
@@ -547,16 +705,6 @@ export function hasCookieSession(): boolean {
 	return getCsrfToken() !== '';
 }
 
-export async function hasSession(): Promise<boolean> {
-	if (hasCookieSession()) return true;
-	try {
-		await api.me();
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 export async function refreshSession(): Promise<MeInfo | null> {
 	try {
 		const me = await api.me();
@@ -567,11 +715,10 @@ export async function refreshSession(): Promise<MeInfo | null> {
 		return null;
 	}
 }
-// Deep-link to a host's page in Zabbix (HomePilot owns state; Zabbix owns
-// history). `base` is HP_ZABBIX_URL (e.g. "/zabbix" via the bundled proxy, or
-// an absolute URL). Filters the Zabbix host view by visible name.
-export function zabbixHostUrl(base: string, hostname: string): string {
-	if (!base || !hostname) return '';
-	const b = base.replace(/\/+$/, '');
-	return `${b}/zabbix.php?action=host.view&filter_name=${encodeURIComponent(hostname)}&filter_set=1`;
+// Link to a host's own metrics inside HomePilot. The Agents page reads the
+// `host` query parameter and opens that host's recent panel, so the link lands
+// on the data rather than on a list the operator has to search.
+export function hostMetricsUrl(base: string, hostname: string): string {
+	if (!hostname) return '';
+	return `${base}/agents?host=${encodeURIComponent(hostname)}`;
 }

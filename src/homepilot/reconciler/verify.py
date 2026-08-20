@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from homepilot.adapters.agent import is_pve_node
 from homepilot.artifacts.models import ArtifactKind, ArtifactStatus
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
@@ -177,23 +178,29 @@ async def _verify_ansible(
         )
 
     pve_nodes: list[str] = getattr(executor, "pve_nodes", []) or []
-    if pve_nodes:
-        from homepilot.adapters.ssh import GuestHostError
-
-        try:
-            executor.ssh._validate_guest_only(host, pve_nodes)
-        except GuestHostError as exc:
-            return VerifyResult(
-                artifact_id=artifact_id,
-                drifted=False,
-                verification_log=str(exc),
-                details={"reason": "forbidden_host"},
-            )
+    # Same dead guard as the ansible executor, but UNGUARDED here: `executor.ssh`
+    # does not exist (the orchestrator exposes .agent / .host_adapter), and
+    # `_validate_guest_only` does not exist either, so this raised AttributeError
+    # - which the `except GuestHostError` did not catch - whenever pve_nodes was
+    # configured. It also imported GuestHostError from adapters.ssh, a different
+    # class from the one the agent adapter raises (#388).
+    if pve_nodes and is_pve_node(host, pve_nodes):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            drifted=False,
+            verification_log=f"PVE node '{host}' - use the Proxmox API instead",
+            details={"reason": "forbidden_host"},
+        )
 
     inventory_content = (
         f"[target]\n"
-        f"{host} ansible_connection=ssh "
-        f"ansible_ssh_common_args='-o ProxyCommand=jump-server-internal'\n"
+        # The jump server was decommissioned in #327; the ProxyCommand here
+        # pointed at a host that no longer resolves (#388). NOTE: this does
+        # not make the ansible path work - it is structurally dead (temp
+        # inventory written on the control plane, ansible-playbook run on the
+        # remote host where neither the files nor ansible exist). That is the
+        # first item of #388 and needs a real transport design.
+        f"{host} ansible_connection=ssh\n"
     )
 
     with tempfile.NamedTemporaryFile(
@@ -302,6 +309,12 @@ async def _verify_proxmox_api(
                 skipped_steps.append(step_id)
                 continue
 
+            # Same guard as the HTTP verifier: an author-supplied precheck may
+            # declare any method, and verify must issue no non-GET (#419).
+            if pre_method != "GET":
+                skipped_steps.append(step_id)
+                continue
+
             try:
                 resp = await executor.proxmox.call(pre_method, pre_path)
                 if _eval_skip_if(skip_if_expr, resp, context.get("target", {})):
@@ -380,6 +393,14 @@ async def _verify_http_sequence(
                     skipped_steps.append(step_id)
                     continue
 
+                # A precheck is author-supplied and can declare any method. Verify
+                # is read-only, so a non-GET precheck is refused rather than run
+                # (#419). Without this the invariant "a verify pass issues no
+                # non-GET" is still violable via `precheck: {method: DELETE}`.
+                if pre_method != "GET":
+                    skipped_steps.append(step_id)
+                    continue
+
                 try:
                     pre_cred = await _resolve_credential(pre_cred_name, executor.vault)
                 except ExecutorError:
@@ -413,45 +434,16 @@ async def _verify_http_sequence(
                     skipped_steps.append(step_id)
                     continue
 
-            method = step.get("method", "GET").upper()
-            if method == "GET":
-                skipped_steps.append(step_id)
-                continue
-
-            try:
-                cred = await _resolve_credential(cred_name, executor.vault)
-            except ExecutorError:
-                skipped_steps.append(step_id)
-                continue
-
-            base_url = cred.get("base_url", "").rstrip("/")
-            headers = cred.get("headers", {})
-            verify_tls = cred.get("verify_tls", True)
-
-            client_key = f"{base_url}:{cred_name}"
-            if client_key not in client_cache:
-                client_cache[client_key] = httpx.AsyncClient(
-                    base_url=base_url,
-                    headers=headers,
-                    verify=verify_tls,
-                    timeout=30.0,
-                )
-            client = client_cache[client_key]
-
-            path = _interpolate(step.get("path", ""), context)
-            try:
-                resp = await client.request(method=method, url=path)
-                proxy = make_response_proxy(resp)
-                skip_if_expr = step.get("skip_if")
-                if skip_if_expr and _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
-                    skipped_steps.append(step_id)
-                    continue
-                else:
-                    drifted_steps.append(step_id)
-                    continue
-            except httpx.HTTPError:
-                skipped_steps.append(step_id)
-                continue
+            # No precheck: report unknown rather than probing. A verify pass must
+            # never issue the step's OWN request - it is the mutating one.
+            #
+            # This previously skipped only GET and then fell through and executed
+            # every non-GET for real, so a `method: DELETE` step fired a live
+            # DELETE against the target on the unattended 1800s drift loop (#419).
+            # _verify_proxmox_api always skipped here; the two verifiers had
+            # drifted apart and the HTTP one was the dangerous side.
+            skipped_steps.append(step_id)
+            continue
     finally:
         for c in client_cache.values():
             with contextlib.suppress(Exception):

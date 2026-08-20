@@ -15,17 +15,34 @@ def _uuid4() -> str:
     return str(uuid.uuid4())
 
 
-VALID_ACTIONS = {"apply", "revoke", "replay"}
+VALID_ACTIONS = {"apply", "revoke", "replay", "provision", "install_agent"}
+
+# Actions that create infrastructure rather than apply an artifact. They carry a
+# NULL artifact_id BY CONTRACT (both ways: artifactless actions must not name an
+# artifact, artifact actions must name one) so they can never be picked up by the
+# artifact-scoped dedup/active-task queries — a provision task must not block, or
+# be mistaken for, an apply/revoke on some artifact.
+ARTIFACTLESS_ACTIONS = {"provision", "install_agent"}
+
+
+def _validate_action(action: str, artifact_id: str | None) -> None:
+    if action not in VALID_ACTIONS:
+        msg = f"Invalid action: {action!r}. Must be one of {VALID_ACTIONS}"
+        raise ValueError(msg)
+    if action in ARTIFACTLESS_ACTIONS and artifact_id is not None:
+        msg = f"Action {action!r} must not carry an artifact_id (got {artifact_id!r})"
+        raise ValueError(msg)
+    if action not in ARTIFACTLESS_ACTIONS and artifact_id is None:
+        msg = f"Action {action!r} requires an artifact_id"
+        raise ValueError(msg)
 
 
 class TaskRepository:
     def __init__(self, db: Database):
         self.db = db
 
-    async def create_task(self, artifact_id: str, action: str) -> str:
-        if action not in VALID_ACTIONS:
-            msg = f"Invalid action: {action!r}. Must be one of {VALID_ACTIONS}"
-            raise ValueError(msg)
+    async def create_task(self, artifact_id: str | None, action: str) -> str:
+        _validate_action(action, artifact_id)
         task_id = _uuid4()
         ts = _now()
         await self.db.execute(
@@ -37,9 +54,9 @@ class TaskRepository:
         return task_id
 
     async def create_task_if_no_active(self, artifact_id: str, action: str) -> str | None:
-        if action not in VALID_ACTIONS:
-            msg = f"Invalid action: {action!r}. Must be one of {VALID_ACTIONS}"
-            raise ValueError(msg)
+        # Artifact-scoped dedup only: the NOT EXISTS guard is meaningless for an
+        # artifactless action, so _validate_action rejects those here too.
+        _validate_action(action, artifact_id)
         task_id = _uuid4()
         ts = _now()
         cursor = await self.db.execute(

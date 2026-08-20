@@ -123,14 +123,14 @@ describe('KB search path construction', () => {
 
 describe('kindColor logic', () => {
 	function kindColor(kind: string): string {
-		if (kind === 'note') return 'text-sky-400';
-		if (kind === 'doc') return 'text-violet-400';
-		if (kind === 'fact') return 'text-emerald-400';
-		return 'text-slate-400';
+		if (kind === 'note') return 'text-accent';
+		if (kind === 'doc') return 'text-note';
+		if (kind === 'fact') return 'text-ok';
+		return 'text-muted';
 	}
 
-	it('note → sky', () => expect(kindColor('note')).toBe('text-sky-400'));
-	it('doc → violet', () => expect(kindColor('doc')).toBe('text-violet-400'));
-	it('fact → emerald', () => expect(kindColor('fact')).toBe('text-emerald-400'));
-	it('unknown → slate', () => expect(kindColor('other')).toBe('text-slate-400'));
+	it('note → accent', () => expect(kindColor('note')).toBe('text-accent'));
+	it('doc → note', () => expect(kindColor('doc')).toBe('text-note'));
+	it('fact → ok', () => expect(kindColor('fact')).toBe('text-ok'));
+	it('unknown → muted', () => expect(kindColor('other')).toBe('text-muted'));
 });

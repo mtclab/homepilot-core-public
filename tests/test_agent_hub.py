@@ -732,34 +732,6 @@ class TestHubIntegration:
             await w.drain()
             assert (await _recv(r))["action"] == "heartbeat_ack"
 
-    async def test_zabbix_agent_error_surfaces_as_failure(self):
-        """#381: an agent-reported zabbix error is returned as a failure (raises),
-        not a silent success, and the result is acked."""
-        async with _hub() as h:
-            r, w = await h.register("A", "web01")
-            assert (await _recv(r))["action"] == "register_ack"
-
-            task = asyncio.create_task(h.srv.send_zabbix_push("A"))
-            push = await _recv(r)
-            assert push["action"] == "zabbix_push"
-
-            w.write(
-                _encode(
-                    {
-                        "action": "zabbix_push_result",
-                        "request_id": push["request_id"],
-                        "error": "zabbix send failed",
-                    }
-                )
-            )
-            await w.drain()
-
-            with pytest.raises(AgentCommandError, match="zabbix send failed"):
-                await task
-
-            ack = await _recv(r)
-            assert ack["action"] == "zabbix_ack"
-
 
 class TestSendCommandTimeout:
     """#380: the caller's timeout is honored, not clamped to the old hardcoded 30."""

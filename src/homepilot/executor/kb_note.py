@@ -54,7 +54,7 @@ async def execute(
         except Exception as exc:
             logger.error(
                 "Unexpected error computing embedding for %s: %s — "
-                "ensure llm-embed service is running (see docker-compose gpu profile)",
+                "check the service named by HP_EMBEDDING_SERVICE_URL",
                 artifact_id,
                 exc,
             )
@@ -100,36 +100,43 @@ async def _compute_embedding(text: str) -> list[float]:
     fallback_url = settings.embedding_fallback_url
     fallback_model = settings.embedding_fallback_model
 
-    is_ollama_primary = "/api/embeddings" in primary_url
-    payload_key_primary = "prompt" if is_ollama_primary else "input"
-    payload = {"model": primary_model, payload_key_primary: text[:2000]}
+    if not primary_url and not fallback_url:
+        # Off by choice: no service is configured, so the note is indexed
+        # keyword-only. Raise the same ValueError the caller already treats as
+        # "index without an embedding" rather than posting to an empty URL.
+        raise ValueError("no embedding service configured — indexing keyword-only")
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(primary_url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            if is_ollama_primary:
-                embedding: list[float] | None = data.get("embedding")
-            else:
-                embedding_data = data.get("data", [])
-                embedding = embedding_data[0].get("embedding") if embedding_data else None
-            if embedding:
-                return embedding
+    if primary_url:
+        is_ollama_primary = "/api/embeddings" in primary_url
+        payload_key_primary = "prompt" if is_ollama_primary else "input"
+        payload = {"model": primary_model, payload_key_primary: text[:2000]}
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(primary_url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                if is_ollama_primary:
+                    embedding: list[float] | None = data.get("embedding")
+                else:
+                    embedding_data = data.get("data", [])
+                    embedding = embedding_data[0].get("embedding") if embedding_data else None
+                if embedding:
+                    return embedding
+                logger.error(
+                    "Primary embedding service returned null embedding (url=%s, model=%s)",
+                    primary_url,
+                    primary_model,
+                )
+        except (httpx.ConnectError, ConnectionRefusedError) as exc:
             logger.error(
-                "Primary embedding service returned null embedding (url=%s, model=%s)",
+                "Primary embedding service unreachable (url=%s): %s — the service named by "
+                "HP_EMBEDDING_SERVICE_URL is not answering",
                 primary_url,
-                primary_model,
+                exc,
             )
-    except (httpx.ConnectError, ConnectionRefusedError) as exc:
-        logger.error(
-            "Primary embedding service unreachable (url=%s): %s — "
-            "ensure llm-embed service is running (docker compose --profile gpu up)",
-            primary_url,
-            exc,
-        )
-    except Exception as exc:
-        logger.warning("Primary embedding service failed, trying fallback: %s", exc)
+        except Exception as exc:
+            logger.warning("Primary embedding service failed, trying fallback: %s", exc)
 
     if fallback_url:
         is_ollama_fallback = "/api/embeddings" in fallback_url

@@ -161,16 +161,44 @@ class TestVerifyAnsible:
         assert result.details["changed"] is True
 
     async def test_ansible_forbidden_host(self, repo, mock_store, mock_executor):
-        from homepilot.adapters.ssh import GuestHostError
+        """A PVE hypervisor node must be refused as an ansible verify target (#388).
 
-        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
+        This test previously did:
+
+            mock_executor.ssh._validate_guest_only = MagicMock(
+                side_effect=GuestHostError("forbidden"))
+
+        which MANUFACTURED both the attribute and the method on a MagicMock. In
+        production neither existed - the orchestrator exposes `.agent` /
+        `.host_adapter`, and the method is `_check_guest_only` - so the guard
+        raised AttributeError (uncaught) while this test stayed green because it
+        had invented the thing that was missing. It also imported GuestHostError
+        from adapters.ssh, a different class from the one the agent adapter
+        raises, and that passed only because the mock raised exactly that class.
+
+        It now drives the real code path: name a real PVE node as the target and
+        assert the refusal, with nothing mocked into existence.
+
+        Teeth: remove the `is_pve_node` guard in `_verify_ansible` and this fails.
+        """
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied", host="pve1")
         body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
         mock_store.read.return_value = (fm, body)
         mock_executor.pve_nodes = ["pve1"]
-        mock_executor.ssh._validate_guest_only = MagicMock(side_effect=GuestHostError("forbidden"))
         result = await verify_artifact("art-1", repo, mock_store, mock_executor)
         assert result.drifted is False
-        assert result.details["reason"] == "forbidden_host"
+        assert result.details["reason"] == "forbidden_host", (
+            f"PVE node target was not refused: {result.details}"
+        )
+
+    async def test_ansible_guest_host_is_not_refused(self, repo, mock_store, mock_executor):
+        """The guard must refuse ONLY hypervisor nodes, not ordinary guests."""
+        fm = _make_artifact_fm(kind="ansible-playbook", status="applied", host="webvm01")
+        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+        mock_store.read.return_value = (fm, body)
+        mock_executor.pve_nodes = ["pve1"]
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+        assert result.details.get("reason") != "forbidden_host"
 
 
 class TestVerifyProxmoxApi:
@@ -358,6 +386,84 @@ class TestVerifyHttpSequence:
 
         assert result.drifted is True
         assert "step1" in result.details["drifted_steps"]
+
+    async def test_verify_never_issues_non_get_requests(self, repo, mock_store, mock_executor):
+        """#419 STANDING GATE: a verify pass must issue ZERO non-GET requests.
+
+        Drift verification is read-only and runs unattended on a 1800s loop, so a
+        single escaped DELETE is a live data-loss event. This asserts the OUTCOME
+        on the transport - what actually went over the wire - not that some branch
+        returned a particular value.
+
+        Covers every dangerous shape in one spec:
+          - non-GET step with NO precheck  (the original P0: fell through and ran)
+          - non-GET step whose PRECHECK is itself declared non-GET
+          - non-GET step with a valid GET precheck (only the GET may be issued)
+          - plain GET step with no precheck
+
+        Teeth: restore the fall-through in `_verify_http_sequence`, or drop the
+        `pre_method != "GET"` guard, and this fails naming the escaped method.
+        """
+        fm = _make_artifact_fm(kind="http-sequence", status="applied")
+        body = (
+            "```yaml http-spec\n"
+            "steps:\n"
+            "  - id: delete-no-precheck\n"
+            "    name: test-svc\n"
+            "    method: DELETE\n"
+            "    path: /api/things/42\n"
+            "  - id: post-with-mutating-precheck\n"
+            "    name: test-svc\n"
+            "    method: POST\n"
+            "    path: /api/things\n"
+            "    precheck:\n"
+            "      name: test-svc\n"
+            "      method: DELETE\n"
+            "      path: /api/things/43\n"
+            '      skip_if: "response.status_code == 200"\n'
+            "  - id: put-with-get-precheck\n"
+            "    name: test-svc\n"
+            "    method: PUT\n"
+            "    path: /api/things/44\n"
+            "    precheck:\n"
+            "      name: test-svc\n"
+            "      method: GET\n"
+            "      path: /api/things/44\n"
+            '      skip_if: "response.status_code == 200"\n'
+            "  - id: plain-get\n"
+            "    name: test-svc\n"
+            "    method: GET\n"
+            "    path: /api/things\n"
+            "```\n"
+        )
+        mock_store.read.return_value = (fm, body)
+        mock_executor.vault.get_secret = AsyncMock(
+            return_value={
+                "base_url": "https://test.example.com",
+                "headers": {},
+                "verify_tls": True,
+            }
+        )
+
+        issued: list[str] = []
+
+        async def _record(*args, **kwargs):
+            issued.append((kwargs.get("method") or (args[0] if args else "")).upper())
+            resp = MagicMock()
+            resp.status_code = 200
+            return resp
+
+        with patch("httpx.AsyncClient") as mock_client:
+            inst = AsyncMock()
+            inst.request = AsyncMock(side_effect=_record)
+            inst.aclose = AsyncMock()
+            mock_client.return_value = inst
+            await verify_artifact("art-1", repo, mock_store, mock_executor)
+
+        offending = [m for m in issued if m != "GET"]
+        assert not offending, (
+            f"verify issued non-GET request(s) {offending}; all issued methods were {issued}"
+        )
 
 
 class TestVerifyComposite:

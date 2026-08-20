@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -43,8 +44,23 @@ async def kb_service(repo, artifact_store):
     return KBService(repo=repo, store=artifact_store, lifecycle=lc)
 
 
+# Both embedding URLs default to EMPTY (ADR-004 S6): a stock install configures no
+# embedding service, so a test of the primary/fallback MECHANISM has to configure
+# it. Patching get_settings is how these tests say "an operator set both URLs".
+@pytest.fixture
+def both_services_configured(monkeypatch):
+    settings = SimpleNamespace(
+        embedding_service_url="http://llm-embed:8081/v1/embeddings",
+        embedding_model="bge-m3",
+        embedding_fallback_url="http://ollama:11434/api/embeddings",
+        embedding_fallback_model="nomic-embed-text",
+    )
+    monkeypatch.setattr("homepilot.kb.service.get_settings", lambda: settings)
+    return settings
+
+
 class TestGetEmbeddingFallback:
-    async def test_primary_succeeds_no_fallback(self):
+    async def test_primary_succeeds_no_fallback(self, both_services_configured):
         fake_embedding = [0.1] * 1024
 
         with patch(
@@ -56,7 +72,7 @@ class TestGetEmbeddingFallback:
 
         assert result == fake_embedding
 
-    async def test_fallback_on_primary_failure(self):
+    async def test_fallback_on_primary_failure(self, both_services_configured):
         fake_embedding = [0.2] * 768
 
         call_count = 0
@@ -106,7 +122,7 @@ class TestGetEmbeddingFallback:
 
         assert result is None
 
-    async def test_primary_uses_configured_model(self):
+    async def test_primary_uses_configured_model(self, both_services_configured):
         fake_embedding = [0.1] * 1024
         captured_calls = []
 
@@ -123,7 +139,7 @@ class TestGetEmbeddingFallback:
         assert len(captured_calls) >= 1
         assert captured_calls[0]["model"] == "bge-m3"
 
-    async def test_fallback_uses_fallback_url(self):
+    async def test_fallback_uses_fallback_url(self, both_services_configured):
         fake_embedding = [0.2] * 768
         captured_calls = []
 

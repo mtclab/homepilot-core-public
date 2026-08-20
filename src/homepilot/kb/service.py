@@ -13,6 +13,7 @@ import httpx
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import LifecycleError
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.common import redact_endpoint
 from homepilot.config import get_settings
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
@@ -20,12 +21,20 @@ from homepilot.db.utils import escape_like
 logger = logging.getLogger(__name__)
 
 
-async def _call_embed_service(url: str, model: str, text: str) -> list[float] | None:
+async def _call_embed_service(
+    url: str, model: str, text: str, timeout: float = 30.0
+) -> list[float] | None:
+    if not url:
+        return None
+    # An embedding endpoint can carry credentials (userinfo, ?key=), and these
+    # log lines are the ones an operator pastes into an issue. Log the redacted
+    # form only - never the configured URL.
+    safe_url = redact_endpoint(url)
     is_ollama = "/api/embeddings" in url
     payload_key = "prompt" if is_ollama else "input"
     payload: dict[str, Any] = {"model": model, payload_key: text[:2000]}
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -38,7 +47,7 @@ async def _call_embed_service(url: str, model: str, text: str) -> list[float] | 
                 logger.error(
                     "Embedding service %s returned empty/null embedding "
                     "(model=%s, response_keys=%s)",
-                    url,
+                    safe_url,
                     model,
                     list(data.keys()),
                 )
@@ -46,17 +55,17 @@ async def _call_embed_service(url: str, model: str, text: str) -> list[float] | 
     except (httpx.ConnectError, ConnectionRefusedError) as e:
         logger.error(
             "Embedding service unreachable at %s (model=%s): %s — "
-            "ensure llm-embed service is running or configure HP_EMBEDDING_FALLBACK_URL",
-            url,
+            "KB search stays keyword-only until it answers",
+            safe_url,
             model,
             e,
         )
         return None
     except (httpx.HTTPError, ConnectionError, OSError) as e:
-        logger.warning("Embedding call to %s failed: %s", url, e)
+        logger.warning("Embedding call to %s failed: %s", safe_url, e)
         return None
     except Exception as e:
-        logger.error("Unexpected error calling embedding service %s: %s", url, e)
+        logger.error("Unexpected error calling embedding service %s: %s", safe_url, e)
         return None
 
 
@@ -67,20 +76,32 @@ async def _get_embedding(text: str) -> list[float] | None:
     fallback_url = settings.embedding_fallback_url
     fallback_model = settings.embedding_fallback_model
 
-    embedding = await _call_embed_service(primary_url, primary_model, text)
-    if embedding is not None:
-        return embedding
+    if not primary_url and not fallback_url:
+        # Off by choice, not broken: no service is configured, so say that rather
+        # than reporting an outage the operator cannot act on. Search still works
+        # in keyword mode - see search().
+        logger.debug("No embedding service configured — KB search runs keyword-only")
+        return None
+
+    if primary_url:
+        embedding = await _call_embed_service(primary_url, primary_model, text)
+        if embedding is not None:
+            return embedding
 
     if fallback_url:
-        logger.info("Primary embedding service failed, falling back to %s", fallback_url)
+        if primary_url:
+            logger.info(
+                "Primary embedding service failed, falling back to %s",
+                redact_endpoint(fallback_url),
+            )
         embedding = await _call_embed_service(fallback_url, fallback_model, text)
         if embedding is not None:
             return embedding
 
     logger.warning(
-        "All embedding services unavailable for query (len=%d) — "
-        "falling back to keyword search. Ensure llm-embed service is running "
-        "or HP_EMBEDDING_SERVICE_URL/HP_EMBEDDING_FALLBACK_URL are configured.",
+        "All configured embedding services unavailable for query (len=%d) — "
+        "falling back to keyword search. Check HP_EMBEDDING_SERVICE_URL / "
+        "HP_EMBEDDING_FALLBACK_URL and that the service is running.",
         len(text),
     )
     return None
@@ -328,8 +349,12 @@ class KBService:
         settings = get_settings()
         primary_url = settings.embedding_service_url
         fallback_url = settings.embedding_fallback_url
-        test_vec = await _call_embed_service(primary_url, settings.embedding_model, "test")
-        primary_ok = test_vec is not None
+        # Only probe what is configured: an unconfigured service is off, and
+        # "off" must never be reported through the same path as "reachable".
+        primary_ok = False
+        if primary_url:
+            test_vec = await _call_embed_service(primary_url, settings.embedding_model, "test")
+            primary_ok = test_vec is not None
         fallback_ok = False
         if fallback_url and not primary_ok:
             fb_vec = await _call_embed_service(fallback_url, settings.embedding_model, "test")
@@ -341,10 +366,16 @@ class KBService:
         if t_rows:
             total = t_rows["c"]
         return {
-            "primary_url": primary_url,
+            # Redacted: an embedding endpoint can carry credentials, and this is
+            # a report, not the configuration itself.
+            "primary_url": redact_endpoint(primary_url),
             "primary_ok": primary_ok,
-            "fallback_url": fallback_url or "",
+            "fallback_url": redact_endpoint(fallback_url or ""),
             "fallback_ok": fallback_ok,
+            # Keyword mode has two causes that need opposite actions: nothing is
+            # configured (fine, by design) or something is configured and down.
+            # A caller that sees only search_mode cannot tell them apart.
+            "configured": bool(primary_url or fallback_url),
             "indexed_with_embeddings": indexed,
             "total_docs": total,
             "search_mode": (

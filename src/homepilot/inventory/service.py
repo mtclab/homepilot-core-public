@@ -89,14 +89,29 @@ ROLE_PATTERNS = [
 ]
 
 
-def _infer_role(hostname: str, description: str | None = None) -> str:
-    """Infer role from description then hostname."""
+def _match_role(hostname: str, description: str | None = None) -> str | None:
+    """Match a role from description then hostname, or None if nothing matches.
+
+    Distinct from :func:`_infer_role`, which substitutes ``"guest"`` when there
+    is no match. Callers that would OVERWRITE an existing role must use this and
+    skip the write on ``None`` - otherwise an unmatched hostname silently
+    demotes a real role to ``guest`` (#416).
+    """
     text = f"{description or ''} {hostname}"
     for role, flag, keywords in ROLE_PATTERNS:
         for kw in keywords:
             if re.search(rf"\b{re.escape(kw)}\b", text, flag):
                 return role
-    return "guest"
+    return None
+
+
+def _infer_role(hostname: str, description: str | None = None) -> str:
+    """Infer role from description then hostname, defaulting to ``"guest"``.
+
+    Correct when CREATING a host (a newly discovered guest with no signal is a
+    guest). Wrong when re-enriching an existing host - see :func:`_match_role`.
+    """
+    return _match_role(hostname, description) or "guest"
 
 
 def derive_status(pve_status: str, ip: str | None) -> str:
@@ -438,11 +453,16 @@ class InventoryService:
 
         updates: dict[str, Any] = {}
 
-        # Role inference
+        # Role inference. Only overwrite when a pattern actually MATCHES - an
+        # unmatched hostname must leave the stored role alone. Previously this
+        # wrote `_infer_role(...)`, whose no-match fallback is "guest", so every
+        # enrich cycle demoted any non-matching host to guest and destroyed roles
+        # set by paths that did not stamp role_source="user" (#416).
         if role_source == "inferred":
-            inferred = _infer_role(host.get("hostname", ""), host.get("description") or None)
-            updates["role"] = inferred
-            updates["role_source"] = "inferred"
+            matched = _match_role(host.get("hostname", ""), host.get("description") or None)
+            if matched is not None:
+                updates["role"] = matched
+                updates["role_source"] = "inferred"
 
         # IP enrichment
         current_ip = host.get("ip_address") or None

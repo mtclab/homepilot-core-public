@@ -3,14 +3,13 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import time
-from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
+from ..common import SlidingWindowLimiter
 from ..config import get_settings
 from ..db.repository import Repository
 from .deps import SCOPE_ENFORCER_ATTR, get_db, require_scope, require_token
@@ -31,7 +30,9 @@ _same_site_lax: Literal["lax"] = "lax"
 
 _TOKEN_CREATE_RATE_LIMIT = 5
 _TOKEN_CREATE_RATE_WINDOW = 60
-_token_create_attempts: dict[str, list[float]] = defaultdict(list)
+_token_create_attempts = SlidingWindowLimiter(
+    limit=_TOKEN_CREATE_RATE_LIMIT, window_seconds=_TOKEN_CREATE_RATE_WINDOW
+)
 
 
 def _cookie_secure(request: Request | None = None) -> bool:
@@ -266,14 +267,8 @@ async def admin_create_token(
 ) -> dict[str, str]:
     """Create an API token via admin secret. Checks vault at runtime if not in settings."""
     client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    window = _token_create_attempts[client_ip]
-    _token_create_attempts[client_ip] = [
-        ts for ts in window if now - ts < _TOKEN_CREATE_RATE_WINDOW
-    ]
-    if len(_token_create_attempts[client_ip]) >= _TOKEN_CREATE_RATE_LIMIT:
+    if not _token_create_attempts.allow(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded for token creation")
-    _token_create_attempts[client_ip].append(now)
 
     admin_secret = await resolve_admin_secret(request)
     if not admin_secret:

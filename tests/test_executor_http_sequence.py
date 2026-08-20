@@ -802,3 +802,63 @@ steps:
             result = await http_sequence_execute(fm, body, {}, mock_vault)
         assert result["success"] is False
         client.aclose.assert_awaited_once()
+
+
+async def test_halt_on_missing_credential_closes_open_clients(mock_vault, make_frontmatter):
+    """#388: every halt path must close the httpx clients it opened.
+
+    Three `halt` returns inside the step loop returned WITHOUT running the
+    `for c in client_cache.values(): await c.aclose()` that the other exits did,
+    leaking an AsyncClient and its connection pool on every apply whose step
+    named a missing vault credential. The loop is now wrapped in try/finally.
+
+    This asserts the OUTCOME - that the client actually got closed - rather than
+    that some branch returned a particular dict.
+
+    Teeth: replace the `finally:` in `http_sequence.execute` with a plain close
+    after the loop and this fails, because the halt returns skip it.
+    """
+    fm = make_frontmatter()
+    body = """\
+## Plan
+First step opens a client, second step halts on a missing credential.
+
+## Spec
+
+```yaml http-spec
+steps:
+  - id: ok-step
+    name: svc
+    method: GET
+    path: /api/test
+  - id: bad-cred
+    name: missing-svc
+    method: GET
+    path: /api/other
+```
+"""
+    good_cred = {
+        "base_url": "https://example.com",
+        "headers": {"Authorization": "Bearer tok"},
+        "verify_tls": False,
+    }
+    # step 1 resolves and opens a client; step 2 raises -> the halt path
+    mock_vault.get_secret = AsyncMock(side_effect=[good_cred, VaultError("secret not found")])
+
+    client = _mock_async_client(_make_response(200, {"ok": True}))
+    with (
+        patch("homepilot.executor.http_sequence.httpx.AsyncClient", return_value=client),
+        patch(
+            "homepilot.executor.http_sequence._interpolate", side_effect=_passthrough_interpolate
+        ),
+        patch(
+            "homepilot.executor.http_sequence._interpolate_obj",
+            side_effect=_passthrough_interpolate_obj,
+        ),
+    ):
+        result = await http_sequence_execute(fm, body, {}, mock_vault)
+
+    assert result["success"] is False
+    assert client.aclose.await_count >= 1, (
+        "halt path returned without closing the httpx.AsyncClient it opened (#388)"
+    )

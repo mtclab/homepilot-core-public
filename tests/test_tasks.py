@@ -1324,9 +1324,11 @@ class TestTaskRunnerReconcilerLifecycle:
 
         task = await task_repo.get_task(result["task_id"])
         assert task["status"] == "succeeded"
-        mock_lifecycle.mark_applied.assert_called_once_with(
-            "2025-01-01-test-abc123", "Ansible applied successfully"
-        )
+        # The runner owns the TASK record only. ArtifactExecutor.apply performs
+        # the artifact transition; doing it here too made a successful apply
+        # attempt applied -> applied, which the transition table forbids, so the
+        # task reported failure while the host had been changed.
+        mock_lifecycle.mark_applied.assert_not_called()
 
     async def test_run_apply_reconciler_marks_failed(
         self, task_repo: TaskRepository, mock_store: MagicMock
@@ -1357,9 +1359,10 @@ class TestTaskRunnerReconcilerLifecycle:
 
         task = await task_repo.get_task(result["task_id"])
         assert task["status"] == "failed"
-        mock_lifecycle.mark_failed.assert_called_once_with(
-            "2025-01-01-test-abc123", "ansible failed"
-        )
+        assert task["error"] == "ansible failed"
+        # Same ownership rule on the failure path: the executor already marked
+        # the artifact failed.
+        mock_lifecycle.mark_failed.assert_not_called()
 
 
 class TestTaskRunnerResponseShape:

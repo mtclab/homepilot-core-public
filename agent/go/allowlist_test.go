@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestAllowlistUnprivileged(t *testing.T) {
 	a := Allowlist{privileged: false}
@@ -32,7 +35,7 @@ func TestAllowlistUnprivileged(t *testing.T) {
 }
 
 func TestAllowlistPrivileged(t *testing.T) {
-	a := Allowlist{privileged: true}
+	a := Allowlist{privileged: true, allowPackageInstall: true}
 	allowed := []string{
 		"systemctl restart nginx.service",
 		"systemctl start docker",
@@ -42,7 +45,6 @@ func TestAllowlistPrivileged(t *testing.T) {
 		"docker compose -f /opt/homepilot/docker-compose.yml up -d",
 		"mkdir -p /opt/homepilot/data",
 		"chmod 644 /opt/homepilot/x",
-		"sudo systemctl restart nginx",
 		"docker ps", // safe still allowed in privileged
 	}
 	for _, c := range allowed {
@@ -54,7 +56,6 @@ func TestAllowlistPrivileged(t *testing.T) {
 		"rm -rf /",            // never allowed
 		"systemctl restart nginx && rm -rf /", // metachar
 		"curl http://evil",    // not in allowlist
-		"sudo rm -rf /",       // sudo but not in sudo allowlist
 	}
 	for _, c := range blocked {
 		if ok, _ := a.IsAllowed(c); ok {
@@ -63,27 +64,55 @@ func TestAllowlistPrivileged(t *testing.T) {
 	}
 }
 
-// #381: the sudo path must re-run the FULL allowlist (metachars + per-command
-// argument regexes) against the wrapped command, so it can no longer be used to
-// bypass the constraints the non-sudo path enforces.
-func TestSudoDoesNotBypassArgRegexes(t *testing.T) {
-	a := Allowlist{privileged: true}
-	blocked := []string{
-		"sudo docker run --volume /:/mnt --user 0 img",       // dangerous docker args
-		"sudo apt-get install -o Dpkg::Pre-Invoke=/x -y curl", // apt pre-invoke hook
-	}
-	for _, c := range blocked {
-		if ok, _ := a.IsAllowed(c); ok {
-			t.Errorf("expected blocked (sudo bypass): %q", c)
+// #422: sudo is not an allowlisted command in ANY mode. A privileged agent is a
+// root unit (nothing to escalate to) and an unprivileged one runs under
+// NoNewPrivileges=yes with no sudoers entry (escalation impossible), so the sudo
+// parser could only ever be a bypass surface — the one #381 had to close.
+//
+// Teeth: reintroduce a sudo branch in IsAllowed and this test fails.
+func TestSudoIsNeverAllowed(t *testing.T) {
+	for _, a := range []Allowlist{
+		{privileged: false},
+		{privileged: true},
+		{privileged: true, allowPackageInstall: true},
+	} {
+		blocked := []string{
+			"sudo",
+			"sudo systemctl restart nginx",
+			"sudo -n -u root systemctl restart nginx",
+			"sudo docker run --volume /:/mnt --user 0 img",
+			"sudo apt-get install -y curl",
+			"sudo sudo systemctl restart nginx",
+		}
+		for _, c := range blocked {
+			if ok, _ := a.IsAllowed(c); ok {
+				t.Errorf("expected blocked (privileged=%v): %q", a.privileged, c)
+			}
 		}
 	}
-	// A legitimately-allowed sudo command still passes.
-	if ok, reason := a.IsAllowed("sudo systemctl restart nginx"); !ok {
-		t.Errorf("expected allowed: %q (%s)", "sudo systemctl restart nginx", reason)
+}
+
+// #422: package management is a SECOND grant. A privileged agent without it must
+// refuse apt/apt-get with a diagnostic that names the fix, instead of running it
+// and dying on the read-only filesystem the privileged unit gives it.
+func TestPackageManagementRequiresItsOwnGrant(t *testing.T) {
+	a := Allowlist{privileged: true} // privileged, package installs NOT granted
+	for _, c := range []string{"apt-get install -y vim", "apt install -y vim", "apt-get update -y x"} {
+		ok, reason := a.IsAllowed(c)
+		if ok {
+			t.Errorf("expected blocked without the package grant: %q", c)
+		}
+		if !strings.Contains(reason, "--allow-package-install") {
+			t.Errorf("refusal must name the fix, got: %q", reason)
+		}
 	}
-	// And with leading sudo options stripped.
-	if ok, reason := a.IsAllowed("sudo -n -u root systemctl restart nginx"); !ok {
-		t.Errorf("expected allowed: %q (%s)", "sudo -n -u root systemctl restart nginx", reason)
+	granted := Allowlist{privileged: true, allowPackageInstall: true}
+	if ok, reason := granted.IsAllowed("apt-get install -y vim"); !ok {
+		t.Errorf("expected allowed with the package grant: %s", reason)
+	}
+	// The grant does not widen anything else: the argument regexes still hold.
+	if ok, _ := granted.IsAllowed("apt-get install -o Dpkg::Pre-Invoke=/x -y curl"); ok {
+		t.Error("apt pre-invoke hook must stay blocked even with the package grant")
 	}
 }
 

@@ -4,12 +4,13 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
 from rich.console import Console
@@ -17,11 +18,16 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
+from homepilot import __version__
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.auth.tokens import generate_api_token
 from homepilot.config import get_settings
 from homepilot.vault import VaultManager
+
+if TYPE_CHECKING:  # imports kept out of CLI startup, present for type checking only
+    from homepilot.db.connection import Database
+    from homepilot.portal.repository import InviteRepository
 
 console = Console()
 err_console = Console(stderr=True)
@@ -52,6 +58,9 @@ app.add_typer(inventory_app, name="inventory")
 
 webhook_app = typer.Typer(help="Webhook management")
 app.add_typer(webhook_app, name="webhook")
+
+invite_app = typer.Typer(help="Self-service provisioning invites (#442 portal)")
+app.add_typer(invite_app, name="invite")
 
 
 def _get_settings() -> Any:
@@ -266,6 +275,66 @@ def init(
         f'[dim]  {{"mcpServers": {{"homepilot": '
         f'{{"command": "hp", "args": ["mcp-serve"], '
         f'"env": {{"HP_MCP_TOKEN": "{full_token}"}}}}}}}}[/dim]'
+    )
+
+
+@app.command("claim-code")
+def claim_code() -> None:
+    """Print this instance's claim code (only needed when it is not claimed from
+    its own network).
+
+    The normal first run needs nothing from this command: a browser on the same
+    network claims the instance directly. The code is what an instance reached
+    from OUTSIDE its network asks for, and this is how to read it without
+    scrolling container logs.
+    """
+    from homepilot.claim.repository import ClaimRepository
+    from homepilot.claim.startup import claim_code_path, read_claim_code
+    from homepilot.db.connection import Database
+
+    settings = _get_settings()
+    data_dir = Path(settings.data_dir)
+
+    async def _state() -> tuple[bool, bool]:
+        """(the instance is claimed, a pending claim row exists)."""
+        database = Database(str(data_dir / "homepilot.db"))
+        await database.connect()
+        try:
+            claims = ClaimRepository(database)
+            return await claims.is_claimed(), (await claims.get()) is not None
+        finally:
+            await database.close()
+
+    if not (data_dir / "homepilot.db").exists():
+        err_console.print(
+            f"[red]No HomePilot database at {data_dir}.[/red] "
+            "Start the backend once, then run this again."
+        )
+        raise typer.Exit(1)
+
+    claimed, has_row = asyncio.run(_state())
+    if claimed:
+        console.print("[green]This instance is already claimed.[/green] No claim code is in use.")
+        return
+    if not has_row:
+        err_console.print(
+            "[red]No claim code has been issued yet.[/red] "
+            "Start the backend once - it issues one on first boot."
+        )
+        raise typer.Exit(1)
+
+    code = read_claim_code(data_dir)
+    if not code:
+        err_console.print(
+            f"[red]The claim code file {claim_code_path(data_dir)} is missing.[/red]\n"
+            "Restart the backend: it issues a fresh code when the saved copy is gone."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[bold]{code}[/bold]")
+    console.print(
+        "[dim]Only needed from outside this network - a browser on the local "
+        "network claims the instance with no code at all.[/dim]"
     )
 
 
@@ -713,9 +782,99 @@ def doc(
         console.print(r.text)
 
 
+# ── Backup / restore (#421) ────────────────────────────────────────────────
+# Bumped only when the tarball LAYOUT changes such that an older build can no
+# longer read it. Import refuses anything newer than this.
+EXPORT_MANIFEST_SCHEMA_VERSION = 1
+
+MANIFEST_NAME = "manifest.json"
+
+# Secret material, relative to the data dir, archived under `secrets/` in the
+# tarball. Without every one of these a restored host can decrypt nothing it
+# used to own: master.protected is the vault identity, the passphrase sources
+# unwrap it, and the rest are the credentials the backend hands out.
+SECRET_PATHS: tuple[str, ...] = (
+    ".env",
+    ".vault_passphrase",
+    ".secret_key",
+    "api-token",
+    "vault/identities",
+    "vault/secrets",
+    "ssh",
+)
+
+
+def _present_secret_paths(data_dir: Path) -> list[str]:
+    return [rel for rel in SECRET_PATHS if (data_dir / rel).exists()]
+
+
+def _print_no_secrets_warning(missing: list[str]) -> None:
+    """Loud, unmissable: a default tarball is not a restorable host backup."""
+    err_console.print("[bold yellow]WARNING: no secrets in this backup.[/bold yellow]")
+    err_console.print("[yellow]This tarball CANNOT restore a working host.[/yellow]")
+    err_console.print("[yellow]Not included:[/yellow]")
+    for rel in missing:
+        err_console.print(f"[yellow]  - {rel}[/yellow]")
+    err_console.print("[yellow]Without them every vault secret stays[/yellow]")
+    err_console.print("[yellow]undecryptable: pve-token, secret-key,[/yellow]")
+    err_console.print("[yellow]admin-secret, webhook secrets.[/yellow]")
+    err_console.print("[yellow]Re-run with --include-secrets for a[/yellow]")
+    err_console.print("[yellow]restorable backup.[/yellow]")
+
+
+def _print_secrets_banner(tarball_path: Path) -> None:
+    err_console.print("[bold red]DANGER: this tarball CONTAINS SECRETS.[/bold red]")
+    err_console.print("[red]It holds the vault identity and passphrase,[/red]")
+    err_console.print("[red]so anyone who reads it can decrypt every[/red]")
+    err_console.print("[red]secret HomePilot holds.[/red]")
+    err_console.print(f"[red]Treat {tarball_path.name} as a credential:[/red]")
+    err_console.print("[red]encrypt it at rest, never commit it,[/red]")
+    err_console.print("[red]delete it once restored.[/red]")
+
+
+def _export_readme(includes_secrets: bool) -> str:
+    secrets_section = (
+        "- `secrets/` - vault identity, vault secrets and key material\n"
+        if includes_secrets
+        else "- (no `secrets/` - this archive cannot restore a working host)\n"
+    )
+    return (
+        "# HomePilot Export\n\n"
+        f"Generated: {datetime.now(UTC).isoformat()}\n\n"
+        "## Contents\n\n"
+        "- `manifest.json` - archive schema, versions, whether secrets are present\n"
+        "- `artifacts/` - Git repo of artifact Markdown files\n"
+        "- `homepilot.db` - SQLite snapshot taken with VACUUM INTO (no -wal/-shm)\n"
+        f"{secrets_section}"
+        "\n## Restore\n\n"
+        "Stop the backend, then `hp import <tarball>`\n"
+        "(add `--restore-secrets` to put the vault back).\n\n"
+        "## How to read without HomePilot\n\n"
+        "- Artifacts: Markdown files in `artifacts/YYYY/MM/<id>.md`\n"
+        '- Database: `sqlite3 homepilot.db "SELECT * FROM hosts;"`\n'
+        "- Embeddings are not exported: run `hp kb reindex` after a restore\n"
+    )
+
+
 @app.command()
-def export() -> None:
-    """Produce tarball (artifacts repo + DB + README)."""
+def export(
+    include_secrets: bool = typer.Option(
+        False,
+        "--include-secrets",
+        help="Include vault identity, vault secrets and key material. "
+        "The tarball can then decrypt everything - guard it accordingly.",
+    ),
+    output: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--output",
+        "-o",
+        help="Destination file, or a directory to write the tarball into.",
+    ),
+) -> None:
+    """Produce a restorable tarball (DB snapshot + artifacts + manifest)."""
+    from homepilot.db.backup import SnapshotError, read_schema_version, snapshot_database
+    from homepilot.db.migrations import MIGRATIONS
+
     settings = _get_settings()
     data_dir = Path(settings.data_dir)
     artifacts_dir = Path(settings.artifacts_dir)
@@ -723,43 +882,189 @@ def export() -> None:
 
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     tarball_name = f"homepilot-export-{ts}.tar.gz"
-    tarball_path = Path.cwd() / tarball_name
+    if output is None:
+        tarball_path = Path.cwd() / tarball_name
+    elif output.is_dir():
+        tarball_path = output / tarball_name
+    else:
+        tarball_path = output
+    tarball_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with tarfile.open(str(tarball_path), "w:gz") as tar:
-        if artifacts_dir.exists():
-            tar.add(str(artifacts_dir), arcname="artifacts")
+    secret_rels = _present_secret_paths(data_dir) if include_secrets else []
+    if include_secrets and not secret_rels:
+        err_console.print("[yellow]--include-secrets: no secret files found in[/yellow]")
+        err_console.print(f"[yellow]{data_dir}[/yellow]")
+
+    with tempfile.TemporaryDirectory(prefix="hp-export-") as staging_str:
+        staging = Path(staging_str)
+
+        db_schema_version: int | None = None
+        db_snapshot = staging / "homepilot.db"
         if db_path.exists():
-            tar.add(str(db_path), arcname="homepilot.db")
+            try:
+                snapshot_database(db_path, db_snapshot)
+            except SnapshotError as exc:
+                err_console.print(f"[red]Database snapshot failed: {exc}[/red]", soft_wrap=True)
+                raise typer.Exit(1) from exc
+            db_schema_version = read_schema_version(db_snapshot)
 
-        readme = (
-            "# HomePilot Export\n\n"
-            f"Generated: {datetime.now(UTC).isoformat()}\n\n"
-            "## Contents\n\n"
-            "- `artifacts/` — Git repo of artifact Markdown files\n"
-            "- `homepilot.db` — SQLite database (inventory, KB, journal)\n\n"
-            "## How to read without HomePilot\n\n"
-            "- Artifacts: Markdown files in `artifacts/YYYY/MM/<id>.md`\n"
-            '- Database: `sqlite3 homepilot.db "SELECT * FROM hosts;"`\n'
-        )
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, prefix="hp-readme-"
-        ) as _rf:
-            _rf.write(readme)
-            _readme_path = _rf.name
-        try:
-            tar.add(_readme_path, arcname="README.md")
-        finally:
-            Path(_readme_path).unlink(missing_ok=True)
+        contents = [MANIFEST_NAME, "README.md"]
+        if db_snapshot.exists():
+            contents.append("homepilot.db")
+        if artifacts_dir.exists():
+            contents.append("artifacts")
+        if secret_rels:
+            contents.append("secrets")
+
+        manifest = {
+            "manifest_schema_version": EXPORT_MANIFEST_SCHEMA_VERSION,
+            "homepilot_version": __version__,
+            "created_at": datetime.now(UTC).isoformat(),
+            "includes_secrets": bool(secret_rels),
+            "secret_paths": secret_rels,
+            "db_schema_version": db_schema_version,
+            "build_supports_db_schema_version": max(MIGRATIONS.keys()),
+            "contents": contents,
+        }
+        manifest_path = staging / MANIFEST_NAME
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        readme_path = staging / "README.md"
+        readme_path.write_text(_export_readme(bool(secret_rels)), encoding="utf-8")
+
+        with tarfile.open(str(tarball_path), "w:gz") as tar:
+            tar.add(str(manifest_path), arcname=MANIFEST_NAME)
+            tar.add(str(readme_path), arcname="README.md")
+            if db_snapshot.exists():
+                # Only the VACUUM INTO snapshot: -wal/-shm are never archived,
+                # they would replay onto the restored file (#421).
+                tar.add(str(db_snapshot), arcname="homepilot.db")
+            if artifacts_dir.exists():
+                tar.add(str(artifacts_dir), arcname="artifacts")
+            for rel in secret_rels:
+                tar.add(str(data_dir / rel), arcname=f"secrets/{rel}")
+
+    if secret_rels:
+        # The archive is now a credential; keep it off other users' reach.
+        os.chmod(str(tarball_path), 0o600)
 
     console.print(f"[green]Exported to {tarball_path}[/green]")
+    if secret_rels:
+        _print_secrets_banner(tarball_path)
+    else:
+        # Name what this host actually holds and the archive left behind, so the
+        # warning is a fact about this backup, not a generic notice.
+        _print_no_secrets_warning(_present_secret_paths(data_dir) or list(SECRET_PATHS))
+
+
+def _read_manifest(tar: tarfile.TarFile) -> dict[str, Any]:
+    try:
+        member = tar.getmember(MANIFEST_NAME)
+    except KeyError as exc:
+        raise ValueError(
+            "no manifest.json. Tarballs produced before the backup fix hold a "
+            "raw copy of a live WAL database and may be torn; refusing to "
+            "restore one. Re-export from the source host."
+        ) from exc
+    handle = tar.extractfile(member)
+    if handle is None:
+        raise ValueError("manifest.json is not a regular file")
+    try:
+        parsed = json.loads(handle.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"manifest.json is unreadable: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("manifest.json is not an object")
+    return parsed
+
+
+def _check_manifest_versions(manifest: dict[str, Any]) -> None:
+    """Refuse anything this build cannot restore. No down-migrations exist."""
+    from homepilot.db.migrations import MIGRATIONS
+
+    archive_version = int(manifest.get("manifest_schema_version", 0))
+    if archive_version > EXPORT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"archive manifest schema version {archive_version} is newer than this "
+            f"build supports (version {EXPORT_MANIFEST_SCHEMA_VERSION}). Restore it "
+            "with the HomePilot version that produced it."
+        )
+    db_version = manifest.get("db_schema_version")
+    supported = max(MIGRATIONS.keys())
+    if db_version is not None and int(db_version) > supported:
+        raise ValueError(
+            f"archive database schema version {int(db_version)} is newer than this "
+            f"build supports (version {supported}). No down-migrations exist: run "
+            "the image that produced the archive."
+        )
+
+
+def _backup_dir_for_import(data_dir: Path, ts: str) -> Path:
+    return data_dir / "backups" / f"pre-import-{ts}"
+
+
+def _backup_current_state(data_dir: Path, artifacts_dir: Path, db_path: Path, ts: str) -> Path:
+    """Snapshot the live DB and artifacts tree before anything is overwritten.
+
+    Fail closed: without a restorable copy the import must not start, because a
+    half-restored data dir has no way back (same rule as the pre-migration
+    backup).
+    """
+    from homepilot.db.backup import snapshot_database
+
+    backup_dir = _backup_dir_for_import(data_dir, ts)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        snapshot_database(db_path, backup_dir / "homepilot.db")
+    if artifacts_dir.exists():
+        shutil.copytree(str(artifacts_dir), str(backup_dir / "artifacts"), symlinks=True)
+    return backup_dir
+
+
+def _restore_tree(src: Path, dest: Path) -> None:
+    """Replace `dest` (file or directory) with the staged `src`, wholesale."""
+    if dest.is_dir() and not dest.is_symlink():
+        shutil.rmtree(str(dest))
+    elif dest.exists() or dest.is_symlink():
+        dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+
+
+def _restore_secret_entry(src: Path, dest: Path, backup_dir: Path, rel: str) -> None:
+    if dest.exists():
+        # Never destroy live key material without a copy: an operator who
+        # restores the wrong tarball still has the previous vault.
+        stashed = backup_dir / "secrets" / rel
+        stashed.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_dir():
+            shutil.copytree(str(dest), str(stashed), symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(str(dest), str(stashed))
+    _restore_tree(src, dest)
+    if dest.is_dir():
+        os.chmod(str(dest), 0o700)
+        for child in dest.rglob("*"):
+            os.chmod(str(child), 0o700 if child.is_dir() else 0o600)
+    else:
+        os.chmod(str(dest), 0o600)
 
 
 @app.command("import")
 def import_backup(
     path: Path = typer.Argument(..., help="Path to homepilot-export-*.tar.gz"),  # noqa: B008
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    restore_secrets: bool = typer.Option(
+        False,
+        "--restore-secrets",
+        help="Also restore the vault identity, vault secrets and key material. "
+        "Overwrites the live keys on this host (the old ones are backed up).",
+    ),
 ) -> None:
-    """Restore artifacts repo + DB from a tarball. Backs up current DB first."""
+    """Restore a HomePilot data dir from a tarball. Backs up current state first."""
+    from homepilot.db.backup import DatabaseLockedError, SnapshotError, ensure_not_locked
+    from homepilot.db.connection import Database
+    from homepilot.db.migrations import run_migrations
+
     if not path.exists():
         err_console.print(f"[red]File not found: {path}[/red]")
         raise typer.Exit(1)
@@ -772,52 +1077,126 @@ def import_backup(
     artifacts_dir = Path(settings.artifacts_dir)
     db_path = data_dir / "homepilot.db"
 
-    if not yes:
-        typer.confirm(
-            f"This will overwrite {artifacts_dir} and {db_path}. "
-            "Current DB will be backed up. Continue?",
-            abort=True,
-        )
-
-    # Back up current DB before any overwrite
-    backups_dir = data_dir / "backups"
-    backups_dir.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
-        ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        backup_dest = backups_dir / f"homepilot-pre-import-{ts}.db"
-        import shutil
-
-        shutil.copy2(str(db_path), str(backup_dest))
-        console.print(f"[dim]Current DB backed up to {backup_dest}[/dim]")
-
     try:
         with tarfile.open(str(path), "r:gz") as tar:
-            # Validate all members before extracting — prevent path traversal
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            # Validate every member before extracting - prevent path traversal
+            for member in members:
                 if member.name.startswith("/") or ".." in member.name.split("/"):
                     err_console.print(f"[red]Unsafe path in archive: {member.name}[/red]")
                     raise typer.Exit(1)
+            manifest = _read_manifest(tar)
+            _check_manifest_versions(manifest)
+    except tarfile.TarError as exc:
+        err_console.print(f"[red]Failed to read archive: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    except ValueError as exc:
+        err_console.print(f"[red]Refusing to import: {exc}[/red]", soft_wrap=True)
+        raise typer.Exit(1) from exc
 
-            # Extract artifacts/
-            artifact_members = [m for m in tar.getmembers() if m.name.startswith("artifacts")]
-            if artifact_members:
-                artifacts_dir.mkdir(parents=True, exist_ok=True)
-                tar.extractall(str(data_dir), members=artifact_members, filter="data")
-                console.print(f"[green]Artifacts restored to {artifacts_dir}[/green]")
+    archive_has_secrets = bool(manifest.get("includes_secrets"))
+    if restore_secrets and not archive_has_secrets:
+        err_console.print("[red]--restore-secrets: this archive has no secrets.[/red]")
+        err_console.print("[red]It was exported without --include-secrets.[/red]")
+        raise typer.Exit(1)
 
-            # Extract DB
+    # Fail closed BEFORE anything is touched: a live backend still writing to
+    # the database would race the restore and lose whichever half it wrote.
+    try:
+        ensure_not_locked(db_path)
+    except DatabaseLockedError as exc:
+        err_console.print("[red]Refusing to import: the database is in use.[/red]")
+        err_console.print(f"[red]{exc}[/red]", soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+    if not yes:
+        typer.confirm(
+            f"This will overwrite {artifacts_dir} and {db_path}. "
+            "Current DB and artifacts will be backed up. Continue?",
+            abort=True,
+        )
+
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    try:
+        backup_dir = _backup_current_state(data_dir, artifacts_dir, db_path, ts)
+    except (SnapshotError, OSError) as exc:
+        err_console.print(f"[red]Pre-import backup failed: {exc}[/red]", soft_wrap=True)
+        err_console.print("[red]Nothing was changed.[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[dim]Current state backed up to {backup_dir}[/dim]")
+
+    with tempfile.TemporaryDirectory(prefix="hp-import-") as staging_str:
+        staging = Path(staging_str)
+        try:
+            with tarfile.open(str(path), "r:gz") as tar:
+                tar.extractall(str(staging), filter="data")
+        except tarfile.TarError as exc:
+            err_console.print(f"[red]Failed to read archive: {exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        staged_db = staging / "homepilot.db"
+        if staged_db.exists():
+            data_dir.mkdir(parents=True, exist_ok=True)
+            _restore_tree(staged_db, db_path)
+            # A stale -wal/-shm left beside a replaced database file is replayed
+            # onto it by SQLite - the restored data would be corrupted by the
+            # journal of the database it just replaced (#421).
+            for sidecar in (
+                db_path.with_name(db_path.name + "-wal"),
+                db_path.with_name(db_path.name + "-shm"),
+            ):
+                if sidecar.exists():
+                    sidecar.unlink()
+                    console.print(f"[dim]Removed stale {sidecar.name}[/dim]")
+            console.print(f"[green]Database restored to {db_path}[/green]")
+        else:
+            console.print("[yellow]No homepilot.db in archive - skipped[/yellow]")
+
+        staged_artifacts = staging / "artifacts"
+        if staged_artifacts.exists():
+            _restore_tree(staged_artifacts, artifacts_dir)
+            console.print(f"[green]Artifacts restored to {artifacts_dir}[/green]")
+
+        staged_secrets = staging / "secrets"
+        if restore_secrets and staged_secrets.exists():
+            for rel in manifest.get("secret_paths", SECRET_PATHS):
+                src = staged_secrets / rel
+                if src.exists():
+                    _restore_secret_entry(src, data_dir / rel, backup_dir, rel)
+            console.print("[green]Vault and key material restored[/green]")
+
+    if db_path.exists():
+
+        async def _migrate() -> int:
+            database = Database(str(db_path))
+            await database.connect()
             try:
-                db_member = tar.getmember("homepilot.db")
-                tar.extractall(str(data_dir), members=[db_member], filter="data")
-                console.print(f"[green]Database restored to {db_path}[/green]")
-            except KeyError:
-                console.print("[yellow]No homepilot.db found in archive — skipped[/yellow]")
+                await run_migrations(database)
+                row = await database.fetchone(
+                    "SELECT value FROM settings WHERE key = 'schema_version'"
+                )
+                return int(row["value"]) if row else 0
+            finally:
+                await database.close()
 
-    except tarfile.TarError as e:
-        err_console.print(f"[red]Failed to read archive: {e}[/red]")
-        raise typer.Exit(1) from e
+        try:
+            version = asyncio.run(_migrate())
+        except Exception as exc:
+            err_console.print(f"[red]Migrations after restore failed: {exc}[/red]", soft_wrap=True)
+            err_console.print(f"[red]Pre-import backup is at {backup_dir}[/red]")
+            raise typer.Exit(1) from exc
+        console.print(f"[dim]Schema migrated to version {version}[/dim]")
 
     console.print("[bold green]Import complete.[/bold green]")
+    if not archive_has_secrets:
+        err_console.print("[bold yellow]No secrets in this archive.[/bold yellow]")
+        err_console.print("[yellow]The vault on this host is unchanged; if[/yellow]")
+        err_console.print("[yellow]this is a fresh host the restored data[/yellow]")
+        err_console.print("[yellow]references secrets it cannot decrypt.[/yellow]")
+    elif not restore_secrets:
+        err_console.print("[yellow]Archive contains secrets; they were NOT[/yellow]")
+        err_console.print("[yellow]restored. Pass --restore-secrets to[/yellow]")
+        err_console.print("[yellow]replace the vault on this host.[/yellow]")
 
 
 @policy_app.command("init")
@@ -887,17 +1266,46 @@ def kb_reindex(
         typer.confirm("Delete and rebuild all KB index entries?", abort=True)
 
     if not no_embeddings:
-        try:
-            import httpx
+        # Judge the CONFIGURED service, not a hardcoded Ollama on localhost: with
+        # no embedding service set (the default), reindexing keyword-only is the
+        # correct outcome and "Ollama not reachable" would name a service this
+        # install never pointed at.
+        from homepilot.common import redact_endpoint
 
-            resp = httpx.get("http://localhost:11434/api/version", timeout=2.0)
-            resp.raise_for_status()
-        except Exception:  # intentional broad catch — prints user-friendly message and exits
+        _settings_for_embed = _get_settings()
+        _embed_url = (
+            _settings_for_embed.embedding_service_url or _settings_for_embed.embedding_fallback_url
+        )
+        if not _embed_url:
             console.print(
-                "[yellow]Warning: Ollama not reachable at localhost:11434. "
-                "Reindex will fall back to keyword-only search (no embeddings).[/yellow]"
+                "[yellow]No embedding service configured "
+                "(HP_EMBEDDING_SERVICE_URL / HP_EMBEDDING_FALLBACK_URL are empty). "
+                "Reindexing keyword-only.[/yellow]"
             )
             no_embeddings = True
+        else:
+            # Ask the service for an actual embedding: a GET liveness ping on a
+            # POST-only endpoint proves nothing about whether reindexing will
+            # produce vectors.
+            import asyncio as _asyncio
+
+            from homepilot.kb.service import _call_embed_service
+
+            _embed_model = (
+                _settings_for_embed.embedding_model
+                if _settings_for_embed.embedding_service_url
+                else _settings_for_embed.embedding_fallback_model
+            )
+            _probe = _asyncio.run(
+                _call_embed_service(_embed_url, _embed_model, "test", timeout=5.0)
+            )
+            if _probe is None:
+                console.print(
+                    f"[yellow]Warning: embedding service at {redact_endpoint(_embed_url)} is not "
+                    "answering. Reindex will fall back to keyword-only search "
+                    "(no embeddings).[/yellow]"
+                )
+                no_embeddings = True
 
     async def _kb_reindex_via_api(no_embs: bool) -> dict[str, Any] | None:
         settings = _get_settings()
@@ -1187,6 +1595,159 @@ def token_revoke(
         err_console.print(f"[red]{err}[/red]")
         raise typer.Exit(1)
     console.print(f"Revoked token {prefix}.")
+
+
+async def _open_invite_repo() -> tuple[Database, InviteRepository]:
+    """Open the control-plane database for invite work. Returns (database, repo).
+
+    Invites are minted on the box by the operator and there is no admin API for
+    them by design (the portal's whole point is a small surface), so the CLI
+    talks to SQLite directly - WAL plus busy_timeout lets it write while the
+    backend is running.
+    """
+    from homepilot.db.connection import Database
+    from homepilot.db.migrations import run_migrations
+    from homepilot.portal.repository import InviteRepository
+
+    settings = _get_settings()
+    data_dir = Path(settings.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    database = Database(str(data_dir / "homepilot.db"))
+    await database.connect()
+    await run_migrations(database)
+    return database, InviteRepository(database)
+
+
+@invite_app.command("create")
+def invite_create(
+    cn: str = typer.Option(..., "--cn", help="Client-certificate CN this invite is bound to"),
+    template: int = typer.Option(..., "--template", help="Proxmox template VMID to clone"),
+    node: str = typer.Option(..., "--node", help="Proxmox node to build on"),
+    pool: str = typer.Option("", "--pool", help="Proxmox pool for the new guest"),
+    cores: int = typer.Option(0, "--cores", help="CPU cores (0 = template default)"),
+    ram: int = typer.Option(0, "--ram", help="Memory in MB (0 = template default)"),
+    disk: int = typer.Option(0, "--disk", help="Disk size in GB (0 = template default)"),
+    disk_device: str = typer.Option("scsi0", "--disk-device", help="PVE disk to resize"),
+    expires: str = typer.Option("7d", "--expires", help="Validity window, e.g. 30m / 48h / 7d"),
+    base_url: str = typer.Option(
+        "", "--base-url", help="Portal origin (defaults to HP_PORTAL_BASE_URL)"
+    ),
+) -> None:
+    """Mint a one-time invite for one client certificate. Prints the URL ONCE."""
+    from pydantic import ValidationError
+
+    from homepilot.portal.models import InviteCaps
+    from homepilot.portal.repository import parse_duration
+
+    if not cn.strip():
+        err_console.print("[red]--cn must not be empty[/red]")
+        raise typer.Exit(1)
+    try:
+        ttl = parse_duration(expires)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    try:
+        # Validated through the SAME model provisioning uses, so a mint can
+        # never produce caps that redemption would later reject.
+        caps = InviteCaps(
+            template_vmid=template,
+            node=node,
+            pool=pool or None,
+            cores=cores or None,
+            memory_mb=ram or None,
+            disk_gb=disk or None,
+            disk=disk_device,
+        )
+    except ValidationError as exc:
+        err_console.print(f"[red]Invalid caps: {exc.errors()[0]['msg']}[/red]")
+        raise typer.Exit(1) from exc
+
+    async def _mint() -> tuple[str, str]:
+        database, invites = await _open_invite_repo()
+        try:
+            _, full_token = await invites.create_invite(
+                bound_cn=cn.strip(),
+                caps=caps,
+                created_by=os.environ.get("USER", "operator"),
+                ttl=ttl,
+            )
+        finally:
+            await database.close()
+        return full_token, full_token[:16]
+
+    token, prefix = asyncio.run(_mint())
+    origin = (base_url or getattr(_get_settings(), "portal_base_url", "")).rstrip("/")
+    url = f"{origin}/invite/{token}" if origin else f"/invite/{token}"
+    console.print(
+        Panel(
+            f"[bold]{url}[/bold]\n\n"
+            f"Bound to CN: {cn}\nPrefix: {prefix}\nValid for: {expires}\n\n"
+            "Shown once - HomePilot stores only a hash. Send it to the holder of that "
+            "certificate; nobody else can redeem it.",
+            title="Invite created",
+        )
+    )
+    if not origin:
+        err_console.print(
+            "[yellow]No portal origin known: set HP_PORTAL_BASE_URL or pass --base-url "
+            "to print a complete URL.[/yellow]"
+        )
+
+
+@invite_app.command("list")
+def invite_list(
+    output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+) -> None:
+    """List invites. Never prints tokens - only prefixes, binding, caps and state."""
+    from homepilot.portal.repository import invite_state
+
+    async def _list() -> list[dict[str, Any]]:
+        database, invites = await _open_invite_repo()
+        try:
+            return await invites.list_invites()
+        finally:
+            await database.close()
+
+    rows = asyncio.run(_list())
+    if output == "json":
+        console.print(json.dumps([{**r, "state": invite_state(r)} for r in rows]))
+        return
+    if not rows:
+        console.print("No invites.")
+        return
+    table = Table("Prefix", "CN", "Template", "Node", "Caps", "Expires", "State")
+    for row in rows:
+        caps = f"{row['cores'] or '-'}c / {row['memory_mb'] or '-'}MB / {row['disk_gb'] or '-'}GB"
+        table.add_row(
+            str(row["token_prefix"]),
+            str(row["bound_cn"]),
+            str(row["template_vmid"]),
+            str(row["node"]),
+            caps,
+            str(row["expires_at"]),
+            invite_state(row),
+        )
+    console.print(table)
+
+
+@invite_app.command("revoke")
+def invite_revoke(
+    prefix: str = typer.Argument(..., help="The invite prefix (first 16 chars) to revoke"),
+) -> None:
+    """Revoke an unredeemed invite by its prefix."""
+
+    async def _revoke() -> bool:
+        database, invites = await _open_invite_repo()
+        try:
+            return await invites.revoke(prefix)
+        finally:
+            await database.close()
+
+    if not asyncio.run(_revoke()):
+        err_console.print(f"[red]No open invite with prefix {prefix}.[/red]")
+        raise typer.Exit(1)
+    console.print(f"Revoked invite {prefix}.")
 
 
 @inventory_app.command("list")
@@ -1698,44 +2259,6 @@ def agent_bootstrap_cmd(
             f"hp-agent"
         )
         console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
-
-
-@agent_app.command("zabbix-push")
-def agent_zabbix_push(
-    agent_id: str = typer.Argument(..., help="Agent ID or hostname"),
-) -> None:
-    """Trigger Zabbix metrics push for a connected agent."""
-    from homepilot.app_state import get_agent_registry
-
-    registry = get_agent_registry()
-    if registry is None or registry.hub_server is None:
-        err_console.print("[yellow]Agent hub not enabled[/yellow]")
-        raise typer.Exit(1)
-
-    agent = registry.get(agent_id) or registry.get_by_hostname(agent_id)
-    if not agent:
-        err_console.print(f"[red]Agent '{agent_id}' not connected[/red]")
-        raise typer.Exit(1)
-
-    hub = registry.hub_server
-
-    async def _push() -> dict[str, Any]:
-        return await hub.send_zabbix_push(agent.agent_id)
-
-    try:
-        result = asyncio.run(_push())
-        metrics_sent = result.get("metrics_sent", 0)
-        zabbix_resp = result.get("zabbix_response", {})
-        console.print(f"[green]Pushed {metrics_sent} metrics to Zabbix[/green]")
-        if zabbix_resp:
-            info = zabbix_resp.get("info", "")
-            console.print(f"[dim]Zabbix response: {info}[/dim]")
-    except ConnectionError as exc:
-        err_console.print(f"[red]Agent not connected: {exc}[/red]")
-        raise typer.Exit(1) from None
-    except TimeoutError:
-        err_console.print("[red]Zabbix push timed out[/red]")
-        raise typer.Exit(1) from None
 
 
 @agent_app.command("revoke")

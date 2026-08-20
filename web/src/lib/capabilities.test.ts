@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { canWrite, isAdmin, canRead } from './capabilities';
+import { canWrite, isAdmin } from './capabilities';
 
 describe('canWrite', () => {
 	it('is true for a write or admin capability', () => {
@@ -26,18 +26,5 @@ describe('isAdmin', () => {
 		expect(isAdmin(['read', 'write'])).toBe(false);
 		expect(isAdmin(['read'])).toBe(false);
 		expect(isAdmin(null)).toBe(false);
-	});
-});
-
-describe('canRead', () => {
-	it('is true for any real capability', () => {
-		expect(canRead(['read'])).toBe(true);
-		expect(canRead(['write'])).toBe(true);
-		expect(canRead(['admin'])).toBe(true);
-	});
-
-	it('is false for empty/missing capabilities', () => {
-		expect(canRead([])).toBe(false);
-		expect(canRead(undefined)).toBe(false);
 	});
 });

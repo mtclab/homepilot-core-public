@@ -98,9 +98,51 @@ docker compose -f docker-compose.yml -f docker-compose.agent.yml --profile gpu u
 docker compose -f docker-compose.yml -f docker-compose.agent.yml --profile cpu up -d
 ```
 
-The LLM overlay adds llama.cpp (chat) and BGE-M3 embedding services. BGE-M3 is required for KB vector search; without it, KB search falls back to keyword-only mode.
+The LLM overlay adds llama.cpp (chat) and BGE-M3 embedding services, and points
+`HP_EMBEDDING_SERVICE_URL` at the embedding container for you. Without the
+overlay that variable is empty and KB search runs keyword-only — which works, and
+which the self-check below states rather than leaving you to discover it.
 
 > **Using a remote LLM?** Just leave the LLM overlay off and configure your preferred backend (Ollama, OpenAI, etc.) via environment variables — no local GPU needed.
+
+### What is on, what is off, what is broken
+
+Every optional subsystem is off by default, and nothing is configured to point at
+a host a stock install does not run (ADR-004 corollary 3). To see where an
+instance actually stands, read the **startup self-check**:
+
+```bash
+docker compose logs backend | grep -A10 'Startup self-check'
+```
+
+```
+Startup self-check - optional subsystems:
+  proxmox: ok - The Proxmox API at pve.example.com answered; inventory and provisioning are available.
+  agent_hub: ok - The agent hub is listening on 0.0.0.0:8443; managed hosts can connect.
+  vault: ok - The vault is unlocked; secrets are stored encrypted in the data directory.
+  embeddings: off - KB search is keyword-only because no embedding service is configured. ...
+  events_webhook: off - Artifact and task events are not forwarded anywhere ...
+```
+
+The same report, computed fresh, is served at `GET /admin/selfcheck` (admin
+scope) and rendered as **Optional subsystems** on the Settings page. It is a
+sibling of `/health`, not part of it: `/health` is public and is the container's
+liveness probe, while this report names the addresses the instance is wired to
+and runs outbound probes.
+
+The states mean different things and need opposite actions:
+
+| State | Meaning | Action |
+|---|---|---|
+| `off` | Not configured. A choice, not a fault | None, unless you wanted the capability |
+| `ok` | Configured and answering | None |
+| `unreachable` | Configured but it did not answer — the capability is silently degraded | Fix the address, credentials or the service |
+| `unknown` | The probe did not finish inside its 2s budget | Re-check; treat as unproven, not as working |
+
+Probes are bounded at 2 seconds each and run concurrently, so the report never
+delays startup (it is scheduled, never awaited) and never holds the endpoint
+open. No token, passphrase or webhook path appears in it — addresses are reduced
+to scheme, host and port.
 
 ---
 
@@ -244,14 +286,41 @@ docker compose exec backend hp inventory refresh
 
 HomePilot v2.3 uses the **Agent Hub** (TCP relay on port 8443) for managed host connectivity. The jump server has been replaced by the `hp-agent` binary, which connects directly to the hub.
 
-### Enable the Agent Hub
+### The hub configures itself (ADR-004 S3)
 
-In `.env`:
+**Nothing has to be set for host management to work.** On a default install the
+hub is enabled, and on first boot it generates what it needs:
+
+| What | Where it goes | Reused on restart |
+| --- | --- | --- |
+| Shared hub token | vault secret `agent-hub-token` if the vault is unlocked, else `<data_dir>/.agent_hub_token` (0600) | yes |
+| Self-signed server certificate | `<data_dir>/hub/hub-cert.pem` | yes |
+| Its private key | `<data_dir>/hub/hub-key.pem` (0600) | yes |
+
+The certificate is regenerated **only** when it is absent or expired, so the
+fingerprint an agent pinned at enrolment keeps working across restarts.
+
+Every setting below is still an override, and an override always wins:
 
 ```env
-HP_AGENT_HUB_ENABLED=true
+HP_AGENT_HUB_ENABLED=false            # turn host management off entirely
 HP_AGENT_HUB_AUTH_TOKEN=<shared-secret>
+HP_AGENT_HUB_TLS_CERT=/path/server.crt   # supplied cert+key replace the generated pair
+HP_AGENT_HUB_TLS_KEY=/path/server.key
 ```
+
+**Upgrade path for existing installs.** This changes defaults, not
+configuration. Nothing under an existing deployment is rewritten:
+
+- `HP_AGENT_HUB_ENABLED=false` in an existing `.env` keeps the hub off.
+- An existing `HP_AGENT_HUB_AUTH_TOKEN` is used as-is; no token file is written.
+- Existing `HP_AGENT_HUB_TLS_CERT`/`_KEY` are used as-is; nothing is generated.
+- An install that set `HP_HUB_ALLOW_INSECURE=1` and never set `HP_AGENT_HUB_TLS`
+  **keeps running plaintext**, so its agents (which dial without TLS) are not
+  broken by the new TLS default. Set `HP_AGENT_HUB_TLS=true` explicitly when you
+  are ready to move that fleet onto TLS.
+- `HP_AGENT_HUB_TLS=false` set explicitly still means no TLS - and therefore
+  still hits the fail-closed error below on a routable bind.
 
 ### Transport security (TLS) — fail closed
 
@@ -263,7 +332,10 @@ As of the #362 hardening it **fails closed** on an exposed plaintext transport:
 - **Any routable bind** (e.g. `0.0.0.0`, a LAN IP) with **no TLS** is a **hard
   startup error** — the backend refuses to start.
 
-To run a non-loopback hub you must either enable TLS:
+A default install satisfies this check **by itself**: TLS is on and the hub
+generates its own certificate. The check is not special-cased, weakened, or
+bypassed - it passes because there really is a TLS context. You only need the
+settings below to depart from the default:
 
 ```env
 HP_AGENT_HUB_TLS=true
@@ -279,29 +351,59 @@ HP_AGENT_HUB_TLS_CA=/path/ca.crt
 HP_HUB_ALLOW_INSECURE=1   # logs a loud warning on every start
 ```
 
-On the agent (`hp-agent`) side, TLS now **verifies the hub certificate and
-hostname by default** (using the provided `HP_AGENT_TLS_CA` or the system trust
-store). The previous silent `CERT_NONE` downgrade is gone. To skip verification
-for **testing only** — which exposes the connection to man-in-the-middle
-interception — set `HP_AGENT_TLS_INSECURE=1` (logs a loud test-only warning).
+### What the agent verifies
 
-> **Migration note.** Existing deployments running the hub on plain TCP over a
-> routable interface will now fail to start. Either configure TLS (recommended)
-> or set `HP_HUB_ALLOW_INSECURE=1` as a temporary, trusted-network-only measure.
+On the agent (`hp-agent`) side, TLS **verifies the hub by default**. There is no
+silent `CERT_NONE`/`InsecureSkipVerify` downgrade anywhere in the shipped path.
+Which check applies depends on how the hub's certificate was obtained:
+
+| Agent configuration | What is verified |
+| --- | --- |
+| `HP_AGENT_TLS_PIN=sha256:<hex>` (what the UI one-liner sets) | The hub's certificate must be **byte-for-byte** the pinned one. Chain and hostname checks are replaced by this exact-identity check, which is strictly stronger for a known certificate. A different certificate - including another well-formed self-signed one - is refused. |
+| `HP_AGENT_TLS_CA=/path/ca.crt` | Standard chain + hostname verification against that CA. |
+| Neither | Standard verification against the system trust store. A self-signed hub certificate **cannot** satisfy this, which is why the pin exists. |
+
+The pin comes from the hub itself: `GET /agents/token` and `GET /agents/bootstrap`
+return `hub_cert_sha256`, and the UI renders it into the install one-liner as
+`--tls-pin`. Because that value is fetched over the authenticated admin API, the
+trust decision is anchored in the operator's session rather than in
+trust-on-first-use.
+
+**Not verified in this slice:** the agent does not present a client certificate
+unless `HP_AGENT_HUB_TLS_CA` + agent cert/key are configured by hand, so agent
+identity to the hub still rests on the per-agent token, not on mTLS (#362).
+Certificate rotation is also manual: replacing the hub certificate invalidates
+every pinned agent, which must be re-enrolled with the new fingerprint.
+
+`HP_AGENT_TLS_INSECURE=1` remains **off** by default and exists for testing only
+- it exposes the connection to man-in-the-middle interception, logs a loud
+warning, and **cannot** override a pin (a pinned agent still refuses a
+mismatched certificate).
+
+> **Migration note (#362).** Deployments that ran the hub on plain TCP over a
+> routable interface fail to start. Since ADR-004 S3 an install that configures
+> nothing gets TLS with a generated certificate instead, so this only affects an
+> install that explicitly set `HP_AGENT_HUB_TLS=false`; the remaining fix is to
+> drop that setting, or set `HP_HUB_ALLOW_INSECURE=1` as a temporary,
+> trusted-network-only measure.
 > Per the P0 finding, also plan to rotate the shared `HP_AGENT_HUB_AUTH_TOKEN`;
 > per-agent credentials, replay resistance, and protocol negotiation are tracked
 > as follow-ups to #362.
 
 ### Enroll a managed host
 
-Install the `hp-agent` binary on each managed host, then:
+Open **Agents** in the UI and copy the generated one-liner - it already carries
+the hub address, the token, and the certificate pin. Run it as root on the host:
 
 ```bash
-hp-agent enroll --hub https://<homepilot-host>:8443 --token <shared-secret>
-hp-agent start
+curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh \
+  | bash -s -- --hub <homepilot-host>:8443 --token <token> --tls --tls-pin sha256:<fingerprint>
 ```
 
-See the Agent Hub documentation for details.
+`--tls-pin` is what lets the agent verify a self-signed hub; without it the
+agent falls back to the system trust store and the connection fails. The
+installer refuses anything that is not a sha256 fingerprint. See the Agent Hub
+documentation for the grant flags (`--privileged`, `--write-prefix`, …).
 
 ---
 
@@ -479,20 +581,37 @@ Client config (e.g. in a Kasm workspace):
 ### Deploy
 
 ```bash
-HP_IMAGE_TAG=2.5.0 docker compose up -d backend
+HP_IMAGE_TAG=2.8.0 docker compose up -d backend
 ```
 
-Migrations run automatically on startup.
+Migrations run automatically on startup. Before applying any pending version the backend writes a
+pre-migration snapshot to `$HP_DATA_DIR/backups/pre-migration-v<current_version>.db` (sqlite backup
+API, so it is a consistent copy even with WAL active). If that backup cannot be written, the backend
+refuses to migrate and starts nothing. Each version is applied in its own transaction and bumps
+`schema_version` inside it, so a failed migration rolls back whole and leaves the database at the
+last version that fully applied.
 
 ### Rollback
 
-```bash
-# Revert to previous known-good tag
-HP_IMAGE_TAG=2.3.4 docker compose up -d
+**Rolling back to an older image requires restoring the matching DB backup.** There are no
+down-migrations: a newer image migrates the schema forward, and an older image refuses to start
+against a schema newer than it supports (`RuntimeError: Database schema version N is newer than this
+build supports`). Downgrading the image alone leaves the backend permanently down.
 
-# Or if the new image never started healthy:
-docker compose down && HP_IMAGE_TAG=2.3.4 docker compose up -d
+```bash
+docker compose down
+
+# Restore the snapshot taken before the schema version this image expects.
+# Backups live in $HP_DATA_DIR/backups/ (default ~/.hp/backups/ on the host volume).
+cp ~/.hp/backups/pre-migration-v<version>.db ~/.hp/homepilot.db
+rm -f ~/.hp/homepilot.db-wal ~/.hp/homepilot.db-shm
+
+HP_IMAGE_TAG=2.3.4 docker compose up -d
 ```
+
+Data written after the backup was taken is lost by the restore - export anything needed first.
+If the new image never started healthy (migrations aborted before any change), the database is
+still at the old version and the image tag can be reverted on its own.
 
 ### Verify
 
@@ -512,28 +631,129 @@ There is no push-triggered CI (this is a private repo — Actions minutes are bi
 
 ---
 
+## 10. Backup & Restore
+
+`hp export` writes a tarball; `hp import` restores one. Read this section before
+you rely on either — the default tarball deliberately holds no secrets, and a
+tarball without secrets cannot bring a host back on its own.
+
+### What is in a tarball
+
+| Path in the tarball | Default | With `--include-secrets` |
+|---|---|---|
+| `manifest.json` (archive schema, hp version, DB schema version, `includes_secrets`) | yes | yes |
+| `README.md` | yes | yes |
+| `homepilot.db` (a `VACUUM INTO` snapshot — consistent, compacted, no `-wal`/`-shm`) | yes | yes |
+| `artifacts/` (the artifact Git repo, history included) | yes | yes |
+| `secrets/vault/identities/master.protected` (the vault identity) | **no** | yes |
+| `secrets/vault/secrets/*.age` (pve-token, secret-key, admin-secret, webhook secrets, …) | **no** | yes |
+| `secrets/.env`, `secrets/.vault_passphrase` (the passphrase that unwraps the identity) | **no** | yes |
+| `secrets/.secret_key`, `secrets/api-token` | **no** | yes |
+| `secrets/ssh/` (managed-host SSH keys) | **no** | yes |
+
+Never in a tarball: `homepilot.db-wal` / `homepilot.db-shm` (a stale journal
+replayed onto a restored database corrupts it), and KB embeddings — run
+`hp kb reindex` after a restore to rebuild them.
+
+### Default export — data only, NOT a host backup
+
+```bash
+docker compose exec backend hp export -o /backups
+```
+
+This prints a loud warning, and it means it: the tarball **cannot restore a
+working host**. The vault identity and the passphrase that unwraps it stay
+behind, so on a rebuilt host every vault secret — `pve-token`, `secret-key`,
+`admin-secret`, webhook secrets — is permanently undecryptable. Use the default
+form only when you already hold the vault material somewhere else (a secrets
+manager, Docker secrets, a passphrase file you back up separately).
+
+### Full export — restorable, and a credential in its own right
+
+```bash
+docker compose exec backend hp export --include-secrets -o /backups
+```
+
+The resulting file is written `0600` and is worth exactly as much as the host:
+anyone who reads it can decrypt everything HomePilot holds. Encrypt it at rest,
+keep it out of Git and off shared storage, and delete the working copy once the
+restore is done.
+
+### Restore recipe
+
+1. **Stop the backend.** `hp import` refuses to run while any process holds the
+   database open (it takes an exclusive SQLite lock to check, so a pidfile-free
+   stale container is detected too):
+
+   ```bash
+   docker compose stop backend
+   ```
+
+2. **Restore.** Add `--restore-secrets` to put the vault back; without it the
+   vault on the target host is left untouched even when the tarball has one.
+
+   ```bash
+   docker compose run --rm --entrypoint hp backend \
+     import /backups/homepilot-export-20260819-101500.tar.gz --restore-secrets
+   ```
+
+   What import does, in order: validate every archive path (no absolute or `..`
+   members), read and version-check `manifest.json`, verify no one holds the DB,
+   back the current DB + artifacts tree up to
+   `<data_dir>/backups/pre-import-<timestamp>/` (fail closed — nothing is
+   overwritten if the backup fails), extract, delete any stale
+   `homepilot.db-wal` / `-shm`, restore secrets if asked (stashing the ones it
+   replaces into the same backup dir), and run migrations.
+
+3. **Start and verify.**
+
+   ```bash
+   docker compose start backend
+   curl http://localhost:8000/health
+   docker compose exec backend hp status
+   docker compose exec backend hp kb reindex   # embeddings are not exported
+   ```
+
+If the restore was wrong, everything it replaced is under
+`<data_dir>/backups/pre-import-<timestamp>/`.
+
+### Version rules
+
+- **Restoring an older DB requires no special step** — `hp import` runs
+  migrations after extraction and leaves the schema at the version this image
+  expects. That upgrade is one-way.
+- **Restoring a NEWER DB is refused.** No down-migrations exist, so an archive
+  whose `db_schema_version` (or `manifest_schema_version`) is ahead of the
+  running build is rejected outright. Run the image that produced the archive —
+  the tarball's `manifest.json` records `homepilot_version` for exactly this.
+- **Tarballs without a `manifest.json` are refused.** Archives produced before
+  the backup fix contain a raw copy of a live WAL database and can be torn;
+  re-export from the source host instead.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `2.5.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `2.8.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to forbid auto-generated secret keys (fail closed) |
-| `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, SSH keys, artifacts) inside the container |
+| `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
 | `HP_SECRET_KEY` | — | Signs API tokens (required in production; auto-generated in dev if not set) |
 | `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred; must be non-empty to mint tokens) |
 | `HP_VAULT_PASSPHRASE` | — | Vault encryption passphrase (auto-generated if not set) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to file containing vault passphrase (overrides `HP_VAULT_PASSPHRASE`) |
-| `HP_VAULT_AUTO_INIT` | — | Set `1`/`true` to auto-generate + persist a vault passphrase when none is set |
+| `HP_VAULT_AUTO_INIT` | `1` | A vault passphrase is generated and persisted when none is set. Set `0` to refuse, leaving the vault disabled. Never generated when `HP_ENV=production` |
 | `HP_PROXMOX_HOST` | — | Proxmox VE hostname or IP |
 | `PVE_API_TOKEN` | — | Proxmox read API token (use vault `pve-token` instead) |
 | `HP_PROXMOX_VERIFY_SSL` | `true` | Set `false` for self-signed Proxmox certs |
-| `HP_AGENT_HUB_ENABLED` | `false` | Enable Agent Hub for managed host connectivity |
+| `HP_AGENT_HUB_ENABLED` | `true` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
 | `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |
-| `HP_AGENT_HUB_AUTH_TOKEN` | — | Shared secret for agent authentication |
-| `HP_AGENT_HUB_TLS` | `false` | Enable TLS on the hub (required for non-loopback binds) |
-| `HP_AGENT_HUB_TLS_CERT` / `_KEY` | — | Hub server certificate and private key |
+| `HP_AGENT_HUB_AUTH_TOKEN` | auto-generated | Shared secret for agent authentication (vault `agent-hub-token`, else `<data_dir>/.agent_hub_token`) |
+| `HP_AGENT_HUB_TLS` | `true` | Enable TLS on the hub (required for non-loopback binds) |
+| `HP_AGENT_HUB_TLS_CERT` / `_KEY` | auto-generated | Hub server certificate and private key; self-signed pair written to `<data_dir>/hub/` when unset |
 | `HP_AGENT_HUB_TLS_CA` | — | CA to verify agent client certs (enables mutual TLS) |
 | `HP_HUB_ALLOW_INSECURE` | `false` | Override fail-closed check: allow plaintext on a non-loopback bind (trusted networks only; logs a loud warning) |
 | `HP_AGENT_TLS_INSECURE` | `false` | **Agent side, test-only:** skip hub cert/hostname verification (`CERT_NONE`); exposes MITM. Never in production |
@@ -544,15 +764,43 @@ There is no push-triggered CI (this is a private repo — Actions minutes are bi
 | `HP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173` | Comma-separated allowed CORS origins (the four localhost dev origins by default) |
 | `HP_COOKIE_SECURE` | `true` | Set `false` only for plain-HTTP local dev |
 | `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs trusted for `X-Forwarded-For` |
-| `HP_ZABBIX_URL` | `/zabbix` | Browser-reachable Zabbix UI base for metric deep-links (empty to hide) |
+| `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
+| `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
+| `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |
+| `HP_PORTAL_CN_HEADER` | `ssl-client-subject-dn` | Header the mTLS proxy sets with the client-certificate subject DN (see [portal.md](portal.md)) |
+| `HP_PORTAL_VERIFY_HEADER` | `ssl-client-verify` | Header that must equal `SUCCESS` for the certificate to be trusted |
+| `HP_PORTAL_TRUSTED_PROXY` | — | Address/CIDR(s) `/invite/*` requests must arrive from; unset = portal 503s |
+| `HP_PORTAL_PROXY_SECRET` | — | Shared secret the proxy sets in `X-Hp-Portal-Secret`; unset = portal 503s |
+| `HP_PORTAL_BASE_URL` | — | Public origin of the mTLS vhost, used only to print complete invite URLs |
 | `HP_INVENTORY_INTERVAL_SECONDS` | `300` | Inventory reconciler interval |
 | `HP_DRIFT_INTERVAL_SECONDS` | `1800` | Drift reconciler interval |
 | `HP_AUTO_APPLY_ENABLED` | `false` | Enable auto-apply reconciler |
 | `HP_AUTO_APPLY_INTERVAL_SECONDS` | `300` | Auto-apply reconciler interval |
-| `HP_EMBEDDING_SERVICE_URL` | `http://llm-embed:8081/v1/embeddings` | Primary embedding endpoint (OpenAI-compatible) |
+| `HP_EMBEDDING_SERVICE_URL` | — (off) | Primary embedding endpoint (OpenAI-compatible). Empty = KB search is keyword-only. The LLM overlay sets it to `http://llm-embed:8081/v1/embeddings` |
 | `HP_EMBEDDING_MODEL` | `bge-m3` | Model name for primary embedding service |
-| `HP_EMBEDDING_FALLBACK_URL` | `http://localhost:11434/api/embeddings` | Fallback embedding endpoint (Ollama-compatible) |
+| `HP_EMBEDDING_FALLBACK_URL` | — (off) | Fallback embedding endpoint (Ollama-compatible). `localhost` here is the backend container; reach a host Ollama as `http://host.docker.internal:11434/api/embeddings` |
 | `HP_EMBEDDING_FALLBACK_MODEL` | `nomic-embed-text` | Model name for fallback embedding service |
+| `HP_PORT` | `8000` | Port the CLI dials the local daemon on (`Settings.daemon_port`; distinct from `HP_DAEMON_PORT`, which is the Docker host mapping) |
+| `HP_LOG_LEVEL` | `info` | Log verbosity: `debug` \| `info` \| `warning` \| `error` |
+| `HP_SECRET_KEY_FILE` | — | Path to a file holding the secret key (Docker secrets; overrides `HP_SECRET_KEY`) |
+| `HP_VAULT_DIR` | `<HP_DATA_DIR>/vault` | Vault directory |
+| `HP_SSH_KEY_DIR` | `<HP_DATA_DIR>/ssh` | SSH key directory |
+| `HP_ARTIFACTS_DIR` | `<HP_DATA_DIR>/artifacts` | Artifact working directory |
+| `HP_ALLOWED_HTTP_DOMAINS` | — | Comma-separated allowlist for `http_call_read` (SSRF guard) |
+| `HP_AUTH_RATE_LIMIT` | `120` | Max authentication requests per IP per minute |
+| `HP_RATE_LIMIT_BACKEND` | `memory` | Rate-limit store. Only `memory` is implemented; other values log a warning and fall back |
+| `HP_BUSY_TIMEOUT` | `10000` | SQLite busy timeout in milliseconds |
+| `HP_DB_CONNECT_RETRIES` | `3` | Database connection attempts on startup |
+| `HP_DB_CONNECT_RETRY_DELAY` | `1.0` | Seconds between database connection retries |
+| `HP_GIT_TIMEOUT` | `30` | Timeout in seconds for git operations during artifact backup |
+| `HP_AUTO_APPLY_MUTATING` | — | Allow the auto-apply reconciler to run mutating actions |
+| `HP_PROXMOX_PORT` | `8006` | Proxmox API port |
+| `HP_AGENT_HUB_HOST` | `0.0.0.0` | Agent Hub bind address |
+| `HP_AGENT_HUB_ALLOW_INSECURE` | `false` | Accepted alias of `HP_HUB_ALLOW_INSECURE` (same setting) |
+| `HP_MCP_TOKEN_SCOPE` | — | Scope granted to the MCP bearer token |
+| `HP_EVENTS_WEBHOOK_URL` | — (off) | Webhook posted when an artifact is proposed. Empty = events are recorded and shown in the UI but forwarded nowhere. n8n is behind the `agents` profile and mints the path per workflow, so there is no default that works |
+| `HP_EVENTS_WEBHOOK_SECRET` | — | Webhook signing secret (vault `webhook-secret` preferred) |
+| `HP_N8N_API_KEY` | — | Optional API key sent to the n8n instance |
 
 ---
 
@@ -564,6 +812,8 @@ There is no push-triggered CI (this is a private repo — Actions minutes are bi
 | 403 on write operations | Token scope is `read_only` | Create a token with `--scope read,write` or `--scope '*'` |
 | Inventory shows 0 hosts | Proxmox not configured or refresh not run | Set `HP_PROXMOX_HOST` + token; run `hp inventory refresh` |
 | Vault errors on start | Passphrase not set | Auto-generated in v2.2+; for manual setup, set `HP_VAULT_PASSPHRASE` or `HP_VAULT_PASSPHRASE_FILE` |
-| Agent not connecting | Hub not enabled or token mismatch | Set `HP_AGENT_HUB_ENABLED=true` and ensure token matches on both sides |
-| Backend won't start: "Agent Hub refusing to start" | Non-loopback hub bind with no TLS | Enable TLS (`HP_AGENT_HUB_TLS=1` + cert/key) or, on a trusted isolated network only, set `HP_HUB_ALLOW_INSECURE=1` |
+| Agent not connecting | Hub disabled or token mismatch | Check `HP_AGENT_HUB_ENABLED` is not set to `false`, and re-copy the one-liner from **Agents** (the token regenerates only if the data dir was wiped) |
+| Agent logs "hub certificate does not match the pinned fingerprint" | The hub certificate was replaced (data dir wiped, or an explicit cert configured) | Re-enroll the host with the current `--tls-pin` from **Agents** |
+| Agent logs a certificate-verification failure with no pin | `--tls` without `--tls-pin` against a self-signed hub | Re-run the installer with the `--tls-pin` the UI shows |
+| Backend won't start: "Agent Hub refusing to start" | `HP_AGENT_HUB_TLS=false` set explicitly on a non-loopback bind | Drop the setting (TLS self-configures) or, on a trusted isolated network only, set `HP_HUB_ALLOW_INSECURE=1` |
 | Artifact push fails | Deploy key permissions or network | Check key has write access; push failures are non-fatal |

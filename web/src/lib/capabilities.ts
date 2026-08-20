@@ -13,8 +13,3 @@ export function canWrite(capabilities: readonly string[] | null | undefined): bo
 export function isAdmin(capabilities: readonly string[] | null | undefined): boolean {
 	return (capabilities ?? []).includes('admin');
 }
-
-export function canRead(capabilities: readonly string[] | null | undefined): boolean {
-	const caps = capabilities ?? [];
-	return caps.includes('read') || caps.includes('write') || caps.includes('admin');
-}

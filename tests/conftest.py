@@ -18,6 +18,120 @@ def _reset_global_rate_limits():
     yield
 
 
+# ── Invite portal (#442 stage 2) ─────────────────────────────────────────────
+# Named portal_* so no portal test module has to shadow another's fixture; the
+# helpers they build on live in tests/portal_support.py.
+
+
+@pytest.fixture
+def portal_pve():
+    from .portal_support import FakePVE
+
+    return FakePVE()
+
+
+@pytest.fixture
+def portal_proxmox(portal_pve):
+    import httpx
+
+    from homepilot.adapters.proxmox import ProxmoxClient
+
+    client = ProxmoxClient(base_url="https://pve.example:8006", token="root@pam!t=uuid")
+    transport = httpx.MockTransport(portal_pve.handle)
+    fake = httpx.AsyncClient(base_url="https://pve.example:8006/api2/json", transport=transport)
+    client._client = fake
+    client._write_client = fake
+    return client
+
+
+@pytest.fixture
+async def portal_db(tmp_path: Path):
+    from homepilot.db.connection import Database
+    from homepilot.db.migrations import run_migrations
+
+    database = Database(str(tmp_path / "portal.db"))
+    await database.connect()
+    await run_migrations(database)
+    yield database
+    await database.close()
+
+
+@pytest.fixture
+def portal_app(portal_db, portal_proxmox):
+    from fastapi import FastAPI
+
+    from homepilot.db.repository import Repository
+    from homepilot.portal import router as portal_router_module
+    from homepilot.portal.repository import InviteRepository
+    from homepilot.portal.router import router as portal_router
+    from homepilot.provision.service import ProvisionService
+    from homepilot.tasks.repository import TaskRepository
+
+    from .portal_support import portal_settings
+
+    # The portal's per-CN redemption limiter is module state; a test must never
+    # inherit another test's attempts.
+    portal_router_module._redeem_attempts.clear()
+
+    application = FastAPI()
+    application.include_router(portal_router, prefix="/invite")
+    task_repo = TaskRepository(portal_db)
+    application.state.repo = Repository(portal_db)
+    application.state.task_repo = task_repo
+    application.state.invite_repo = InviteRepository(portal_db)
+    application.state.settings = portal_settings()
+    application.state.provision_service = ProvisionService(
+        proxmox=portal_proxmox,
+        task_repo=task_repo,
+        repo=Repository(portal_db),
+        poll_interval=0.01,
+        task_timeout_s=5.0,
+        ip_wait_s=2.0,
+        ip_interval=0.05,
+    )
+    yield application
+    portal_router_module._redeem_attempts.clear()
+
+
+# ── The real hp-agent binary ─────────────────────────────────────────────────
+# Session-scoped and shared: the journey gates drive the SHIPPED artifact, and
+# building it once per module put two cold Go builds in one run, which is enough
+# to trip the 120s per-test timeout on the test that happens to own the fixture.
+
+
+@pytest.fixture(scope="session")
+def hp_agent_binary(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Build agent/go once per session; skip when no Go toolchain is present."""
+    import os
+    import shutil
+    import subprocess
+
+    go = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
+    if not go:
+        pytest.skip("Go toolchain not available")
+    repo_root = Path(__file__).resolve().parents[1]
+    out = tmp_path_factory.mktemp("hp-agent-build") / "hp-agent"
+    env = {
+        **os.environ,
+        "CGO_ENABLED": "0",
+        # An ambient GOCACHE (the repo's documented Go invocation sets one) makes
+        # this a warm build; without it, a throwaway cache still works.
+        "GOCACHE": os.environ.get("GOCACHE") or str(tmp_path_factory.mktemp("gocache")),
+        "GOFLAGS": "-mod=mod",
+    }
+    proc = subprocess.run(
+        [go, "build", "-o", str(out), "."],
+        cwd=str(repo_root / "agent" / "go"),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        pytest.fail(f"could not build hp-agent: {proc.stderr}")
+    return str(out)
+
+
 @pytest.fixture
 def tmp_artifacts_dir(tmp_path: Path) -> Path:
     d = tmp_path / "artifacts"

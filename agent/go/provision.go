@@ -60,10 +60,22 @@ const (
 // installPackage installs an apt package idempotently. It first probes dpkg for
 // the installed state (an allowlisted read-only `dpkg -s <name>`) and only runs
 // the allowlisted `apt-get install -y <name>` when the package is not already
-// installed. Requires privileged mode; validates name.
-func installPackage(run commandRunner, privileged bool, name string) (provisionResult, error) {
+// installed. Requires privileged mode AND the separate package-install grant;
+// validates name.
+//
+// The package grant is separate because unpacking a package writes across the
+// whole filesystem, which the privileged unit's ProtectSystem= boundary forbids
+// unless the operator opted in (#422). Refusing here — naming the flag — beats
+// running apt and returning an unexplained read-only-filesystem failure.
+func installPackage(run commandRunner, privileged, allowPackageInstall bool, name string) (provisionResult, error) {
 	if !privileged {
 		return provisionResult{}, fmt.Errorf("install_package requires privileged mode")
+	}
+	if !allowPackageInstall {
+		return provisionResult{}, fmt.Errorf(
+			"install_package is not granted on this host: package management writes across the " +
+				"whole filesystem, so it is a separate opt-in — reinstall the agent with " +
+				"`install-agent.sh --privileged --allow-package-install`")
 	}
 	if !safeNameRe.MatchString(name) {
 		return provisionResult{}, fmt.Errorf("invalid package name: %q", name)

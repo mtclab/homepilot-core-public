@@ -55,6 +55,19 @@ class GuestHostError(AgentAdapterError):
     pass
 
 
+def is_pve_node(host: str, pve_nodes: list[str]) -> bool:
+    """True if ``host`` names a Proxmox hypervisor node rather than a guest.
+
+    Shared by the callers that hold a ``pve_nodes`` list of their own (the
+    ansible executor and the drift verifier) so they do not have to reach into
+    ``AgentAdapter`` privates. Reaching in is how the guard silently died: both
+    called ``_validate_guest_only``, a method that no longer exists, one behind a
+    ``hasattr`` that therefore never fired (#388).
+    """
+    host_lower = host.lower().strip()
+    return any(host_lower == node.lower().strip() for node in pve_nodes)
+
+
 class ReadOnlyCommandError(AgentAdapterError):
     pass
 
