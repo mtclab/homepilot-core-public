@@ -62,7 +62,20 @@ var catAllowedPrefixes = []string{
 	"/etc/resolv.conf", "/etc/hosts", "/etc/systemd/", "/opt/",
 }
 
-type Allowlist struct{ privileged bool }
+// packageManagers are the privileged allowlist entries that install software.
+// They are gated by a SEPARATE opt-in (HP_AGENT_ALLOW_PACKAGE_INSTALL) because
+// unpacking a package writes across the whole filesystem (/usr, /etc, /var), so
+// the systemd unit must drop its ProtectSystem= write boundary for them to work
+// at all (#422). Gating them here means a host that was not granted package
+// management is told so, instead of running apt and failing with EROFS.
+var packageManagers = map[string]bool{"apt": true, "apt-get": true}
+
+type Allowlist struct {
+	privileged bool
+	// allowPackageInstall additionally permits the apt/apt-get entries of
+	// privilegedCommands. Meaningless without privileged.
+	allowPackageInstall bool
+}
 
 func firstField(s string) string {
 	f := strings.Fields(s)
@@ -72,36 +85,14 @@ func firstField(s string) string {
 	return f[0]
 }
 
-// sudoArgTaking are sudo options that consume the following token as their
-// value (so it must be skipped when finding the wrapped command).
-var sudoArgTaking = map[string]bool{
-	"-u": true, "-g": true, "-p": true, "-U": true, "-C": true,
-	"-h": true, "-r": true, "-t": true, "-R": true, "-T": true,
-	"--user": true, "--group": true, "--prompt": true, "--host": true,
-}
-
-// stripSudo removes a leading "sudo" token and any leading sudo options
-// (flags and their arguments) and returns the wrapped command. E.g.
-// "sudo -n -u root systemctl restart nginx" -> "systemctl restart nginx".
-func stripSudo(actual string) string {
-	fields := strings.Fields(actual)
-	i := 1 // fields[0] == "sudo"
-	for i < len(fields) {
-		tok := fields[i]
-		if !strings.HasPrefix(tok, "-") {
-			break
-		}
-		i++
-		// "-u root" style options consume the next token as their value,
-		// but only when the value is not glued on with "=" (e.g. "-u=root").
-		if sudoArgTaking[tok] && i < len(fields) {
-			i++
-		}
-	}
-	return strings.Join(fields[i:], " ")
-}
-
 // IsAllowed mirrors CommandAllowlist.is_allowed → (allowed, reason).
+//
+// There is deliberately NO sudo path (#422). A privileged agent is installed as
+// a root systemd unit, so it never needs to escalate; an unprivileged agent runs
+// under NoNewPrivileges=yes with no sudoers entry, so sudo could never escalate
+// even if it were permitted. Keeping a sudo parser would only re-open the
+// wrapped-command bypass surface that #381 had to close. `sudo …` is therefore
+// simply not an allowlisted command.
 func (a Allowlist) IsAllowed(command string) (bool, string) {
 	stripped := strings.TrimSpace(command)
 	if stripped == "" {
@@ -111,33 +102,17 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 		return false, "shell metacharacters forbidden: " + command
 	}
 
-	usesSudo := stripped == "sudo" || strings.HasPrefix(stripped, "sudo ")
-
-	if usesSudo {
-		if !a.privileged {
-			return false, "sudo requires privileged mode: " + command
-		}
-		// Re-run the FULL allowlist against the wrapped command so the sudo
-		// path enforces every check (metachars + per-command arg regexes) the
-		// non-sudo path enforces. Prevents e.g. `sudo docker run --volume /:/mnt`
-		// from bypassing the docker/apt argument constraints (#381).
-		inner := stripSudo(stripped)
-		if inner == "" {
-			return false, "sudo requires a command: " + command
-		}
-		if inner == "sudo" || strings.HasPrefix(inner, "sudo ") {
-			return false, "nested sudo forbidden: " + command
-		}
-		if ok, reason := a.IsAllowed(inner); !ok {
-			return false, "sudo: " + reason
-		}
-		return true, ""
-	}
-
 	actual := stripped
 	base := firstField(actual)
 
 	if a.privileged {
+		// Package management is a second, explicit grant: refuse it with a
+		// diagnostic that names the fix rather than letting apt run and die on a
+		// read-only filesystem.
+		if packageManagers[base] && !a.allowPackageInstall {
+			return false, "package management not granted on this host " +
+				"(reinstall the agent with --allow-package-install): " + actual
+		}
 		parts := strings.Fields(actual)
 		if base == "docker" && len(parts) >= 2 {
 			sub := parts[1]

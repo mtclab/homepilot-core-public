@@ -1,8 +1,8 @@
 """Dashboard summary — current-state aggregates for the overview page.
 
-HomePilot owns current state (coverage, drift, inventory shape, fleet, pipeline);
-historical telemetry lives in Zabbix. This endpoint returns counts/breakdowns
-only — no time series — plus the configured Zabbix URL for deep-linking.
+Counts and breakdowns only. Time series live under ``/monitoring`` (ADR-004 S5) —
+HomePilot now collects its own history, so the old "current state here, history
+in an external monitoring server" boundary is gone.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 @router.get("/config", dependencies=[Depends(require_scope("read"))])
 async def ui_config() -> dict[str, Any]:
-    """Small UI config shared across pages (e.g. the Zabbix deep-link base)."""
-    return {"zabbix_url": get_settings().zabbix_url or ""}
+    """Small UI config shared across pages."""
+    return {"metrics_retention_days": get_settings().metrics_retention_days}
 
 
 @router.get("/summary", dependencies=[Depends(require_scope("read"))])
@@ -61,8 +61,22 @@ async def summary(request: Request) -> dict[str, Any]:
     tasks_by_status = await grouped("SELECT status, COUNT(*) FROM tasks GROUP BY status")
 
     # ── Agent fleet (persisted + live) ─────────────────────────────────────────
-    agents_known = (await db.fetchone("SELECT COUNT(*) c FROM agents"))["c"]
-    agents_connected = (await db.fetchone("SELECT COUNT(*) c FROM agents WHERE connected = 1"))["c"]
+    # "Connected" comes from the LIVE registry, never from agents.connected. That
+    # column is written best-effort on register/unregister, so it stays 1 for any
+    # agent that vanished without a clean goodbye - a killed process, a dropped
+    # link, or a backend restart. It was therefore most wrong exactly when an
+    # operator loads this page to check the fleet survived a restart, reporting a
+    # healthy fleet over stranded agents (#469, and it masked #468).
+    #
+    # GET /agents/ overlays the same registry on the same rows, so both endpoints
+    # now answer from one source and cannot disagree.
+    from ..app_state import get_agent_registry
+
+    registry = get_agent_registry()
+    live_ids = {a["agent_id"] for a in registry.list_connected()} if registry else set()
+    known_ids = {row["agent_id"] for row in await repo.list_agents()}
+    agents_known = len(known_ids | live_ids)
+    agents_connected = len(live_ids)
 
     return {
         "inventory": {
@@ -78,5 +92,17 @@ async def summary(request: Request) -> dict[str, Any]:
         "artifacts": artifacts_by_status,
         "tasks": tasks_by_status,
         "agents": {"known": agents_known, "connected": agents_connected},
-        "zabbix_url": get_settings().zabbix_url or "",
+        # Deliberately NOT counting metric rows or distinct series here: the
+        # metrics table is the one table that grows without an operator doing
+        # anything, and a COUNT(DISTINCT ...) over it would put a full scan on
+        # the page every operator opens first. alert_state has one row per
+        # (rule, host) and is cheap.
+        "metrics": {
+            "firing_alerts": (
+                await db.fetchone(
+                    "SELECT COUNT(*) c FROM alert_state WHERE firing_since IS NOT NULL"
+                )
+            )["c"],
+            "retention_days": get_settings().metrics_retention_days,
+        },
     }

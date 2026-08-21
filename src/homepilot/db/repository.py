@@ -32,6 +32,7 @@ _HOST_COLUMN_TYPES: dict[str, type] = {
     "import_state": str,
     "role_source": str,
     "ip_source": str,
+    "owner": str,
 }
 
 _SERVICE_COLUMN_TYPES: dict[str, type] = {
@@ -80,6 +81,7 @@ _HOST_COLUMNS: frozenset[str] = frozenset(
         "import_state",
         "role_source",
         "ip_source",
+        "owner",
     }
 )
 
@@ -500,6 +502,7 @@ class Repository:
         role_source: str = "inferred",
         ip_source: str | None = None,
         status: str | None = None,
+        owner: str | None = None,
     ) -> str:
         host_id = uuid4()
         ts = now()
@@ -509,10 +512,10 @@ class Repository:
                 status, tags, managed_by, managed, storage_pool, os_info,
                 cpu_cores, memory_mb, disk_gb, network_bridge, vlan_id,
                 pve_status, source, description, artifact_id, import_state,
-                role_source, ip_source, created_at, updated_at)
+                role_source, ip_source, owner, created_at, updated_at)
                VALUES (
                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, ?, ?, ?, ?
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                )""",
             (
                 host_id,
@@ -541,6 +544,7 @@ class Repository:
                 import_state,
                 role_source,
                 ip_source,
+                owner,
                 ts,
                 ts,
             ),

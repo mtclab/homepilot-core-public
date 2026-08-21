@@ -10,6 +10,7 @@ from homepilot.inventory.service import (
     InventoryService,
     _guess_ip,
     _infer_role,
+    _match_role,
     derive_status,
     node_pve_status,
     verify_connectivity,
@@ -487,6 +488,68 @@ class TestEnrichment:
         updated = await repo.get_host(host_id)
         assert updated["role"] == "web-server"
         assert updated["role_source"] == "user"
+
+    async def test_enrich_does_not_demote_unmatched_role_to_guest(self, repo):
+        """#416: an unmatched hostname must NOT reset an existing role to guest.
+
+        Regression for the live data-loss bug: `_enrich_single_host` called
+        `_infer_role`, whose no-match fallback is "guest", and wrote the result
+        unconditionally whenever role_source == "inferred". Any host whose role
+        was set by a path that did not stamp role_source="user" was therefore
+        demoted to guest on every refresh (the reconciler auto-enriches).
+
+        Teeth: restore the `updates["role"] = _infer_role(...)` write in
+        `_enrich_single_host` and this fails with role == "guest".
+        """
+        svc = InventoryService(repo=repo)
+        host_id = await repo.create_host(
+            hostname="nondescript-box-42",  # matches no ROLE_PATTERNS keyword
+            host_type="qemu",
+            pve_status="running",
+            role="web-server",
+            role_source="inferred",
+        )
+        await svc._enrich_single_host(await repo.get_host(host_id))
+        updated = await repo.get_host(host_id)
+        assert updated["role"] == "web-server", (
+            f"unmatched hostname demoted an existing role to {updated['role']!r} (#416)"
+        )
+
+    async def test_enrich_is_idempotent_for_unmatched_role(self, repo):
+        """Repeated refreshes must not erode the role (the reconciler runs on a timer)."""
+        svc = InventoryService(repo=repo)
+        host_id = await repo.create_host(
+            hostname="nondescript-box-43",
+            host_type="qemu",
+            pve_status="running",
+            role="monitoring",
+            role_source="inferred",
+        )
+        for _ in range(3):
+            await svc._enrich_single_host(await repo.get_host(host_id))
+        updated = await repo.get_host(host_id)
+        assert updated["role"] == "monitoring"
+
+    async def test_enrich_still_infers_when_pattern_matches(self, repo):
+        """The fix must not disable inference - a matching hostname still wins."""
+        svc = InventoryService(repo=repo)
+        host_id = await repo.create_host(
+            hostname="db-postgres-07",
+            host_type="qemu",
+            pve_status="running",
+            role="guest",
+            role_source="inferred",
+        )
+        await svc._enrich_single_host(await repo.get_host(host_id))
+        updated = await repo.get_host(host_id)
+        assert updated["role"] == "database"
+        assert updated["role_source"] == "inferred"
+
+    def test_match_role_returns_none_when_nothing_matches(self):
+        """_match_role is the non-destructive primitive; _infer_role keeps the guest default."""
+        assert _match_role("nondescript-box-42") is None
+        assert _match_role("db-postgres-01") == "database"
+        assert _infer_role("nondescript-box-42") == "guest"
 
     async def test_enrich_derives_status_with_ip(self, repo):
         svc = InventoryService(repo=repo)

@@ -103,9 +103,9 @@
 
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
-		<h1 class="text-lg font-bold text-slate-100">Tokens</h1>
+		<h1 class="page-title">Tokens</h1>
 		<div class="flex gap-2 items-center">
-			<span class="text-slate-500 text-xs">{total} tokens</span>
+			<span class="text-muted text-xs">{total} tokens</span>
 			{#if isAdmin}
 				<button class="btn btn-primary text-xs" on:click={() => (showCreate = !showCreate)}>
 					{showCreate ? 'Cancel' : '+ Create Token'}
@@ -116,11 +116,11 @@
 
 	{#if showCreate}
 		<form class="card p-4 space-y-3" on:submit|preventDefault={createToken}>
-			<h2 class="text-sm font-semibold text-slate-300">Create New Token</h2>
+			<h2 class="section-title">Create New Token</h2>
 
 			<div class="flex gap-3 flex-wrap">
 				<div class="flex-1 min-w-[160px]">
-					<label class="block text-xs text-slate-400 mb-1">Label</label>
+					<label class="field-label block mb-1">Label</label>
 					<input
 						class="input text-sm w-full"
 						placeholder="e.g. ci-bot, admin"
@@ -128,7 +128,7 @@
 					/>
 				</div>
 				<div>
-					<label class="block text-xs text-slate-400 mb-1">Scope</label>
+					<label class="field-label block mb-1">Scope</label>
 					<select class="input text-sm" bind:value={newScope}>
 						<option value="read_only">read_only</option>
 						<option value="full">full</option>
@@ -138,7 +138,7 @@
 			</div>
 
 			<div>
-				<label class="block text-xs text-slate-400 mb-1">Admin Secret (HP_VAULT_PASSPHRASE)</label>
+				<label class="field-label block mb-1">Admin Secret (HP_VAULT_PASSPHRASE)</label>
 				<input
 					type="password"
 					class="input text-sm w-full font-mono"
@@ -146,7 +146,7 @@
 					bind:value={adminSecret}
 					required
 				/>
-				<p class="text-xs text-slate-600 mt-1">Find this in your server's HP_VAULT_PASSPHRASE env var.</p>
+				<p class="prose-note text-xs mt-1">Find this in your server's HP_VAULT_PASSPHRASE env var.</p>
 			</div>
 
 			<div class="flex justify-end">
@@ -156,33 +156,33 @@
 			</div>
 
 			{#if createdToken}
-				<div class="bg-slate-900 border border-emerald-700 rounded p-3">
-					<p class="text-xs text-emerald-400 font-mono mb-1">New token (copy now):</p>
-					<code class="text-xs text-slate-200 break-all select-all">{createdToken}</code>
+				<div class="bg-canvas border border-ok-border rounded p-3">
+					<p class="text-xs text-ok mb-1">New token (copy now):</p>
+					<code class="text-xs text-ink break-all select-all">{createdToken}</code>
 				</div>
 			{/if}
 		</form>
 	{/if}
 
 	{#if loading}
-		<p class="text-slate-500 text-sm">Loading…</p>
+		<p class="text-muted text-sm">Loading…</p>
 	{:else if loadError}
 		<div class="card p-6 text-center space-y-3">
-			<p class="text-red-400">Could not load tokens.</p>
-			<p class="text-xs text-slate-500">{loadError}</p>
+			<p class="text-danger">Could not load tokens.</p>
+			<p class="text-xs text-muted">{loadError}</p>
 			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
 		</div>
 	{:else if !isAdmin}
 		<div class="card p-6 text-center">
-			<p class="text-slate-400">You need admin scope to manage API tokens.</p>
+			<p class="prose-note">You need admin scope to manage API tokens.</p>
 		</div>
 	{:else if tokens.length === 0}
-		<p class="text-slate-500 text-sm">No tokens found.</p>
+		<p class="prose-note text-sm">No tokens found.</p>
 	{:else}
 		<div class="card overflow-x-auto">
-			<table class="w-full text-xs">
+			<table class="data-table text-xs">
 				<thead>
-					<tr class="text-slate-400 border-b border-slate-700">
+					<tr>
 						<th class="text-left pb-2 pr-4">Prefix</th>
 						<th class="text-left pb-2 pr-4">Label</th>
 						<th class="text-left pb-2 pr-4">Scope</th>
@@ -194,22 +194,22 @@
 				</thead>
 				<tbody>
 					{#each tokens as t}
-						<tr class="border-b border-slate-700/50">
-							<td class="py-2 pr-4 font-mono text-sky-400">
+						<tr class="border-b border-divider">
+							<td class="py-2 pr-4 font-mono text-accent">
 								{t.prefix}
 								{#if currentPrefix && t.prefix === currentPrefix}
-									<span class="ml-1 text-[10px] text-amber-400" title="This token backs your current session">(current)</span>
+									<span class="ml-1 text-[10px] text-warn" title="This token backs your current session">(current)</span>
 								{/if}
 							</td>
-							<td class="py-2 pr-4 text-slate-300">{t.label || '—'}</td>
+							<td class="py-2 pr-4 text-ink">{t.label || '—'}</td>
 							<td class="py-2 pr-4">
 								<span class="badge {t.scope === '*' || t.scope === 'full' ? 'badge-applied' : t.scope === 'read_only' ? 'badge-proposed' : 'badge-failed'}">
 									{scopeDisplay(t.scope, t.role)}
 								</span>
 							</td>
-							<td class="py-2 pr-4 text-slate-400">{t.role || '—'}</td>
-							<td class="py-2 pr-4 text-slate-500">{fmtDate(t.created_at)}</td>
-							<td class="py-2 pr-4 text-slate-600">{fmtDate(t.last_used_at)}</td>
+							<td class="py-2 pr-4 text-muted">{t.role || '—'}</td>
+							<td class="py-2 pr-4 text-muted">{fmtDate(t.created_at)}</td>
+							<td class="py-2 pr-4 text-muted">{fmtDate(t.last_used_at)}</td>
 							<td class="py-2">
 								<button
 									class="btn btn-danger text-xs"

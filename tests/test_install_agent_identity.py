@@ -33,7 +33,7 @@ def _identity_block() -> str:
     return block
 
 
-def _run(conf_dir: Path) -> dict[str, str]:
+def _run(conf_dir: Path, tls_pin: str = "") -> dict[str, str]:
     """Run the installer's identity block against conf_dir and return agent.env."""
     script = "\n".join(
         [
@@ -44,7 +44,11 @@ def _run(conf_dir: Path) -> dict[str, str]:
             "HUB_PORT=8443",
             'TOKEN="enrollment-token"',
             'USE_TLS="false"',
+            f'TLS_PIN="{tls_pin}"',
             'PRIVILEGED="false"',
+            # Grant settings the env block records alongside the identity (#422).
+            'ALLOW_PACKAGE_INSTALL="false"',
+            'WRITE_PREFIXES_ENV="/etc/homepilot"',
             'mkdir -p "$CONF_DIR"',
             _identity_block(),
         ]
@@ -99,3 +103,35 @@ class TestInstallerAgentIdentity:
     def test_existing_env_keys_preserved(self, tmp_path, key):
         """The identity change must not drop the connection settings."""
         assert _run(tmp_path)[key]
+
+
+class TestInstallerHubPin:
+    """The hub's certificate is self-signed, so the agent can only verify it
+    against the fingerprint the installer was given. That fingerprint has to
+    reach agent.env or the agent has nothing to verify against."""
+
+    def test_pin_reaches_the_agent_environment(self, tmp_path):
+        pin = "sha256:" + "ab" * 32
+        assert _run(tmp_path, tls_pin=pin)["HP_AGENT_TLS_PIN"] == pin
+
+    def test_no_pin_leaves_the_variable_empty(self, tmp_path):
+        assert _run(tmp_path)["HP_AGENT_TLS_PIN"] == ""
+
+    def test_installer_refuses_a_non_fingerprint_pin(self):
+        """A pin is written verbatim into agent.env, so anything that is not a
+        sha256 hex fingerprint is rejected before it gets there."""
+        script = SCRIPT.read_text()
+        proc = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + script],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HUB": "hub.example:8443",
+                "TOKEN": "t",
+                "TLS_PIN": "not-a-fingerprint\nHP_AGENT_PRIVILEGED=true",
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode != 0
+        assert "--tls-pin must be a sha256 fingerprint" in proc.stderr

@@ -828,7 +828,7 @@ Function calls (including `.get()`, `.json()`) and private/dunder attributes are
 **Decision:** the audit log lives in a SQLite table, not in a git-tracked file.
 **Why:** cheaper writes (no commit per audit entry), still backed up via `hp export` (which dumps the DB), still queryable. Git history of artifact files already provides a separate immutable record of the artifact lifecycle.
 **Schema:** `audit_log (id, user, action, artifact_id, at, source, request_id, details_json)`.
-**Export:** `hp export` includes the audit log as `audit_log.jsonl` in the tarball.
+**Export:** the audit log travels inside the `homepilot.db` snapshot in the `hp export` tarball; there is no separate `audit_log.jsonl`.
 
 ### D7. Working tree is truth; manual git edits are unsupported
 **Decision:** HomePilot reads the working tree on every operation. It does not fight git. If the user manually edits an artifact file in the repo, the next HomePilot read sees the edit. There is no locking, no mtime check, no merge resolution.

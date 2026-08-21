@@ -51,7 +51,7 @@ func (f *fakeRunner) called(substr string) bool {
 func TestInstallPackageAlreadyInstalled(t *testing.T) {
 	f := newFakeRunner()
 	f.resp["dpkg -s nginx"] = fakeResp{code: 0, out: "Status: install ok installed\n"}
-	res, err := installPackage(f.run, true, "nginx")
+	res, err := installPackage(f.run, true, true, "nginx")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestInstallPackageNotInstalledInstalls(t *testing.T) {
 	f := newFakeRunner()
 	f.resp["dpkg -s nginx"] = fakeResp{code: 1, out: ""}
 	f.resp["apt-get install -y nginx"] = fakeResp{code: 0}
-	res, err := installPackage(f.run, true, "nginx")
+	res, err := installPackage(f.run, true, true, "nginx")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestInstallPackageNotInstalledInstalls(t *testing.T) {
 // Privileged gate teeth: a non-privileged agent must be refused.
 func TestInstallPackageRequiresPrivileged(t *testing.T) {
 	f := newFakeRunner()
-	if _, err := installPackage(f.run, false, "nginx"); err == nil {
+	if _, err := installPackage(f.run, false, true, "nginx"); err == nil {
 		t.Fatal("expected install_package to require privileged mode")
 	}
 	if len(f.calls) != 0 {
@@ -92,11 +92,28 @@ func TestInstallPackageRequiresPrivileged(t *testing.T) {
 	}
 }
 
+// #422: privileged alone is not enough — package management is a separate grant
+// because it is the one action whose unit must drop the filesystem write
+// boundary. The refusal names the flag that fixes it.
+func TestInstallPackageRequiresPackageGrant(t *testing.T) {
+	f := newFakeRunner()
+	_, err := installPackage(f.run, true, false, "nginx")
+	if err == nil {
+		t.Fatal("expected install_package to require the package-install grant")
+	}
+	if !strings.Contains(err.Error(), "--allow-package-install") {
+		t.Fatalf("refusal must name the fix, got: %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatal("no command should run without the package grant")
+	}
+}
+
 // Injection teeth: a name with a metacharacter is rejected before any command
 // is built.
 func TestInstallPackageRejectsBadName(t *testing.T) {
 	f := newFakeRunner()
-	if _, err := installPackage(f.run, true, "nginx; rm -rf /"); err == nil {
+	if _, err := installPackage(f.run, true, true, "nginx; rm -rf /"); err == nil {
 		t.Fatal("expected an invalid package name to be rejected")
 	}
 	if len(f.calls) != 0 {

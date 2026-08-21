@@ -152,16 +152,17 @@ class TaskRunner:
         await self.repo.update_task_status(task_id, "running")
         try:
             if self.apply_reconciler is not None:
+                # ArtifactExecutor.apply already performs the artifact transition
+                # and writes the audit row (orchestrator.py). Repeating it here
+                # meant a SUCCESSFUL apply attempted applied -> applied, which the
+                # transition table forbids, so every apply through the API and the
+                # UI - the product's primary action - reported the task as failed
+                # while the host had in fact been changed. This branch owns the
+                # TASK record only; the artifact's state has exactly one owner.
                 result = await self.apply_reconciler.apply_single(artifact_id, approved_by)
                 if result.success:
-                    await self.lifecycle.mark_applied(
-                        artifact_id, result.execution_log or "Applied via reconciler"
-                    )
                     await self.repo.update_task_status(task_id, "succeeded")
                 else:
-                    await self.lifecycle.mark_failed(
-                        artifact_id, result.failure_reason or "apply failed"
-                    )
                     await self.repo.update_task_status(
                         task_id,
                         "failed",

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Claim your machine{% endblock %}
+{% block content %}
+<h1>Claim your machine</h1>
+<hr class="rule">
+<p class="lede">This invite was issued to <strong>{{ cn }}</strong> and can be used once. Tell us
+who you are on the machine and it will be built for you.</p>
+
+<div class="card">
+  <h2 style="margin-top:0">What you get</h2>
+  <dl class="spec">
+    <dt>CPU cores</dt><dd>{{ caps.cores or "template default" }}</dd>
+    <dt>Memory</dt><dd>{% if caps.memory_mb %}{{ caps.memory_mb }} MB{% else %}template default{% endif %}</dd>
+    <dt>Disk</dt><dd>{% if caps.disk_gb %}{{ caps.disk_gb }} GB{% else %}template default{% endif %}</dd>
+    <dt>Network</dt><dd>{{ caps.ipconfig0 }}</dd>
+    <dt>Invite expires</dt><dd>{{ expires_at }}</dd>
+  </dl>
+</div>
+
+{% if error %}
+<p class="notice">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="{{ post_url }}">
+  <div class="field">
+    <label for="ciuser">Username</label>
+    <p class="hint">Your login on the machine. Lowercase letters, digits and hyphens.</p>
+    <input type="text" id="ciuser" name="ciuser" value="{{ submitted.ciuser }}" required>
+  </div>
+
+  <div class="field">
+    <label for="ssh_authorized_key">SSH public key</label>
+    <p class="hint">One line, the contents of your <code>id_ed25519.pub</code>. This is the only
+    way in - there is no password.</p>
+    <textarea id="ssh_authorized_key" name="ssh_authorized_key" required>{{ submitted.ssh_authorized_key }}</textarea>
+  </div>
+
+  <div class="field">
+    <label for="hostname">Hostname <span class="hint" style="display:inline">optional</span></label>
+    <p class="hint">Left blank, we name it for you.</p>
+    <input type="text" id="hostname" name="hostname" value="{{ submitted.hostname }}">
+  </div>
+
+  <div class="field">
+    <label for="tailscale_auth_key">Tailscale auth key <span class="hint" style="display:inline">optional</span></label>
+    <p class="hint">Your own key, from your own tailnet. We use it once to join the machine and
+    never store it.</p>
+    <input type="text" id="tailscale_auth_key" name="tailscale_auth_key" value="">
+  </div>
+
+  <button type="submit">Build my machine</button>
+</form>
+{% endblock %}

@@ -56,9 +56,17 @@ class Settings(BaseSettings):
     events_webhook_secret: str | None = None
     n8n_api_key: str = ""
 
-    embedding_service_url: str = "http://llm-embed:8081/v1/embeddings"
+    # Both URLs default to EMPTY, which means "no embedding service" and puts KB
+    # search in keyword mode (ADR-004 corollary 3: an optional service works out
+    # of the box or is off and says so). Neither service exists in a stock
+    # install - llm-embed lives in the docker-compose.agent.yml overlay behind the
+    # gpu/cpu profiles and needs a model file the repo does not ship, and
+    # localhost:11434 inside the backend container is the container itself, not an
+    # Ollama host. The overlay sets the primary URL for the backend when it is
+    # enabled; the startup self-check states the consequence when it is not.
+    embedding_service_url: str = ""
     embedding_model: str = "bge-m3"
-    embedding_fallback_url: str = "http://localhost:11434/api/embeddings"
+    embedding_fallback_url: str = ""
     embedding_fallback_model: str = "nomic-embed-text"
 
     inventory_interval_seconds: int = 300
@@ -68,7 +76,11 @@ class Settings(BaseSettings):
 
     daemon_port: int = Field(default=8000, validation_alias="HP_PORT")
     log_level: str = "info"
-    agent_hub_enabled: bool = False
+    # Host management is the product, so the hub is on unless an operator turned
+    # it off (ADR-004 S3). Everything it needs that an operator would otherwise
+    # have to decide - the shared token below, the TLS certificate - generates
+    # itself on first boot.
+    agent_hub_enabled: bool = True
     agent_hub_host: str = "0.0.0.0"
     agent_hub_port: int = 8443
     # Address agents should DIAL to reach the hub. agent_hub_host is the bind
@@ -77,7 +89,11 @@ class Settings(BaseSettings):
     # (optionally host:port) agents can reach the hub on.
     agent_hub_advertise_host: str = ""
     agent_hub_auth_token: str = ""
-    agent_hub_tls: bool = False
+    # TLS is on by default; with no cert/key supplied the hub generates a
+    # self-signed pair on first boot (agent_hub/selfconfig.py). Setting
+    # HP_AGENT_HUB_TLS=false explicitly still turns it off, and an install that
+    # opted into the insecure override keeps plaintext (see app_state).
+    agent_hub_tls: bool = True
     agent_hub_tls_cert: str = ""
     agent_hub_tls_key: str = ""
     agent_hub_tls_ca: str = ""
@@ -89,15 +105,29 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HP_HUB_ALLOW_INSECURE", "HP_AGENT_HUB_ALLOW_INSECURE"),
     )
 
-    # Base URL of the Zabbix UI for deep-linking host metrics from HomePilot
-    # (HomePilot owns current state; historical telemetry lives in Zabbix).
-    # This is opened in the operator's BROWSER, so it must be browser-reachable —
-    # NOT the internal docker name (`http://zabbix:8080`, container-only). Default
-    # is the relative same-origin path served by the bundled reverse proxy
-    # (`/zabbix/` in nginx-hp-proxy.conf), so a standard co-deployment works with
-    # no config. Set an absolute URL if Zabbix is exposed elsewhere; set empty to
-    # hide the links.
-    zabbix_url: str = "/zabbix"
+    # ── Native metrics (ADR-004 S5) ──────────────────────────────────────────
+    # How long raw samples are kept. Seven days is the ADR's deliberate starting
+    # point: HomePilot now owns metric storage, and a window it can size honestly
+    # beats a window that quietly outgrows the disk. There is NO rollup — measure
+    # a real week first, then decide whether one earns its complexity.
+    metrics_retention_days: int = 7
+    metrics_prune_interval_seconds: int = 3600
+    metrics_alert_interval_seconds: int = 60
+
+    # ── Invite portal (#442 stage 2) ─────────────────────────────────────────
+    # The /invite/* pages trust a client-certificate identity ONLY when all
+    # three of these are set and the request satisfies all three: it arrives
+    # from portal_trusted_proxy, carries the shared secret header, and carries
+    # the proxy's verify + subject-DN headers. Any of them unset = every portal
+    # route returns 503. The header NAMES are configurable because they belong
+    # to the operator's existing nginx vhost, not to HomePilot.
+    portal_cn_header: str = "ssl-client-subject-dn"
+    portal_verify_header: str = "ssl-client-verify"
+    portal_trusted_proxy: str = ""
+    portal_proxy_secret: str = ""
+    # Public origin of the mTLS vhost, used ONLY to print a complete invite URL
+    # at mint time. Nothing at request time depends on it.
+    portal_base_url: str = ""
 
     trusted_proxies: str = ""
     cors_origins: str = (
@@ -168,6 +198,42 @@ class Settings(BaseSettings):
             )
             return key, True
 
+    def _auto_generate_hub_token(self) -> str:
+        """The shared agent-hub token, persisted next to the other generated
+        material so it survives restarts.
+
+        Same shape as ``_auto_generate_secret_key``: reuse the persisted value if
+        one exists, else mint and persist one. A token that changed on restart
+        would invalidate every pending enrolment one-liner."""
+        import logging
+        import secrets as secrets_mod
+
+        logger = logging.getLogger(__name__)
+        token_path = Path(self.data_dir) / ".agent_hub_token"
+        try:
+            if token_path.exists():
+                token = token_path.read_text().strip()
+                if token:
+                    logger.info("Agent hub token loaded from %s", token_path)
+                    return token
+            token = secrets_mod.token_urlsafe(32)
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(token)
+            token_path.chmod(0o600)
+            logger.info(
+                "No HP_AGENT_HUB_AUTH_TOKEN - auto-generated and saved to %s",
+                token_path,
+            )
+            return token
+        except OSError:
+            token = secrets_mod.token_urlsafe(32)
+            logger.warning(
+                "No HP_AGENT_HUB_AUTH_TOKEN - auto-generated (could not persist to %s). "
+                "Enrolled agents will have to re-enroll after a restart.",
+                token_path,
+            )
+            return token
+
     def _try_vault_secret(self, name: str) -> str:
         """Attempt to load a secret from the vault.
 
@@ -232,13 +298,28 @@ class Settings(BaseSettings):
 
         # ── Resolve vault passphrase FIRST (vault reads depend on it) ──
         if not self.vault_passphrase and not self.vault_passphrase_file:
-            auto_init = _os.environ.get("HP_VAULT_AUTO_INIT", "").lower() in ("1", "true", "yes")
-            if auto_init:
+            # Self-generating is the DEFAULT (ADR-004): the operator supplies a
+            # Proxmox address and token and nothing else, and that token needs a
+            # vault to live in. An install that silently has no vault cannot
+            # store the one secret it was given. Production still refuses to
+            # invent key material, exactly as HP_SECRET_KEY does - there the
+            # passphrase must be supplied, because an auto-generated one that
+            # lives only on that host is not a credential anyone can restore.
+            # An empty value means "unset", not "off": `HP_VAULT_AUTO_INIT=` is
+            # how a .env spells a variable it does not care about, and reading
+            # that as opt-out would silently disable the vault on a stock file.
+            # Only an explicit falsy value turns it off.
+            raw_auto_init = _os.environ.get("HP_VAULT_AUTO_INIT", "").strip().lower()
+            auto_init = raw_auto_init not in ("0", "false", "no")
+            if auto_init and self.env != "production":
                 self.vault_passphrase = self._auto_generate_passphrase()
-            else:
-                logger.info(
-                    "Vault passphrase not set and HP_VAULT_AUTO_INIT not enabled — vault disabled"
+            elif self.env == "production":
+                logger.warning(
+                    "HP_ENV=production and no vault passphrase set — vault disabled. "
+                    "Set HP_VAULT_PASSPHRASE or HP_VAULT_PASSPHRASE_FILE."
                 )
+            else:
+                logger.info("Vault passphrase not set and HP_VAULT_AUTO_INIT=0 — vault disabled")
         else:
             if self.vault_passphrase:
                 logger.info("Vault passphrase loaded from HP_VAULT_PASSPHRASE env var")
@@ -273,6 +354,16 @@ class Settings(BaseSettings):
             if _admin:
                 self.admin_secret = _admin
                 logger.info("HP_ADMIN_SECRET loaded from vault")
+
+        # The hub's shared token is fleet material, not an operator decision:
+        # vault first (where it can be rotated), else a persisted file.
+        if self.agent_hub_enabled and not self.agent_hub_auth_token:
+            _vault_hub_token = self._try_vault_secret("agent-hub-token")
+            if _vault_hub_token:
+                self.agent_hub_auth_token = _vault_hub_token
+                logger.info("HP_AGENT_HUB_AUTH_TOKEN loaded from vault")
+            else:
+                self.agent_hub_auth_token = self._auto_generate_hub_token()
 
         if self.env == "production" and _secret_key_auto_generated:
             raise ConfigError(

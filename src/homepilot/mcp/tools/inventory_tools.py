@@ -39,7 +39,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "refresh_inventory",
         "description": (
-            "Re-pull inventory data from Proxmox API and SSH-to-guests. "
+            "Re-pull inventory data from the Proxmox REST API and connected hp-agents. "
             'Pass "full" to refresh everything, or a specific scope like '
             '"hosts", "services", or "networks".'
         ),

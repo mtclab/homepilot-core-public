@@ -45,12 +45,10 @@ Check if `.env` already exists. If yes, review it with the user. If not:
 cp .env.example .env
 ```
 
-Edit `.env` — minimum viable (adjust per user's existing setup):
+Nothing in `.env` has to be edited for a normal install — every variable is an override, and the Proxmox address and token are asked for in the browser during the claim. Only touch it for a non-default port or an existing setup:
 
 ```env
 HP_DAEMON_PORT=8000
-HP_PROXMOX_HOST=pve.example.local
-HP_PROXMOX_VERIFY_SSL=false
 HP_IMAGE_TAG=2.3.0
 ```
 
@@ -62,17 +60,27 @@ HP_IMAGE_TAG=2.3.0
 docker compose up -d
 ```
 
-### 4. Bootstrap secrets
+### 4. Claim the instance in the browser
+
+Open `http://<host>:8000/ui` **from a machine on the same network**. A fresh instance shows the claim screen: it creates the admin credential and takes the Proxmox address + API token in the same step (both optional — Proxmox can be added later in Settings). The credentials are verified against the live Proxmox API before they are stored, and the inventory reconciler picks them up without a restart.
+
+There is no shell step and no token to copy out of container output. **Claim it immediately:** until it is claimed, anyone on the same network can.
+
+The claim closes permanently once it succeeds; a second attempt gets `410 Gone`.
+
+**If the instance is reached from OUTSIDE its own network** (public address, port-forward, reverse proxy on a public host), the codeless path is refused and a claim code is required:
 
 ```bash
-docker compose exec backend hp init
+docker compose exec backend hp claim-code
 ```
 
-Copies admin token from output.
+The code is generated on first boot, stored hashed, and stable across restarts. Behind a reverse proxy set `HP_TRUSTED_PROXIES` to the proxy's address so HomePilot judges the forwarded client rather than the proxy — a forwarding header from an unlisted address is never trusted.
 
-### 5. Open UI
+`hp init` still exists for scripted installs; it is not part of a normal install, and minting an admin token any other way closes the claim path too.
 
-http://localhost:8000/ui → Settings → paste token → Save.
+### 5. Verify
+
+The dashboard loads with the session the claim created. Settings → Proxmox shows `connection_status: ok` when the credentials were supplied.
 
 ## Platform Architecture
 
@@ -111,10 +119,11 @@ http://localhost:8000/ui → Settings → paste token → Save.
 ### Vault (zero-secrets)
 
 ```bash
-# Auto-generated on first boot:
+# Auto-generated and persisted on first boot (HP_VAULT_AUTO_INIT=1):
 HP_VAULT_PASSPHRASE=...
 
-# Stored in vault by `hp init`:
+# Stored in the vault by the first-run claim, the Settings page,
+# `hp vault set`, or `hp init`:
 #   secret-key      — JWT signing
 #   admin-secret    — Admin auth
 #   pve-token       — Proxmox read API
@@ -233,9 +242,11 @@ docker compose up -d backend
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| Login page asks for a claim code | Reached from outside the local network (or through an untrusted proxy) | `docker compose exec backend hp claim-code`, or set `HP_TRUSTED_PROXIES` to the reverse proxy |
+| Claim returns 410 | Instance already claimed (or an admin token exists) | Sign in with that token; `hp token create` for another |
 | 401 all API | Missing token | `hp token create`, paste in UI |
 | 403 write | Read-only scope | `hp token create --scope read,write` |
-| Vault fail | Passphrase missing | Run `hp init` inside container |
+| Vault fail | Passphrase missing | Set `HP_VAULT_AUTO_INIT=1` and restart (or `hp init` for a scripted install) |
 | 0 inventory hosts | PVE not configured | Set `HP_PROXMOX_HOST` + store `pve-token` |
 | Agent offline | Hub not enabled / token mismatch | Check `HP_AGENT_HUB_ENABLED=true` |
 | n8n blank | Workflows not imported | UI: Workflows → Import from File |

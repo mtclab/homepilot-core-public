@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -77,22 +78,75 @@ async def execute(
     log_lines: list[str] = []
     start = time.monotonic()
 
-    for step in steps:
-        step_id = step.get("id", "unknown")
-        step_log = f"[{step_id}]"
+    try:
+        for step in steps:
+            step_id = step.get("id", "unknown")
+            step_log = f"[{step_id}]"
 
-        cred_name = step.get("name", "")
-        precheck = step.get("precheck")
-        if precheck and not rollback:
-            pre_cred_name = precheck.get("name", cred_name)
-            pre_method = precheck.get("method", "GET").upper()
-            pre_path = _interpolate(precheck.get("path", ""), context)
-            skip_if_expr = precheck.get("skip_if")
+            cred_name = step.get("name", "")
+            precheck = step.get("precheck")
+            if precheck and not rollback:
+                pre_cred_name = precheck.get("name", cred_name)
+                pre_method = precheck.get("method", "GET").upper()
+                pre_path = _interpolate(precheck.get("path", ""), context)
+                skip_if_expr = precheck.get("skip_if")
+
+                try:
+                    pre_cred = await _resolve_credential(pre_cred_name, vault)
+                except ExecutorError as e:
+                    step_log += f" credential '{pre_cred_name}' not found"
+                    log_lines.append(step_log)
+                    on_error = step.get("on_error", "halt")
+                    if on_error == "halt":
+                        return {
+                            "success": False,
+                            "execution_log": "\n".join(log_lines),
+                            "failure_reason": str(e),
+                        }
+                    continue
+
+                base_url = pre_cred.get("base_url", "").rstrip("/")
+                headers = pre_cred.get("headers", {})
+                verify_tls = pre_cred.get("verify_tls", True)
+
+                client_key = f"{base_url}:{pre_cred_name}"
+                if client_key not in client_cache:
+                    client_cache[client_key] = httpx.AsyncClient(
+                        base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
+                    )
+                pre_client = client_cache[client_key]
+
+                step_log += f" precheck {pre_method} {pre_path}"
+                try:
+                    resp = await pre_client.request(method=pre_method, url=pre_path)
+                    proxy = make_response_proxy(resp)
+                    if skip_if_expr and _eval_skip_if(
+                        skip_if_expr, proxy, context.get("target", {})
+                    ):
+                        step_log += " -> SKIPPED (precheck)"
+                        log_lines.append(step_log)
+                        continue
+                except httpx.HTTPError as e:
+                    step_log += f" -> precheck error: {e}"
+                    on_error = step.get("on_error", "halt")
+                    if on_error == "halt":
+                        log_lines.append(step_log)
+                        return {
+                            "success": False,
+                            "execution_log": "\n".join(log_lines),
+                            "failure_reason": str(e),
+                        }
+
+            method = step.get("method", "GET").upper()
+            path = _interpolate(step.get("path", ""), context)
+            do_body = step.get("body")
+            if do_body is not None:
+                do_body = _interpolate_obj(do_body, context)
 
             try:
-                pre_cred = await _resolve_credential(pre_cred_name, vault)
+                cred = await _resolve_credential(cred_name, vault)
             except ExecutorError as e:
-                step_log += f" credential '{pre_cred_name}' not found"
+                step_log += f" credential '{cred_name}' not found"
                 log_lines.append(step_log)
                 on_error = step.get("on_error", "halt")
                 if on_error == "halt":
@@ -103,27 +157,34 @@ async def execute(
                     }
                 continue
 
-            base_url = pre_cred.get("base_url", "").rstrip("/")
-            headers = pre_cred.get("headers", {})
-            verify_tls = pre_cred.get("verify_tls", True)
+            base_url = cred.get("base_url", "").rstrip("/")
+            headers = cred.get("headers", {})
+            verify_tls = cred.get("verify_tls", True)
 
-            client_key = f"{base_url}:{pre_cred_name}"
+            client_key = f"{base_url}:{cred_name}"
             if client_key not in client_cache:
                 client_cache[client_key] = httpx.AsyncClient(
                     base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
                 )
-            pre_client = client_cache[client_key]
+            client = client_cache[client_key]
 
-            step_log += f" precheck {pre_method} {pre_path}"
             try:
-                resp = await pre_client.request(method=pre_method, url=pre_path)
-                proxy = make_response_proxy(resp)
-                if skip_if_expr and _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
-                    step_log += " -> SKIPPED (precheck)"
-                    log_lines.append(step_log)
-                    continue
+                kwargs: dict[str, Any] = {}
+                if do_body is not None and method in ("POST", "PUT", "PATCH"):
+                    kwargs["json"] = do_body
+                resp = await client.request(method=method, url=path, **kwargs)
+                step_log += f" {method} {path} -> {resp.status_code}"
+                if resp.status_code >= 400:
+                    on_error = step.get("on_error", "halt")
+                    if on_error == "halt":
+                        log_lines.append(step_log)
+                        return {
+                            "success": False,
+                            "execution_log": "\n".join(log_lines),
+                            "failure_reason": f"step {step_id}: HTTP {resp.status_code}",
+                        }
             except httpx.HTTPError as e:
-                step_log += f" -> precheck error: {e}"
+                step_log += f" {method} {path} -> ERROR: {e}"
                 on_error = step.get("on_error", "halt")
                 if on_error == "halt":
                     log_lines.append(step_log)
@@ -133,71 +194,17 @@ async def execute(
                         "failure_reason": str(e),
                     }
 
-        method = step.get("method", "GET").upper()
-        path = _interpolate(step.get("path", ""), context)
-        do_body = step.get("body")
-        if do_body is not None:
-            do_body = _interpolate_obj(do_body, context)
-
-        try:
-            cred = await _resolve_credential(cred_name, vault)
-        except ExecutorError as e:
-            step_log += f" credential '{cred_name}' not found"
             log_lines.append(step_log)
-            on_error = step.get("on_error", "halt")
-            if on_error == "halt":
-                return {
-                    "success": False,
-                    "execution_log": "\n".join(log_lines),
-                    "failure_reason": str(e),
-                }
-            continue
 
-        base_url = cred.get("base_url", "").rstrip("/")
-        headers = cred.get("headers", {})
-        verify_tls = cred.get("verify_tls", True)
-
-        client_key = f"{base_url}:{cred_name}"
-        if client_key not in client_cache:
-            client_cache[client_key] = httpx.AsyncClient(
-                base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
-            )
-        client = client_cache[client_key]
-
-        try:
-            kwargs: dict[str, Any] = {}
-            if do_body is not None and method in ("POST", "PUT", "PATCH"):
-                kwargs["json"] = do_body
-            resp = await client.request(method=method, url=path, **kwargs)
-            step_log += f" {method} {path} -> {resp.status_code}"
-            if resp.status_code >= 400:
-                on_error = step.get("on_error", "halt")
-                if on_error == "halt":
-                    log_lines.append(step_log)
-                    for c in client_cache.values():
-                        await c.aclose()
-                    return {
-                        "success": False,
-                        "execution_log": "\n".join(log_lines),
-                        "failure_reason": f"step {step_id}: HTTP {resp.status_code}",
-                    }
-        except httpx.HTTPError as e:
-            step_log += f" {method} {path} -> ERROR: {e}"
-            on_error = step.get("on_error", "halt")
-            if on_error == "halt":
-                log_lines.append(step_log)
-                for c in client_cache.values():
-                    await c.aclose()
-                return {
-                    "success": False,
-                    "execution_log": "\n".join(log_lines),
-                    "failure_reason": str(e),
-                }
-
-        log_lines.append(step_log)
-
-    for c in client_cache.values():
-        await c.aclose()
+    finally:
+        # Every `halt` path used to `return` from inside the loop; three of them
+        # skipped the close, leaking an httpx.AsyncClient and its pool on every
+        # apply whose step named a missing vault credential (#388). A finally
+        # covers every exit, including exceptions, and removes the three
+        # duplicated close blocks that used to guard only some of them.
+        for c in client_cache.values():
+            with contextlib.suppress(Exception):
+                await c.aclose()
 
     elapsed = time.monotonic() - start
     log_lines.append(f"duration={elapsed:.1f}s")

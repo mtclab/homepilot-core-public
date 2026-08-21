@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -125,30 +124,30 @@ class TestApplyReconcilerApplySingle:
         assert rows[0]["user_id"] == "admin"
         assert rows[0]["artifact_id"] == "a1"
 
-    async def test_apply_single_success_writes_audit(self, repo):
+    async def test_apply_single_does_not_write_its_own_apply_audit(self, repo):
+        """One apply, one actor-bearing audit row - written by the executor.
+
+        The reconciler used to add a second row under its own source, so the log
+        an operator reads to answer "who applied this" had two answers for one
+        event. The executor's row carries the actor and the snapshot id.
+        """
         executor = _make_executor(success=True, execution_log="done")
         reconciler = ApplyReconciler(store=MagicMock(), repo=repo, executor=executor)
         await reconciler.apply_single("a1", approved_by="admin")
 
-        rows = await repo.db.fetchall(
-            "SELECT * FROM audit_log WHERE source = 'reconciler:apply' AND action = 'apply'"
-        )
-        assert len(rows) == 1
-        assert rows[0]["user_id"] == "admin"
-        assert rows[0]["artifact_id"] == "a1"
+        rows = await repo.db.fetchall("SELECT * FROM audit_log WHERE source = 'reconciler:apply'")
+        assert rows == []
 
-    async def test_apply_single_failure_writes_audit(self, repo):
+    async def test_apply_single_failure_does_not_write_its_own_audit(self, repo):
         executor = _make_executor(success=False, execution_log="fail", failure_reason="err")
         reconciler = ApplyReconciler(store=MagicMock(), repo=repo, executor=executor)
-        await reconciler.apply_single("a1", approved_by="admin")
+        result = await reconciler.apply_single("a1", approved_by="admin")
 
-        rows = await repo.db.fetchall(
-            "SELECT * FROM audit_log WHERE source = 'reconciler:apply' AND action = 'apply_failed'"
-        )
-        assert len(rows) == 1
-        details = json.loads(rows[0]["details_json"])
-        assert details["approved_by"] == "admin"
-        assert "failure_reason" in details
+        rows = await repo.db.fetchall("SELECT * FROM audit_log WHERE source = 'reconciler:apply'")
+        assert rows == []
+        # The failure itself must still reach the caller.
+        assert result.success is False
+        assert result.failure_reason == "err"
 
     async def test_apply_single_audit_failure_does_not_fail_apply(self, repo):
         executor = _make_executor(success=True)

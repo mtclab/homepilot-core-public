@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -123,6 +124,20 @@ class TestKBSearchFallbackLogging:
         )
 
 
+# Both embedding URLs default to EMPTY (ADR-004 S6), so a test of the
+# primary/fallback probing has to configure what it probes.
+@pytest.fixture
+def both_services_configured(monkeypatch):
+    settings = SimpleNamespace(
+        embedding_service_url="http://llm-embed:8081/v1/embeddings",
+        embedding_model="bge-m3",
+        embedding_fallback_url="http://ollama:11434/api/embeddings",
+        embedding_fallback_model="nomic-embed-text",
+    )
+    monkeypatch.setattr("homepilot.kb.service.get_settings", lambda: settings)
+    return settings
+
+
 class TestEmbeddingStatus:
     async def test_embedding_status_returns_keyword_mode_when_no_services(self, kb_service, repo):
         with patch(
@@ -136,7 +151,9 @@ class TestEmbeddingStatus:
         assert status["primary_ok"] is False
         assert status["fallback_ok"] is False
 
-    async def test_embedding_status_returns_vector_mode_when_primary_works(self, kb_service, repo):
+    async def test_embedding_status_returns_vector_mode_when_primary_works(
+        self, kb_service, repo, both_services_configured
+    ):
         fake_embedding = [0.1] * 1024
         with patch(
             "homepilot.kb.service._call_embed_service",
@@ -148,7 +165,9 @@ class TestEmbeddingStatus:
         assert status["search_mode"] == "vector"
         assert status["primary_ok"] is True
 
-    async def test_embedding_status_returns_fallback_vector_mode(self, kb_service, repo):
+    async def test_embedding_status_returns_fallback_vector_mode(
+        self, kb_service, repo, both_services_configured
+    ):
         fake_embedding = [0.1] * 768
         call_count = 0
 

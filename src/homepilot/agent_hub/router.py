@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from ..auth.deps import require_scope
 from .audit import set_audit_caller
+from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
 from .registry import AgentRegistry
 
 if TYPE_CHECKING:
@@ -82,6 +83,10 @@ def _advertised_hub(request: Request, bind_host: str, bind_port: int) -> tuple[s
       3. the request hostname (the address the operator reached the API on) — but
          this comes from the untrusted client Host header, so it is validated
          against a strict hostname/IP pattern before use.
+
+    This is the ONE place hub-address resolution lives; the generated
+    certificate's SAN list (agent_hub/selfconfig.py) covers the same candidates
+    rather than re-deriving the answer.
     """
     from homepilot.config import get_settings
 
@@ -110,6 +115,20 @@ def _advertised_hub(request: Request, bind_host: str, bind_port: int) -> tuple[s
         "returning a non-executable placeholder"
     )
     return _INVALID_HUB_HOST_PLACEHOLDER, bind_port
+
+
+def _hub_tls_fields(hub: Any) -> dict[str, Any]:
+    """Transport facts an enrolling agent needs.
+
+    ``hub_cert_sha256`` is the fingerprint of the certificate this hub serves.
+    The hub's certificate is normally self-signed, so it chains to nothing an
+    agent already trusts; handing the fingerprint out over the authenticated
+    admin API is what lets the agent PIN this exact hub instead of accepting any
+    certificate. Empty when TLS is off, in which case there is nothing to pin."""
+    return {
+        "hub_tls": bool(getattr(hub, "tls_enabled", False)),
+        "hub_cert_sha256": getattr(hub, "cert_fingerprint", "") or "",
+    }
 
 
 def _get_registry() -> AgentRegistry:
@@ -289,7 +308,59 @@ async def get_hub_token(request: Request) -> dict[str, Any]:
         "auth_token": token,
         "hub_host": host,
         "hub_port": port,
+        **_hub_tls_fields(hub),
     }
+
+
+class MigrateTLSRequest(BaseModel):
+    # Naming the stranding explicitly, rather than letting a bare retry escalate
+    # into one: force means "flip even though these agents will need re-enrolling
+    # by hand", which is a sentence an operator should have to write down.
+    force: bool = False
+
+
+@router.get("/migrate-tls", dependencies=[_admin_only])
+async def preview_tls_migration(request: Request) -> dict[str, Any]:
+    """Who would move onto TLS, and who would be stranded - changing nothing."""
+    from .migrate_tls import plan_migration
+
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="Repository not available")
+    registry = _get_registry()
+    plan = await plan_migration(repo, registry)
+    hub = registry.hub_server
+    plan["hub_tls_enabled"] = bool(hub is not None and hub.tls_enabled)
+    return plan
+
+
+@router.post("/migrate-tls", dependencies=[_admin_only])
+async def migrate_fleet_tls(request: Request, body: MigrateTLSRequest) -> dict[str, Any]:
+    """Push the hub's certificate to the fleet, then flip the transport (#468).
+
+    The alternative this replaces is editing /etc/homepilot/agent.env on every
+    managed host, which ADR-004 exists to abolish.
+    """
+    from .migrate_tls import MigrationRefusedError, migrate_fleet_to_tls
+
+    repo = getattr(request.app.state, "repo", None)
+    settings = getattr(request.app.state, "settings", None)
+    if repo is None or settings is None:
+        raise HTTPException(status_code=503, detail="Control plane not fully initialised")
+    registry = _get_registry()
+    try:
+        return await migrate_fleet_to_tls(
+            repo,
+            registry,
+            registry.hub_server,
+            settings.data_dir,
+            settings=settings,
+            force=body.force,
+        )
+    except MigrationRefusedError as exc:
+        # 409: the request is well formed, the fleet is simply not in a state
+        # where flipping is safe. The message names every agent involved.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/bootstrap", dependencies=[_admin_only])
@@ -304,7 +375,99 @@ async def create_bootstrap_token(request: Request) -> dict[str, Any]:
         "bootstrap_token": token,
         "hub_host": host,
         "hub_port": port,
+        **_hub_tls_fields(hub),
     }
+
+
+class InstallAgentRequest(BaseModel):
+    host_id: str
+
+
+def _get_enroll_service(request: Request) -> AgentEnrollService:
+    service = getattr(request.app.state, "agent_enroll_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Agent install not available")
+    enroll_service: AgentEnrollService = service
+    return enroll_service
+
+
+async def _load_host(request: Request, host_id: str) -> dict[str, Any]:
+    repo = getattr(request.app.state, "repo", None)
+    host = await repo.get_host(host_id) if repo is not None else None
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+    return dict(host)
+
+
+# Declared BEFORE the `/{agent_id}` routes at the bottom of this module: FastAPI
+# matches in declaration order, so a literal path registered after them would be
+# swallowed as an agent id.
+@router.get("/install/{host_id}", dependencies=[_admin_only])
+async def agent_install_eligibility(request: Request, host_id: str) -> dict[str, Any]:
+    """Whether this host can be enrolled over qemu-guest-agent, and if not, why.
+
+    The reason is the product here: a host that cannot be enrolled this way must
+    say what to do about it instead of leaving the operator to click and find out.
+    """
+    host = await _load_host(request, host_id)
+    service = _get_enroll_service(request)
+    registry = getattr(request.app.state, "agent_registry", None)
+    hub = getattr(registry, "hub_server", None) if registry is not None else None
+    hub_host, hub_port = _advertised_hub(
+        request,
+        getattr(hub, "host", "") or "",
+        int(getattr(hub, "port", 0) or 0),
+    )
+    payload: dict[str, Any] = {
+        "host_id": host_id,
+        "hostname": host.get("hostname"),
+        "in_flight": service.is_inflight(host_id),
+    }
+    try:
+        await service.check(host, hub_host)
+    except EnrollPreconditionError as exc:
+        return {**payload, "eligible": False, "reason": exc.code, "message": exc.message}
+    return {
+        **payload,
+        "eligible": True,
+        "reason": None,
+        "message": (
+            f"HomePilot can install and enrol the agent on {host.get('hostname')} through "
+            f"qemu-guest-agent, pointing it at {hub_host}:{hub_port}."
+        ),
+    }
+
+
+@router.post("/install", status_code=202)
+async def install_agent_on_host(
+    request: Request,
+    body: InstallAgentRequest,
+    token: dict[str, Any] = _admin_token,
+) -> dict[str, Any]:
+    """Install and enrol hp-agent inside a managed guest. Progress: /tasks/{id}."""
+    host = await _load_host(request, body.host_id)
+    service = _get_enroll_service(request)
+    registry = getattr(request.app.state, "agent_registry", None)
+    hub = getattr(registry, "hub_server", None) if registry is not None else None
+    hub_host, hub_port = _advertised_hub(
+        request,
+        getattr(hub, "host", "") or "",
+        int(getattr(hub, "port", 0) or 0),
+    )
+    try:
+        task_id = await service.start(
+            host, hub_host, hub_port, actor=token.get("user_id") or "system"
+        )
+    except EnrollPreconditionError as exc:
+        # 409, not 400: the request is well-formed, the host is not in a state
+        # that admits it. The code lets the UI keep its own wording; the message
+        # is what a curl caller sees.
+        raise HTTPException(
+            status_code=409, detail={"reason": exc.code, "message": exc.message}
+        ) from None
+    except EnrollConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"task_id": task_id, "status": "pending", "host_id": body.host_id}
 
 
 @router.get("/audit", dependencies=[_admin_only])
@@ -399,24 +562,6 @@ async def write_file_to_agent(agent_id: str, body: WriteFileRequest) -> dict[str
         raise HTTPException(status_code=502, detail=str(exc)) from None
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Write timed out") from None
-    return result
-
-
-@router.post("/{agent_id}/zabbix-push", dependencies=[_admin_only])
-async def trigger_zabbix_push(agent_id: str) -> dict[str, Any]:
-    registry = _get_registry()
-    hub = registry.hub_server
-    if hub is None:
-        raise HTTPException(status_code=503, detail="Agent hub server not available")
-    agent = registry.get(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-    try:
-        result = await hub.send_zabbix_push(agent_id)
-    except ConnectionError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from None
-    except TimeoutError:
-        raise HTTPException(status_code=504, detail="Zabbix push timed out") from None
     return result
 
 

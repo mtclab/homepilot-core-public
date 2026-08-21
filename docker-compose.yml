@@ -4,7 +4,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.7.1}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-2.8.0}
     build:
       context: .
       dockerfile: Dockerfile
@@ -16,7 +16,7 @@ services:
     env_file:
       - .env
     environment:
-      HP_AGENT_HUB_ENABLED: ${HP_AGENT_HUB_ENABLED:-false}
+      HP_AGENT_HUB_ENABLED: ${HP_AGENT_HUB_ENABLED:-true}
       HP_AGENT_HUB_PORT: "8443"
       HP_AGENT_HUB_AUTH_TOKEN: ${HP_AGENT_HUB_AUTH_TOKEN:-}
     restart: unless-stopped

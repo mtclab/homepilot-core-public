@@ -1,19 +1,19 @@
 {
   "errors": [],
-  "generated_at": "2026-06-12T06:25:47Z",
+  "generated_at": "2026-08-21T05:48:32Z",
   "metrics": {
     "_totals": {
-      "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 9,
-      "CONFIDENCE.MEDIUM": 31,
+      "CONFIDENCE.HIGH": 2,
+      "CONFIDENCE.LOW": 15,
+      "CONFIDENCE.MEDIUM": 34,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 19,
-      "SEVERITY.MEDIUM": 21,
+      "SEVERITY.LOW": 24,
+      "SEVERITY.MEDIUM": 27,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 13221,
+      "loc": 19612,
       "nosec": 0,
-      "skipped_tests": 0
+      "skipped_tests": 1
     },
     "src/homepilot/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -50,7 +50,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 127,
+      "loc": 175,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -63,7 +63,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 121,
+      "loc": 256,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -102,7 +102,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 325,
+      "loc": 351,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -128,7 +128,33 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 63,
+      "loc": 147,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/agent_hub/enroll.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 1,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 400,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/agent_hub/migrate_tls.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 131,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -141,7 +167,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 105,
+      "loc": 200,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/agent_hub/replay.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 148,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -154,7 +193,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 253,
+      "loc": 474,
+      "nosec": 0,
+      "skipped_tests": 1
+    },
+    "src/homepilot/agent_hub/selfconfig.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 191,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -167,7 +219,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 279,
+      "loc": 842,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/agent_hub/tls_mode.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 65,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -193,7 +258,7 @@
       "SEVERITY.LOW": 10,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 302,
+      "loc": 348,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -245,7 +310,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 155,
+      "loc": 233,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -297,7 +362,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 113,
+      "loc": 121,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -336,7 +401,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 30,
+      "loc": 31,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -362,7 +427,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 90,
+      "loc": 92,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -375,7 +440,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 230,
+      "loc": 251,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -405,6 +470,84 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "src/homepilot/claim/__init__.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 2,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/claim/repository.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 91,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/claim/router.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 1,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 171,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/claim/startup.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 110,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/claim/tokens.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 18,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/claim/trust.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 77,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "src/homepilot/cli/__init__.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -427,7 +570,7 @@
       "SEVERITY.LOW": 3,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1443,
+      "loc": 1905,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -440,20 +583,46 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 14,
+      "loc": 69,
       "nosec": 0,
       "skipped_tests": 0
     },
     "src/homepilot/config.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
-      "CONFIDENCE.MEDIUM": 2,
+      "CONFIDENCE.MEDIUM": 1,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 2,
+      "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 227,
+      "loc": 279,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/dashboard/__init__.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 0,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/dashboard/router.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 72,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -467,6 +636,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 5,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/db/backup.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 82,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -492,20 +674,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 311,
+      "loc": 556,
       "nosec": 0,
       "skipped_tests": 0
     },
     "src/homepilot/db/repository.py": {
       "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 4,
+      "CONFIDENCE.LOW": 5,
       "CONFIDENCE.MEDIUM": 5,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 9,
+      "SEVERITY.MEDIUM": 10,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 786,
+      "loc": 1042,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -587,6 +769,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "src/homepilot/executor/host_provision.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 165,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "src/homepilot/executor/http_sequence.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -596,7 +791,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 173,
+      "loc": 175,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -622,7 +817,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 157,
+      "loc": 160,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -635,7 +830,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 235,
+      "loc": 248,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -661,7 +856,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 103,
+      "loc": 124,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -691,6 +886,19 @@
       "nosec": 0,
       "skipped_tests": 0
     },
+    "src/homepilot/inventory/introspect.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 263,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
     "src/homepilot/inventory/router.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
@@ -700,7 +908,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 171,
+      "loc": 227,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -713,7 +921,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 425,
+      "loc": 514,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -732,14 +940,14 @@
     },
     "src/homepilot/kb/router.py": {
       "CONFIDENCE.HIGH": 0,
-      "CONFIDENCE.LOW": 1,
+      "CONFIDENCE.LOW": 2,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
       "SEVERITY.LOW": 0,
-      "SEVERITY.MEDIUM": 1,
+      "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 134,
+      "loc": 140,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -752,7 +960,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 395,
+      "loc": 412,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -765,7 +973,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 547,
+      "loc": 692,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -804,7 +1012,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 341,
+      "loc": 377,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -869,11 +1077,24 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 131,
+      "loc": 143,
       "nosec": 0,
       "skipped_tests": 0
     },
     "src/homepilot/mcp/tools/system_tools.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 1,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 248,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/metrics/__init__.py": {
       "CONFIDENCE.HIGH": 0,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
@@ -882,7 +1103,202 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 212,
+      "loc": 15,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/metrics/alerts.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 171,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/metrics/repository.py": {
+      "CONFIDENCE.HIGH": 1,
+      "CONFIDENCE.LOW": 2,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 1,
+      "SEVERITY.MEDIUM": 2,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 240,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/metrics/retention.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 41,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/metrics/router.py": {
+      "CONFIDENCE.HIGH": 1,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 1,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 94,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/__init__.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 5,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/models.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 109,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/repository.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 2,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 2,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 154,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/router.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 245,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/templates.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 24,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/tokens.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 10,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/portal/trust.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 1,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 1,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 177,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/provision/__init__.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 4,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/provision/models.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 96,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/provision/router.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 25,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/provision/service.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 237,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -908,7 +1324,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 143,
+      "loc": 137,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -934,7 +1350,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 146,
+      "loc": 177,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -947,7 +1363,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 74,
+      "loc": 82,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -960,7 +1376,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 446,
+      "loc": 465,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "src/homepilot/selfcheck.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 351,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -999,7 +1428,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 110,
+      "loc": 131,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1012,7 +1441,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 24,
+      "loc": 34,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1025,7 +1454,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 151,
+      "loc": 158,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1051,7 +1480,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 169,
+      "loc": 185,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1084,7 +1513,7 @@
   },
   "results": [
     {
-      "code": "65 async def _resolve_proxmox_token(request: Request) -> tuple[str, str]:\n66     token = \"\"\n67     source = \"\"\n",
+      "code": "67 async def _resolve_proxmox_token(request: Request) -> tuple[str, str]:\n68     token = \"\"\n69     source = \"\"\n",
       "col_offset": 12,
       "end_col_offset": 14,
       "filename": "src/homepilot/admin/router.py",
@@ -1095,16 +1524,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 66,
+      "line_number": 68,
       "line_range": [
-        66
+        68
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "87 async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:\n88     write_token = \"\"\n89     source = \"\"\n",
+      "code": "89 async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:\n90     write_token = \"\"\n91     source = \"\"\n",
       "col_offset": 18,
       "end_col_offset": 20,
       "filename": "src/homepilot/admin/router.py",
@@ -1115,16 +1544,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 88,
+      "line_number": 90,
       "line_range": [
-        88
+        90
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "262 \n263     new_token = \"\"\n264     new_source = \"\"\n",
+      "code": "282 \n283     new_token = \"\"\n284     new_source = \"\"\n",
       "col_offset": 16,
       "end_col_offset": 18,
       "filename": "src/homepilot/admin/router.py",
@@ -1135,16 +1564,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 263,
+      "line_number": 283,
       "line_range": [
-        263
+        283
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "281 \n282         new_write_token = \"\"\n283         new_write_source = \"\"\n",
+      "code": "301 \n302         new_write_token = \"\"\n303         new_write_source = \"\"\n",
       "col_offset": 26,
       "end_col_offset": 28,
       "filename": "src/homepilot/admin/router.py",
@@ -1155,16 +1584,36 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 282,
+      "line_number": 302,
       "line_range": [
-        282
+        302
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "54         self,\n55         host: str = \"0.0.0.0\",\n56         port: int = 8443,\n57         auth_token: str | None = None,\n58         registry: AgentRegistry | None = None,\n59         ssl_context: ssl.SSLContext | None = None,\n60         token_store: BootstrapTokenStore | None = None,\n61     ) -> None:\n62         self.host = host\n",
+      "code": "259         vmid = int(host.get(\"proxmox_id\") or 0)\n260         token = \"\"\n261         try:\n",
+      "col_offset": 16,
+      "end_col_offset": 18,
+      "filename": "src/homepilot/agent_hub/enroll.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: ''",
+      "line_number": 260,
+      "line_range": [
+        260
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "197         self,\n198         host: str = \"0.0.0.0\",\n199         port: int = 8443,\n200         auth_token: str | None = None,\n201         registry: AgentRegistry | None = None,\n202         ssl_context: ssl.SSLContext | None = None,\n203         token_store: BootstrapTokenStore | None = None,\n204         allow_insecure: bool = False,\n205         cert_fingerprint: str = \"\",\n206     ) -> None:\n207         self.host = host\n",
       "col_offset": 20,
       "end_col_offset": 29,
       "filename": "src/homepilot/agent_hub/server.py",
@@ -1175,22 +1624,24 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 55,
+      "line_number": 198,
       "line_range": [
-        54,
-        55,
-        56,
-        57,
-        58,
-        59,
-        60
+        197,
+        198,
+        199,
+        200,
+        201,
+        202,
+        203,
+        204,
+        205
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "85 \n86     pve_token_source = \"\"\n87 \n",
+      "code": "93 \n94     pve_token_source = \"\"\n95 \n",
       "col_offset": 23,
       "end_col_offset": 25,
       "filename": "src/homepilot/app_state.py",
@@ -1201,16 +1652,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 86,
+      "line_number": 94,
       "line_range": [
-        86
+        94
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "113         if proxmox_host:\n114             token = \"\"\n115             if vault:\n",
+      "code": "121         if proxmox_host:\n122             token = \"\"\n123             if vault:\n",
       "col_offset": 20,
       "end_col_offset": 22,
       "filename": "src/homepilot/app_state.py",
@@ -1221,16 +1672,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 114,
+      "line_number": 122,
       "line_range": [
-        114
+        122
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "123                             logger.warning(\"PVE token from vault has invalid format \u2014 skipping\")\n124                             token = \"\"\n125                         else:\n",
+      "code": "131                             logger.warning(\"PVE token from vault has invalid format \u2014 skipping\")\n132                             token = \"\"\n133                         else:\n",
       "col_offset": 36,
       "end_col_offset": 38,
       "filename": "src/homepilot/app_state.py",
@@ -1241,16 +1692,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 124,
+      "line_number": 132,
       "line_range": [
-        124
+        132
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "125                         else:\n126                             pve_token_source = \"vault\"\n127                 except (VaultError, OSError):\n",
+      "code": "133                         else:\n134                             pve_token_source = \"vault\"\n135                 except (VaultError, OSError):\n",
       "col_offset": 47,
       "end_col_offset": 54,
       "filename": "src/homepilot/app_state.py",
@@ -1261,38 +1712,18 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'vault'",
-      "line_number": 126,
+      "line_number": 134,
       "line_range": [
-        126
+        134
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "137                         else:\n138                             pve_token_source = \"env\"\n139                             logger.warning(\n",
+      "code": "145                         else:\n146                             pve_token_source = \"env\"\n147                             logger.warning(\n",
       "col_offset": 47,
       "end_col_offset": 52,
-      "filename": "src/homepilot/app_state.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 259,
-        "link": "https://cwe.mitre.org/data/definitions/259.html"
-      },
-      "issue_severity": "LOW",
-      "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 138,
-      "line_range": [
-        138
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
-      "test_id": "B105",
-      "test_name": "hardcoded_password_string"
-    },
-    {
-      "code": "145                 if _validate_pve_token(env_token):\n146                     pve_token_source = \"env\"\n147                     logger.warning(\"PVE_API_TOKEN via env var \u2014 use vault for better security\")\n",
-      "col_offset": 39,
-      "end_col_offset": 44,
       "filename": "src/homepilot/app_state.py",
       "issue_confidence": "MEDIUM",
       "issue_cwe": {
@@ -1310,7 +1741,27 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "149             if token:\n150                 write_token = \"\"\n151                 if vault:\n",
+      "code": "153                 if _validate_pve_token(env_token):\n154                     pve_token_source = \"env\"\n155                     logger.warning(\"PVE_API_TOKEN via env var \u2014 use vault for better security\")\n",
+      "col_offset": 39,
+      "end_col_offset": 44,
+      "filename": "src/homepilot/app_state.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: 'env'",
+      "line_number": 154,
+      "line_range": [
+        154
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
+    },
+    {
+      "code": "157             if token:\n158                 write_token = \"\"\n159                 if vault:\n",
       "col_offset": 30,
       "end_col_offset": 32,
       "filename": "src/homepilot/app_state.py",
@@ -1321,16 +1772,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 150,
+      "line_number": 158,
       "line_range": [
-        150
+        158
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "173 \n174     webhook_secret_source = \"\"\n175     if vault:\n",
+      "code": "181 \n182     webhook_secret_source = \"\"\n183     if vault:\n",
       "col_offset": 28,
       "end_col_offset": 30,
       "filename": "src/homepilot/app_state.py",
@@ -1341,16 +1792,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 174,
+      "line_number": 182,
       "line_range": [
-        174
+        182
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "182                 settings.events_webhook_secret = secret_val\n183                 webhook_secret_source = \"vault\"  # pragma: allowlist secret\n184         except (_VaultErrorWebhook, OSError):\n",
+      "code": "190                 settings.events_webhook_secret = secret_val\n191                 webhook_secret_source = \"vault\"  # pragma: allowlist secret\n192         except (_VaultErrorWebhook, OSError):\n",
       "col_offset": 40,
       "end_col_offset": 47,
       "filename": "src/homepilot/app_state.py",
@@ -1361,16 +1812,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'vault'",
-      "line_number": 183,
+      "line_number": 191,
       "line_range": [
-        183
+        191
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "189     if not webhook_secret_source and os.environ.get(\"HP_EVENTS_WEBHOOK_SECRET\"):\n190         webhook_secret_source = \"env\"  # pragma: allowlist secret\n191         logger.warning(\"HP_EVENTS_WEBHOOK_SECRET via env var \u2014 use vault for better security\")\n",
+      "code": "197     if not webhook_secret_source and os.environ.get(\"HP_EVENTS_WEBHOOK_SECRET\"):\n198         webhook_secret_source = \"env\"  # pragma: allowlist secret\n199         logger.warning(\"HP_EVENTS_WEBHOOK_SECRET via env var \u2014 use vault for better security\")\n",
       "col_offset": 32,
       "end_col_offset": 37,
       "filename": "src/homepilot/app_state.py",
@@ -1381,16 +1832,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'env'",
-      "line_number": 190,
+      "line_number": 198,
       "line_range": [
-        190
+        198
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "225         \"/proc\",\n226         \"/tmp\",\n227     )\n228     if not str(data_dir_resolved).startswith(\"/home\"):\n229         protected_paths = (*protected_paths, \"/home\")\n230     for blocked in protected_paths:\n231         if str(artifacts_dir) == blocked or str(artifacts_dir).startswith(blocked + \"/\"):\n232             raise ValueError(f\"artifacts_dir ({artifacts_dir}) points to a protected path\")\n233     if not str(artifacts_dir).startswith(str(data_dir_resolved)):\n234         raise ValueError(\n235             f\"artifacts_dir ({artifacts_dir}) is outside data_dir ({data_dir_resolved})\"\n236         )\n",
+      "code": "233         \"/proc\",\n234         \"/tmp\",\n235     )\n236     if not str(data_dir_resolved).startswith(\"/home\"):\n237         protected_paths = (*protected_paths, \"/home\")\n238     for blocked in protected_paths:\n239         if str(artifacts_dir) == blocked or str(artifacts_dir).startswith(blocked + \"/\"):\n240             raise ValueError(f\"artifacts_dir ({artifacts_dir}) points to a protected path\")\n241     if not str(artifacts_dir).startswith(str(data_dir_resolved)):\n242         raise ValueError(\n243             f\"artifacts_dir ({artifacts_dir}) is outside data_dir ({data_dir_resolved})\"\n244         )\n",
       "col_offset": 8,
       "end_col_offset": 14,
       "filename": "src/homepilot/app_state.py",
@@ -1401,25 +1852,25 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Probable insecure usage of temp file/directory.",
-      "line_number": 226,
+      "line_number": 234,
       "line_range": [
-        218,
-        219,
-        220,
-        221,
-        222,
-        223,
-        224,
-        225,
         226,
-        227
+        227,
+        228,
+        229,
+        230,
+        231,
+        232,
+        233,
+        234,
+        235
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b108_hardcoded_tmp_directory.html",
       "test_id": "B108",
       "test_name": "hardcoded_tmp_directory"
     },
     {
-      "code": "26 \n27 _COOKIE_HP_TOKEN = \"hp_token\"\n28 _COOKIE_HP_CSRF = \"hp_csrf\"\n",
+      "code": "25 \n26 _COOKIE_HP_TOKEN = \"hp_token\"\n27 _COOKIE_HP_CSRF = \"hp_csrf\"\n",
       "col_offset": 19,
       "end_col_offset": 29,
       "filename": "src/homepilot/auth/router.py",
@@ -1430,16 +1881,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'hp_token'",
-      "line_number": 27,
+      "line_number": 26,
       "line_range": [
-        27
+        26
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "257         user_id=user_id,\n258         token_type=\"personal\",\n259         prefix=prefix,\n260         hash=token_hash,\n261         scope=body.scope,\n262         label=body.label,\n263         expires_at=None,\n264     )\n265     await db.db.conn.commit()\n266     return {\"token\": full_token, \"scope\": body.scope}\n267 \n",
+      "code": "295         user_id=user_id,\n296         token_type=\"personal\",\n297         prefix=prefix,\n298         hash=token_hash,\n299         scope=body.scope,\n300         label=body.label,\n301         expires_at=None,\n302     )\n303     await db.db.conn.commit()\n304     return {\"token\": full_token, \"scope\": body.scope}\n305 \n",
       "col_offset": 10,
       "end_col_offset": 5,
       "filename": "src/homepilot/auth/router.py",
@@ -1450,24 +1901,52 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 258,
+      "line_number": 296,
       "line_range": [
-        256,
-        257,
-        258,
-        259,
-        260,
-        261,
-        262,
-        263,
-        264
+        294,
+        295,
+        296,
+        297,
+        298,
+        299,
+        300,
+        301,
+        302
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
       "test_id": "B106",
       "test_name": "hardcoded_password_funcarg"
     },
     {
-      "code": "174             user_id=str(user_id),\n175             token_type=\"personal\",\n176             prefix=token_prefix,\n177             hash=token_hash,\n178             scope=\"read,write\",\n179             expires_at=None,\n180         )\n181         await database.conn.commit()\n182         await database.close()\n183 \n",
+      "code": "195             user_id=user_id,\n196             token_type=\"personal\",\n197             prefix=prefix,\n198             hash=token_hash,\n199             scope=_ADMIN_SCOPE,\n200             label=body.label,\n201             expires_at=None,\n202         )\n203         await claims.record_minted_token(prefix)\n204     except Exception:\n205         # Releasing the latch leaves the instance claimable, which is the point.\n",
+      "col_offset": 14,
+      "end_col_offset": 9,
+      "filename": "src/homepilot/claim/router.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: 'personal'",
+      "line_number": 196,
+      "line_range": [
+        194,
+        195,
+        196,
+        197,
+        198,
+        199,
+        200,
+        201,
+        202
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
+      "test_id": "B106",
+      "test_name": "hardcoded_password_funcarg"
+    },
+    {
+      "code": "229             user_id=str(user_id),\n230             token_type=\"personal\",\n231             prefix=token_prefix,\n232             hash=token_hash,\n233             scope=\"read,write\",\n234             expires_at=None,\n235         )\n236         await database.conn.commit()\n237         await database.close()\n238 \n",
       "col_offset": 14,
       "end_col_offset": 9,
       "filename": "src/homepilot/cli/main.py",
@@ -1478,23 +1957,23 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 175,
+      "line_number": 230,
       "line_range": [
-        173,
-        174,
-        175,
-        176,
-        177,
-        178,
-        179,
-        180
+        228,
+        229,
+        230,
+        231,
+        232,
+        233,
+        234,
+        235
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
       "test_id": "B106",
       "test_name": "hardcoded_password_funcarg"
     },
     {
-      "code": "264     transport: str = typer.Option(\"stdio\", \"--transport\", help=\"Transport: stdio or http\"),\n265     host: str = typer.Option(\"0.0.0.0\", \"--host\", help=\"Bind host (http only)\"),\n266     port: int = typer.Option(8000, \"--port\", help=\"Bind port (http only)\"),\n",
+      "code": "379     transport: str = typer.Option(\"stdio\", \"--transport\", help=\"Transport: stdio or http\"),\n380     host: str = typer.Option(\"0.0.0.0\", \"--host\", help=\"Bind host (http only)\"),\n381     port: int = typer.Option(8000, \"--port\", help=\"Bind port (http only)\"),\n",
       "col_offset": 29,
       "end_col_offset": 38,
       "filename": "src/homepilot/cli/main.py",
@@ -1505,18 +1984,18 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 265,
+      "line_number": 380,
       "line_range": [
-        265
+        380
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "688         readme = (\n689             \"# HomePilot Export\\n\\n\"\n690             f\"Generated: {datetime.now(UTC).isoformat()}\\n\\n\"\n691             \"## Contents\\n\\n\"\n692             \"- `artifacts/` \u2014 Git repo of artifact Markdown files\\n\"\n693             \"- `homepilot.db` \u2014 SQLite database (inventory, KB, journal)\\n\\n\"\n694             \"## How to read without HomePilot\\n\\n\"\n695             \"- Artifacts: Markdown files in `artifacts/YYYY/MM/<id>.md`\\n\"\n696             '- Database: `sqlite3 homepilot.db \"SELECT * FROM hosts;\"`\\n'\n697         )\n",
-      "col_offset": 12,
-      "end_col_offset": 25,
+      "code": "841     return (\n842         \"# HomePilot Export\\n\\n\"\n843         f\"Generated: {datetime.now(UTC).isoformat()}\\n\\n\"\n844         \"## Contents\\n\\n\"\n845         \"- `manifest.json` - archive schema, versions, whether secrets are present\\n\"\n846         \"- `artifacts/` - Git repo of artifact Markdown files\\n\"\n847         \"- `homepilot.db` - SQLite snapshot taken with VACUUM INTO (no -wal/-shm)\\n\"\n848         f\"{secrets_section}\"\n849         \"\\n## Restore\\n\\n\"\n850         \"Stop the backend, then `hp import <tarball>`\\n\"\n851         \"(add `--restore-secrets` to put the vault back).\\n\\n\"\n852         \"## How to read without HomePilot\\n\\n\"\n853         \"- Artifacts: Markdown files in `artifacts/YYYY/MM/<id>.md`\\n\"\n854         '- Database: `sqlite3 homepilot.db \"SELECT * FROM hosts;\"`\\n'\n855         \"- Embeddings are not exported: run `hp kb reindex` after a restore\\n\"\n856     )\n",
+      "col_offset": 8,
+      "end_col_offset": 21,
       "filename": "src/homepilot/cli/main.py",
       "issue_confidence": "LOW",
       "issue_cwe": {
@@ -1525,23 +2004,29 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 689,
+      "line_number": 842,
       "line_range": [
-        689,
-        690,
-        691,
-        692,
-        693,
-        694,
-        695,
-        696
+        842,
+        843,
+        844,
+        845,
+        846,
+        847,
+        848,
+        849,
+        850,
+        851,
+        852,
+        853,
+        854,
+        855
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1045                 user_id=str(user_id),\n1046                 token_type=\"personal\",\n1047                 prefix=prefix,\n1048                 hash=token_hash,\n1049                 scope=scope,\n1050                 expires_at=None,\n1051             )\n1052             await database.conn.commit()\n1053             await database.close()\n1054         except OperationalError as exc:\n",
+      "code": "1499                 user_id=str(user_id),\n1500                 token_type=\"personal\",\n1501                 prefix=prefix,\n1502                 hash=token_hash,\n1503                 scope=scope,\n1504                 expires_at=None,\n1505             )\n1506             await database.conn.commit()\n1507             await database.close()\n1508         except OperationalError as exc:\n",
       "col_offset": 18,
       "end_col_offset": 13,
       "filename": "src/homepilot/cli/main.py",
@@ -1552,23 +2037,23 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'personal'",
-      "line_number": 1046,
+      "line_number": 1500,
       "line_range": [
-        1044,
-        1045,
-        1046,
-        1047,
-        1048,
-        1049,
-        1050,
-        1051
+        1498,
+        1499,
+        1500,
+        1501,
+        1502,
+        1503,
+        1504,
+        1505
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b106_hardcoded_password_funcarg.html",
       "test_id": "B106",
       "test_name": "hardcoded_password_funcarg"
     },
     {
-      "code": "1296 \n1297                 token = \"\"\n1298                 import os as _os\n",
+      "code": "1903 \n1904                 token = \"\"\n1905                 import os as _os\n",
       "col_offset": 24,
       "end_col_offset": 26,
       "filename": "src/homepilot/cli/main.py",
@@ -1579,36 +2064,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: ''",
-      "line_number": 1297,
+      "line_number": 1904,
       "line_range": [
-        1297
+        1904
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "71 \n72     daemon_host: str = Field(default=\"0.0.0.0\", validation_alias=\"HP_HOST\")\n73     daemon_port: int = Field(default=8000, validation_alias=\"HP_PORT\")\n",
-      "col_offset": 37,
-      "end_col_offset": 46,
-      "filename": "src/homepilot/config.py",
-      "issue_confidence": "MEDIUM",
-      "issue_cwe": {
-        "id": 605,
-        "link": "https://cwe.mitre.org/data/definitions/605.html"
-      },
-      "issue_severity": "MEDIUM",
-      "issue_text": "Possible binding to all interfaces.",
-      "line_number": 72,
-      "line_range": [
-        72
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
-      "test_id": "B104",
-      "test_name": "hardcoded_bind_all_interfaces"
-    },
-    {
-      "code": "75     agent_hub_enabled: bool = False\n76     agent_hub_host: str = \"0.0.0.0\"\n77     agent_hub_port: int = 8443\n",
+      "code": "83     agent_hub_enabled: bool = True\n84     agent_hub_host: str = \"0.0.0.0\"\n85     agent_hub_port: int = 8443\n",
       "col_offset": 26,
       "end_col_offset": 35,
       "filename": "src/homepilot/config.py",
@@ -1619,16 +2084,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 76,
+      "line_number": 84,
       "line_range": [
-        76
+        84
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "189         await self.db.execute(\n190             f\"INSERT INTO api_tokens ({col_names}) VALUES ({placeholders})\",\n191             vals,\n",
+      "code": "192         await self.db.execute(\n193             f\"INSERT INTO api_tokens ({col_names}) VALUES ({placeholders})\",\n194             vals,\n",
       "col_offset": 14,
       "end_col_offset": 38,
       "filename": "src/homepilot/db/repository.py",
@@ -1639,16 +2104,36 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 190,
+      "line_number": 193,
       "line_range": [
-        190
+        193
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "325         params.extend([limit, offset])\n326         rows = await self.db.fetchall(f\"SELECT * FROM hosts{where} LIMIT ? OFFSET ?\", params)\n327         return [dict(r) for r in rows]\n",
+      "code": "472         rows = await self.db.fetchall(\n473             f\"SELECT * FROM agent_audit{where} ORDER BY id DESC LIMIT ?\",\n474             params,\n",
+      "col_offset": 14,
+      "end_col_offset": 39,
+      "filename": "src/homepilot/db/repository.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 473,
+      "line_range": [
+        473
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "589         params.extend([limit, offset])\n590         rows = await self.db.fetchall(f\"SELECT * FROM hosts{where} LIMIT ? OFFSET ?\", params)\n591         return [dict(r) for r in rows]\n",
       "col_offset": 40,
       "end_col_offset": 59,
       "filename": "src/homepilot/db/repository.py",
@@ -1659,16 +2144,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 326,
+      "line_number": 590,
       "line_range": [
-        326
+        590
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "345         vals = [*set_vals, now(), host_id]\n346         await self.db.execute(f\"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?\", vals)\n347 \n",
+      "code": "609         vals = [*set_vals, now(), host_id]\n610         await self.db.execute(f\"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?\", vals)\n611         await self.db.conn.commit()\n",
       "col_offset": 32,
       "end_col_offset": 49,
       "filename": "src/homepilot/db/repository.py",
@@ -1679,16 +2164,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 346,
+      "line_number": 610,
       "line_range": [
-        346
+        610
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "387         vals = [*set_vals, now(), service_id]\n388         await self.db.execute(f\"UPDATE services SET {sets}, updated_at = ? WHERE id = ?\", vals)\n389 \n",
+      "code": "654         vals = [*set_vals, now(), service_id]\n655         await self.db.execute(f\"UPDATE services SET {sets}, updated_at = ? WHERE id = ?\", vals)\n656         await self.db.conn.commit()\n",
       "col_offset": 32,
       "end_col_offset": 52,
       "filename": "src/homepilot/db/repository.py",
@@ -1699,16 +2184,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 388,
+      "line_number": 655,
       "line_range": [
-        388
+        655
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "454         rows = await self.db.fetchall(\n455             f\"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?\",\n456             params,\n",
+      "code": "724         rows = await self.db.fetchall(\n725             f\"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?\",\n726             params,\n",
       "col_offset": 14,
       "end_col_offset": 37,
       "filename": "src/homepilot/db/repository.py",
@@ -1719,16 +2204,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 455,
+      "line_number": 725,
       "line_range": [
-        455
+        725
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "481         where = (\" WHERE \" + \" AND \".join(clauses)) if clauses else \"\"\n482         row = await self.db.fetchone(f\"SELECT COUNT(*) as cnt FROM audit_log{where}\", params)\n483         return row[\"cnt\"] if row else 0\n",
+      "code": "751         where = (\" WHERE \" + \" AND \".join(clauses)) if clauses else \"\"\n752         row = await self.db.fetchone(f\"SELECT COUNT(*) as cnt FROM audit_log{where}\", params)\n753         return row[\"cnt\"] if row else 0\n",
       "col_offset": 39,
       "end_col_offset": 76,
       "filename": "src/homepilot/db/repository.py",
@@ -1739,16 +2224,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 482,
+      "line_number": 752,
       "line_range": [
-        482
+        752
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "555         rows = await self.db.fetchall(\n556             f\"SELECT * FROM artifacts{where} ORDER BY created_at DESC LIMIT ? OFFSET ?\",\n557             params,\n",
+      "code": "826         rows = await self.db.fetchall(\n827             f\"SELECT * FROM artifacts{where} ORDER BY created_at DESC LIMIT ? OFFSET ?\",\n828             params,\n",
       "col_offset": 14,
       "end_col_offset": 37,
       "filename": "src/homepilot/db/repository.py",
@@ -1759,16 +2244,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 556,
+      "line_number": 827,
       "line_range": [
-        556
+        827
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "571         vals.append(artifact_id)\n572         await self.db.execute(f\"UPDATE artifacts SET {', '.join(sets_parts)} WHERE id = ?\", vals)\n573 \n",
+      "code": "842         vals.append(artifact_id)\n843         await self.db.execute(f\"UPDATE artifacts SET {', '.join(sets_parts)} WHERE id = ?\", vals)\n844         await self.db.conn.commit()\n",
       "col_offset": 32,
       "end_col_offset": 53,
       "filename": "src/homepilot/db/repository.py",
@@ -1779,16 +2264,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 572,
+      "line_number": 843,
       "line_range": [
-        572
+        843
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "696         vals.append(doc_id)\n697         await self.db.execute(f\"UPDATE doc_metadata SET {', '.join(sets)} WHERE id = ?\", vals)\n698         await self.db.conn.commit()\n",
+      "code": "971         vals.append(doc_id)\n972         await self.db.execute(f\"UPDATE doc_metadata SET {', '.join(sets)} WHERE id = ?\", vals)\n973         await self.db.conn.commit()\n",
       "col_offset": 32,
       "end_col_offset": 56,
       "filename": "src/homepilot/db/repository.py",
@@ -1799,16 +2284,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 697,
+      "line_number": 972,
       "line_range": [
-        697
+        972
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "169         hosts = await self.repo.db.fetchall(\n170             f\"SELECT * FROM hosts{where} ORDER BY hostname LIMIT ? OFFSET ?\",\n171             params,\n",
+      "code": "211         hosts = await self.repo.db.fetchall(\n212             f\"SELECT * FROM hosts{where} ORDER BY hostname LIMIT ? OFFSET ?\",\n213             params,\n",
       "col_offset": 14,
       "end_col_offset": 33,
       "filename": "src/homepilot/inventory/service.py",
@@ -1819,16 +2304,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 170,
+      "line_number": 212,
       "line_range": [
-        170
+        212
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "381                 (\n382                     f\"SELECT * FROM hosts\"\n383                     f\"{' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''}\"\n384                 ),\n",
+      "code": "427                 (\n428                     f\"SELECT * FROM hosts\"\n429                     f\"{' WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''}\"\n430                 ),\n",
       "col_offset": 22,
       "end_col_offset": 41,
       "filename": "src/homepilot/inventory/service.py",
@@ -1839,17 +2324,37 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 382,
+      "line_number": 428,
       "line_range": [
-        382,
-        383
+        428,
+        429
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "64     rows = await repo.db.fetchall(\n65         f\"SELECT * FROM doc_metadata{where} ORDER BY embedded_at DESC LIMIT ? OFFSET ?\",\n66         params,\n",
+      "code": "70     count_row = await repo.db.fetchone(\n71         f\"SELECT COUNT(*) AS cnt FROM doc_metadata{where}\",\n72         list(params),\n",
+      "col_offset": 10,
+      "end_col_offset": 50,
+      "filename": "src/homepilot/kb/router.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 71,
+      "line_range": [
+        71
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "75     rows = await repo.db.fetchall(\n76         f\"SELECT * FROM doc_metadata{where} ORDER BY embedded_at DESC LIMIT ? OFFSET ?\",\n77         [*params, limit, offset],\n",
       "col_offset": 10,
       "end_col_offset": 36,
       "filename": "src/homepilot/kb/router.py",
@@ -1860,16 +2365,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 65,
+      "line_number": 76,
       "line_range": [
-        65
+        76
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "308         rows = await self.repo.db.fetchall(\n309             f\"SELECT * FROM doc_metadata WHERE {where} ORDER BY embedded_at DESC LIMIT ?\",\n310             params,\n",
+      "code": "329         rows = await self.repo.db.fetchall(\n330             f\"SELECT * FROM doc_metadata WHERE {where} ORDER BY embedded_at DESC LIMIT ?\",\n331             params,\n",
       "col_offset": 14,
       "end_col_offset": 47,
       "filename": "src/homepilot/kb/service.py",
@@ -1880,16 +2385,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 309,
+      "line_number": 330,
       "line_range": [
-        309
+        330
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "408 \n409 async def run_server_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n410     import uvicorn\n",
+      "code": "457 \n458 async def run_server_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n459     import uvicorn\n",
       "col_offset": 38,
       "end_col_offset": 47,
       "filename": "src/homepilot/mcp/server.py",
@@ -1900,16 +2405,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 409,
+      "line_number": 458,
       "line_range": [
-        409
+        458
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
     },
     {
-      "code": "422 \n423 def main_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n424     logging.basicConfig(level=logging.INFO, format=\"%(name)s %(levelname)s: %(message)s\")\n",
+      "code": "481 \n482 def main_http(host: str = \"0.0.0.0\", port: int = 8000) -> None:\n483     logging.basicConfig(level=logging.INFO, format=\"%(name)s %(levelname)s: %(message)s\")\n",
       "col_offset": 26,
       "end_col_offset": 35,
       "filename": "src/homepilot/mcp/server.py",
@@ -1920,13 +2425,184 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible binding to all interfaces.",
-      "line_number": 423,
+      "line_number": 482,
       "line_range": [
-        423
+        482
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b104_hardcoded_bind_all_interfaces.html",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
+    },
+    {
+      "code": "49     \"/sys/\",\n50     \"/tmp/homepilot/\",\n51     \"/home/\",\n52     \"/usr/local/bin/\",\n53 )\n54 \n55 # Secrets that are blocked regardless of prefix (some, like /etc/shadow, live\n56 # under an allowed prefix).\n57 _DENIED_READ_PATHS = (\"/etc/shadow\", \"/etc/gshadow\")\n58 _DENIED_READ_BASENAMES = (\"id_rsa\", \"id_ed25519\")\n59 _DENIED_READ_SUFFIXES = (\".key\", \".pem\")\n60 \n",
+      "col_offset": 4,
+      "end_col_offset": 21,
+      "filename": "src/homepilot/mcp/tools/system_tools.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 377,
+        "link": "https://cwe.mitre.org/data/definitions/377.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Probable insecure usage of temp file/directory.",
+      "line_number": 50,
+      "line_range": [
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b108_hardcoded_tmp_directory.html",
+      "test_id": "B108",
+      "test_name": "hardcoded_tmp_directory"
+    },
+    {
+      "code": "166         last_ok = await self.db.fetchone(\n167             f\"SELECT MAX(ts) AS t FROM metrics WHERE hostname = ? AND metric = ? \"\n168             f\"AND ts >= ? AND NOT (value {op} ?)\",\n169             (hostname, metric, since_ts, threshold),\n",
+      "col_offset": 14,
+      "end_col_offset": 41,
+      "filename": "src/homepilot/metrics/repository.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 167,
+      "line_range": [
+        167,
+        168
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "172         start = await self.db.fetchone(\n173             f\"SELECT MIN(ts) AS t FROM metrics WHERE hostname = ? AND metric = ? \"\n174             f\"AND ts >= ? AND value {op} ?\",\n175             (hostname, metric, floor_ts, threshold),\n",
+      "col_offset": 14,
+      "end_col_offset": 36,
+      "filename": "src/homepilot/metrics/repository.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 173,
+      "line_range": [
+        173,
+        174
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "228         rule = await self.get_rule(rule_id)\n229         assert rule is not None\n230         return rule\n",
+      "col_offset": 8,
+      "end_col_offset": 31,
+      "filename": "src/homepilot/metrics/repository.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Use of assert detected. The enclosed code will be removed when compiling to optimised byte code.",
+      "line_number": 229,
+      "line_range": [
+        229
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b101_assert_used.html",
+      "test_id": "B101",
+      "test_name": "assert_used"
+    },
+    {
+      "code": "115     rule = await repo.get_rule(rule_id)\n116     assert rule is not None\n117     return rule\n",
+      "col_offset": 4,
+      "end_col_offset": 27,
+      "filename": "src/homepilot/metrics/router.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 703,
+        "link": "https://cwe.mitre.org/data/definitions/703.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Use of assert detected. The enclosed code will be removed when compiling to optimised byte code.",
+      "line_number": 116,
+      "line_range": [
+        116
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b101_assert_used.html",
+      "test_id": "B101",
+      "test_name": "assert_used"
+    },
+    {
+      "code": "120         return await self.db.fetchone(\n121             f\"SELECT {_LIST_COLUMNS} FROM invites WHERE token_prefix = ?\", (prefix,)\n122         )\n",
+      "col_offset": 14,
+      "end_col_offset": 21,
+      "filename": "src/homepilot/portal/repository.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 121,
+      "line_range": [
+        121
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "125         return await self.db.fetchall(\n126             f\"SELECT {_LIST_COLUMNS} FROM invites ORDER BY created_at DESC\"\n127         )\n",
+      "col_offset": 14,
+      "end_col_offset": 21,
+      "filename": "src/homepilot/portal/repository.py",
+      "issue_confidence": "LOW",
+      "issue_cwe": {
+        "id": 89,
+        "link": "https://cwe.mitre.org/data/definitions/89.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Possible SQL injection vector through string-based query construction.",
+      "line_number": 126,
+      "line_range": [
+        126
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
+      "code": "13 # names belong to the operator's existing vhost and are therefore configurable).\n14 PROXY_SECRET_HEADER = \"x-hp-portal-secret\"\n15 \n",
+      "col_offset": 22,
+      "end_col_offset": 42,
+      "filename": "src/homepilot/portal/trust.py",
+      "issue_confidence": "MEDIUM",
+      "issue_cwe": {
+        "id": 259,
+        "link": "https://cwe.mitre.org/data/definitions/259.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Possible hardcoded password: 'x-hp-portal-secret'",
+      "line_number": 14,
+      "line_range": [
+        14
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
+      "test_id": "B105",
+      "test_name": "hardcoded_password_string"
     }
   ]
 }

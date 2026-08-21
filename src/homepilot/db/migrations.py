@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import sqlite3
+from pathlib import Path
 
 from .connection import Database
+
+logger = logging.getLogger(__name__)
 
 MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
     1: [
@@ -340,7 +344,328 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     ],
+    15: [
+        # Provision-from-template (#442 stage 1). Two independent changes:
+        #
+        # 1. tasks: admit the 'provision' action and make artifact_id NULLABLE.
+        #    A provision task has no artifact — it creates infrastructure rather
+        #    than applying authored intent — and it must stay OUT of the
+        #    artifact-scoped dedup/active-task queries, which a NULL artifact_id
+        #    guarantees (`WHERE artifact_id = ?` never matches NULL). Same
+        #    rebuild dance as migration 14 (CHECK constraints and column
+        #    nullability are not ALTERable in SQLite): rename → recreate → copy
+        #    → drop → recreate the indexes AFTER the drop, because the old
+        #    indexes ride the rename and only vanish with the old table.
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT, "
+            "action TEXT NOT NULL "
+            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        # 2. hosts.owner: who asked for this guest. Recorded at provision time
+        #    and never derived from Proxmox, so an inventory refresh cannot
+        #    overwrite it.
+        ("ALTER TABLE hosts ADD COLUMN owner TEXT", "hosts", "owner"),
+    ],
+    16: [
+        # Invite-based self-service provisioning (#442 stage 2).
+        #
+        # The token is NEVER stored: only its 16-char prefix (the lookup key) and
+        # the sha256 of the whole token, exactly as api_tokens does — a database
+        # copy must not let anyone redeem an invite.
+        #
+        # bound_cn is the client-certificate CN the invite is minted FOR. It is
+        # the whole point of the binding: the portal refuses a redemption whose
+        # proxy-asserted CN differs, so a leaked URL is useless without the cert.
+        #
+        # The caps columns (template_vmid .. ipconfig0) are chosen by the OPERATOR
+        # at mint time and are the only values that ever reach ProvisionService.
+        # Nothing the redeemer submits can widen them.
+        #
+        # redeemed_at is the single-use latch: redemption claims the row with
+        # `UPDATE ... WHERE redeemed_at IS NULL` and trusts rowcount, so two
+        # simultaneous posts can never both provision.
+        """CREATE TABLE IF NOT EXISTS invites (
+            id                TEXT PRIMARY KEY,
+            token_prefix      TEXT NOT NULL,
+            token_hash        TEXT NOT NULL,
+            bound_cn          TEXT NOT NULL,
+            template_vmid     INTEGER NOT NULL,
+            node              TEXT NOT NULL,
+            pool              TEXT,
+            cores             INTEGER,
+            memory_mb         INTEGER,
+            disk_gb           INTEGER,
+            disk              TEXT NOT NULL DEFAULT 'scsi0',
+            ipconfig0         TEXT NOT NULL DEFAULT 'ip=dhcp',
+            expires_at        TEXT NOT NULL,
+            created_by        TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            redeemed_at       TEXT,
+            redeemed_cn       TEXT,
+            resulting_host_id TEXT,
+            resulting_task_id TEXT,
+            revoked_at        TEXT
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_invites_prefix ON invites(token_prefix)",
+        "CREATE INDEX IF NOT EXISTS idx_invites_expires ON invites(expires_at)",
+    ],
+    17: [
+        # First-run claim (#458 S1). ONE row, ever: `CHECK (id = 1)` makes a
+        # second instance-claim row impossible at the storage layer rather than
+        # by convention, so no query has to pick "the right" row.
+        #
+        # A dedicated table rather than a settings key/value row because the
+        # single-use latch is a conditional UPDATE whose rowcount is the whole
+        # guarantee (`WHERE id = 1 AND claimed_at IS NULL`, the invites.claim
+        # pattern). Packing four fields into settings.value as JSON would make
+        # that latch a read-modify-write, which two simultaneous POSTs both win.
+        #
+        # code_hash is the sha256 of the WHOLE code (auth/tokens.py scheme); the
+        # code itself is never stored here. code_prefix is for log correlation
+        # only - with a single row there is nothing to look up by.
+        """CREATE TABLE IF NOT EXISTS instance_claim (
+            id                  INTEGER PRIMARY KEY CHECK (id = 1),
+            code_prefix         TEXT NOT NULL,
+            code_hash           TEXT NOT NULL,
+            created_at          TEXT NOT NULL,
+            claimed_at          TEXT,
+            claimed_label       TEXT,
+            minted_token_prefix TEXT
+        )""",
+    ],
+    18: [
+        # Zero-touch agent rollout (#458 S4): the tasks CHECK constraint must
+        # admit the 'install_agent' action. Artifactless like 'provision' - it
+        # enrols a host rather than applying authored intent - so it relies on
+        # the same NULL artifact_id to stay out of the artifact-scoped
+        # dedup/active-task queries.
+        #
+        # Same rebuild dance as migrations 14 and 15 (a CHECK constraint is not
+        # ALTERable in SQLite): rename -> recreate -> copy -> drop -> recreate
+        # the indexes AFTER the drop, because the old indexes ride the rename
+        # and only vanish with the old table.
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT, "
+            "action TEXT NOT NULL "
+            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    ],
+    19: [
+        # Native metrics (#458 S5, ADR-004). Raw samples only - NO rollups: the
+        # ADR says measure a week of real data before deciding whether they earn
+        # their complexity.
+        #
+        # WITHOUT ROWID with PRIMARY KEY (hostname, metric, ts) is the whole
+        # storage design. One b-tree holds the data in exactly the order the
+        # only read pattern wants ("this host, this metric, this window"), so
+        # that query is a range scan over a key prefix and never touches another
+        # host's rows. A rowid table would need the same three columns duplicated
+        # into a secondary index PLUS a rowid b-tree - roughly double the bytes
+        # for the same answer. The PK doubles as the dedupe key: a re-sent batch
+        # (the agent re-sends anything the hub did not ack) is an INSERT OR
+        # REPLACE onto the same key, not a duplicate point.
+        #
+        # The series is keyed by HOSTNAME, not agent_id: a reinstalled agent gets
+        # a new agent_id but is the same machine, and an operator asking "what did
+        # this host do last night" means the machine. agent_id is recorded as a
+        # plain column so the reporter is still known.
+        """CREATE TABLE IF NOT EXISTS metrics (
+            hostname  TEXT NOT NULL,
+            metric    TEXT NOT NULL,
+            ts        INTEGER NOT NULL,
+            value     REAL NOT NULL,
+            agent_id  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (hostname, metric, ts)
+        ) WITHOUT ROWID""",
+        # Retention prunes by AGE across every series, which the PK cannot serve
+        # (ts is its last column). Without this the hourly pruner is a full scan
+        # of the whole table.
+        "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
+        # Alert rules. `for_seconds` is the point of the feature: a rule fires
+        # only when its condition held for that whole span, so a single spike
+        # cannot page anyone.
+        """CREATE TABLE IF NOT EXISTS alert_rules (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            host_filter  TEXT NOT NULL DEFAULT '*',
+            metric       TEXT NOT NULL,
+            comparison   TEXT NOT NULL,
+            threshold    REAL NOT NULL,
+            for_seconds  INTEGER NOT NULL DEFAULT 300,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled)",
+        # One row per (rule, host) the rule has ever evaluated. firing_since is
+        # the latch: NULL means not firing, a timestamp means "firing since".
+        # It is what makes a fire notify ONCE rather than every evaluation, and
+        # what lets a recovery be detected at all.
+        """CREATE TABLE IF NOT EXISTS alert_state (
+            rule_id      TEXT NOT NULL,
+            hostname     TEXT NOT NULL,
+            firing_since TEXT,
+            last_value   REAL,
+            last_eval    TEXT NOT NULL,
+            PRIMARY KEY (rule_id, hostname)
+        )""",
+    ],
 }
+
+
+_SCHEMA_VERSION_UPSERT = (
+    "INSERT INTO settings (key, value, updated_at) "
+    "VALUES ('schema_version', ?, ?) "
+    "ON CONFLICT(key) DO UPDATE SET "
+    "value=excluded.value, updated_at=excluded.updated_at"
+)
+
+
+def _is_memory_db(db_path: str) -> bool:
+    return db_path == ":memory:" or "mode=memory" in db_path
+
+
+async def _backup_before_migration(db: Database, current_version: int) -> Path | None:
+    """Back the database up before any DDL runs.
+
+    Fail closed: without a restorable copy the migration must not start, because
+    there is no way back from a partially applied schema (#420).
+
+    Returns None when there is provably nothing to lose: an in-memory database,
+    or a database with no user tables at all (a fresh install, and every test
+    that builds its own). Note this is decided on the TABLES, not on the version
+    being 0 - a legacy database predating the schema_version row also reports 0
+    and very much has data to protect.
+    """
+    if _is_memory_db(db.db_path):
+        return None
+    row = await db.fetchone(
+        "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type = 'table' "
+        "AND name NOT LIKE 'sqlite_%'"
+    )
+    if row is not None and int(row["cnt"]) == 0:
+        return None
+
+    backup_path = Path(db.db_path).parent / "backups" / f"pre-migration-v{current_version}.db"
+    try:
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        # sqlite backup API, never a file copy: copying a live WAL database
+        # file-by-file yields a torn snapshot (#421).
+        target = sqlite3.connect(str(backup_path), check_same_thread=False)
+        try:
+            await db.conn.backup(target)
+        finally:
+            target.close()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Pre-migration backup to {backup_path} failed: {exc}. "
+            "Migrations aborted - the database is unchanged."
+        ) from exc
+
+    logger.info("Pre-migration backup written: %s", backup_path)
+    return backup_path
+
+
+async def _apply_statement(db: Database, entry: str | tuple[str, str, str]) -> None:
+    if isinstance(entry, tuple):
+        sql, table, column = entry
+        cols = await db.fetchall(f"PRAGMA table_info({table})")
+        col_names = [c["name"] for c in cols]
+        if column in col_names:
+            logger.info("Skipping ALTER TABLE — column %s.%s already exists", table, column)
+            return
+        await db.execute(sql)
+        return
+
+    try:
+        await db.execute(entry)
+    except Exception as exc:
+        # Only a re-run of an idempotent ADD COLUMN is survivable. Every other
+        # ALTER failure - a RENAME above all - must abort the version, or the
+        # database is left half-migrated with the version not bumped (#420).
+        if "duplicate column name" not in str(exc).lower():
+            raise
+        logger.warning("Skipping ALTER TABLE - column already exists: %s", entry.strip())
+
+
+async def _apply_version(db: Database, version: int, backup_path: Path | None) -> None:
+    """Apply one version's statements and its schema_version bump in one transaction."""
+    # The driver may hold an implicit transaction from earlier DML; BEGIN inside
+    # one is an error, so close it first.
+    await db.conn.commit()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        for entry in MIGRATIONS[version]:
+            await _apply_statement(db, entry)
+        ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        await db.execute(_SCHEMA_VERSION_UPSERT, (str(version), ts))
+    except Exception as exc:
+        rolled_back = True
+        try:
+            await db.execute("ROLLBACK")
+        except Exception as rollback_exc:
+            rolled_back = False
+            logger.error(
+                "ROLLBACK after failed migration to version %d failed: %s",
+                version,
+                rollback_exc,
+            )
+        # Restoring the backup is only the right move when the rollback itself
+        # failed - after a clean rollback the database is intact at the prior
+        # version and a plain retry (with the migration fixed) is correct;
+        # restoring would needlessly rewind versions committed earlier this run.
+        if rolled_back:
+            raise RuntimeError(
+                f"Migration to schema version {version} failed and was rolled back "
+                f"(database intact at version {version - 1}): {exc}. "
+                "Fix the cause and restart - no restore needed."
+            ) from exc
+        recovery = (
+            f" Restore the pre-migration backup {backup_path} before retrying."
+            if backup_path is not None
+            else ""
+        )
+        raise RuntimeError(
+            f"Migration to schema version {version} failed AND could not be rolled "
+            f"back - the database may be inconsistent.{recovery}"
+        ) from exc
+    await db.execute("COMMIT")
 
 
 async def run_migrations(db: Database) -> None:
@@ -351,47 +676,17 @@ async def run_migrations(db: Database) -> None:
         current_version = 0
 
     target_version = max(MIGRATIONS.keys())
-    if current_version >= target_version:
+    if current_version > target_version:
+        raise RuntimeError(
+            f"Database schema version {current_version} is newer than this build supports "
+            f"(version {target_version}). No down-migrations exist: to run this build, restore "
+            f"the database backup matching schema version {target_version} "
+            "(<data_dir>/backups/pre-migration-v<version>.db)."
+        )
+    if current_version == target_version:
         return
 
+    backup_path = await _backup_before_migration(db, current_version)
+
     for version in range(current_version + 1, target_version + 1):
-        for entry in MIGRATIONS[version]:
-            if isinstance(entry, tuple):
-                sql, table, column = entry
-                cols = await db.fetchall(f"PRAGMA table_info({table})")
-                col_names = [c["name"] for c in cols]
-                if column in col_names:
-                    logging.getLogger(__name__).info(
-                        "Skipping ALTER TABLE — column %s.%s already exists",
-                        table,
-                        column,
-                    )
-                    continue
-                await db.execute(sql)
-            else:
-                sql = entry
-                try:
-                    await db.execute(sql)
-                except Exception:  # re-raised if not ALTER TABLE
-                    sql_stripped = sql.strip().upper()
-                    if sql_stripped.startswith("ALTER TABLE"):
-                        logging.getLogger(__name__).warning(
-                            "Skipping ALTER TABLE (column may exist): %s",
-                            sql.strip(),
-                        )
-                    else:
-                        raise
-
-    import datetime
-
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    await db.execute(
-        (
-            "INSERT INTO settings (key, value, updated_at) "
-            "VALUES ('schema_version', ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET "
-            "value=excluded.value, updated_at=excluded.updated_at"
-        ),
-        (str(target_version), ts),
-    )
-    await db.conn.commit()
+        await _apply_version(db, version, backup_path)

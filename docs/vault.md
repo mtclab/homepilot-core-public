@@ -36,6 +36,7 @@ When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the sy
 ```python
 # src/homepilot/config.py — Settings._auto_generate_passphrase()
 
+
 def _auto_generate_passphrase(self, secrets_mod, logger):
     passphrase_path = Path(self.data_dir) / ".vault_passphrase"
     if passphrase_path.exists():
@@ -119,6 +120,8 @@ HP_AUTO_APPLY_ENABLED=true
 HP_INVENTORY_INTERVAL_SECONDS=300
 HP_RATE_LIMIT=60
 HP_CORS_ORIGINS=*
+# Empty by default (KB search is then keyword-only). Set it only when you
+# actually run an embedding service — here, the LLM overlay's llm-embed.
 HP_EMBEDDING_SERVICE_URL=http://llm-embed:8081/v1/embeddings
 HP_EMBEDDING_MODEL=bge-m3
 

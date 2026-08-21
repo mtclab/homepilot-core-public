@@ -115,7 +115,14 @@ class ArtifactExecutor:
 
         if result.success:
             await self.lifecycle.mark_applied(artifact_id, result.execution_log)
-            await self.lifecycle._log_audit("apply", artifact_id, approved_by)
+            # The single actor-bearing record of this apply. The snapshot id rides
+            # here because it is what an operator needs to undo the change.
+            await self.lifecycle._log_audit(
+                "apply",
+                artifact_id,
+                approved_by,
+                {"snapshot_id": snapshot_id} if snapshot_id else None,
+            )
         else:
             await self.lifecycle.mark_failed(
                 artifact_id, result.failure_reason or "unknown", result.execution_log

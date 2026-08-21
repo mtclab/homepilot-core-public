@@ -1,5 +1,112 @@
 # Changelog
 
+## v2.8.0 (2026-08-20)
+
+The zero-touch install (ADR-004): a fresh HomePilot is claimed from a browser
+and finished with a Proxmox address and token, and nothing else. Monitoring
+moves in-product, the agent hub configures its own TLS, and agents are enrolled
+from the UI instead of by hand on each host.
+
+### REQUIRED READING BEFORE UPGRADING
+
+**Your existing fleet keeps working, and that is deliberate.** 2.8.0 turns the
+agent hub's TLS on by default, but only for installs that have never had an
+agent. An install that already has enrolled agents keeps serving the transport
+those agents speak, records that decision once, and says so in the log. Flipping
+it under a live fleet would strand every agent: they read `HP_AGENT_TLS` from
+`/etc/homepilot/agent.env`, written once at enrolment, so even upgrading the
+agent binary would not have saved them (#468).
+
+To move an existing fleet onto TLS, use the new migration rather than editing
+any host:
+
+```
+curl -sS -H "authorization: Bearer $HP_ADMIN_TOKEN" http://<hp>:8000/agents/migrate-tls   # preview
+curl -sS -X POST -H "authorization: Bearer $HP_ADMIN_TOKEN" \
+     -H 'content-type: application/json' -d '{}' http://<hp>:8000/agents/migrate-tls
+```
+
+It refuses, naming names, if an enrolled agent is offline and would be stranded;
+`{"force": true}` overrides. Restart the backend afterwards to serve TLS.
+
+**If your `.env` sets `HP_AGENT_HUB_TLS=false`**, the hub still refuses to serve
+plaintext on a routable bind — but the control plane now starts anyway, with the
+hub disabled and the reason reported at `GET /admin/selfcheck`. Before 2.8.0 that
+configuration exited the process outright.
+
+### Added
+
+- **First-run claim (#458 S1+S2).** A fresh instance is claimable from a browser
+  with nothing to type on a local network, and a printed claim code when it is
+  reached from outside. No `hp init`, no copying a token out of container logs.
+  The same screen takes the Proxmox address and token and verifies them live.
+  The vault passphrase and secret key generate and persist themselves.
+- **The agent hub configures itself (#458 S3).** On by default, with a
+  self-signed certificate generated on first boot and pinned by the agent at
+  enrolment. Closes #454.
+- **Agent rollout from the UI (#458 S4).** Enrolling an agent into a guest is a
+  host action driven through qemu-guest-agent, verified by the agent appearing in
+  the hub registry rather than by an exit code.
+- **Native metrics, and Zabbix retires (#458 S5).** CPU, memory, disk and load
+  over the existing hub channel with a 7-day retention window, duration-based
+  alert rules with recovery, and sparklines in the UI. Storage is measured, not
+  guessed: 6.26 MB per agent per week. The hardcoded `/zabbix` proxy block,
+  `HP_ZABBIX_URL` and the deep-links are gone.
+- **Fleet TLS migration (#468).** The hub pushes its certificate to every
+  connected agent over the channel it already has, so "enable TLS" never means
+  visiting a host. `GET/POST /agents/migrate-tls`.
+- **A startup self-check (#458 S6).** `GET /admin/selfcheck` reports every
+  optional subsystem as `off` / `ok` / `unreachable` / `unknown` with the
+  consequence in plain words. "Off" and "configured but unreachable" are separate
+  states because they call for opposite actions.
+- **Self-service guest provisioning (#442).** A Proxmox template is cloned,
+  cloud-init configured, resized and started as a HomePilot task, with an
+  invite-based portal behind a client-certificate vhost.
+- **Design tokens and the estate type voice in the web UI (#445 lane B1).**
+
+### Fixed
+
+- **P0: a failed migration bricked the backend permanently (#420).** Migrations
+  are now per-version transactional with a pre-migration backup taken through the
+  sqlite backup API.
+- **P0: the backup was not a backup (#421).** It omitted the vault, so a restore
+  left every secret undecryptable, and a live-WAL copy could be torn; import left
+  the old `-wal` in place and could corrupt the restored database.
+- **P0: drift verification issued real mutating HTTP requests (#419).** An
+  http-sequence step without a precheck had the verifier executing its own
+  DELETE/POST, unattended, every 1800 seconds.
+- **P0: `--privileged` could not work on the shipped systemd unit (#422).**
+  Phase B provisioning was undeliverable on a stock install.
+- **P0: every successful apply reported failure to the operator (#467).** The
+  executor and the task runner each performed the same transition, so a correct
+  apply ended with `Invalid transition: applied → applied` and a `failed` task.
+- **P0: an upgrade either stranded the fleet or refused to boot (#468).**
+- **The dashboard overstated connected agents (#469).** It counted a persisted
+  column that survives an unclean disconnect, while `/agents/` read the live
+  registry — so it was most wrong right after a restart, when an operator checks
+  the fleet came back.
+- **The liveness probe failed the whole instance over one unhappy subsystem
+  (#470).** A locked vault, an unreachable Proxmox or a disabled hub made a
+  serving HomePilot answer 503, marking the container unhealthy over something no
+  restart repairs. Only the database failing means `down` now; everything else is
+  `degraded` with HTTP 200 and still named in the check map.
+- **Web: an inert API-base setting, an endless cancelled-task poller, ungated
+  write actions and SSE refetch storms (#434).** Every KB document is reachable
+  and the count is true (#447).
+- **Host roles no longer revert to `guest` after an inventory refresh (#416).**
+- A secret leak in the embedding client, which logged a configured URL complete
+  with any `user:pass@` or `?key=` it carried.
+
+### Changed
+
+- **Honest defaults (#458 S6).** `HP_EMBEDDING_SERVICE_URL` and
+  `HP_EMBEDDING_FALLBACK_URL` no longer point at hosts a stock install does not
+  run. An optional service either works out of the box or is off and says so.
+- **fastapi is pinned below 0.137 (#472).** That release stopped flattening
+  `include_router`, which took the startup route scope guard from inspecting 81
+  routes to 5 while still reporting no problems. Dependencies are otherwise
+  current, including cryptography 50.
+
 ## v2.7.1 (2026-08-16)
 
 ### Fixed

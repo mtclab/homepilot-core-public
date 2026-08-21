@@ -166,6 +166,31 @@ class TestCanonicalization:
         assert canonical_bytes(PINNED_FRAME) == PINNED_CANON
         assert compute_mac(PINNED_KEY, PINNED_FRAME) == PINNED_HEX
 
+    def test_metrics_frame_vector_matches_go(self):
+        """The metrics frame carries a LIST OF OBJECTS - the first frame shape
+        that does - and objects nested in a list must canonicalise with sorted
+        keys on both sides.
+
+        Go emits a map's keys sorted but a STRUCT's fields in declaration order,
+        so an agent that put structs on the wire would fail this MAC on every
+        single metrics frame and lose the connection. `agent/go/metrics_test.go`
+        pins the same string from the Go side; change one and the other goes red.
+        """
+        frame = {
+            "action": "metrics",
+            "request_id": "r-1",
+            "seq": 1,
+            "samples": [
+                {"metric": "load.1m", "value": 0.42, "clock": 1700000000},
+                {"metric": "cpu.count", "value": 8, "clock": 1700000000},
+            ],
+        }
+        assert canonical_bytes(frame) == (
+            b'{"action":"metrics","request_id":"r-1","samples":'
+            b'[{"clock":1700000000,"metric":"load.1m","value":0.42},'
+            b'{"clock":1700000000,"metric":"cpu.count","value":8}],"seq":1}'
+        )
+
     def test_mac_field_excluded(self):
         with_mac = {"a": 1, "mac": "whatever"}
         without = {"a": 1}

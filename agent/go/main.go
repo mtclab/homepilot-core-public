@@ -1,9 +1,9 @@
 // hp-agent — HomePilot managed-host agent (Go port of hp_agent).
 //
 // Connects outbound to the HomePilot agent hub over a persistent TCP connection
-// (length-prefixed JSON framing), registers, and serves exec / file-ops /
-// zabbix-push requests with command + path allowlists. Pure stdlib; builds as a
-// static binary (CGO_ENABLED=0) for amd64 + arm64.
+// (length-prefixed JSON framing), registers, serves exec / file-ops requests
+// with command + path allowlists, and reports system metrics on an interval.
+// Pure stdlib; builds as a static binary (CGO_ENABLED=0) for amd64 + arm64.
 package main
 
 import (
@@ -25,6 +25,14 @@ type Agent struct {
 
 	conn    net.Conn
 	writeMu sync.Mutex
+	// connGen identifies the LIVE connection. Per-connection loops capture it and
+	// send through sendOn, so a loop that has not noticed the drop yet cannot
+	// write onto the socket that replaced it. Read and written under writeMu.
+	connGen uint64
+
+	// Bounded FIFO of metric samples awaiting delivery. Lives on the Agent, not
+	// on a connection, so a hub restart delays the series instead of holing it.
+	metrics *metricBuffer
 
 	// usingFileToken is true while cfg.AuthToken is the durable token loaded from
 	// (or persisted to) HP_AGENT_TOKEN_FILE, rather than the env enrollment
@@ -51,9 +59,33 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// errStaleConn is returned by sendOn when the caller's connection has already
+// been replaced. It is an expected outcome during a reconnect, not a fault.
+var errStaleConn = fmt.Errorf("connection replaced")
+
 func (a *Agent) send(m msg) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
+	return a.sendLocked(m)
+}
+
+// sendOn writes m only while gen is still the live connection.
+//
+// Without this a loop belonging to a dropped connection could stamp the NEXT
+// connection's sequence number onto a stale frame: the hub verifies sequences
+// fail-closed, so the frame would look like a replay and cost the agent the
+// connection it had just established.
+func (a *Agent) sendOn(gen uint64, m msg) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	if a.connGen != gen {
+		return errStaleConn
+	}
+	return a.sendLocked(m)
+}
+
+// sendLocked is the write path; the caller must hold writeMu.
+func (a *Agent) sendLocked(m msg) error {
 	// On a replay-protected connection, stamp a monotonic seq + MAC under the
 	// write lock so the on-wire order matches the assigned sequence.
 	if a.replayOn {
@@ -106,9 +138,22 @@ func (a *Agent) connect() error {
 	if err != nil {
 		return err
 	}
+	// Publish the socket and its generation together under the write lock, so a
+	// sender from the previous connection can never observe the new socket with
+	// the old generation.
+	a.writeMu.Lock()
 	a.conn = conn
+	a.connGen++
+	a.writeMu.Unlock()
 	log.Printf("connecting to hub at %s%s", addr, label)
 	return nil
+}
+
+// currentGen reports the live connection generation.
+func (a *Agent) currentGen() uint64 {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return a.connGen
 }
 
 func (a *Agent) register() error {
@@ -283,7 +328,7 @@ func (a *Agent) closeConn() {
 	}
 }
 
-func (a *Agent) heartbeatLoop(done <-chan struct{}) {
+func (a *Agent) heartbeatLoop(done <-chan struct{}, gen uint64) {
 	t := time.NewTicker(time.Duration(a.cfg.HeartbeatInterval) * time.Second)
 	defer t.Stop()
 	for {
@@ -291,31 +336,8 @@ func (a *Agent) heartbeatLoop(done <-chan struct{}) {
 		case <-done:
 			return
 		case <-t.C:
-			if err := a.send(msg{"action": "heartbeat", "request_id": newUUID()}); err != nil {
+			if err := a.sendOn(gen, msg{"action": "heartbeat", "request_id": newUUID()}); err != nil {
 				return
-			}
-		}
-	}
-}
-
-func (a *Agent) zabbixLoop(done <-chan struct{}) {
-	if !a.cfg.ZabbixEnabled {
-		return
-	}
-	host := a.cfg.ZabbixHostname
-	if host == "" {
-		host = hostnameOrUnknown()
-	}
-	t := time.NewTicker(time.Duration(a.cfg.ZabbixInterval) * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-done:
-			return
-		case <-t.C:
-			items := systemInfoToMetrics(host, collectSystemInfo())
-			if _, ok := zabbixSend(a.cfg.ZabbixServer, a.cfg.ZabbixPort, items); !ok {
-				log.Printf("zabbix metrics send failed")
 			}
 		}
 	}
@@ -325,8 +347,12 @@ func (a *Agent) zabbixLoop(done <-chan struct{}) {
 func (a *Agent) serve() error {
 	done := make(chan struct{})
 	defer close(done)
-	go a.heartbeatLoop(done)
-	go a.zabbixLoop(done)
+	// Metrics acks are routed from this read loop to the metrics loop, which
+	// drops a batch from the buffer only once the hub has confirmed it.
+	acks := make(chan string, 4)
+	gen := a.currentGen()
+	go a.heartbeatLoop(done, gen)
+	go a.metricsLoop(done, acks, gen)
 
 	for {
 		_ = a.conn.SetReadDeadline(time.Now().Add(300 * time.Second))
@@ -355,8 +381,14 @@ func (a *Agent) serve() error {
 			a.handleManageService(m, reqID)
 		case "write_config":
 			a.handleWriteConfig(m, reqID)
-		case "zabbix_push":
-			a.handleZabbixPush(m, reqID)
+		case "set_transport":
+			a.handleSetTransport(m, reqID)
+		case "metrics_ack":
+			// Non-blocking: a late/duplicate ack must never stall the read loop.
+			select {
+			case acks <- reqID:
+			default:
+			}
 		default:
 			// Acks (heartbeat_ack/result_ack/register_ack) and anything else:
 			// drain + ignore (don't ping-pong the hub with errors).
@@ -400,7 +432,8 @@ func (a *Agent) handleWriteFile(m msg, reqID string) {
 // returns a structured {changed, detail} result (or an error frame). The
 // existing send() path stamps replay framing.
 func (a *Agent) handleInstallPackage(m msg, reqID string) {
-	res, err := installPackage(a.exec.Exec, a.exec.allow.privileged, str(m, "name"))
+	res, err := installPackage(a.exec.Exec, a.exec.allow.privileged,
+		a.exec.allow.allowPackageInstall, str(m, "name"))
 	a.sendProvisionResult(res, err, reqID)
 }
 
@@ -431,24 +464,72 @@ func (a *Agent) sendProvisionResult(res provisionResult, err error, reqID string
 	})
 }
 
-func (a *Agent) handleZabbixPush(m msg, reqID string) {
-	if !a.cfg.ZabbixEnabled {
-		_ = a.send(msg{"error": "zabbix not configured", "request_id": reqID})
+// handleSetTransport applies a transport the hub pushed - today, "move to TLS
+// and here is my certificate's fingerprint" (#468).
+//
+// This exists because the alternative is editing /etc/homepilot/agent.env on
+// every managed host: the TLS env vars are written once at enrolment and
+// nothing rewrites them, so a hub that turned on TLS stranded its whole fleet
+// with no way back through the channel that just closed.
+//
+// Order matters. The pin is PARSED BEFORE ANYTHING IS PERSISTED OR ACKED,
+// because a stored pin that cannot be parsed is unrecoverable in exactly the
+// way this feature is meant to prevent: the agent would refuse every handshake
+// with the hub it needs in order to be fixed. A rejected push leaves the agent
+// on its current, working transport and tells the hub why.
+func (a *Agent) handleSetTransport(m msg, reqID string) {
+	wantTLS, _ := m["tls"].(bool)
+	pin := str(m, "pin")
+
+	if !wantTLS {
+		// Only the plaintext -> TLS direction is supported. Accepting the reverse
+		// would let anyone who reached the channel talk a fleet back down onto
+		// plaintext, which is a downgrade attack with extra steps.
+		_ = a.send(msg{
+			"action": "command_result", "request_id": reqID,
+			"error": "set_transport: only enabling TLS is supported",
+		})
 		return
 	}
-	host := a.cfg.ZabbixHostname
-	if host == "" {
-		host = hostnameOrUnknown()
+	if _, err := parsePin(pin); err != nil {
+		_ = a.send(msg{
+			"action": "command_result", "request_id": reqID,
+			"error": fmt.Sprintf("set_transport: unusable pin, keeping current transport: %v", err),
+		})
+		return
 	}
-	items := systemInfoToMetrics(host, collectSystemInfo())
-	sent, ok := zabbixSend(a.cfg.ZabbixServer, a.cfg.ZabbixPort, items)
+
+	if err := writeTransportFile(a.cfg.TransportFile, persistedTransport{TLS: true, Pin: pin}); err != nil {
+		_ = a.send(msg{
+			"action": "command_result", "request_id": reqID,
+			"error": fmt.Sprintf("set_transport: could not persist to %s: %v", a.cfg.TransportFile, err),
+		})
+		return
+	}
+
+	// Ack on the CURRENT connection before dropping it: the hub counts acks to
+	// decide when the fleet is ready for the listener to flip, and an ack sent
+	// after the reconnect would arrive on a socket the hub is not waiting on.
 	_ = a.send(msg{
-		"action": "zabbix_push_result", "metrics_sent": sent,
-		"zabbix_ok": ok, "request_id": reqID,
+		"action": "command_result", "status": "ok", "request_id": reqID,
+		"transport": "tls", "persisted_to": a.cfg.TransportFile,
 	})
+
+	a.cfg.TLS = true
+	if a.cfg.TLSPin == "" {
+		a.cfg.TLSPin = pin
+	}
+	log.Printf("hub pushed a TLS transport (persisted to %s); reconnecting", a.cfg.TransportFile)
+	// Dropping the socket returns serve(), and run() redials - now over TLS.
+	// Nothing here restarts the process, so a pushed transport survives without
+	// systemd's help and applies immediately.
+	a.closeConn()
 }
 
 func (a *Agent) run() {
+	// One sampler for the process: metrics keep being collected across
+	// reconnects, which is what makes the buffer worth having.
+	go a.samplerLoop(nil)
 	for {
 		a.connectWithRetry()
 		err := a.serve()
@@ -461,21 +542,35 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 	log.SetPrefix("[hp-agent] ")
 	cfg := ConfigFromEnv()
+	// Fail closed, at startup, loudly: an agent that was TOLD to be privileged but
+	// cannot do privileged work must say so now, not fail opaquely on the first
+	// hub request hours later (#422).
+	report, err := preflight(cfg, os.Geteuid(), writeAllowedPrefixes())
+	for _, line := range report {
+		log.Print(line)
+	}
+	if err != nil {
+		log.Printf("FATAL: %v", err)
+		os.Exit(1)
+	}
 	agent := &Agent{
-		cfg:  cfg,
-		exec: Executor{allow: Allowlist{privileged: cfg.Privileged}},
+		cfg: cfg,
+		exec: Executor{allow: Allowlist{
+			privileged:          cfg.Privileged,
+			allowPackageInstall: cfg.AllowPackageInstall,
+		}},
 		// A STABLE id across restarts: HP_AGENT_ID, else the persisted id file,
 		// else a freshly generated id that is written to that file.
 		agentID:        resolveAgentID(cfg.AgentID, cfg.AgentIDFile),
 		hasPerAgent:    cfg.HasPersistedToken,
 		usingFileToken: cfg.HasPersistedToken,
+		metrics:        newMetricBuffer(cfg.MetricsBuffer),
 	}
-	if cfg.ZabbixEnabled {
-		host := cfg.ZabbixHostname
-		if host == "" {
-			host = hostnameOrUnknown()
-		}
-		log.Printf("Zabbix trapper enabled: %s:%d as %s", cfg.ZabbixServer, cfg.ZabbixPort, host)
+	if cfg.MetricsEnabled {
+		log.Printf("metrics enabled: every %ds, buffering up to %d samples while offline",
+			cfg.MetricsInterval, cfg.MetricsBuffer)
+	} else {
+		log.Printf("metrics DISABLED (HP_AGENT_METRICS_ENABLED=false) - this host reports no metrics")
 	}
 	agent.run()
 }

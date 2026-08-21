@@ -12,12 +12,33 @@
 #   --token TOKEN     Hub auth token or one-time bootstrap token. Required to enroll.
 #   --version TAG     Release tag (e.g. v2.3.7). Default: latest.
 #   --tls             Connect to the hub over TLS.
-#   --privileged      Allow privileged commands (default: safe allowlist only).
+#   --tls-pin FP      sha256 fingerprint of the hub certificate (as shown by the
+#                     UI / GET /agents/token). Implies --tls. The hub's
+#                     certificate is self-signed, so this pin is what the agent
+#                     verifies the hub against; without it a self-signed hub
+#                     cannot be verified at all.
+#   --privileged      Grant privileged commands + provisioning. Installs the agent
+#                     as a ROOT systemd unit whose writable paths are exactly the
+#                     write prefixes below. Default: unprivileged.
+#   --allow-package-install
+#                     Additionally grant apt/apt-get. Implies --privileged and
+#                     REMOVES the unit's filesystem write boundary (a package
+#                     unpacks into /usr, /etc, /var), leaving the command
+#                     allowlist as the only containment. Opt in deliberately.
+#   --write-prefix P  Grant writes under P (repeatable). Replaces the default
+#                     prefix set; /etc/homepilot is always included.
 #   --no-start        Install the unit but do not start it.
 #
 # The agent is purely env-configured and runs as a systemd service. This script
 # writes /etc/homepilot/agent.env with the connection settings and installs the
 # hp-agent.service unit pointing at it.
+#
+# SECURITY (#422): the unit and the agent's own configuration MUST agree. A unit
+# with ProtectSystem=strict + ReadWritePaths=/etc/homepilot cannot honour
+# HP_AGENT_PRIVILEGED=true — the agent would accept provisioning requests it can
+# never carry out. This script therefore derives User=, ProtectSystem= and
+# ReadWritePaths= from the SAME grant decision it writes into agent.env, and the
+# agent refuses to start if the two ever drift apart.
 
 set -euo pipefail
 
@@ -27,7 +48,10 @@ INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 HUB="${HUB:-}"
 TOKEN="${TOKEN:-}"
 USE_TLS="${USE_TLS:-false}"
+TLS_PIN="${TLS_PIN:-}"
 PRIVILEGED="${PRIVILEGED:-false}"
+ALLOW_PACKAGE_INSTALL="${ALLOW_PACKAGE_INSTALL:-false}"
+WRITE_PREFIXES="${WRITE_PREFIXES:-}"
 START=1
 
 # ─── Parse flags (the UI passes --hub / --token) ───
@@ -37,11 +61,117 @@ while [ $# -gt 0 ]; do
         --token)      TOKEN="$2"; shift 2 ;;
         --version)    VERSION="$2"; shift 2 ;;
         --tls)        USE_TLS="true"; shift ;;
+        --tls-pin)    TLS_PIN="$2"; USE_TLS="true"; shift 2 ;;
         --privileged) PRIVILEGED="true"; shift ;;
+        --allow-package-install)
+                      PRIVILEGED="true"; ALLOW_PACKAGE_INSTALL="true"; shift ;;
+        --write-prefix) WRITE_PREFIXES="$WRITE_PREFIXES $2"; shift 2 ;;
         --no-start)   START=0; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# >>> grant block (executed verbatim by agent/go/unit_matrix_test.go)
+# Default write-prefix sets. The privileged set MUST stay in lockstep with
+# defaultWritePrefixes in agent/go/fileops.go — the matrix test fails if the two
+# drift, or if the generated unit does not make every one of them writable.
+DEFAULT_PRIVILEGED_PREFIXES="/etc/homepilot /opt/homepilot /tmp/homepilot /etc/systemd/system /etc/docker /etc/nginx"
+# Unprivileged agents get HomePilot's OWN directories only. The system config
+# dirs above all require root, so offering them to a non-root agent would only
+# reproduce the "granted but impossible" bug at file-write granularity.
+DEFAULT_UNPRIVILEGED_PREFIXES="/etc/homepilot /opt/homepilot /tmp/homepilot"
+
+if [ -z "$WRITE_PREFIXES" ]; then
+    if [ "$PRIVILEGED" = "true" ]; then
+        WRITE_PREFIXES="$DEFAULT_PRIVILEGED_PREFIXES"
+    else
+        WRITE_PREFIXES="$DEFAULT_UNPRIVILEGED_PREFIXES"
+    fi
+fi
+
+# Validate in the CURRENT shell (a pipeline subshell could not abort the install)
+# and then normalise: absolute paths only, no trailing slash, deduplicated, and
+# /etc/homepilot always present (the agent persists its id + token there).
+for p in $WRITE_PREFIXES; do
+    case "$p" in
+        /*) ;;
+        *) echo "Write prefix must be an absolute path: $p" >&2; exit 1 ;;
+    esac
+    case "$p" in
+        *..*) echo "Write prefix must not contain '..': $p" >&2; exit 1 ;;
+    esac
+    if [ "$(printf '%s' "$p" | sed 's:/*$::')" = "" ]; then
+        echo "Write prefix '/' is not allowed (grant the directories you need)" >&2
+        exit 1
+    fi
+done
+WRITE_PREFIXES=$(printf '%s' "/etc/homepilot $WRITE_PREFIXES" | tr ' ' '\n' \
+    | sed 's:/*$::' | grep -v '^$' | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/ *$//')
+WRITE_PREFIXES_ENV=$(printf '%s' "$WRITE_PREFIXES" | tr ' ' ':')
+# <<< end grant block
+
+# ─── Tell the operator exactly what this install grants ───
+print_grant_summary() {
+    echo ""
+    if [ "$PRIVILEGED" != "true" ]; then
+        echo "=== Grant: UNPRIVILEGED (default) ==="
+        echo "  runs as        : hp-agent (non-root systemd unit)"
+        echo "  commands       : read-only allowlist only (cat, ls, ps, df, free, ip,"
+        echo "                   ss, systemctl status/is-active, journalctl, dpkg -l, docker ps)"
+        echo "  writable paths : $WRITE_PREFIXES"
+        echo "  provisioning   : install_package / manage_service / write_config are REFUSED"
+        return
+    fi
+    echo "=== Grant: PRIVILEGED — this host gives hp-agent ROOT ==="
+    echo "  runs as        : root (systemd unit hp-agent.service)"
+    echo "  writable paths : $WRITE_PREFIXES"
+    echo "  commands granted (each still argument-checked by the agent allowlist):"
+    echo "    - systemctl        start|stop|restart|enable|disable|daemon-reload <unit>"
+    echo "    - docker-run       docker run <image>"
+    echo "    - docker-pull      docker pull <image>"
+    echo "    - docker-compose-up  docker compose [-f FILE] up|down"
+    echo "    - docker-stop      docker stop|rm|restart <container>"
+    echo "    - mkdir            mkdir -p <path>       (contained by the writable paths)"
+    echo "    - chmod            chmod <mode> <path>   (contained by the writable paths)"
+    echo "    - cp               cp <src> <dst>        (contained by the writable paths)"
+    echo "    - mv               mv <src> <dst>        (contained by the writable paths)"
+    echo "    - bash             bash /opt/homepilot/<name>.sh"
+    if [ "$ALLOW_PACKAGE_INSTALL" = "true" ]; then
+        echo "    - apt-get / apt    install|update|upgrade -y <packages>   ** GRANTED **"
+        echo ""
+        echo "  !! Package management writes across the whole filesystem, so this unit is"
+        echo "  !! installed with ProtectSystem=no: the filesystem write boundary is OFF and"
+        echo "  !! the command allowlist is the only containment left."
+    else
+        echo "    - apt-get / apt    NOT granted (add --allow-package-install)"
+    fi
+    echo ""
+    echo "  Boundary note: ProtectSystem=strict + ReadWritePaths confines the AGENT's own"
+    echo "  writes. It does not confine what systemd, docker or a package's maintainer"
+    echo "  scripts do once the agent asks them to act."
+}
+
+# The pin is written verbatim into agent.env, so only hex (with an optional
+# "sha256:" prefix and optional colons) is accepted - nothing that could carry a
+# newline and inject another variable into that file.
+if [ -n "$TLS_PIN" ]; then
+    case "$TLS_PIN" in
+        sha256:*) PIN_HEX="${TLS_PIN#sha256:}" ;;
+        *)        PIN_HEX="$TLS_PIN" ;;
+    esac
+    PIN_HEX=$(printf '%s' "$PIN_HEX" | tr -d ':')
+    if ! printf '%s' "$PIN_HEX" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+        echo "--tls-pin must be a sha256 fingerprint (64 hex chars): $TLS_PIN" >&2
+        exit 1
+    fi
+    TLS_PIN="sha256:$PIN_HEX"
+fi
+
+if [ "$USE_TLS" = "true" ] && [ -z "$TLS_PIN" ]; then
+    echo "NOTE: --tls without --tls-pin. The agent will verify the hub against the"
+    echo "      system trust store, which a self-signed hub certificate cannot satisfy."
+    echo "      Use the --tls-pin value the UI shows beside the token."
+fi
 
 # Strip an accidental scheme and split HOST:PORT.
 HUB="${HUB#http://}"; HUB="${HUB#https://}"
@@ -142,7 +272,10 @@ HP_AGENT_TOKEN_FILE=$CONF_DIR/agent.token
 HP_AGENT_ID=$AGENT_ID
 HP_AGENT_ID_FILE=$CONF_DIR/agent.id
 HP_AGENT_TLS=$USE_TLS
+HP_AGENT_TLS_PIN=${TLS_PIN:-}
 HP_AGENT_PRIVILEGED=$PRIVILEGED
+HP_AGENT_ALLOW_PACKAGE_INSTALL=$ALLOW_PACKAGE_INSTALL
+HP_AGENT_WRITE_PREFIXES=$WRITE_PREFIXES_ENV
 HP_AGENT_LOG_LEVEL=INFO
 EOF
 $SUDO chmod 600 "$CONF_DIR/agent.env"
@@ -150,10 +283,85 @@ $SUDO chmod 600 "$CONF_DIR/agent.env"
 # The agent persists the durable token it's handed at enrollment to agent.token,
 # so it reconnects across hub restarts even if enrolled with a one-time bootstrap.
 # agent.id keeps the identity that token is bound to stable across restarts.
-$SUDO chown -R hp-agent:hp-agent "$CONF_DIR" 2>/dev/null || true
+
+# ─── Create the HomePilot-owned write prefixes and set ownership ───
+# systemd tolerates a missing ReadWritePaths entry only with a "-" prefix (used
+# below), but HomePilot's own directories should exist from install time. A
+# privileged agent runs as root, so root owns them; an unprivileged agent must be
+# able to write its own directories, so hp-agent owns them.
+if [ "$PRIVILEGED" = "true" ]; then
+    OWNER="root:root"
+else
+    OWNER="hp-agent:hp-agent"
+fi
+for p in $WRITE_PREFIXES; do
+    case "$p" in
+        /etc/homepilot|/opt/homepilot|/tmp/homepilot)
+            $SUDO mkdir -p "$p"
+            $SUDO chmod 750 "$p"
+            $SUDO chown -R "$OWNER" "$p" 2>/dev/null || true
+            ;;
+    esac
+done
+$SUDO chown -R "$OWNER" "$CONF_DIR" 2>/dev/null || true
 
 # ─── Install the systemd unit ───
-$SUDO tee /etc/systemd/system/hp-agent.service >/dev/null <<'EOF'
+# UNIT_PATH is overridable so the unit block below can be rendered into a sandbox
+# by agent/go/unit_matrix_test.go; production always uses the default.
+UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/hp-agent.service}"
+
+# >>> systemd-unit block (rendered verbatim by agent/go/unit_matrix_test.go)
+# The unit is DERIVED from the same grant decision written into agent.env, so the
+# two cannot drift (#422):
+#
+#   unprivileged  -> User=hp-agent, ProtectSystem=strict, ReadWritePaths = the
+#                    HomePilot-owned prefixes. Nothing privileged is granted, so
+#                    nothing privileged can silently fail.
+#   privileged    -> User=root (a root unit, NOT hp-agent + sudo: sudo cannot
+#                    escalate under NoNewPrivileges, a sudoers rule broad enough
+#                    for apt/systemctl is root anyway, and a sudo'd child stays in
+#                    THIS unit's mount namespace so it would still hit EROFS).
+#                    ProtectSystem=strict keeps the write boundary real, and
+#                    ReadWritePaths lists exactly the granted prefixes — which is
+#                    what confines the path-unconstrained mkdir/chmod/cp/mv and
+#                    `bash /opt/homepilot/*.sh` entries.
+#   + package installs -> ProtectSystem=no, because dpkg unpacks into /usr, /etc
+#                    and /var. This is the one grant that removes the filesystem
+#                    boundary, which is why it is a separate flag.
+if [ "$PRIVILEGED" = "true" ]; then
+    RUN_USER="root"
+    RUN_GROUP="root"
+    if [ "$ALLOW_PACKAGE_INSTALL" = "true" ]; then
+        PROTECT_SYSTEM="no"
+    else
+        PROTECT_SYSTEM="strict"
+    fi
+    # Left empty for privileged installs: apt/dpkg maintainer scripts and the
+    # docker CLI need capabilities and syscalls a bounding set would strip.
+    EXTRA_HARDENING=""
+else
+    RUN_USER="hp-agent"
+    RUN_GROUP="hp-agent"
+    PROTECT_SYSTEM="strict"
+    # An unprivileged agent only runs read-only probes, so it can take the full
+    # lockdown: no capabilities at all, no new privileges to gain, no device
+    # nodes, no W^X mappings, and a service syscall filter.
+    EXTRA_HARDENING="CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM"
+fi
+# "-" prefix: tolerate a prefix that does not exist yet (e.g. /etc/nginx before
+# nginx is installed) instead of refusing to start the unit.
+RW_PATHS=""
+for p in $WRITE_PREFIXES; do
+    RW_PATHS="$RW_PATHS -$p"
+done
+RW_PATHS="${RW_PATHS# }"
+
+$SUDO tee "$UNIT_PATH" >/dev/null <<EOF
 [Unit]
 Description=HomePilot Agent
 After=network-online.target
@@ -163,21 +371,41 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-User=hp-agent
-Group=hp-agent
-EnvironmentFile=/etc/homepilot/agent.env
-ExecStart=/usr/local/bin/hp-agent
+User=$RUN_USER
+Group=$RUN_GROUP
+EnvironmentFile=$CONF_DIR/agent.env
+ExecStart=$INSTALL_DIR/hp-agent
 Restart=always
 RestartSec=5
+
+# Containment. ReadWritePaths MUST match HP_AGENT_WRITE_PREFIXES in agent.env —
+# the agent refuses to start in privileged mode if any of them is not writable.
 NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/etc/homepilot
+ProtectSystem=$PROTECT_SYSTEM
+ReadWritePaths=$RW_PATHS
 ProtectHome=yes
-PrivateTmp=yes
+# PrivateTmp=no on purpose: /tmp/homepilot is a granted write prefix, and a
+# private /tmp would make writes there invisible to the host (and to any unit the
+# agent then asks systemd to start) while still reporting success.
+PrivateTmp=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+$EXTRA_HARDENING
 
 [Install]
 WantedBy=multi-user.target
 EOF
+# <<< end systemd-unit block
+
+print_grant_summary
 
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable hp-agent >/dev/null 2>&1 || true

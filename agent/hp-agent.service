@@ -1,33 +1,52 @@
+# Reference copy of the UNPRIVILEGED hp-agent unit.
+#
+# scripts/install-agent.sh is the source of truth: it derives User=,
+# ProtectSystem= and ReadWritePaths= from the grant it writes into
+# /etc/homepilot/agent.env, so the unit and the agent's configuration cannot
+# drift (#422). Install with that script rather than copying this file.
+#
+# A PRIVILEGED agent needs a DIFFERENT unit (User=root, ReadWritePaths covering
+# every granted write prefix). Setting HP_AGENT_PRIVILEGED=true under this unit
+# is a misconfiguration: the agent detects it at startup and refuses to run.
+
 [Unit]
 Description=HomePilot Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 User=hp-agent
 Group=hp-agent
-Environment=HP_AGENT_HUB_HOST=%H
-Environment=HP_AGENT_HUB_PORT=8443
-Environment=HP_AGENT_AUTH_TOKEN=%h/.hp/agent-token
-Environment=HP_AGENT_LOG_LEVEL=INFO
+EnvironmentFile=/etc/homepilot/agent.env
 ExecStart=/usr/local/bin/hp-agent
 Restart=always
 RestartSec=5
-StartLimitBurst=3
-StartLimitIntervalSec=60
 
-# Security hardening
-NoNewPrivileges=no
+# Containment. ReadWritePaths MUST match HP_AGENT_WRITE_PREFIXES in agent.env.
+NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/etc/homepilot /opt/homepilot /tmp/homepilot /var/log/homepilot
-PrivateTmp=yes
+ReadWritePaths=-/etc/homepilot -/opt/homepilot -/tmp/homepilot
+ProtectHome=yes
+PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
 RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
 LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

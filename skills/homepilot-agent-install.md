@@ -87,6 +87,9 @@ docker compose exec backend hp agent list
 | "Unauthorized" on enroll | Token mismatch | Verify `HP_AGENT_HUB_AUTH_TOKEN` matches the token passed to `--token` |
 | Agent not in UI list | Enrollment incomplete | Run `hp-agent enroll` again, check logs with `hp-agent start --verbose` |
 | Agent disconnects after reboot | No systemd service | Run `hp-agent service install` and `systemctl enable hp-agent` |
+| Agent exits with `FATAL: HP_AGENT_PRIVILEGED is set but the agent is running as euid N` | Privileged grant on a non-root unit (the pre-#422 install) | Re-run `scripts/install-agent.sh --hub ... --token ... --privileged` to regenerate a root unit, or remove `HP_AGENT_PRIVILEGED` from `/etc/homepilot/agent.env` |
+| Agent exits naming write prefixes that are "NOT WRITABLE" | Unit's `ReadWritePaths` does not cover `HP_AGENT_WRITE_PREFIXES` | Re-run the installer with the flags you want, or narrow `HP_AGENT_WRITE_PREFIXES` |
+| `install_package` fails with "not granted on this host" | Package management is a separate opt-in | Re-run the installer with `--allow-package-install` |
 
 ## Key Files
 
@@ -102,4 +105,4 @@ docker compose exec backend hp agent list
 - **Agent connects outbound** to HomePilot on TCP 8443 — no inbound ports on managed host
 - **Protocol**: Length-prefixed JSON over TCP, encrypted with TLS
 - **Authentication**: Shared secret (`HP_AGENT_HUB_AUTH_TOKEN`) set once at enrollment
-- **Authorization**: Command allowlist — safe commands always allowed, privileged commands require `HP_AGENT_PRIVILEGED=true`
+- **Authorization**: Command allowlist — safe commands always allowed, privileged commands require `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit (`install-agent.sh --privileged`); apt/`install_package` require `--allow-package-install` on top. The unit's `ReadWritePaths` must equal `HP_AGENT_WRITE_PREFIXES`, and the agent refuses to start when it does not (#422)

@@ -133,7 +133,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "read_file_on_guest",
-        "description": "Read a file from a guest host via SFTP through the jump server.",
+        "description": "Read a file from a guest host via the connected hp-agent (agent hub).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -152,7 +152,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "exec_on_guest_readonly",
         "description": (
-            "Execute a whitelisted read-only command on a guest via SSH. "
+            "Execute an allowlisted read-only command on a guest via the connected "
+            "hp-agent (agent hub). "
             "Allowed commands: ls, ps, systemctl status, journalctl, "
             "dpkg, ip, ss, hostname, uname, df, free, uptime. "
             "For file reading, use read_file_on_guest instead (logs access)."

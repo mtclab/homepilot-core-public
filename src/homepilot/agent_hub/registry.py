@@ -44,7 +44,7 @@ class ConnectedAgent:
 
 
 class AgentRegistry:
-    def __init__(self, repo: Any = None) -> None:
+    def __init__(self, repo: Any = None, metrics_repo: Any = None) -> None:
         self._agents: dict[str, ConnectedAgent] = {}
         self._hostname_index: dict[str, str] = {}
         self.hub_server: AgentHubServer | None = None
@@ -55,6 +55,9 @@ class AgentRegistry:
         # (Agents view + coverage show last-known agents instead of flapping to
         # empty). Best-effort: never blocks or fails the hub.
         self._repo = repo
+        # Optional MetricsRepository. None in unit tests that build a bare
+        # registry; metric frames are then validated and acked but not stored.
+        self.metrics_repo = metrics_repo
 
     def _persist(self, coro: Any) -> None:
         if self._repo is None:
@@ -193,11 +196,16 @@ class AgentRegistry:
             agent.last_heartbeat = datetime.now(UTC)
 
     def update_state(self, agent_id: str, state: dict[str, Any]) -> None:
+        """Fold the agent's freshest reported values into its live state.
+
+        Called from ONE place: the metrics-frame ingest (ADR-004 S5). Metric
+        frames arrive on an interval, which is the right cadence to persist a
+        fresh heartbeat without writing on every keepalive — and, unlike the
+        removed ``report_state`` action, it is a channel the agent actually
+        uses, so the persisted ``last_heartbeat`` moves (#430)."""
         agent = self._agents.get(agent_id)
         if agent:
             agent.state.update(state)
-            # State pushes are periodic — a good cadence to persist fresh
-            # metrics + heartbeat without writing on every keepalive.
             if self._repo is not None:
                 self._persist(self._repo.touch_agent(agent_id, agent.state))
 

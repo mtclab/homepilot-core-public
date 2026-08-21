@@ -12,6 +12,8 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from ..auth.deps import require_scope
+from ..config import get_settings
+from ..selfcheck import selfcheck_report
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,24 @@ async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:
             write_token = read_token
             source = "read_token"
     return write_token, source
+
+
+@router.get("/selfcheck")
+async def selfcheck(
+    request: Request,
+    token: dict[str, Any] = _require_admin_dep,
+) -> dict[str, Any]:
+    """What each optional subsystem is doing, and what that costs (ADR-004 S6).
+
+    A SIBLING of /health rather than an extension of it, for three reasons:
+    /health is public and this report names the addresses an instance is wired
+    to; /health is the container's liveness probe every 30s and must not grow
+    outbound network probes; and /health's flat check map is a contract the UI and
+    its tests already depend on. The report is computed per request so it
+    describes now, not boot - the boot copy goes to the log.
+    """
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    return await selfcheck_report(request.app.state, settings)
 
 
 @router.get("/settings/proxmox", dependencies=[Depends(require_scope("admin"))])
@@ -344,7 +364,24 @@ async def _do_reload(request: Request) -> dict[str, Any]:
                 artifact_executor = getattr(request.app.state, "artifact_executor", None)
                 if artifact_executor is not None:
                     artifact_executor.proxmox = new_proxmox
-                request.app.state.artifact_lifecycle._executor_ref.proxmox = new_proxmox
+                provision_service = getattr(request.app.state, "provision_service", None)
+                if provision_service is not None:
+                    provision_service.proxmox = new_proxmox
+                enroll_service = getattr(request.app.state, "agent_enroll_service", None)
+                if enroll_service is not None:
+                    enroll_service.proxmox = new_proxmox
+                # `_executor_ref` defaults to None (lifecycle.py:33) and is only
+                # assigned inside main.py's `if mcp_token and state.proxmox and
+                # state.vault` block, so on a fresh install it is still None here.
+                # Assigning through it raised AttributeError -> 500 on the primary
+                # "Settings -> paste Proxmox token -> Save" flow, and it raised
+                # AFTER the client swap and version bump, so the UI reported
+                # failure on a partly-applied change (#388). Guarded like the two
+                # lookups above it.
+                lifecycle = getattr(request.app.state, "artifact_lifecycle", None)
+                executor_ref = getattr(lifecycle, "_executor_ref", None)
+                if executor_ref is not None:
+                    executor_ref.proxmox = new_proxmox
                 try:
                     from ..mcp.server import _server_context
 

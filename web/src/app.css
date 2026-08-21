@@ -2,41 +2,376 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+   HomePilot design tokens — the ONE place colour, type and spacing are decided.
+   Everything else (tailwind.config.js theme, the component classes below, the
+   route markup) references these names, never a raw palette value.
+
+   House: civic / data — deep institutional field, ONE restrained accent, serif
+   reading register. The accent is a muted copper on near-black: deliberately
+   not the stock template blue. Red / amber / green / teal are RESERVED for
+   status meaning and never used as decoration.
+
+   Type rule: serif = reading text (titles, prose, KB/journal content).
+   sans = UI chrome and data (nav, buttons, controls, table headers, numbers).
+   mono = genuinely machine-shaped values only (ids, hashes, paths, log output).
+
+   Contrast: every text/background pair below is asserted against WCAG AA by
+   src/lib/tokens.test.ts. Change a value there and the gate re-checks it.
+--------------------------------------------------------------------------- */
+:root {
+	color-scheme: dark;
+
+	/* Type voice — no downloads: every fallback ships with the OS. */
+	--font-serif: "Source Serif 4", Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
+	--font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	--font-mono: ui-monospace, "JetBrains Mono", "Fira Code", SFMono-Regular, Menlo, Consolas, monospace;
+
+	/* Field */
+	--color-bg: #100f0d;
+	--color-surface: #191714;
+	--color-surface-raised: #221f1b;
+	--color-divider: #262320;
+	--color-border: #33302a;
+	/* Control boundaries (inputs, checkboxes): >= 3:1 on bg, surface and raised. */
+	--color-border-strong: #736a5c;
+
+	/* Ink */
+	--color-text: #ded7cc;
+	--color-text-strong: #f3efe8;
+	--color-muted: #a79d90;
+
+	/* Accent — muted copper. The single non-status colour. */
+	--color-accent: #c8804f;
+	--color-accent-strong: #dc9c6f;
+	--color-accent-tint: #2c1d13;
+	--color-accent-border: #55361f;
+
+	/* Status — meaning only, never decoration. */
+	--color-ok: #74c78a;
+	--color-ok-tint: #14251a;
+	--color-ok-border: #2f5238;
+	--color-warn: #d9a441;
+	--color-warn-tint: #2a1f0d;
+	--color-warn-border: #57411c;
+	--color-danger: #ea8177;
+	--color-danger-tint: #2a1512;
+	--color-danger-border: #5a2a24;
+	--color-info: #63bdb4;
+	--color-info-tint: #10241f;
+	--color-info-border: #24493f;
+	--color-note: #a996d8;
+	--color-note-tint: #1e1a2b;
+	--color-note-border: #3a3350;
+
+	/* Solid action surfaces (dark ink on colour). */
+	--color-on-accent: #140f0a;
+	/* The primary action carries the full accent, not a dimmed version of it: at
+	   #b8703f the button read as disabled next to its own label. */
+	--color-accent-solid: #c8804f;
+	--color-accent-solid-hover: #dc9c6f;
+	--color-ok-solid: #2f6b41;
+	--color-ok-solid-hover: #37784a;
+	--color-on-ok: #f1f7f0;
+	--color-danger-solid: #8c3229;
+	--color-danger-solid-hover: #a33d33;
+	--color-on-danger: #fdeceb;
+
+	/* Categorical chart ramp — for dimensions that have NO status meaning (host
+	   role, artifact kind). Copper-anchored so charts stay in the family; the
+	   status colours above are deliberately kept out of it so a green arc never
+	   reads as "healthy" when it only means "role: worker". */
+	--chart-1: #c8804f;
+	--chart-2: #63bdb4;
+	--chart-3: #a996d8;
+	--chart-4: #d9a441;
+	--chart-5: #8fa5c4;
+	--chart-6: #a79d90;
+
+	/* Space — generous and active; calm, not cramped. */
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-5: 1.5rem;
+	--space-6: 2.5rem;
+
+	--radius-sm: 3px;
+	--radius-md: 6px;
+}
+
 @layer base {
 	* {
 		box-sizing: border-box;
 	}
-	:root {
-		color-scheme: dark;
+
+	body {
+		font-family: var(--font-sans);
+		background: var(--color-bg);
+		color: var(--color-text);
+		line-height: 1.5;
+		-webkit-font-smoothing: antialiased;
+	}
+
+	::selection {
+		background: var(--color-accent-tint);
+		color: var(--color-text-strong);
+	}
+
+	/* One visible, accent-coloured focus ring everywhere — keyboard users get the
+	   same clarity the palette gives everyone else. */
+	:focus-visible {
+		outline: 2px solid var(--color-accent);
+		outline-offset: 2px;
 	}
 }
 
 @layer components {
+	/* --- Type ------------------------------------------------------------- */
+	/* Reading text is serif. Chrome and data are sans. */
+	.page-title {
+		font-family: var(--font-serif);
+		font-size: 1.375rem;
+		font-weight: 600;
+		line-height: 1.3;
+		letter-spacing: -0.01em;
+		color: var(--color-text-strong);
+	}
+
+	.section-title {
+		font-family: var(--font-serif);
+		font-size: 0.9375rem;
+		font-weight: 600;
+		line-height: 1.4;
+		color: var(--color-text-strong);
+	}
+
+	/* Descriptions, empty states, KB/journal content — anything meant to be READ. */
+	.prose-note {
+		font-family: var(--font-serif);
+		line-height: 1.65;
+		color: var(--color-muted);
+	}
+
+	.prose-body {
+		font-family: var(--font-serif);
+		line-height: 1.65;
+		color: var(--color-text);
+	}
+
+	/* Chrome: form labels sit with the controls, so they stay sans. */
+	.field-label {
+		font-family: var(--font-sans);
+		font-size: 0.75rem;
+		color: var(--color-muted);
+	}
+
+	/* The product's name is the one place the estate's type voice should be
+	   unmistakable, so it is set in the serif, mixed case. Letterspaced caps in
+	   a generic sans is the exact template tell the identity system names. */
+	.wordmark {
+		font-family: var(--font-serif);
+		font-size: 1.0625rem;
+		font-weight: 600;
+		letter-spacing: 0;
+		color: var(--color-accent);
+	}
+
+	/* The maker's mark — quiet, muted, never louder than the utility row. */
+	.maker-mark {
+		font-family: var(--font-sans);
+		font-size: 0.6875rem;
+		color: var(--color-muted);
+		text-decoration: none;
+	}
+	.maker-mark:hover {
+		color: var(--color-text);
+	}
+
+	/* --- Data ------------------------------------------------------------- */
+	/* Tables stay dense but aligned: sans throughout, numerals tabular so
+	   columns line up down the page. */
+	.data-table {
+		width: 100%;
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums;
+	}
+	.data-table thead th {
+		text-align: left;
+		font-weight: 600;
+		color: var(--color-muted);
+		border-bottom: 1px solid var(--color-border);
+	}
+
+	/* Numbers read right-aligned and tabular wherever they are compared. */
+	.num {
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+	}
+
+	.metric {
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums;
+		font-weight: 700;
+		letter-spacing: -0.02em;
+	}
+
+	/* Machine-shaped values only: ids, hashes, paths, log output. In markup that
+	   is the `font-mono` utility (mapped to --font-mono); this is its block form. */
+	.code-block {
+		font-family: var(--font-mono);
+		background: var(--color-bg);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		padding: var(--space-3);
+		color: var(--color-text);
+		line-height: 1.55;
+	}
+
+	/* --- Badges (status meaning) ------------------------------------------ */
 	.badge {
-		@apply inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium;
+		display: inline-flex;
+		align-items: center;
+		font-family: var(--font-sans);
+		font-size: 0.6875rem;
+		font-weight: 500;
+		line-height: 1.4;
+		padding: 0.125rem var(--space-2);
+		border-radius: var(--radius-sm);
+		border: 1px solid transparent;
 	}
-	.badge-proposed   { @apply bg-sky-900 text-sky-300 border border-sky-700; }
-	.badge-approved   { @apply bg-emerald-900 text-emerald-300 border border-emerald-700; }
-	.badge-applied    { @apply bg-green-900 text-green-300 border border-green-700; }
-	.badge-rejected   { @apply bg-red-900 text-red-300 border border-red-700; }
-	.badge-revoked    { @apply bg-slate-700 text-slate-400 border border-slate-600; }
-	.badge-failed     { @apply bg-orange-900 text-orange-300 border border-orange-700; }
-	.badge-superseded { @apply bg-slate-700 text-slate-500 border border-slate-600; }
+	.badge-proposed {
+		background: var(--color-accent-tint);
+		color: var(--color-accent);
+		border-color: var(--color-accent-border);
+	}
+	.badge-approved {
+		background: var(--color-info-tint);
+		color: var(--color-info);
+		border-color: var(--color-info-border);
+	}
+	.badge-applied {
+		background: var(--color-ok-tint);
+		color: var(--color-ok);
+		border-color: var(--color-ok-border);
+	}
+	.badge-rejected {
+		background: var(--color-danger-tint);
+		color: var(--color-danger);
+		border-color: var(--color-danger-border);
+	}
+	.badge-failed {
+		background: var(--color-warn-tint);
+		color: var(--color-warn);
+		border-color: var(--color-warn-border);
+	}
+	.badge-revoked {
+		background: var(--color-surface-raised);
+		color: var(--color-text);
+		border-color: var(--color-border);
+	}
+	/* Superseded differs from revoked by more than a shade — a dashed edge, so
+	   the distinction survives greyscale and colour-blindness. */
+	.badge-superseded {
+		background: var(--color-surface-raised);
+		color: var(--color-muted);
+		border-style: dashed;
+		border-color: var(--color-border-strong);
+	}
 
+	/* --- Buttons ---------------------------------------------------------- */
 	.btn {
-		@apply px-3 py-1.5 rounded text-sm font-mono font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+		font-family: var(--font-sans);
+		font-size: 0.8125rem;
+		font-weight: 500;
+		line-height: 1.3;
+		padding: 0.375rem var(--space-3);
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--color-border-strong);
+		background: var(--color-surface-raised);
+		color: var(--color-text);
+		transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
 	}
-	.btn-primary  { @apply bg-sky-700 hover:bg-sky-600 text-white; }
-	.btn-success  { @apply bg-emerald-700 hover:bg-emerald-600 text-white; }
-	.btn-danger   { @apply bg-red-800 hover:bg-red-700 text-white; }
-	.btn-ghost    { @apply bg-slate-700 hover:bg-slate-600 text-slate-200; }
+	.btn:hover:not(:disabled) {
+		border-color: var(--color-accent);
+		color: var(--color-text-strong);
+	}
+	.btn:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
+	.btn-primary {
+		background: var(--color-accent-solid);
+		border-color: var(--color-accent-solid);
+		color: var(--color-on-accent);
+	}
+	.btn-primary:hover:not(:disabled) {
+		background: var(--color-accent-solid-hover);
+		border-color: var(--color-accent-solid-hover);
+		color: var(--color-on-accent);
+	}
+	.btn-success {
+		background: var(--color-ok-solid);
+		border-color: var(--color-ok-solid);
+		color: var(--color-on-ok);
+	}
+	.btn-success:hover:not(:disabled) {
+		background: var(--color-ok-solid-hover);
+		border-color: var(--color-ok-solid-hover);
+		color: var(--color-on-ok);
+	}
+	.btn-danger {
+		background: var(--color-danger-solid);
+		border-color: var(--color-danger-solid);
+		color: var(--color-on-danger);
+	}
+	.btn-danger:hover:not(:disabled) {
+		background: var(--color-danger-solid-hover);
+		border-color: var(--color-danger-solid-hover);
+		color: var(--color-on-danger);
+	}
+	.btn-ghost {
+		background: transparent;
+		border-color: var(--color-border);
+		color: var(--color-muted);
+	}
+	.btn-ghost:hover:not(:disabled) {
+		background: var(--color-surface-raised);
+		border-color: var(--color-border-strong);
+		color: var(--color-text);
+	}
+	.btn-sm {
+		font-size: 0.75rem;
+		padding: 0.25rem var(--space-2);
+	}
+	.btn-xs {
+		font-size: 0.6875rem;
+		padding: 0.125rem var(--space-2);
+	}
 
+	/* --- Surfaces --------------------------------------------------------- */
 	.card {
-		@apply bg-slate-800 border border-slate-700 rounded-lg p-4;
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		padding: var(--space-4);
 	}
 
 	.input {
-		@apply bg-slate-700 border border-slate-600 rounded px-3 py-1.5 text-sm font-mono text-slate-200
-		       focus:outline-none focus:border-sky-500 placeholder-slate-500;
+		font-family: var(--font-sans);
+		font-size: 0.8125rem;
+		background: var(--color-surface-raised);
+		border: 1px solid var(--color-border-strong);
+		border-radius: var(--radius-sm);
+		padding: 0.375rem var(--space-3);
+		color: var(--color-text);
+	}
+	.input::placeholder {
+		color: var(--color-muted);
+	}
+	.input:focus {
+		outline: none;
+		border-color: var(--color-accent);
 	}
 }

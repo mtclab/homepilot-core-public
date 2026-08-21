@@ -30,6 +30,45 @@ class TestRealAppFullyScoped:
         # The shipped app must be clean — no non-public route without a scope dep.
         assert find_unscoped_routes(real_app) == []
 
+    def test_the_guard_actually_sees_the_api(self):
+        """An empty finding must mean "nothing is wrong", never "nothing was checked".
+
+        FastAPI 0.137 stopped flattening `include_router` into the parent's route
+        list, which dropped what this guard inspects from 81 routes to 5 - every
+        route behind an include, i.e. essentially the whole API - while
+        `find_unscoped_routes` still returned `[]`. The suite stayed green because
+        the teeth tests below build routes with a bare `@app.get`, a shape the
+        real app never uses.
+
+        So the count is asserted, not just the verdict. The floor is deliberately
+        far below the current number: this catches a guard going blind, not a
+        release that adds or removes a handful of routes.
+        """
+        from fastapi.routing import APIRoute
+
+        inspected = [route for route in real_app.routes if isinstance(route, APIRoute)]
+        assert len(inspected) > 50, (
+            f"the scope guard can only see {len(inspected)} routes on the shipped app - "
+            "it is walking a route list that no longer holds the API, so its clean "
+            "verdict means nothing (see the fastapi bound in pyproject.toml)"
+        )
+
+    def test_a_route_added_by_include_router_is_inspected(self):
+        """The real app is built entirely from include_router, so the guard has to
+        work on THAT shape - the gap the version bump walked through."""
+        from fastapi import APIRouter
+
+        app = FastAPI()
+        router = APIRouter()
+
+        @router.get("/danger")
+        async def danger():  # forgot its scope dep, and lives behind an include
+            return {"ok": True}
+
+        app.include_router(router, prefix="/nested")
+
+        assert ("GET", "/nested/danger") in find_unscoped_routes(app)
+
 
 class TestGuardHasTeeth:
     def test_unscoped_route_is_flagged(self):

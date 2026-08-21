@@ -129,12 +129,11 @@ class ApplyReconciler(Reconciler):
         if result.failure_reason:
             details["failure_reason"] = result.failure_reason
 
-        await self._log_audit(
-            artifact_id=artifact_id,
-            approved_by=approved_by,
-            action="apply" if result.success else "apply_failed",
-            details=details if not result.success else {"approved_by": approved_by},
-        )
+        # ArtifactExecutor.apply already wrote the actor-bearing audit row for
+        # this same event; writing a second one here gave the log two rows per
+        # apply, which is one too many for the record an operator reads to answer
+        # "who applied what". The snapshot id it used to carry is handed to the
+        # executor instead, so nothing is lost.
 
         return ApplyResult(
             artifact_id=artifact_id,

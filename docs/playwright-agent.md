@@ -27,6 +27,7 @@ Display for headed (visible) mode:
 
 ```python
 import os
+
 os.environ["DISPLAY"] = ":1.0"
 ```
 
@@ -49,12 +50,7 @@ with sync_playwright() as p:
     ctx = browser.new_context(ignore_https_errors=True)
 
     # Inject auth cookie so every page load is authenticated
-    ctx.add_cookies([{
-        "name": "hp_token",
-        "value": TOKEN,
-        "domain": "homepilot",
-        "path": "/"
-    }])
+    ctx.add_cookies([{"name": "hp_token", "value": TOKEN, "domain": "homepilot", "path": "/"}])
 
     page = ctx.new_page()
     # ... do work ...
@@ -66,13 +62,13 @@ with sync_playwright() as p:
 ## Navigation
 
 ```python
-page.goto(UI + "/artifacts")                    # navigate, wait for load event
+page.goto(UI + "/artifacts")  # navigate, wait for load event
 page.goto(UI + "/inventory", wait_until="networkidle")  # wait until no network activity
 page.go_back()
 page.go_forward()
 page.reload()
-print(page.url)                                 # current URL
-print(page.title())                             # page <title>
+print(page.url)  # current URL
+print(page.title())  # page <title>
 ```
 
 `wait_until` options: `"load"` (default), `"domcontentloaded"`, `"networkidle"`, `"commit"`.
@@ -105,7 +101,7 @@ page.get_by_placeholder("Search...")
 page.locator("input#token")
 page.locator("nav a.active")
 page.locator(".artifact-card:first-child")
-page.locator("table tbody tr")           # all rows
+page.locator("table tbody tr")  # all rows
 
 # Chain: scope child within parent
 page.locator(".settings-panel").get_by_role("button", name="Save")
@@ -164,7 +160,7 @@ page.locator("select#scope").select_option(index=1)
 # Check / uncheck checkbox
 page.get_by_role("checkbox", name="Notify on drift").check()
 page.get_by_role("checkbox", name="Notify on drift").uncheck()
-page.get_by_role("checkbox").is_checked()   # → bool
+page.get_by_role("checkbox").is_checked()  # → bool
 
 # Upload file
 page.locator("input[type=file]").set_input_files("/path/to/file.yaml")
@@ -179,8 +175,8 @@ page.locator("input[type=file]").set_input_files("/path/to/file.yaml")
 page.keyboard.press("Enter")
 page.keyboard.press("Tab")
 page.keyboard.press("Escape")
-page.keyboard.press("Control+a")   # select all
-page.keyboard.press("Control+c")   # copy
+page.keyboard.press("Control+a")  # select all
+page.keyboard.press("Control+c")  # copy
 
 # Type text at current focus (no element needed)
 page.keyboard.type("some text")
@@ -216,7 +212,7 @@ page.wait_for_load_state("networkidle")
 # Wait for a specific response
 with page.expect_response("**/api/inventory") as resp:
     page.get_by_role("button", name="Refresh").click()
-resp.value.json()   # response body
+resp.value.json()  # response body
 
 # Wait for navigation triggered by a click
 with page.expect_navigation():
@@ -237,7 +233,7 @@ html = page.locator(".card").inner_html()
 
 # Attribute value
 href = page.locator("a.logo").get_attribute("href")
-cls  = page.locator("button").get_attribute("class")
+cls = page.locator("button").get_attribute("class")
 
 # Input value
 val = page.locator("input#token").input_value()
@@ -246,9 +242,9 @@ val = page.locator("input#token").input_value()
 n = page.locator("tr").count()
 
 # Check visibility / existence
-page.locator(".error").is_visible()   # → bool
-page.locator(".error").is_hidden()    # → bool
-page.locator(".error").count() > 0   # element exists in DOM
+page.locator(".error").is_visible()  # → bool
+page.locator(".error").is_hidden()  # → bool
+page.locator(".error").count() > 0  # element exists in DOM
 ```
 
 ---
@@ -291,7 +287,7 @@ page.screenshot(path="debug.png", full_page=True)
 page.locator(".card").screenshot(path="card.png")
 
 # Dump page content for inspection
-print(page.content())        # full HTML
+print(page.content())  # full HTML
 print(page.locator("nav").inner_html())
 
 # Pause execution (opens interactive inspector — headed mode only)
@@ -301,7 +297,7 @@ page.pause()
 page.on("console", lambda msg: print(f"[{msg.type}] {msg.text}"))
 
 # Intercept requests
-page.on("request",  lambda req:  print(">>", req.method, req.url))
+page.on("request", lambda req: print(">>", req.method, req.url))
 page.on("response", lambda resp: print("<<", resp.status, resp.url))
 ```
 
@@ -318,16 +314,13 @@ assert resp.ok
 body = resp.json()
 
 # GET with auth header
-resp = page.request.get(
-    f"{BASE_URL}/artifacts",
-    headers={"Authorization": f"Bearer {TOKEN}"}
-)
+resp = page.request.get(f"{BASE_URL}/artifacts", headers={"Authorization": f"Bearer {TOKEN}"})
 
 # POST JSON
 resp = page.request.post(
     f"{BASE_URL}/auth/login",
     data='{"token": "hp_..."}',
-    headers={"Content-Type": "application/json"}
+    headers={"Content-Type": "application/json"},
 )
 ```
 
@@ -364,7 +357,7 @@ HP_TEST_TOKEN=hp_... .venv/bin/pytest tests/test_e2e.py -v \
 
 ```python
 page.goto(UI + "/settings")
-page.get_by_label("API Token").fill(TOKEN)   # or: page.locator("input#token").fill(TOKEN)
+page.get_by_label("API Token").fill(TOKEN)  # or: page.locator("input#token").fill(TOKEN)
 page.get_by_role("button", name="Save").click()
 page.wait_for_url("**/artifacts**")
 ```
@@ -372,12 +365,7 @@ page.wait_for_url("**/artifacts**")
 ### Login via cookie (faster — skip UI)
 
 ```python
-ctx.add_cookies([{
-    "name": "hp_token",
-    "value": TOKEN,
-    "domain": "homepilot",
-    "path": "/"
-}])
+ctx.add_cookies([{"name": "hp_token", "value": TOKEN, "domain": "homepilot", "path": "/"}])
 ```
 
 ### Check all nav routes for errors
