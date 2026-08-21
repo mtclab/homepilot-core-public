@@ -368,3 +368,52 @@ class TestLivenessMeansServing:
         data = self._serving_but_unhappy(client).json()
         assert data["checks"]["vault"] == "locked"
         assert data["status"] != "ok"
+
+
+class TestInformationalFieldsAreNotStatuses:
+    """A count in the check map must not be read as a status (#470 follow-up).
+
+    `agents_connected` is a number that lives alongside the statuses, and it only
+    appears when the hub is running. Turning the hub on by default (ADR-004 S3)
+    therefore made every healthy instance report `degraded`: "0" is neither "ok"
+    nor "not_configured", so it fell through to the catch-all. Nothing in the
+    suite noticed, because these tests all build states with the hub disabled -
+    it took the public E2E run, against a default install, to surface it.
+
+    Teeth: compute the verdict over `checks.values()` instead of the filtered
+    statuses and both tests here fail with 'degraded'.
+    """
+
+    def _hub_up(self, client, connected: str):
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=None)
+        mock_vault = MagicMock()
+        mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_settings = MagicMock(agent_hub_enabled=True, cors_origins="http://localhost:5173")
+        mock_settings.proxmox_host = ""
+        registry = MagicMock()
+        registry.list_connected = MagicMock(return_value=[{"agent_id": "a"}] * int(connected))
+        _setup_state(client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings)
+        client.app.state.agent_registry = registry
+        try:
+            return client.get("/health")
+        finally:
+            client.app.state.agent_registry = None
+
+    def test_a_healthy_instance_with_no_agents_is_ok(self, client):
+        """The default install: hub running, nothing enrolled yet. That is a
+        brand-new HomePilot, and it must not describe itself as degraded."""
+        resp = self._hub_up(client, "0")
+        data = resp.json()
+        assert data["checks"]["agents_connected"] == "0"
+        assert data["status"] == "ok", (
+            "a healthy instance reported degraded because an agent COUNT was read "
+            "as if it were a status"
+        )
+        assert resp.status_code == 200
+
+    def test_the_count_still_appears_for_the_ui(self, client):
+        """Excluding it from the verdict must not remove it from the payload."""
+        data = self._hub_up(client, "2").json()
+        assert data["checks"]["agents_connected"] == "2"
+        assert data["status"] == "ok"

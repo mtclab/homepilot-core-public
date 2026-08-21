@@ -568,6 +568,17 @@ class TestAuthRoundTrip:
         assert body.get("authenticated") is True
 
         logout_resp = page.request.post(f"{BASE_URL}/auth/logout")
+        if logout_resp.status == 429:
+            # The whole E2E run shares one per-IP budget on CI (everything is
+            # localhost), so a late test can find it spent. The window slides, so
+            # give it a moment rather than skipping on the first refusal - and if
+            # it is still spent, say so instead of failing as though logout were
+            # broken. The same condition is already skipped during session setup
+            # above.
+            time.sleep(10)
+            logout_resp = page.request.post(f"{BASE_URL}/auth/logout")
+            if logout_resp.status == 429:
+                pytest.skip("Rate limited on logout (shared per-IP budget for the E2E run)")
         assert logout_resp.ok, f"Logout failed: {logout_resp.status}"
 
         # The token was deleted by logout; verify 401

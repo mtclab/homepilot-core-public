@@ -879,13 +879,22 @@ async def health(request: Request) -> JSONResponse:
     # which exists to draw exactly these distinctions (#470).
     #
     # The check map is unchanged, so the UI contract that reads it is untouched.
+    # `agents_connected` is a COUNT that happens to live in a map of statuses, so
+    # it must not be read as one. It only appears when the hub is running, which
+    # is why turning the hub on by default (S3) quietly made every healthy
+    # instance report `degraded`: "0" is neither "ok" nor "not_configured", so it
+    # fell through to the catch-all. Informational entries are named here rather
+    # than being moved out of `checks`, because the UI reads that map.
+    informational = {"agents_connected"}
+    statuses = [value for key, value in checks.items() if key not in informational]
+
     subsystem_trouble = {"error", "unreachable", "locked", "misconfigured"}
     database_failed = checks.get("database") != "ok"
     if database_failed:
         overall = "down"
-    elif any(v in subsystem_trouble for v in checks.values()):
+    elif any(value in subsystem_trouble for value in statuses):
         overall = "degraded"
-    elif all(v == "ok" or v == "not_configured" for v in checks.values()):
+    elif all(value == "ok" or value == "not_configured" for value in statuses):
         overall = "ok"
     else:
         overall = "degraded"

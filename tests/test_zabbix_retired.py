@@ -125,7 +125,12 @@ def test_the_removed_surfaces_are_actually_gone():
 
     nginx = (REPO_ROOT / "deploy/control-plane/nginx-hp-proxy.conf").read_text()
     assert "location /zabbix/" not in nginx
-    assert "10.0.0.1" not in nginx, "the hardcoded monitoring host is still proxied"
+    # Asserted by NAME, not by the monitoring host's address. The scrub rewrites
+    # operator IPs to a placeholder, and the placeholder it chooses is the same
+    # one this sample already uses for its other upstreams - so an address-based
+    # assertion passes here and fails on the public mirror, against a file that
+    # is correct in both. It also says what is meant: no Zabbix, by any address.
+    assert "zabbix" not in nginx.lower(), "the monitoring host is still proxied"
 
     from homepilot.config import Settings
 
