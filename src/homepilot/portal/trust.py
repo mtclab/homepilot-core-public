@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # The header the reverse proxy sets to prove the request came THROUGH it. Its
 # name is fixed because we define it (unlike the client-cert headers, whose
 # names belong to the operator's existing vhost and are therefore configurable).
-PROXY_SECRET_HEADER = "x-hp-portal-secret"
+PROXY_SECRET_HEADER = "x-hp-portal-secret"  # pragma: allowlist secret - a header NAME
 
 # The value nginx puts in $ssl_client_verify for a certificate that passed.
 VERIFY_OK = "SUCCESS"
