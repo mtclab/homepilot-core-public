@@ -36,6 +36,7 @@ When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the sy
 ```python
 # src/homepilot/config.py — Settings._auto_generate_passphrase()
 
+
 def _auto_generate_passphrase(self, secrets_mod, logger):
     passphrase_path = Path(self.data_dir) / ".vault_passphrase"
     if passphrase_path.exists():

@@ -58,7 +58,10 @@ ALLOWED_LINES = {
     # Leak-scrub patterns for the OWNER's private hostnames and PVE token names.
     # These exist to keep private strings out of a public copy; dropping them
     # would weaken that, and they say nothing about HomePilot's own monitoring.
-    ("scripts/scrub-for-public.sh", "scrub_files 's|monitor@pam!monitoring|monitor@pam!monitoring|g'"),
+    (
+        "scripts/scrub-for-public.sh",
+        "scrub_files 's|monitor@pam!monitoring|monitor@pam!monitoring|g'",
+    ),
     (
         "scripts/scrub-for-public.sh",
         "scrub_files 's|monitor@pam!monitoring|monitor@pam!monitoring|g'",
