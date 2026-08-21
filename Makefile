@@ -38,6 +38,14 @@ gate-py:
 	$(VENV)/python -m pytest -q
 
 gate-web:
+	# `npm ci --dry-run` FIRST, because it is the only step here that checks the
+	# lockfile against package.json. `npm run build` and vitest happily use
+	# whatever node_modules is already on disk, so a lockfile that `npm ci`
+	# rejects passes this gate while breaking BOTH the Docker image build and
+	# public CI, which install with `npm ci`. A dependency refresh produced
+	# exactly that once (an unsatisfiable transitive picomatch pin) and it was
+	# caught by CI on a release sync rather than here.
+	cd web && npm ci --dry-run >/dev/null
 	cd web && npm run build && npx svelte-check && npx vitest run
 
 gate-go:
