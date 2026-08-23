@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,32 @@ from pyrage import x25519
 
 class VaultError(Exception):
     pass
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically, never leaving a partial file (#431).
+
+    `store_secret` and `rotate_passphrase` both wrote in place and chmod'd
+    AFTERWARDS, so there were two windows: a crash mid-write truncated the only
+    copy of a secret (or of the master identity), and the file existed at 0644
+    until the chmod landed.
+
+    Written to a temp file in the SAME directory - `os.replace` is only atomic
+    within a filesystem - created 0600 from the start, fsync'd before the
+    rename so the rename cannot expose a file whose contents are still in cache.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 class VaultManager:
@@ -188,8 +215,7 @@ class VaultManager:
         recipient = await self.ensure_master_identity()
         encrypted = await self.encrypt(json.dumps(value), recipient)
         secret_file = self._secrets_dir / f"{name}.age"
-        secret_file.write_bytes(encrypted)
-        os.chmod(str(secret_file), 0o600)
+        _atomic_write(secret_file, encrypted)
 
     async def get_secret(self, name: str) -> dict[str, Any]:
         self._validate_secret_name(name)
@@ -221,8 +247,23 @@ class VaultManager:
         salt = os.urandom(16)
         new_protected_data = self._protect_identity(identity_data, salt)
 
-        old_protected.write_bytes(new_protected_data)
-        os.chmod(str(old_protected), 0o600)
+        # ATOMIC, with a backup (#431). This rewrote the master identity IN
+        # PLACE: a crash or a full disk mid-write destroyed the only copy, and
+        # every secret in the vault became unrecoverable. There is no second
+        # chance at this file.
+        backup = old_protected.with_suffix(".protected.bak")
+        backup.write_bytes(old_protected.read_bytes())
+        os.chmod(str(backup), 0o600)
+        try:
+            _atomic_write(old_protected, new_protected_data)
+        except Exception:
+            # Put the old wrapping back before re-raising: a half-written
+            # identity is the one state from which nothing can be recovered.
+            old_protected.write_bytes(backup.read_bytes())
+            os.chmod(str(old_protected), 0o600)
+            raise
+        finally:
+            backup.unlink(missing_ok=True)
         # The identity bytes are unchanged by rotation (only the wrapping key
         # changed), so refresh the cache directly rather than re-deriving.
         self._master_identity = None

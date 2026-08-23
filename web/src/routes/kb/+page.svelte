@@ -9,6 +9,9 @@
 	let items: KBEntry[] = [];
 	let total = 0;
 	let loading = false;
+	// A load/search failure, shown inline. Never let a failure be indistinguishable
+	// from an empty result (#445 B4).
+	let loadError = '';
 	let searched = false;
 
 	let showForm = false;
@@ -36,6 +39,7 @@
 	async function search() {
 		loading = true;
 		searched = true;
+		loadError = '';
 		try {
 			if (query.trim()) {
 				const res = await api.searchKB(query.trim(), filterKind || undefined, 50);
@@ -47,7 +51,11 @@
 				total = res.total;
 			}
 		} catch (e) {
-			notify(String(e), 'err');
+			// Kept on screen, NOT just toasted. Clearing items and toasting made a
+			// failed search render as "No knowledge base entries yet" - a failure
+			// shown as a successful empty result, which is the worst way to be
+			// wrong: the operator concludes the KB is empty and stops looking.
+			loadError = e instanceof Error ? e.message : String(e);
 			items = [];
 			total = 0;
 		} finally {
@@ -161,39 +169,47 @@
 		<form class="card p-4 space-y-3" on:submit|preventDefault={createNote}>
 			<div class="flex gap-3">
 				<div class="flex-1">
-					<label class="field-label block mb-1">Target</label>
-					<input
-						class="input text-sm w-full"
-						placeholder="e.g. nginx, haproxy"
-						bind:value={formTarget}
-					/>
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Target</span>
+						<input
+							class="input text-sm w-full"
+							placeholder="e.g. nginx, haproxy"
+							bind:value={formTarget}
+						/>
+					</label>
 				</div>
 				<div>
-					<label class="field-label block mb-1">Kind</label>
-					<select class="input text-sm" bind:value={formKind}>
-						<option value="note">note</option>
-						<option value="policy">policy</option>
-						<option value="fact">fact</option>
-					</select>
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Kind</span>
+						<select class="input text-sm" bind:value={formKind}>
+							<option value="note">note</option>
+							<option value="policy">policy</option>
+							<option value="fact">fact</option>
+						</select>
+					</label>
 				</div>
 			</div>
 			<div>
-				<label class="field-label block mb-1">Content</label>
-				<textarea
-					class="input text-sm w-full font-serif"
-					rows="5"
-					placeholder="Enter knowledge base note content…"
-					bind:value={formContent}
-					required
-				></textarea>
+				<label class="field-label block mb-1">
+					<span class="block mb-1">Content</span>
+					<textarea
+						class="input text-sm w-full font-serif"
+						rows="5"
+						placeholder="Enter knowledge base note content…"
+						bind:value={formContent}
+						required
+					></textarea>
+				</label>
 			</div>
 			<div>
-				<label class="field-label block mb-1">Supersedes (comma-separated IDs, optional)</label>
-				<input
-					class="input text-sm w-full"
-					placeholder="artifact-id-1, artifact-id-2"
-					bind:value={formSupersedes}
-				/>
+				<label class="field-label block mb-1">
+					<span class="block mb-1">Supersedes (comma-separated IDs, optional)</span>
+					<input
+						class="input text-sm w-full"
+						placeholder="artifact-id-1, artifact-id-2"
+						bind:value={formSupersedes}
+					/>
+				</label>
 			</div>
 			<div class="flex justify-end">
 				<button class="btn btn-primary text-xs" type="submit" disabled={saving}>
@@ -208,26 +224,34 @@
 			<h2 class="section-title">Edit KB Entry #{editEntry.id}</h2>
 			<div class="flex gap-3">
 				<div>
-					<label class="field-label block mb-1">Kind</label>
-					<select class="input text-sm" bind:value={editKind}>
-						<option value="note">note</option>
-						<option value="policy">policy</option>
-						<option value="fact">fact</option>
-						<option value="doc">doc</option>
-					</select>
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Kind</span>
+						<select class="input text-sm" bind:value={editKind}>
+							<option value="note">note</option>
+							<option value="policy">policy</option>
+							<option value="fact">fact</option>
+							<option value="doc">doc</option>
+						</select>
+					</label>
 				</div>
 				<div class="flex-1">
-					<label class="field-label block mb-1">Target</label>
-					<input class="input text-sm w-full" bind:value={editTarget} />
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Target</span>
+						<input class="input text-sm w-full" bind:value={editTarget} />
+					</label>
 				</div>
 			</div>
 			<div>
-				<label class="field-label block mb-1">Title</label>
-				<input class="input text-sm w-full" bind:value={editTitle} />
+				<label class="field-label block mb-1">
+					<span class="block mb-1">Title</span>
+					<input class="input text-sm w-full" bind:value={editTitle} />
+				</label>
 			</div>
 			<div>
-				<label class="field-label block mb-1">Content</label>
-				<textarea class="input text-sm w-full font-serif" rows="6" bind:value={editContent}></textarea>
+				<label class="field-label block mb-1">
+					<span class="block mb-1">Content</span>
+					<textarea class="input text-sm w-full font-serif" rows="6" bind:value={editContent}></textarea>
+				</label>
 			</div>
 			<div class="flex justify-end gap-2">
 				<button class="btn btn-ghost text-xs" type="button" on:click={() => (editEntry = null)}>Cancel</button>
@@ -257,6 +281,12 @@
 
 	{#if loading}
 		<p class="text-muted text-sm">Loading…</p>
+	{:else if loadError}
+		<div class="card p-6 text-center space-y-3">
+			<p class="text-sm text-ink-strong">The knowledge base could not be searched.</p>
+			<p class="prose-note text-xs">{loadError}</p>
+			<button class="btn btn-ghost text-xs" on:click={search}>Try again</button>
+		</div>
 	{:else if items.length === 0 && searched && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
 			<p class="prose-note text-sm">No entries match the current search / filter.</p>

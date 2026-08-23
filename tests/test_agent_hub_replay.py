@@ -69,7 +69,7 @@ class _Hub:
         for w in self._writers:
             w.close()
             with contextlib.suppress(Exception):
-                await w.wait_closed()
+                await asyncio.wait_for(w.wait_closed(), timeout=5)
         await self.srv.stop()
 
 
@@ -115,7 +115,7 @@ async def _enroll_get_token(hub, agent_id: str, hostname: str) -> str:
     ack = await _recv(reader)
     minted = ack["auth_token"]
     writer.close()
-    await writer.wait_closed()
+    await asyncio.wait_for(writer.wait_closed(), timeout=5)
     await asyncio.sleep(0.05)
     return minted
 

@@ -51,7 +51,14 @@
 			loading = false;
 		}
 	}
-	onMount(load);
+	onMount(() => {
+		try {
+			onboardingHidden = localStorage.getItem(HIDE_KEY) === '1';
+		} catch {
+			onboardingHidden = false;
+		}
+		return load();
+	});
 	// The dashboard summary rolls up artifact + drift counts, so refresh it live
 	// on any lifecycle/drift event — coalesced, so a burst is one summary call.
 	const refresh = debounce(() => load(), 400);
@@ -61,6 +68,24 @@
 		refresh.cancel();
 	});
 
+	// The checklist hides itself once the path is walked; this is the escape for
+	// an operator who does not want it in the meantime. Per-browser on purpose -
+	// it is a display preference, not estate state, and it must never be able to
+	// make the dashboard claim setup is further along than it is.
+	let onboardingHidden = false;
+	const HIDE_KEY = 'hp.onboarding.hidden';
+
+	function hideOnboarding() {
+		onboardingHidden = true;
+		try {
+			localStorage.setItem(HIDE_KEY, '1');
+		} catch {
+			// A browser with storage blocked still gets the hide for this session.
+		}
+	}
+
+	$: doneCount = d ? d.onboarding.steps.filter((s) => s.done).length : 0;
+	$: nextStep = d ? d.onboarding.steps.find((s) => !s.done) : undefined;
 	$: statusSegments = d ? toSegments(d.inventory.by_status, STATUS_COLORS) : [];
 	$: roleSegments = d ? toSegments(d.inventory.by_role) : [];
 	$: artifactSegments = d ? toSegments(d.artifacts) : [];
@@ -77,6 +102,49 @@
 	{:else if error && !d}
 		<div class="card text-sm text-muted">Could not load the dashboard: {error}</div>
 	{:else if d}
+		{#if d.onboarding && !d.onboarding.complete && !onboardingHidden}
+			<!-- A fresh install showed 0% coverage, three empty donuts and no
+			     indication of what to do next (#445 A7). Every step's state is
+			     read from the estate, so this cannot claim something happened
+			     that did not. -->
+			<section class="card space-y-3" aria-labelledby="getting-started">
+				<div class="flex items-start justify-between gap-3">
+					<div>
+						<h2 class="section-title" id="getting-started">Getting started</h2>
+						<p class="prose-note text-xs">
+							{doneCount} of {d.onboarding.steps.length} done. This disappears on its own once
+							a change has been applied to a managed host.
+						</p>
+					</div>
+					<button class="btn btn-ghost text-xs" on:click={hideOnboarding}>Hide</button>
+				</div>
+				<ol class="space-y-2">
+					{#each d.onboarding.steps as step, i}
+						<li class="flex items-start gap-3">
+							<span
+								class="mt-0.5 shrink-0 {step.done ? 'text-ok' : 'text-muted'}"
+								aria-hidden="true">{step.done ? '✓' : `${i + 1}.`}</span
+							>
+							<span class="space-y-0.5">
+								<span class="block text-sm {step.done ? 'text-muted line-through' : 'text-ink'}">
+									{step.title}
+									<span class="sr-only">{step.done ? '(done)' : '(not done yet)'}</span>
+								</span>
+								{#if !step.done}
+									<span class="block prose-note text-xs">{step.detail}</span>
+									{#if step.key === nextStep?.key}
+										<a class="btn btn-primary text-xs mt-1 inline-block" href="{base}{step.href}"
+											>Do this next →</a
+										>
+									{/if}
+								{/if}
+							</span>
+						</li>
+					{/each}
+				</ol>
+			</section>
+		{/if}
+
 		<div class="grid grid-cols-2 md:grid-cols-4 gap-3">
 			<StatCard
 				label="Coverage"
@@ -95,8 +163,10 @@
 			<StatCard
 				label="In spec"
 				value="{d.drift.in_spec_pct}%"
-				sub="{d.drift.drifted} drifting / {d.drift.total} checked"
-				accent={d.drift.drifted === 0 ? 'ok' : 'danger'}
+				sub={d.drift.unknown
+					? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established`
+					: `${d.drift.drifted} drifting / ${d.drift.checked} checked`}
+				accent={d.drift.drifted > 0 ? 'danger' : d.drift.unknown > 0 ? 'warn' : 'ok'}
 				href="{base}/drift"
 			/>
 			<StatCard

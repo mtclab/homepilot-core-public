@@ -53,8 +53,19 @@ async def summary(request: Request) -> dict[str, Any]:
 
     # ── Drift ────────────────────────────────────────────────────────────────
     drift_total = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks"))["c"]
-    drifted = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks WHERE drifted = 1"))["c"]
-    in_spec_pct = round(100 * (drift_total - drifted) / drift_total) if drift_total else 100
+    drifted = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks WHERE state = 'drifted'"))[
+        "c"
+    ]
+    in_spec = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks WHERE state = 'in_spec'"))[
+        "c"
+    ]
+    # Percentage of what was actually CHECKED (#425). It used to be
+    # (total - drifted) / total, which counted every unverifiable and errored
+    # artifact as healthy - the headline number on the operator's first screen,
+    # inflated by exactly the things nobody had looked at.
+    checked = in_spec + drifted
+    unknown = drift_total - checked
+    in_spec_pct = round(100 * in_spec / checked) if checked else 100
 
     # ── Pipeline ───────────────────────────────────────────────────────────────
     artifacts_by_status = await grouped("SELECT status, COUNT(*) FROM artifacts GROUP BY status")
@@ -78,7 +89,52 @@ async def summary(request: Request) -> dict[str, Any]:
     agents_known = len(known_ids | live_ids)
     agents_connected = len(live_ids)
 
+    # ── First-run path (#445 A7) ──────────────────────────────────────────────
+    # Derived entirely from values this endpoint already computed: no extra
+    # query, and - more importantly - no separate notion of "have you done the
+    # setup" that could disagree with the estate. A checklist that ticks itself
+    # off from a stored flag rather than from the thing it claims happened is
+    # just a tutorial that lies.
+    #
+    # The steps are the actual path from an empty install to a managed change:
+    # something in inventory -> adopt it -> give it an agent -> apply a change.
+    applied_artifacts = artifacts_by_status.get("applied", 0)
+    onboarding_steps = [
+        {
+            "key": "inventory",
+            "title": "Get a host into inventory",
+            "detail": "Sync from Proxmox, or add a host by hand if it is not a Proxmox guest.",
+            "href": "/inventory",
+            "done": hosts_total > 0,
+        },
+        {
+            "key": "adopt",
+            "title": "Adopt a host to manage",
+            "detail": "Adopting says HomePilot may act on it. Discovery alone never does.",
+            "href": "/inventory",
+            "done": managed > 0,
+        },
+        {
+            "key": "agent",
+            "title": "Install the agent on it",
+            "detail": "The agent is how a change reaches the host, and how metrics come back.",
+            "href": "/agents",
+            "done": agents_connected > 0,
+        },
+        {
+            "key": "artifact",
+            "title": "Approve and apply your first change",
+            "detail": "Propose an artifact, review what it will do on the host, then apply it.",
+            "href": "/artifacts",
+            "done": applied_artifacts > 0,
+        },
+    ]
+
     return {
+        "onboarding": {
+            "steps": onboarding_steps,
+            "complete": all(step["done"] for step in onboarding_steps),
+        },
         "inventory": {
             "total": hosts_total,
             "managed": managed,
@@ -88,7 +144,16 @@ async def summary(request: Request) -> dict[str, Any]:
             "by_role": by_role,
             "by_type": by_type,
         },
-        "drift": {"total": drift_total, "drifted": drifted, "in_spec_pct": in_spec_pct},
+        "drift": {
+            "total": drift_total,
+            "drifted": drifted,
+            "in_spec": in_spec,
+            # Surfaced, not hidden: "we have not checked 40 of these" is
+            # actionable, and rolling it into a green percentage is not.
+            "unknown": unknown,
+            "checked": checked,
+            "in_spec_pct": in_spec_pct,
+        },
         "artifacts": artifacts_by_status,
         "tasks": tasks_by_status,
         "agents": {"known": agents_known, "connected": agents_connected},

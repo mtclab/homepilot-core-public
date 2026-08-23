@@ -5,10 +5,18 @@ const goto = vi.fn();
 const invalidate = vi.fn();
 const invalidateAll = vi.fn();
 
+// `afterNavigate`/`beforeNavigate` are lifecycle registrars, not actions: the
+// layout calls them at component init, so a mock without them throws before the
+// shell can render at all.
+const afterNavigate = vi.fn();
+const beforeNavigate = vi.fn();
+
 vi.mock('$app/navigation', () => ({
 	goto,
 	invalidate,
 	invalidateAll,
+	afterNavigate,
+	beforeNavigate,
 }));
 
 const mockPageStore = readable({
@@ -42,17 +50,54 @@ vi.mock('$lib/api', async () => {
 			claimStatus: vi.fn().mockResolvedValue({ state: 'claimed' }),
 			claimInstance: vi.fn(),
 			listArtifacts: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			planArtifact: vi.fn().mockRejectedValue(new Error('no plan in tests')),
+			getArtifactBody: vi.fn().mockResolvedValue(''),
 			getArtifact: vi.fn(),
 			approveArtifact: vi.fn(),
 			rejectArtifact: vi.fn(),
 			applyArtifact: vi.fn(),
 			revokeArtifact: vi.fn(),
-			listInventory: vi.fn().mockResolvedValue({ items: [], total: 0 }),
-			refreshInventory: vi.fn(),
 			getHostDoc: vi.fn(),
 			searchKB: vi.fn().mockResolvedValue({ results: [], total: 0 }),
 			listKB: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			// The Agents page: enough of the fleet surface that the route can be
+			// rendered in a test at all. Same reason sessionStore is here - almost
+			// every web test used to be a pure-function $lib test because a route
+			// could not be mounted.
+			getDashboard: vi.fn().mockResolvedValue(null),
+			listInventory: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			addHost: vi.fn(),
+			forgetHost: vi.fn().mockResolvedValue({ forgotten: true }),
+			refreshInventory: vi.fn(),
+			enrichInventory: vi.fn(),
+			adoptHost: vi.fn(),
+			ignoreHost: vi.fn(),
+			bulkHosts: vi.fn(),
+			listAgents: vi.fn().mockResolvedValue([]),
+			listFiringAlerts: vi.fn().mockResolvedValue({ items: [] }),
+			listAlertRules: vi.fn().mockResolvedValue({ items: [] }),
+			createAlertRule: vi.fn(),
+			deleteAlertRule: vi.fn(),
+			setAlertRuleEnabled: vi.fn(),
+			getHostSeries: vi.fn().mockResolvedValue({ hostname: '', metric: '', points: [] }),
+			getHubToken: vi.fn(),
+			getBootstrapToken: vi.fn(),
+			revokeAgent: vi.fn().mockResolvedValue({ revoked: true, channel_closed: true }),
+			forgetAgent: vi.fn().mockResolvedValue({ forgotten: true }),
 		},
+		// Pages gate their write controls off the session's capability list, so a
+		// page test cannot render without this. Admin by default: a test about
+		// error states should not also be fighting a permission screen.
+		sessionStore: writable({
+			authenticated: true,
+			token_label: 'test',
+			capabilities: ['read', 'write', 'admin'],
+		}),
+		// Not part of `api`: a module-level helper the Inventory page imports
+		// alongside it. A vi.mock factory replaces the WHOLE module, so anything
+		// the page imports from $lib/api has to be here or the import throws.
+		hostMetricsUrl: (base: string, hostname: string) =>
+			`${base}/monitoring?host=${encodeURIComponent(hostname)}`,
 		setToken: vi.fn((t: string) => _tokenStore.set(t)),
 		getToken: vi.fn(() => ''),
 		hasCookieSession: vi.fn(() => false),
@@ -69,4 +114,4 @@ vi.mock('$lib/stores', async () => {
 	};
 });
 
-export { goto };
+export { goto, afterNavigate };

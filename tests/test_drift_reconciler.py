@@ -10,6 +10,7 @@ from homepilot.reconciler import (
     DriftReconciler,
     verify_artifact,
 )
+from homepilot.reconciler.verify import DriftState
 
 
 @pytest.fixture
@@ -132,33 +133,30 @@ class TestVerifyAnsible:
         assert result.drifted is False
         assert result.details["reason"] == "no_host"
 
-    async def test_ansible_no_drift(self, repo, mock_store, mock_executor):
-        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
-        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
-        mock_store.read.return_value = (fm, body)
-        mock_executor.ssh.exec = AsyncMock(
-            return_value=(0, "PLAY RECAP *** changed=0 unreachable=0 failed=0", "")
-        )
-        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
-            mock_sem.__aenter__ = AsyncMock(return_value=None)
-            mock_sem.__aexit__ = AsyncMock(return_value=None)
-            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
-        assert result.drifted is False
-        assert result.details["changed"] is False
+    async def test_ansible_reports_unknown_rather_than_a_verdict(
+        self, repo, mock_store, mock_executor
+    ):
+        """Ansible drift checking does not exist (#425).
 
-    async def test_ansible_detected_drift(self, repo, mock_store, mock_executor):
+        The two tests that stood here asserted `changed=0 -> not drifted` and
+        `changed=2 -> drifted` by setting `mock_executor.ssh.exec`, MANUFACTURING
+        the very attribute production does not have: `ArtifactExecutor` lost
+        `.ssh` with the jump server, so the real call raised AttributeError into
+        a handler that returned `drifted=False`. The tests were green and every
+        applied ansible artifact reported "in spec" forever.
+
+        The verifier now says it did not check, which is the only true answer
+        until the playbook transport is rebuilt (#388).
+        """
         fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
         body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
         mock_store.read.return_value = (fm, body)
-        mock_executor.ssh.exec = AsyncMock(
-            return_value=(0, "PLAY RECAP *** changed=2 unreachable=0 failed=0", "")
-        )
-        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
-            mock_sem.__aenter__ = AsyncMock(return_value=None)
-            mock_sem.__aexit__ = AsyncMock(return_value=None)
-            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
-        assert result.drifted is True
-        assert result.details["changed"] is True
+
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+
+        assert result.state is DriftState.UNKNOWN
+        assert result.details["reason"] == "ansible_unverifiable"
+        assert "not implemented" in result.verification_log
 
     async def test_ansible_forbidden_host(self, repo, mock_store, mock_executor):
         """A PVE hypervisor node must be refused as an ansible verify target (#388).
@@ -186,7 +184,7 @@ class TestVerifyAnsible:
         mock_store.read.return_value = (fm, body)
         mock_executor.pve_nodes = ["pve1"]
         result = await verify_artifact("art-1", repo, mock_store, mock_executor)
-        assert result.drifted is False
+        assert result.state is DriftState.UNKNOWN
         assert result.details["reason"] == "forbidden_host", (
             f"PVE node target was not refused: {result.details}"
         )
@@ -556,17 +554,34 @@ class TestVerifyUnknownKind:
 
 
 class TestVerifyTimeout:
-    async def test_timeout_returns_no_drift(self, repo, mock_store, mock_executor):
-        fm = _make_artifact_fm(kind="ansible-playbook", status="applied")
-        body = "```yaml ansible-spec\n- hosts: all\n  tasks: []\n```"
+    async def test_a_timeout_is_not_a_clean_bill_of_health(self, repo, mock_store, mock_executor):
+        """A check that timed out established nothing (#425).
+
+        This test used to assert `drifted is False` for a timeout - which is the
+        defect, written down as the requirement. It drove the ansible path via a
+        manufactured `executor.ssh`; the proxmox path is a real one, so the
+        timeout is exercised where it can actually happen.
+        """
+        fm = _make_artifact_fm(kind="proxmox-api-sequence", status="applied")
+        body = (
+            "```yaml proxmox-api-spec\n"
+            "steps:\n"
+            "  - id: s1\n"
+            "    method: POST\n"
+            "    path: /nodes/pve1/qemu\n"
+            "    precheck:\n"
+            "      method: GET\n"
+            "      path: /nodes/pve1/qemu/100/status/current\n"
+            "```"
+        )
         mock_store.read.return_value = (fm, body)
-        mock_executor.ssh.exec = AsyncMock(side_effect=TimeoutError())
-        with patch("homepilot.reconciler.verify._ansible_semaphore") as mock_sem:
-            mock_sem.__aenter__ = AsyncMock(return_value=None)
-            mock_sem.__aexit__ = AsyncMock(return_value=None)
-            result = await verify_artifact("art-1", repo, mock_store, mock_executor)
-        assert result.drifted is False
-        assert result.details["reason"] == "timeout"
+        mock_executor.proxmox.call = AsyncMock(side_effect=TimeoutError())
+
+        result = await verify_artifact("art-1", repo, mock_store, mock_executor)
+
+        assert result.state is not DriftState.IN_SPEC, (
+            "a check that never completed is reporting the artifact as in spec"
+        )
 
 
 class TestDriftReconciler:

@@ -92,7 +92,7 @@ async def _served_cert_fingerprint(host: str, port: int, ca_file: str | None) ->
     finally:
         writer.close()
         with contextlib.suppress(ConnectionError, ssl.SSLError):
-            await writer.wait_closed()
+            await asyncio.wait_for(writer.wait_closed(), timeout=5)
     del reader
     assert der is not None
     return hashlib.sha256(der).hexdigest()

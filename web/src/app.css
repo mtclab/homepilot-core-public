@@ -202,6 +202,30 @@
 		color: var(--color-muted);
 		border-bottom: 1px solid var(--color-border);
 	}
+	/* Row density lives HERE, not on six hundred individual cells (#445 B3).
+	   Every table repeated `py-2 pr-4` on every `<td>` and `pb-2 pr-4` on every
+	   `<th>`, so an ops console whose tables ARE the product had no single place
+	   to tune how calm its rows are - and the six tables had already begun to
+	   disagree. The values are exactly what those utilities produced, so this is
+	   a de-duplication first and a knob second.
+	   `vertical-align: top` matters once a cell can hold two lines (a failure
+	   reason under a status): centred cells make such a row look misaligned. */
+	.data-table th,
+	.data-table td {
+		padding-right: var(--space-4);
+		vertical-align: top;
+	}
+	.data-table th:last-child,
+	.data-table td:last-child {
+		padding-right: 0;
+	}
+	.data-table thead th {
+		padding-bottom: var(--space-2);
+	}
+	.data-table tbody td {
+		padding-top: var(--space-2);
+		padding-bottom: var(--space-2);
+	}
 
 	/* Numbers read right-aligned and tabular wherever they are compared. */
 	.num {

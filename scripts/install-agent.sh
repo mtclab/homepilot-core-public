@@ -44,6 +44,12 @@ set -euo pipefail
 
 REPO="mtclab/homepilot-core-public"
 VERSION="${VERSION:-latest}"
+# Where to fetch the agent binary from. When HomePilot's API base is known, the
+# CONTROL PLANE serves it (#464) - a guest with no route to the internet can then
+# still enrol, which is where "installs automatically" used to fail, and the
+# agent version always matches the hub managing it. GitHub stays as the fallback
+# for a host being set up without a reachable control plane.
+HP_API="${HP_API:-}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 HUB="${HUB:-}"
 TOKEN="${TOKEN:-}"
@@ -58,6 +64,7 @@ START=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --hub)        HUB="$2"; shift 2 ;;
+        --hp-api)     HP_API="$2"; shift 2 ;;
         --token)      TOKEN="$2"; shift 2 ;;
         --version)    VERSION="$2"; shift 2 ;;
         --tls)        USE_TLS="true"; shift ;;
@@ -192,18 +199,48 @@ esac
 
 echo "=== Installing hp-agent (linux-$GOARCH) ==="
 
-# ─── Resolve version ───
-if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
-        | grep '"tag_name":' | head -1 | sed 's/.*"tag_name": "\([^"]*\)".*/\1/')
-    [ -z "$VERSION" ] && { echo "Could not resolve latest release tag." >&2; exit 1; }
-    echo "Latest release: $VERSION"
-fi
-
 # ─── Download ───
-URL="https://github.com/$REPO/releases/download/$VERSION/hp-agent-linux-$GOARCH"
-echo "Downloading $URL ..."
-curl -fSL -o /tmp/hp-agent "$URL"
+#
+# Prefer the control plane. It has the binary in its own image, it is reachable
+# from a guest that has no internet at all, and the version it serves is by
+# construction the one managing this host (#464). GitHub is the fallback for a
+# host installed without a reachable HomePilot.
+if [ -n "$HP_API" ]; then
+    SRC="${HP_API%/}/agents/dist/hp-agent-linux-$GOARCH"
+    echo "Downloading $SRC ..."
+    # The digest travels in a header alongside the bytes, so it is verified below
+    # without a second request that could be answered by something else.
+    EXPECTED=$(curl -fsSL -D /tmp/hp-agent.hdr -o /tmp/hp-agent \
+        -H "x-hp-agent-token: $TOKEN" "$SRC" \
+        && tr -d '\r' < /tmp/hp-agent.hdr \
+        | awk 'tolower($1) == "x-hp-sha256:" { print $2 }' | tail -1)
+    rm -f /tmp/hp-agent.hdr
+    if [ -z "$EXPECTED" ]; then
+        echo "The control plane served no x-hp-sha256 for the agent binary." >&2
+        echo "Refusing to install an unverified binary." >&2
+        exit 1
+    fi
+    ACTUAL=$(sha256sum /tmp/hp-agent | awk '{print $1}')
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Checksum mismatch for hp-agent:" >&2
+        echo "  expected $EXPECTED" >&2
+        echo "  got      $ACTUAL" >&2
+        rm -f /tmp/hp-agent
+        exit 1
+    fi
+    echo "Verified sha256 $ACTUAL"
+else
+    # ─── Resolve version (GitHub fallback) ───
+    if [ "$VERSION" = "latest" ]; then
+        VERSION=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
+            | grep '"tag_name":' | head -1 | sed 's/.*"tag_name": "\([^"]*\)".*/\1/')
+        [ -z "$VERSION" ] && { echo "Could not resolve latest release tag." >&2; exit 1; }
+        echo "Latest release: $VERSION"
+    fi
+    URL="https://github.com/$REPO/releases/download/$VERSION/hp-agent-linux-$GOARCH"
+    echo "Downloading $URL ..."
+    curl -fSL -o /tmp/hp-agent "$URL"
+fi
 if ! file /tmp/hp-agent | grep -q "ELF"; then
     echo "Downloaded file is not a valid binary. Check the release exists." >&2
     exit 1

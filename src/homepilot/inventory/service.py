@@ -166,6 +166,11 @@ async def verify_connectivity(host: str, port: int = 22, timeout: float = 3.0) -
         return False
 
 
+# Sources that Proxmox is the authority for. A host an operator added by hand is
+# not one of them: a sync that never looked for it must never declare it gone.
+_HYPERVISOR_SOURCES: tuple[str, ...] = ("discovered", "hp_created", "imported")
+
+
 class InventoryService:
     def __init__(
         self,
@@ -329,11 +334,15 @@ class InventoryService:
                     "pve_status": node_status,
                     "status": derive_status(node_status, node_ip),
                     "source": "hp_created",
-                    "role_source": "user",
+                    # NOT "user": this is a sync deciding, and stamping an
+                    # operator's provenance over its own guess is the forgery
+                    # #424 names - it defeated #416 and hid the "inferred" badge.
+                    # (`role_source` is constrained to inferred/user/artifact.)
+                    "role_source": "inferred",
                     "ip_source": "pve",
                 }
                 if existing:
-                    await self.repo.update_host(existing["id"], **data)
+                    await self.repo.update_host_from_automation(existing["id"], **data)
                     refreshed["proxmox_host_ids"].append(existing["id"])
                 else:
                     new_id = await self.repo.create_host(
@@ -344,7 +353,7 @@ class InventoryService:
                         pve_status=node_status,
                         status=derive_status(node_status, node_ip),
                         source="hp_created",
-                        role_source="user",
+                        role_source="inferred",
                         ip_source="pve",
                     )
                     refreshed["proxmox_host_ids"].append(new_id)
@@ -376,7 +385,9 @@ class InventoryService:
                                 imp = g_existing.get("import_state")
                                 if src == "discovered" and not imp:
                                     data["import_state"] = "pending"
-                                await self.repo.update_host(g_existing["id"], **data)
+                                await self.repo.update_host_from_automation(
+                                    g_existing["id"], **data
+                                )
                                 refreshed["proxmox_host_ids"].append(g_existing["id"])
                             else:
                                 g_new_id = await self.repo.create_host(
@@ -400,6 +411,14 @@ class InventoryService:
 
                 refreshed["hosts"] += 1
 
+            # Everything Proxmox still reports has now been seen; anything
+            # hypervisor-derived that was NOT is gone from the hypervisor (#445
+            # A5). Only done for a FULL refresh: a scoped sync looks at one node,
+            # so every guest on every other node would look absent.
+            if scope is None:
+                refreshed["absent"] = await self.repo.mark_hosts_absent(
+                    set(refreshed["proxmox_host_ids"]), _HYPERVISOR_SOURCES
+                )
         except Exception as e:
             logger.warning("Failed to refresh proxmox inventory: %s", e)
 
@@ -490,7 +509,14 @@ class InventoryService:
         updates["status"] = derived
 
         if updates:
-            await self.repo.update_host(host_id, **updates)
+            # Through the one door: enrich used to re-derive `status` over
+            # anything an operator had set with PATCH, which made that PATCH
+            # field a lie (#424).
+            skipped = await self.repo.update_host_from_automation(host_id, **updates)
+            if skipped:
+                logger.debug(
+                    "enrich left operator-set fields alone on %s: %s", host_id, ", ".join(skipped)
+                )
 
     async def introspect_and_record(self, host: dict[str, Any], adapter: Any) -> dict[str, Any]:
         """Run best-effort read-only introspection of an adopted host and record

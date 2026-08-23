@@ -7,11 +7,38 @@ from jinja2 import StrictUndefined, TemplateSyntaxError
 from jinja2.exceptions import SecurityError, UndefinedError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+
+class _AnySecret(dict):  # type: ignore[type-arg]
+    """A stand-in for the vault at VALIDATION time (#505).
+
+    The validator renders a body under StrictUndefined to catch typos, with a
+    context that fakes each variable. `vault` was faked as `{"key": ""}`, so any
+    real reference - `{{ vault.appdb.password }}` - raised "no attribute
+    'appdb'" and the propose was REFUSED. Vault references were therefore
+    unusable in a body no matter which executor resolved them.
+
+    Secret names are not knowable at propose time (the vault may be locked, and
+    the secret may be created later), so this answers for any name. It checks
+    that the reference is well-FORMED, which is all a template validator can
+    honestly check. A missing secret is caught at execute time, where it is a
+    refusal rather than a guess.
+    """
+
+    def __getitem__(self, key: object) -> _AnySecret:
+        return _AnySecret()
+
+    def __getattr__(self, name: str) -> _AnySecret:
+        return _AnySecret()
+
+    def __str__(self) -> str:
+        return ""
+
+
 _SAFE_CONTEXT: dict[str, Any] = {
     "target": "",
     "host": "",
     "inventory": [],
-    "vault": {"key": ""},
+    "vault": _AnySecret(),
     "fact": "",
 }
 

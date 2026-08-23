@@ -23,7 +23,9 @@ from .tools.artifact_tools import (
 from .tools.artifact_tools import (
     handle_approve_artifact,
     handle_check_artifact_drift,
+    handle_get_artifact,
     handle_get_artifact_status,
+    handle_get_task_result,
     handle_propose_artifact,
     handle_query_artifacts,
 )
@@ -46,6 +48,7 @@ from .tools.system_tools import (
     TOOL_DEFINITIONS as SYSTEM_TOOL_DEFS,
 )
 from .tools.system_tools import (
+    handle_check_host_reachable,
     handle_exec_on_guest_readonly,
     handle_http_call_read,
     handle_proxmox_api_read,
@@ -147,7 +150,17 @@ async def _bootstrap() -> dict[str, Any]:
         )
         lifecycle._executor_ref = executor
 
+    from homepilot.app_state import get_agent_registry
+    from homepilot.inventory.service import InventoryService
     from homepilot.reconciler import DriftReconciler
+    from homepilot.tasks.repository import TaskRepository
+
+    inventory_service = InventoryService(
+        state.repo,
+        proxmox=proxmox,
+        kb_service=state.kb_service,
+        proxmox_host=settings.proxmox_host,
+    )
 
     executor_ref = getattr(lifecycle, "_executor_ref", None)
     drift_reconciler = DriftReconciler(
@@ -167,7 +180,19 @@ async def _bootstrap() -> dict[str, Any]:
         "proxmox": proxmox,
         "agent_adapter": agent_adapter,
         "kb_service": state.kb_service,
+        # The environment doc's real implementation lives on the service; the MCP
+        # handler used to re-render a lesser version of it without the KB (#427).
+        # Built HERE rather than read off `state`: the MCP process has no FastAPI
+        # app, which is where the API's instance lives.
+        "inventory_service": inventory_service,
         "drift_reconciler": drift_reconciler,
+        # Task outcomes live here. Without it an agent can start an apply and
+        # never learn whether it worked (#427).
+        "task_repo": TaskRepository(state.database),
+        # The hub's live registry, for the reachability check. None when the hub
+        # is not running in this process, which the handler reports as "unknown"
+        # rather than as "reachable".
+        "agent_registry": get_agent_registry(),
     }
 
 
@@ -183,6 +208,9 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "refresh_inventory": handle_refresh_inventory,
     "get_environment_doc": handle_get_environment_doc,
     "query_artifacts": handle_query_artifacts,
+    "get_artifact": handle_get_artifact,
+    "get_task_result": handle_get_task_result,
+    "check_host_reachable": handle_check_host_reachable,
     "search_kb": handle_search_kb,
     "proxmox_api_read": handle_proxmox_api_read,
     "http_call_read": handle_http_call_read,

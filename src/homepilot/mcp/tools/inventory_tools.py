@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -121,47 +120,58 @@ async def handle_refresh_inventory(
 async def handle_get_environment_doc(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> list[TextContent]:
-    repo: Repository = ctx["repo"]
+    """Everything HomePilot knows about a target, INCLUDING the KB (#427).
+
+    This handler rendered inventory + services + artifacts and no KB at all,
+    while its own tool description advertised "inventory facts, KB intent, and
+    artifact history". The correct implementation already existed on
+    `InventoryService.get_environment_doc` and nothing called it - so the AI, for
+    whom this tool exists, was the one caller getting the lesser answer.
+    """
+    service = ctx.get("inventory_service")
     target = arguments["target"]
-    host = await repo.get_host_by_hostname(target)
-    services = []
-    if host:
-        svc_list = await repo.list_services(host_id=host.get("id"))
-        services = svc_list if svc_list else []
+    if service is None:
+        raise RuntimeError("Inventory service not configured")
 
-    artifacts = await asyncio.to_thread(ctx["store"].list)
-    target_artifacts = [
-        a
-        for a in artifacts
-        if a.get("target", {}).get("host") == target
-        or a.get("intent", "").lower().find(target.lower()) >= 0
-    ]
+    doc = await service.get_environment_doc(target)
 
-    doc_parts = []
-    heading = target
-    if host:
-        heading = f"{target} (vmid {host.get('proxmox_id', '?')}, node {host.get('node', '?')})"
-    doc_parts.append(f"=== {heading} ===\n")
+    lines: list[str] = [f"=== {target} ==="]
 
-    if host:
-        doc_parts.append("Inventory facts:")
-        for k, v in host.items():
-            if v is not None and v != "unknown":
-                doc_parts.append(f"  {k}: {v}")
+    hosts = doc.get("hosts") or []
+    for host in hosts:
+        lines.append(
+            f"\nHost {host.get('hostname', '?')} "
+            f"(vmid {host.get('proxmox_id', '?')}, node {host.get('node', '?')})"
+        )
+        for key, value in host.items():
+            if key == "services" or value is None or value == "unknown":
+                continue
+            lines.append(f"  {key}: {value}")
 
+    services = doc.get("services") or []
     if services:
-        doc_parts.append("\nServices:")
+        lines.append("\nServices:")
         for svc in services:
-            doc_parts.append(f"  {svc.get('name', '?')} — {svc.get('status', '?')}")
+            lines.append(f"  {svc.get('name', '?')} - {svc.get('status', '?')}")
 
-    if target_artifacts:
-        doc_parts.append("\nArtifact history:")
-        for a in target_artifacts:
-            doc_parts.append(
-                f"  {a.get('created_at', '?')}  {a.get('intent', '?')[:60]}  {a.get('status', '?')}"
+    kb_entries = doc.get("kb_entries") or []
+    if kb_entries:
+        lines.append("\nKnowledge base:")
+        for entry in kb_entries:
+            title = entry.get("title") or entry.get("target") or "?"
+            content = (entry.get("content") or "").strip().replace("\n", " ")
+            lines.append(f"  {title}: {content[:200]}")
+
+    history = doc.get("artifact_history") or []
+    if history:
+        lines.append("\nArtifact history:")
+        for a in history:
+            lines.append(
+                f"  {a.get('created_at', '?')}  {str(a.get('intent', '?'))[:60]}  "
+                f"{a.get('status', '?')}"
             )
 
-    if not doc_parts:
-        doc_parts.append(f"No inventory data found for target '{target}'")
+    if len(lines) == 1:
+        lines.append(f"No data found for target '{target}'")
 
-    return [TextContent(type="text", text="\n".join(doc_parts))]
+    return [TextContent(type="text", text="\n".join(lines))]

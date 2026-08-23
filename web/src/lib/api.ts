@@ -176,6 +176,12 @@ export interface AgentInfo {
 	stale_seconds?: number;
 	connected?: boolean;
 	disconnected_at?: string | null;
+	/**
+	 * Why this agent is not here (#430). Null on a live agent - the hub clears it
+	 * on a successful register - and on any agent that has never been refused.
+	 */
+	last_error?: string | null;
+	last_error_at?: string | null;
 }
 
 export interface AgentInstallEligibility {
@@ -189,7 +195,21 @@ export interface AgentInstallEligibility {
 	in_flight: boolean;
 }
 
+export interface OnboardingStep {
+	key: string;
+	title: string;
+	detail: string;
+	href: string;
+	done: boolean;
+}
+
 export interface DashboardSummary {
+	/**
+	 * The first-run path (#445 A7). Every step's `done` is derived from the
+	 * estate itself, never from a stored "you did the setup" flag - a checklist
+	 * that ticks itself off from anything else is a tutorial that lies.
+	 */
+	onboarding: { steps: OnboardingStep[]; complete: boolean };
 	inventory: {
 		total: number;
 		managed: number;
@@ -199,7 +219,15 @@ export interface DashboardSummary {
 		by_role: Record<string, number>;
 		by_type: Record<string, number>;
 	};
-	drift: { total: number; drifted: number; in_spec_pct: number };
+	drift: {
+		total: number;
+		drifted: number;
+		in_spec: number;
+		/** Checks that could not establish anything - never counted as healthy (#425). */
+		unknown: number;
+		checked: number;
+		in_spec_pct: number;
+	};
 	artifacts: Record<string, number>;
 	tasks: Record<string, number>;
 	agents: { known: number; connected: number };
@@ -290,6 +318,56 @@ export interface ArtifactDetail {
 	active_task: ActiveTask | null;
 }
 
+/** What a person fills in to propose an artifact; the server adds the rest. */
+export interface ArtifactProposal {
+	kind: string;
+	intent: string;
+	body: string;
+	idempotence?: string;
+	target?: {
+		kind: string;
+		host?: string;
+		vmid?: number;
+		node?: string;
+		service?: string;
+		network?: string;
+	};
+	tags?: string[];
+}
+
+/** One thing the plan checked on the host, with what is there now. */
+export interface ArtifactPlanItem {
+	kind: 'package' | 'service' | 'config';
+	id: string;
+	name: string;
+	desired: string;
+	observed: string;
+	changes: boolean;
+	log: string;
+}
+
+export interface ArtifactPolicy {
+	id?: number | string;
+	title: string;
+	content: string;
+	target?: string | null;
+}
+
+export interface ArtifactPlan {
+	artifact_id: string;
+	host: string;
+	kind: string;
+	items: ArtifactPlanItem[];
+	change_count: number;
+	in_spec: boolean;
+	summary: string;
+	/**
+	 * The operator's own recorded rules for this host (#429). Reviewing is meant
+	 * to be an informed decision, and this is the half the plan cannot supply.
+	 */
+	policies?: ArtifactPolicy[];
+}
+
 export interface Host {
 	id: string;
 	hostname: string;
@@ -308,6 +386,12 @@ export interface Host {
 	import_state?: string;
 	role_source?: string;
 	ip_source?: string;
+	/**
+	 * When the hypervisor stopped reporting this host (#445 A5). Null for a host
+	 * Proxmox still sees, and for every manually added host - Proxmox never
+	 * looked for those, so it has no standing to call them gone.
+	 */
+	absent_since?: string | null;
 }
 
 export interface DriftCheck {
@@ -315,6 +399,12 @@ export interface DriftCheck {
 	drifted: boolean;
 	checked_at: string;
 	details_json: string | null;
+	/**
+	 * What the check actually established (#425). `drifted: false` used to cover
+	 * both "I looked and it matches" and "I could not look", and the UI painted
+	 * both green. `unknown` is the honest third answer.
+	 */
+	state?: 'in_spec' | 'drifted' | 'unknown';
 }
 
 export interface AuditEntry {
@@ -434,11 +524,34 @@ export interface ProxmoxConfigIn {
 
 export const api = {
 	// --- Artifacts ---
-	listArtifacts(params: { status?: string; kind?: string; limit?: number } = {}) {
+	listArtifacts(params: { status?: string; kind?: string; q?: string; limit?: number } = {}) {
 		return req<{ items: Artifact[]; total: number }>('/artifacts' + qs(params));
 	},
 	getArtifact(id: string) {
 		return req<ArtifactDetail>(`/artifacts/${id}`);
+	},
+	/**
+	 * Propose a new artifact (#445 A2).
+	 *
+	 * `id` and `produced_by` are deliberately NOT sent: the server derives them,
+	 * so every client gets the same identity rules and `user` comes from the
+	 * authenticated token rather than from whatever the browser claims.
+	 */
+	proposeArtifact(spec: ArtifactProposal) {
+		return req<{ id: string }>('/artifacts', {
+			method: 'POST',
+			body: JSON.stringify(spec),
+		});
+	},
+	/**
+	 * What applying this artifact would change ON THE HOST (#445 A1).
+	 *
+	 * Not to be confused with the preview endpoint, which diffs the artifact
+	 * FILE. Read-only: it runs the same probe drift uses, so opening an approval
+	 * screen cannot alter anything.
+	 */
+	planArtifact(id: string) {
+		return req<ArtifactPlan>(`/artifacts/${id}/plan`, { method: 'POST' });
 	},
 	approveArtifact(id: string, user = 'web') {
 		return req<{ id: string; status: string }>(`/artifacts/${id}/approve`, {
@@ -488,13 +601,33 @@ export const api = {
 	},
 
 	// --- Audit ---
-	listAudit(params: { action?: string; artifact_id?: string; source?: string; limit?: number; offset?: number } = {}) {
+	listAudit(params: { action?: string; artifact_id?: string; source?: string; q?: string; limit?: number; offset?: number } = {}) {
 		return req<{ items: AuditEntry[]; total: number }>('/audit' + qs(params as Record<string, string | number | boolean | undefined>));
 	},
 
 	// --- Inventory ---
-	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string } = {}) {
+	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string; q?: string; limit?: number; offset?: number } = {}) {
 		return req<{ items: Host[]; total: number }>('/inventory' + qs(params));
+	},
+	/**
+	 * Add a host Proxmox has never heard of (#445 A5) - the NAS, the router, the
+	 * Pi. Recorded as `source: "manual"`, which is also what stops a sync from
+	 * ever declaring it absent.
+	 */
+	addHost(body: {
+		hostname: string;
+		ip_address?: string;
+		role?: string;
+		host_type?: string;
+		description?: string;
+		tags?: string;
+		fqdn?: string;
+	}) {
+		return req<Host>('/inventory', { method: 'POST', body: JSON.stringify(body) });
+	},
+	/** Remove a host and its services/observation note. 409 while Proxmox still reports it. */
+	forgetHost(hostId: string) {
+		return req<{ id: string; forgotten: boolean }>(`/inventory/${hostId}`, { method: 'DELETE' });
 	},
 	refreshInventory() {
 		return req<{ hosts: number; services: number }>('/inventory/refresh', { method: 'POST' });
@@ -591,6 +724,25 @@ export const api = {
 	// --- Agents ---
 	listAgents() {
 		return req<AgentInfo[]>('/agents/');
+	},
+	/**
+	 * Forget a decommissioned agent (#415).
+	 *
+	 * Removes the persisted row AND revokes its per-agent credential - that row
+	 * IS the credential store, so a scrapped host whose record survives can still
+	 * authenticate. Refused with 409 while the agent is connected.
+	 */
+	/** Revoke an agent's credential AND close its live channel (#430). */
+	revokeAgent(agentId: string) {
+		return req<{ agent_id: string; revoked: boolean; channel_closed: boolean }>(
+			`/agents/${agentId}/revoke`,
+			{ method: 'POST' }
+		);
+	},
+	forgetAgent(agentId: string) {
+		return req<{ agent_id: string; forgotten: boolean }>(`/agents/${agentId}`, {
+			method: 'DELETE',
+		});
 	},
 	getBootstrapToken() {
 		return req<{

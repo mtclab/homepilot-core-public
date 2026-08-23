@@ -546,6 +546,153 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             PRIMARY KEY (rule_id, hostname)
         )""",
     ],
+    20: [
+        # Why an agent is not here (#430). Every reason the hub refuses or drops
+        # an agent - a revoked credential, a hostname-bound token presented from
+        # elsewhere, a replayed register, an identity already claimed, a banned
+        # peer, a plain socket drop - was `logger.warning` only. None of it
+        # reached the database, the audit trail or the API, so a revoked agent,
+        # a banned agent, a duplicate-identity clash and a powered-off box were
+        # pixel-identical grey dots in the UI.
+        #
+        # Two columns rather than a table: this is the LAST reason, the one an
+        # operator looking at a dark host needs, and it is overwritten on each
+        # new one. The history of rejections belongs in - and now goes to - the
+        # audit log, which already has a durable append-only shape.
+        ("ALTER TABLE agents ADD COLUMN last_error TEXT", "agents", "last_error"),
+        ("ALTER TABLE agents ADD COLUMN last_error_at TEXT", "agents", "last_error_at"),
+    ],
+    21: [
+        # A guest that no longer exists in Proxmox (#445 A5). The refresh only
+        # ever wrote what it FOUND, so a destroyed VM kept its last-known row and
+        # its last-known status forever - it simply stopped being updated, which
+        # from the inventory looks exactly like a machine that is merely powered
+        # off. The reconciler already computed the absent set and spent it on an
+        # audit counter; nothing reached the host or the UI.
+        #
+        # A timestamp rather than a flag: "gone since Tuesday" is what decides
+        # whether this is a deletion or a hypervisor that was briefly
+        # unreachable, and clearing it on the next sighting is one write either
+        # way.
+        ("ALTER TABLE hosts ADD COLUMN absent_since TEXT", "hosts", "absent_since"),
+        # Widen hosts.source to admit 'manual' (#445 A5). A CHECK constraint is
+        # not ALTERable in SQLite, so it is the same rebuild dance as migrations
+        # 14/15/18: rename -> recreate -> copy -> drop -> recreate the indexes
+        # AFTER the drop, because the old indexes ride the rename and only vanish
+        # with the old table.
+        #
+        # 'manual' is not cosmetic: it is what tells the absence sweep that
+        # Proxmox never looked for this machine, so a sync must never declare it
+        # gone.
+        # NOTE the shape of this rebuild: build-copy-drop-RENAME, not the
+        # rename-first dance migrations 14/15/18 use for `tasks`. `services.host_id`
+        # REFERENCES hosts(id), and modern SQLite REWRITES that reference to
+        # follow a rename - so renaming `hosts` out of the way first leaves
+        # `services` pointing at `hosts_old`, and dropping it breaks every later
+        # write to services with "no such table: main.hosts_old". Renaming the
+        # NEW table into place instead leaves the reference text untouched,
+        # pointing at the name that exists again by the end.
+        """CREATE TABLE hosts_new (
+            id              TEXT PRIMARY KEY,
+            proxmox_id      INTEGER,
+            hostname        TEXT NOT NULL,
+            node            TEXT,
+            host_type       TEXT NOT NULL,
+            role            TEXT NOT NULL DEFAULT 'guest',
+            ip_address      TEXT,
+            fqdn            TEXT,
+            status          TEXT NOT NULL DEFAULT 'unknown',
+            tags            TEXT,
+            managed_by      TEXT NOT NULL DEFAULT 'user',
+            managed         INTEGER NOT NULL DEFAULT 0,
+            storage_pool    TEXT,
+            os_info         TEXT,
+            cpu_cores       INTEGER,
+            memory_mb       INTEGER,
+            disk_gb         INTEGER,
+            network_bridge  TEXT,
+            vlan_id         INTEGER,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            pve_status      TEXT,
+            source          TEXT NOT NULL DEFAULT 'discovered'
+                            CHECK(source IN ('hp_created','discovered','imported','manual')),
+            description     TEXT,
+            artifact_id     TEXT,
+            import_state    TEXT CHECK(import_state IN ('pending','adopted','ignored')),
+            role_source     TEXT DEFAULT 'inferred'
+                            CHECK(role_source IN ('inferred','user','artifact')),
+            ip_source       TEXT CHECK(ip_source IN ('pve','dhcp','user','dns')),
+            owner           TEXT,
+            absent_since    TEXT
+        )""",
+        """INSERT INTO hosts_new (
+            id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
+            tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
+            disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
+            source, description, artifact_id, import_state, role_source, ip_source,
+            owner, absent_since
+        ) SELECT
+            id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
+            tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
+            disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
+            source, description, artifact_id, import_state, role_source, ip_source,
+            owner, absent_since
+        FROM hosts""",
+        "DROP TABLE hosts",
+        "ALTER TABLE hosts_new RENAME TO hosts",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
+    ],
+    22: [
+        # Drift is tri-state (#425). `drifted` was a boolean, so every path that
+        # could not check - no spec, no host, no executor, a timeout, an error,
+        # and the whole (dead) ansible verifier - stored `drifted = 0`, which the
+        # UI rendered as a green "in spec" for something nobody had looked at.
+        #
+        # The column carries 'in_spec' | 'drifted' | 'unknown'. Existing rows are
+        # backfilled to 'unknown' rather than 'in_spec': what a pre-migration
+        # `drifted = 0` row actually means is unknowable, and guessing "fine"
+        # would carry the exact defect across the upgrade. A real check overwrites
+        # it within one reconciler cycle.
+        ("ALTER TABLE drift_checks ADD COLUMN state TEXT", "drift_checks", "state"),
+        "UPDATE drift_checks SET state = 'drifted' WHERE drifted = 1 AND state IS NULL",
+        "UPDATE drift_checks SET state = 'unknown' WHERE state IS NULL",
+    ],
+    23: [
+        # What a host looked like before a host-provision artifact touched it
+        # (#426). Without this there is nothing to invert TO: after the apply the
+        # prior file bytes are gone, and "was this package already installed"
+        # cannot be reconstructed from anywhere.
+        #
+        # One row per artifact, replaced on re-apply: the useful capture is the
+        # state before the LAST apply, which is what a revoke now undoes. Keeping
+        # a history would invite restoring a host to a state two applies ago.
+        """CREATE TABLE IF NOT EXISTS host_state_captures (
+            artifact_id  TEXT PRIMARY KEY,
+            captured_at  TEXT NOT NULL,
+            items_json   TEXT NOT NULL
+        )""",
+    ],
+    24: [
+        # Fields an OPERATOR set, which automation must not overwrite (#424).
+        #
+        # `role_source` / `ip_source` were the only provenance guards and they
+        # covered two fields out of the several an operator can write. Worse, the
+        # node refresh FORGED `role_source = "user"` from automation, which
+        # defeated the #416 fix and hid the UI's "inferred" badge - a lie about
+        # who decided a value.
+        #
+        # One JSON list per host rather than a `*_source` column per field: the
+        # question is always "did a person set this", the answer is the same
+        # shape for every field, and a new operator-writable field then needs no
+        # migration - only the PATCH that writes it.
+        ("ALTER TABLE hosts ADD COLUMN pinned_fields TEXT", "hosts", "pinned_fields"),
+    ],
 }
 
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
 from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError
 from ..artifacts.models import ArtifactStatus
 from ..artifacts.store import ArtifactStore
+from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..executor.orchestrator import ArtifactExecutor
 from .repository import TaskRepository
 
@@ -44,6 +46,12 @@ class TaskRunner:
                 del self._task_by_id[task_id]
 
         task.add_done_callback(_done)
+
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Let in-flight apply/revoke/replay runs finish before the database
+        goes away (#496). Nothing else awaits them - they run behind an already
+        -accepted request - so a shutdown is where they get lost."""
+        await drain_tasks(self._running_tasks, "artifact run(s)", timeout)
 
     async def start_apply(self, artifact_id: str, approved_by: str = "system") -> dict[str, Any]:
         # Validate the artifact BEFORE creating a task (#386). An already-APPLIED
@@ -114,6 +122,39 @@ class TaskRunner:
             "status": "pending",
         }
 
+    async def start_replay(self, artifact_id: str) -> dict[str, Any]:
+        """Re-apply an already-applied artifact, through the ONE engine (#423).
+
+        Replay used to exist only on the CLI, where it called a second, weaker
+        apply path - so `hp artifacts replay` bypassed the `replay_safe: false`
+        and replay-only guards that `ArtifactExecutor.replay` enforces and
+        ARTIFACT_SPEC promises. Those guards live in the executor, so the fix is
+        to have exactly one way in.
+        """
+        active = await self.repo.get_active_task(artifact_id)
+        if active is not None and active["action"] in ("apply", "replay", "revoke"):
+            raise ValueError(f"apply_in_progress: task {active['id']} is {active['status']}")
+
+        try:
+            fm, _body = self.store.read(artifact_id)
+        except FileNotFoundError:
+            raise ValueError(f"Artifact not found: {artifact_id}") from None
+
+        status = ArtifactStatus(fm["status"])
+        if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED):
+            raise ConflictError(f"Invalid transition: {status.value} -> replay")
+
+        task_id = await self.repo.create_task(artifact_id, "replay")
+        task = asyncio.create_task(self._run_replay(task_id, artifact_id))
+        self._track_task(task, task_id)
+
+        return {
+            "task_id": task_id,
+            "artifact_id": artifact_id,
+            "action": "replay",
+            "status": "pending",
+        }
+
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
         # Best-effort stop-then-mark. If we still hold the in-flight asyncio.Task
         # (same process, still running) cancel it — the CancelledError raised into
@@ -148,6 +189,39 @@ class TaskRunner:
             raise ValueError(f"Task not found: {task_id}")
         return task
 
+    # How much execution output a task row keeps. Enough to diagnose an apply
+    # without letting one chatty run bloat the table the Tasks page reads - the
+    # full text is still in the artifact's applied record.
+    _MAX_STORED_LOG = 20000
+
+    async def _record_outcome(self, task_id: str, result: Any) -> None:
+        """Finish a task, KEEPING the execution output (#445 A3).
+
+        The executor produces an execution_log for every apply and the runner
+        used to drop it on the floor, so the one artefact that says what actually
+        happened on the host existed for the length of one function call and was
+        then unrecoverable. A failed apply left an operator with a one-line
+        `error` and nothing to diagnose from.
+        """
+        log = str(getattr(result, "execution_log", "") or "")
+        if len(log) > self._MAX_STORED_LOG:
+            # Truncate from the FRONT: the end of a log is where the failure is.
+            kept = log[-self._MAX_STORED_LOG :]
+            log = (
+                f"[earlier output truncated, showing the last {self._MAX_STORED_LOG} chars]\n{kept}"
+            )
+        payload = json.dumps({"execution_log": log}) if log else None
+
+        if getattr(result, "success", False):
+            await self.repo.update_task_status(task_id, "succeeded", result_json=payload)
+        else:
+            await self.repo.update_task_status(
+                task_id,
+                "failed",
+                error=getattr(result, "failure_reason", None) or "apply failed",
+                result_json=payload,
+            )
+
     async def _run_apply(self, task_id: str, artifact_id: str, approved_by: str) -> None:
         await self.repo.update_task_status(task_id, "running")
         try:
@@ -160,24 +234,10 @@ class TaskRunner:
                 # while the host had in fact been changed. This branch owns the
                 # TASK record only; the artifact's state has exactly one owner.
                 result = await self.apply_reconciler.apply_single(artifact_id, approved_by)
-                if result.success:
-                    await self.repo.update_task_status(task_id, "succeeded")
-                else:
-                    await self.repo.update_task_status(
-                        task_id,
-                        "failed",
-                        error=result.failure_reason or "apply failed",
-                    )
+                await self._record_outcome(task_id, result)
             elif self.executor is not None:
                 result = await self.executor.apply(artifact_id, approved_by)
-                if result.success:
-                    await self.repo.update_task_status(task_id, "succeeded")
-                else:
-                    await self.repo.update_task_status(
-                        task_id,
-                        "failed",
-                        error=result.failure_reason or "apply failed",
-                    )
+                await self._record_outcome(task_id, result)
             else:
                 await self.lifecycle.mark_applied(artifact_id, "Applied without executor")
                 await self.repo.update_task_status(task_id, "succeeded")
@@ -195,16 +255,43 @@ class TaskRunner:
                 logger.warning("Could not mark artifact %s as failed", artifact_id, exc_info=True)
             await self.repo.update_task_status(task_id, "failed", error=error_msg)
 
+    async def _run_replay(self, task_id: str, artifact_id: str) -> None:
+        await self.repo.update_task_status(task_id, "running")
+        try:
+            if self.executor is None:
+                raise RuntimeError("no executor configured - cannot replay")
+            # `executor.replay` owns the guards (replay_safe, replay-only,
+            # tamper) AND the artifact's state; this branch owns the task record.
+            result = await self.executor.replay(artifact_id)
+            await self._record_outcome(task_id, result)
+        except Exception as exc:
+            logger.exception("Replay task %s failed for artifact %s", task_id, artifact_id)
+            await self.repo.update_task_status(task_id, "failed", error=str(exc))
+
     async def _run_revoke(
         self, task_id: str, artifact_id: str, user: str, reason: str | None
     ) -> None:
         await self.repo.update_task_status(task_id, "running")
         try:
+            outcome = None
             if self.executor is not None:
-                await self.executor.revoke(artifact_id, user, reason)
+                outcome = await self.executor.revoke(artifact_id, user, reason)
             else:
                 await self.lifecycle.revoke(artifact_id, user, reason)
-            await self.repo.update_task_status(task_id, "succeeded")
+            # Carry "reversed vs relabelled" onto the task record (#426): the
+            # revoke SUCCEEDED either way - the artifact is revoked - but whether
+            # the host was actually put back is a different fact, and it is the
+            # one an operator undoing a change came here for.
+            payload = None
+            if outcome is not None:
+                payload = json.dumps(
+                    {
+                        "rolled_back": outcome.rolled_back,
+                        "rollback_detail": outcome.reason,
+                        "execution_log": outcome.execution_log,
+                    }
+                )
+            await self.repo.update_task_status(task_id, "succeeded", result_json=payload)
         except Exception as exc:
             logger.exception("Revoke task %s failed for artifact %s", task_id, artifact_id)
             await self.repo.update_task_status(task_id, "failed", error=str(exc))

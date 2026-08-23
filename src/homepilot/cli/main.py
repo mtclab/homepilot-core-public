@@ -63,6 +63,61 @@ invite_app = typer.Typer(help="Self-service provisioning invites (#442 portal)")
 app.add_typer(invite_app, name="invite")
 
 
+def _vault_state(settings: Any) -> str:
+    """Whether the vault can actually be OPENED (#431).
+
+    This reported "unlocked" from a non-empty passphrase alone, so a wrong
+    passphrase, a missing identity or a corrupt one all read as unlocked - `hp
+    status` said the thing was fine and every secret lookup then failed
+    elsewhere. Unwrap the identity and report what happens.
+    """
+    if not settings.vault_passphrase:
+        return "locked"
+    try:
+        from homepilot.vault import VaultManager
+
+        vault = VaultManager(Path(settings.data_dir), settings.vault_passphrase)
+        asyncio.run(vault.ensure_master_identity())
+    except Exception as exc:
+        return f"locked ({type(exc).__name__})"
+    return "unlocked"
+
+
+async def _migrate_or_refuse(database: Any, what: str) -> None:
+    """Run migrations from the CLI, unless a backend holds this data directory.
+
+    `hp init`, `hp token create|revoke`, `hp agent revoke`, `hp kb reindex` and
+    `hp import` each migrate the same file a running server is using, so a CLI
+    could change the schema under it (#431). One helper rather than a guard per
+    call site: five copies is five chances to forget the fifth.
+    """
+    from homepilot.db.migrations import run_migrations
+
+    _refuse_if_server_running(_get_settings(), what)
+    await run_migrations(database)
+
+
+def _refuse_if_server_running(settings: Any, what: str) -> None:
+    """Refuse a schema migration while a backend holds this data directory (#431).
+
+    `hp init`, `hp token create` and `hp agent revoke` each run `run_migrations()`
+    on the same file a running server is using, so a CLI could migrate the schema
+    out from under it. The backend takes an advisory lock for its lifetime; this
+    asks whether anyone holds it.
+    """
+    from homepilot.instance_lock import another_instance_is_running
+
+    if another_instance_is_running(settings.data_dir):
+        err_console.print(
+            f"[red]The HomePilot backend is running against {settings.data_dir}.[/red]"
+        )
+        err_console.print(
+            f"[yellow]{what} would migrate the schema under it. Stop the backend "
+            "first, or use the API.[/yellow]"
+        )
+        raise typer.Exit(1)
+
+
 def _get_settings() -> Any:
     return get_settings()
 
@@ -216,13 +271,12 @@ def init(
 
     async def _register_token() -> None:
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
 
         db_path = data_dir / "homepilot.db"
         database = Database(str(db_path))
         await database.connect()
-        await run_migrations(database)
+        await _migrate_or_refuse(database, "hp init")
         repo = Repository(database)
         user_id = await repo.create_user(display_name="admin", auth_source="api_token")
         await repo.create_api_token(
@@ -351,7 +405,7 @@ def status() -> None:
     table.add_row("Data dir", str(data_dir))
     table.add_row("Artifacts dir", str(Path(settings.artifacts_dir)))
     table.add_row("PVE host", settings.proxmox_host or "(not configured)")
-    table.add_row("Vault", "unlocked" if settings.vault_passphrase else "locked")
+    table.add_row("Vault", _vault_state(settings))
 
     store = _get_artifact_store()
     all_artifacts = store.list()
@@ -582,14 +636,57 @@ def artifacts_edit(
         console.print(f"[dim]Edit sync: {e}[/dim]")
 
 
+def _run_artifact_task(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    past_tense: str,
+    artifact_id: str,
+) -> None:
+    """Drive an apply/replay/revoke through the backend and report the OUTCOME.
+
+    `sync=true` so the command does not exit while the change is still happening:
+    a CLI that returns before the host has been touched is the same lie as a
+    rollback that prints and does nothing.
+    """
+    try:
+        result = asyncio.run(_backend_api(method, f"{path}?sync=true", body, scope="write"))
+    except RuntimeError as exc:
+        err_console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(1) from None
+
+    if not isinstance(result, dict):
+        err_console.print(f"[red]Unexpected response from {path}[/red]")
+        raise typer.Exit(1)
+
+    # A finished task reports its own status; a successful sync apply returns the
+    # artifact instead. Anything that is not an explicit failure is a success.
+    status = result.get("status")
+    if status in ("failed", "cancelled"):
+        error = result.get("error") or "no reason recorded"
+        err_console.print(f"[red]{past_tense} failed for {artifact_id}: {error}[/red]")
+        log = (result.get("result") or {}).get("execution_log") if result.get("result") else None
+        if log:
+            console.print(f"[dim]{log}[/dim]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]{past_tense}: {artifact_id}[/green]")
+
+
 @artifacts_app.command("apply")
 def artifacts_apply(
     id: str = typer.Argument(..., help="Artifact ID"),
     approve: bool = typer.Option(False, "--approve", help="Approve first, then apply"),
 ) -> None:
-    """Apply an approved artifact (or approve+apply together)."""
-    from homepilot.mcp.executor_tools import apply_artifact
+    """Apply an approved artifact (or approve+apply together).
 
+    Runs through the backend's executor - the same engine the UI and MCP use.
+    It used to call a second, weaker one (#423) that had no pre-apply snapshot,
+    no approved-body tamper check, no task row, no host-provision support and no
+    rollback: on revoke it printed "Rollback spec exists in artifact body" and
+    executed nothing, telling the operator a rollback had happened while the host
+    was untouched.
+    """
     lifecycle = _get_lifecycle()
 
     if approve:
@@ -600,23 +697,7 @@ def artifacts_apply(
             err_console.print(f"[red]Approve failed: {e}[/red]")
             raise typer.Exit(1) from e
 
-    try:
-        result = asyncio.run(apply_artifact(lifecycle, id, approved_by="cli"))
-        if result.get("success"):
-            console.print(f"[green]Applied: {id}[/green]")
-        else:
-            err_console.print(f"[red]Apply failed: {result.get('error', 'unknown')}[/red]")
-            raise typer.Exit(1)
-    except NotImplementedError as e:
-        err_console.print(f"[red]Executor not implemented: {e}[/red]")
-        err_console.print(
-            "[dim]Per-kind executors need proxmox/ssh/vault injection "
-            "— use lifecycle.mark_applied() manually[/dim]"
-        )
-        raise typer.Exit(1) from e
-    except Exception as e:
-        err_console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1) from e
+    _run_artifact_task("POST", f"/artifacts/{id}/apply", {"approved_by": "cli"}, "Applied", id)
 
 
 @artifacts_app.command("replay")
@@ -624,26 +705,17 @@ def artifacts_replay(
     id: str = typer.Argument(..., help="Artifact ID"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ) -> None:
-    """Re-apply an already-applied artifact."""
-    from homepilot.mcp.executor_tools import apply_artifact
+    """Re-apply an already-applied artifact.
 
+    This is the command that made the shadow engine dangerous: it bypassed the
+    `replay_safe: false` and replay-only guards the executor enforces and
+    ARTIFACT_SPEC promises, because the engine it called had never heard of them
+    (#423).
+    """
     if not yes:
         typer.confirm(f"Replay artifact {id}? This will re-execute the spec.", abort=True)
 
-    lifecycle = _get_lifecycle()
-    try:
-        result = asyncio.run(apply_artifact(lifecycle, id, approved_by="cli"))
-        if result.get("success"):
-            console.print(f"[green]Replayed: {id}[/green]")
-        else:
-            err_console.print(f"[red]Replay failed: {result.get('error', 'unknown')}[/red]")
-            raise typer.Exit(1)
-    except NotImplementedError as e:
-        err_console.print(f"[red]Executor not implemented: {e}[/red]")
-        raise typer.Exit(1) from e
-    except Exception as e:
-        err_console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1) from e
+    _run_artifact_task("POST", f"/artifacts/{id}/replay", None, "Replayed", id)
 
 
 @artifacts_app.command("revoke")
@@ -651,19 +723,16 @@ def artifacts_revoke(
     id: str = typer.Argument(..., help="Artifact ID"),
     reason: list[str] | None = typer.Option(None, "--reason", help="Revocation reason"),  # noqa: B008
 ) -> None:
-    """Revoke an applied artifact."""
-    from homepilot.mcp.executor_tools import revoke_artifact
+    """Revoke an applied artifact, running its rollback.
 
-    lifecycle = _get_lifecycle()
+    The old CLI path never rolled anything back - it looked for a `## Rollback`
+    heading and printed that one existed (#423).
+    """
     reason_str = " ".join(reason) if reason else None
-    try:
-        result = asyncio.run(revoke_artifact(lifecycle, id, user="cli", reason=reason_str))
-        console.print(f"[yellow]Revoked: {id}[/yellow]")
-        if result.get("has_rollback"):
-            console.print("[dim]Rollback spec exists in artifact body[/dim]")
-    except Exception as e:
-        err_console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1) from e
+    body: dict[str, Any] = {"user": "cli"}
+    if reason_str:
+        body["reason"] = reason_str
+    _run_artifact_task("DELETE", f"/artifacts/{id}", body, "Revoked", id)
 
 
 @artifacts_app.command("push")
@@ -1063,7 +1132,6 @@ def import_backup(
     """Restore a HomePilot data dir from a tarball. Backs up current state first."""
     from homepilot.db.backup import DatabaseLockedError, SnapshotError, ensure_not_locked
     from homepilot.db.connection import Database
-    from homepilot.db.migrations import run_migrations
 
     if not path.exists():
         err_console.print(f"[red]File not found: {path}[/red]")
@@ -1171,7 +1239,7 @@ def import_backup(
             database = Database(str(db_path))
             await database.connect()
             try:
-                await run_migrations(database)
+                await _migrate_or_refuse(database, "hp import")
                 row = await database.fetchone(
                     "SELECT value FROM settings WHERE key = 'schema_version'"
                 )
@@ -1310,10 +1378,17 @@ def kb_reindex(
     async def _kb_reindex_via_api(no_embs: bool) -> dict[str, Any] | None:
         settings = _get_settings()
         base_url = f"http://127.0.0.1:{settings.daemon_port}"
-        headers: dict[str, str] = {}
-        admin_secret = settings.admin_secret
-        if admin_secret:
-            headers["X-HP-Admin-Secret"] = admin_secret
+        # `/kb/reindex` requires the ADMIN SCOPE, i.e. a bearer token. This sent
+        # only the admin-secret header, so every invocation 401'd and fell
+        # silently through to the offline path - which is the path that wiped the
+        # index (#388). Mint a short-lived admin token the same way the other
+        # CLI-to-backend commands do.
+        token, mint_error = await _mint_token_via_api(settings, "cli-kb-reindex", "admin")
+        if token is None:
+            if mint_error:
+                err_console.print(f"[yellow]{mint_error}[/yellow]")
+            return None
+        headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
         import httpx as _httpx
 
         async with _httpx.AsyncClient(timeout=30.0) as client:
@@ -1342,7 +1417,6 @@ def kb_reindex(
             return via_api
 
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
         from homepilot.executor import kb_note
 
@@ -1355,7 +1429,7 @@ def kb_reindex(
         database = Database(str(db_path))
         await database.connect()
         try:
-            await run_migrations(database)
+            await _migrate_or_refuse(database, "hp kb reindex")
             repo = Repository(database)
             store = _get_artifact_store()
 
@@ -1463,7 +1537,6 @@ def token_create(
         from aiosqlite import OperationalError
 
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
@@ -1484,7 +1557,7 @@ def token_create(
         try:
             database = Database(str(db_path))
             await database.connect()
-            await run_migrations(database)
+            await _migrate_or_refuse(database, "hp token create")
             repo = Repository(database)
 
             full_token, prefix, token_hash = generate_api_token()
@@ -1606,7 +1679,6 @@ async def _open_invite_repo() -> tuple[Database, InviteRepository]:
     backend is running.
     """
     from homepilot.db.connection import Database
-    from homepilot.db.migrations import run_migrations
     from homepilot.portal.repository import InviteRepository
 
     settings = _get_settings()
@@ -1614,7 +1686,7 @@ async def _open_invite_repo() -> tuple[Database, InviteRepository]:
     data_dir.mkdir(parents=True, exist_ok=True)
     database = Database(str(data_dir / "homepilot.db"))
     await database.connect()
-    await run_migrations(database)
+    await _migrate_or_refuse(database, "hp token revoke")
     return database, InviteRepository(database)
 
 
@@ -1761,7 +1833,6 @@ def inventory_list(
 
     async def _list() -> list[dict[str, Any]]:
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
@@ -1770,7 +1841,7 @@ def inventory_list(
             return []
         db = Database(str(db_path))
         await db.connect()
-        await run_migrations(db)
+        await _migrate_or_refuse(db, "hp inventory list")
         repo = Repository(db)
         svc = InventoryService(repo=repo)
         filt: dict[str, Any] = {}
@@ -1818,7 +1889,6 @@ def inventory_show(
 
     async def _show() -> dict[str, Any] | None:
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
@@ -1827,7 +1897,7 @@ def inventory_show(
             return None
         db = Database(str(db_path))
         await db.connect()
-        await run_migrations(db)
+        await _migrate_or_refuse(db, "hp inventory show")
         repo = Repository(db)
         host = await repo.get_host_by_hostname(hostname)
         await db.close()
@@ -1886,14 +1956,13 @@ def inventory_refresh(
 
         # Backend not running → refresh directly against the DB.
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
         from homepilot.inventory.service import InventoryService
 
         db_path = Path(settings.data_dir) / "homepilot.db"
         db = Database(str(db_path))
         await db.connect()
-        await run_migrations(db)
+        await _migrate_or_refuse(db, "hp inventory refresh")
         repo = Repository(db)
 
         proxmox = None
@@ -2021,14 +2090,13 @@ def vault_delete(
 
 async def _get_repo_for_webhook() -> tuple[Any, Any]:
     from homepilot.db.connection import Database
-    from homepilot.db.migrations import run_migrations
     from homepilot.db.repository import Repository
 
     settings = _get_settings()
     db_path = Path(settings.data_dir) / "homepilot.db"
     db = Database(str(db_path))
     await db.connect()
-    await run_migrations(db)
+    await _migrate_or_refuse(db, "hp vault delete")
     return db, Repository(db)
 
 
@@ -2071,7 +2139,16 @@ def webhook_list(
     configs = asyncio.run(_list())
 
     if output == "json":
-        console.print(json.dumps(configs, default=str))
+        # The HMAC signing key is redacted, exactly as the table branch omits it
+        # (#388). `--output json` is what gets piped into CI logs.
+        # nosec B105 - "***" is the redaction MARKER that replaces the signing
+        # key, not a credential. Flagged as a hardcoded password by bandit,
+        # which cannot tell the two apart.
+        redacted = [
+            {**c, "secret": "***"} if c.get("secret") else dict(c)  # nosec B105
+            for c in configs
+        ]
+        console.print(json.dumps(redacted, default=str))
         return
 
     if not configs:
@@ -2137,14 +2214,23 @@ def webhook_test(
             "timestamp": datetime.now(UTC).isoformat(),
         }
         console.print(f"[dim]Sending test event to {config['url']}...[/dim]")
-        await deliver_with_retry(
+        delivered = await deliver_with_retry(
             url=config["url"],
             payload=test_payload,
             secret=config.get("secret"),
             max_retries=config.get("max_retries", 3),
         )
         await db.close()
-        console.print("[green]Test event sent[/green]")
+        if not delivered:
+            # This command exists to answer "does delivery work". Printing
+            # success for an endpoint that never answered is the one thing it
+            # must not do (#388).
+            err_console.print(
+                f"[red]Test event was NOT accepted by {config['url']} "
+                f"after {config.get('max_retries', 3) + 1} attempt(s)[/red]"
+            )
+            raise typer.Exit(1)
+        console.print("[green]Test event delivered[/green]")
 
     asyncio.run(_test())
 
@@ -2155,33 +2241,102 @@ agent_app = typer.Typer(help="Agent hub management")
 app.add_typer(agent_app, name="agent")
 
 
+async def _backend_api(
+    method: str,
+    path: str,
+    json_body: dict[str, Any] | None = None,
+    scope: str = "admin",
+) -> dict[str, Any] | list[Any]:
+    """Call the running backend, as an operator would.
+
+    Two families of command need this, for the same reason. `hp agent
+    list|token|bootstrap` used to read `app_state.get_agent_registry()`, a global
+    only ever set inside the FastAPI lifespan, so a standalone `hp` process
+    ALWAYS printed "Agent hub not enabled" (#430). `hp artifacts
+    apply|replay|revoke` ran a SECOND apply engine with weaker guarantees for the
+    same reason - the real executor, its agent transport, its snapshots and its
+    task rows all live in the backend process (#423).
+
+    The engine and the hub live there; the only honest way for a separate process
+    to use them is over the API.
+
+    The short-lived admin token is minted through the same admin-secret endpoint
+    the other CLI-to-backend commands use, and DELETED again afterwards - a
+    read-only `hp agent list` must not leave a fleet-root credential behind on
+    every invocation.
+    """
+    import httpx
+
+    settings = _get_settings()
+    token, err = await _mint_token_via_api(settings, f"cli-{scope}", scope)
+    if token is None:
+        raise RuntimeError(
+            err
+            or (
+                "The HomePilot backend is not reachable on "
+                f"127.0.0.1:{getattr(settings, 'daemon_port', 8000)}. The agent hub runs "
+                "inside it, so it has to be running to answer this."
+            )
+        )
+    port = getattr(settings, "daemon_port", 8000)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.request(
+                method,
+                f"http://127.0.0.1:{port}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=json_body,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code} from {path}: {resp.text}")
+            body: dict[str, Any] | list[Any] = resp.json()
+            return body
+    finally:
+        # Best-effort cleanup: the prefix is the token's own first 16 chars.
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.delete(
+                    f"http://127.0.0.1:{port}/auth/tokens/{token[:16]}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+        except Exception:
+            import logging as _logging
+
+            _logging.getLogger(__name__).debug("could not revoke the CLI token", exc_info=True)
+
+
 @agent_app.command("list")
 def agent_list() -> None:
-    """List connected agents."""
-    from homepilot.app_state import get_agent_registry
-
-    registry = get_agent_registry()
-    if registry is None:
-        err_console.print("[yellow]Agent hub not enabled[/yellow]")
-        raise typer.Exit(1)
-    agents = registry.list_connected()
-    if not agents:
-        console.print("[dim]No agents connected[/dim]")
+    """List the fleet: connected agents, and the known ones that are not."""
+    try:
+        agents = asyncio.run(_backend_api("GET", "/agents/"))
+    except RuntimeError as exc:
+        err_console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(1) from None
+    if not isinstance(agents, list) or not agents:
+        console.print("[dim]No agents known[/dim]")
         return
-    table = Table(title="Connected Agents")
+    table = Table(title="Agents")
     table.add_column("Agent ID", style="cyan")
     table.add_column("Hostname", style="green")
     table.add_column("OS", style="blue")
+    table.add_column("Version", style="magenta")
+    table.add_column("State", style="yellow")
     table.add_column("Last Heartbeat", style="dim")
-    table.add_column("Stale (s)", style="yellow")
+    table.add_column("Last error", style="red")
     for a in agents:
-        sys_info = a.get("system_info", {})
+        sys_info = a.get("system_info") or {}
+        connected = bool(a.get("connected"))
         table.add_row(
-            a["agent_id"],
-            a["hostname"],
+            str(a.get("agent_id", "")),
+            str(a.get("hostname", "")),
             f"{sys_info.get('os', '?')} {sys_info.get('arch', '?')}",
-            a["last_heartbeat"],
-            str(a["stale_seconds"]),
+            # An agent built before the version stamp existed reports nothing;
+            # say so rather than inventing a value (#430).
+            str(sys_info.get("agent_version") or "unknown"),
+            "connected" if connected else "disconnected",
+            str(a.get("last_heartbeat") or "-"),
+            str(a.get("last_error") or ""),
         )
     console.print(table)
 
@@ -2191,48 +2346,49 @@ def agent_token(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
     """Show the agent hub auth token for configuring agents."""
-    from homepilot.app_state import get_agent_registry
-
-    registry = get_agent_registry()
-    if registry is None or registry.hub_server is None:
-        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+    try:
+        data = asyncio.run(_backend_api("GET", "/agents/token"))
+    except RuntimeError as exc:
+        err_console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(1) from None
+    if not isinstance(data, dict):
+        err_console.print("[red]Unexpected response from /agents/token[/red]")
         raise typer.Exit(1)
-    hub = registry.hub_server
-    token = hub.auth_token or ""
+    token = str(data.get("auth_token") or "")
+    hub_host = str(data.get("hub_host") or "")
+    hub_port = data.get("hub_port")
     if json_output:
-        console.print_json(
-            data={
-                "auth_token": token,
-                "hub_host": hub.host,
-                "hub_port": hub.port,
-            }
-        )
+        console.print_json(data={"auth_token": token, "hub_host": hub_host, "hub_port": hub_port})
     else:
         if token:
             console.print(
                 Panel(token, title="Agent Hub Auth Token", subtitle="Set HP_AGENT_HUB_AUTH_TOKEN")
             )
         else:
-            console.print("[yellow]No auth token configured — set HP_AGENT_HUB_AUTH_TOKEN[/yellow]")
-        console.print(f"[dim]Hub endpoint: {hub.host}:{hub.port}[/dim]")
+            console.print("[yellow]No auth token configured - set HP_AGENT_HUB_AUTH_TOKEN[/yellow]")
+        console.print(f"[dim]Hub endpoint: {hub_host}:{hub_port}[/dim]")
 
 
 @agent_app.command("bootstrap")
 def agent_bootstrap_cmd(
-    hub_host: str = typer.Option("localhost", help="Agent hub host"),
-    hub_port: int = typer.Option(8443, help="Agent hub port"),
+    hub_host: str = typer.Option("", help="Agent hub host (default: what the hub advertises)"),
+    hub_port: int = typer.Option(0, help="Agent hub port (default: what the hub advertises)"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
     """Generate a one-time bootstrap token for agent enrollment."""
-    from homepilot.app_state import get_agent_registry
-
-    registry = get_agent_registry()
-    if registry is None or registry.hub_server is None:
-        err_console.print("[yellow]Agent hub not enabled[/yellow]")
+    try:
+        data = asyncio.run(_backend_api("GET", "/agents/bootstrap"))
+    except RuntimeError as exc:
+        err_console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(1) from None
+    if not isinstance(data, dict) or not data.get("bootstrap_token"):
+        err_console.print("[red]Unexpected response from /agents/bootstrap[/red]")
         raise typer.Exit(1)
-
-    hub = registry.hub_server
-    token = asyncio.run(hub._token_store.create())
+    token = str(data["bootstrap_token"])
+    # The hub knows its own reachable address; the flags exist to override it
+    # from behind a NAT or a different name, not to be guessed at by default.
+    hub_host = hub_host or str(data.get("hub_host") or "localhost")
+    hub_port = hub_port or int(data.get("hub_port") or 8443)
 
     if json_output:
         console.print_json(
@@ -2273,7 +2429,6 @@ def agent_revoke(
 
     async def _revoke() -> bool:
         from homepilot.db.connection import Database
-        from homepilot.db.migrations import run_migrations
         from homepilot.db.repository import Repository
 
         settings = get_settings()
@@ -2284,7 +2439,7 @@ def agent_revoke(
         db = Database(str(db_path))
         await db.connect()
         try:
-            await run_migrations(db)
+            await _migrate_or_refuse(db, "hp agent revoke")
             repo = Repository(db)
             return await repo.revoke_agent_credential(agent_id)
         finally:
@@ -2296,4 +2451,59 @@ def agent_revoke(
         console.print("[dim]The agent must re-enroll (bootstrap/shared token) to reconnect.[/dim]")
     else:
         err_console.print(f"[yellow]No active credential to revoke for agent '{agent_id}'[/yellow]")
+        raise typer.Exit(1)
+
+
+@agent_app.command("remove")
+def agent_remove(
+    agent_id: str = typer.Argument(..., help="Agent ID to forget entirely"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+) -> None:
+    """Forget a decommissioned agent: delete its record AND revoke its credential.
+
+    Unlike `agent revoke`, which leaves the row in place so the host can be
+    re-enrolled, this removes the agent entirely. Use it when a box is gone for
+    good - the `agents` table doubles as the per-agent credential store, so a
+    record left behind is a credential a scrapped machine can still present.
+
+    This CLI path talks to the database directly, so it does NOT know whether the
+    agent is currently connected (the API refuses that case). Removing a live
+    agent's record pulls the credential out from under an open connection; stop
+    the agent first.
+    """
+
+    async def _remove() -> bool:
+        from homepilot.db.connection import Database
+        from homepilot.db.repository import Repository
+
+        settings = get_settings()
+        db_path = Path(settings.data_dir) / "homepilot.db"
+        if not db_path.exists():
+            err_console.print(f"[red]Database not found at {db_path}[/red]")
+            raise typer.Exit(1)
+        db = Database(str(db_path))
+        await db.connect()
+        try:
+            await _migrate_or_refuse(db, "hp agent remove")
+            repo = Repository(db)
+            # Revoke FIRST: if the delete then fails, the credential is already
+            # dead rather than the other way round.
+            await repo.revoke_agent_credential(agent_id)
+            return await repo.delete_agent(agent_id)
+        finally:
+            await db.close()
+
+    if not yes:
+        confirmed = typer.confirm(
+            f"Forget agent {agent_id} and revoke its credential? This cannot be undone"
+        )
+        if not confirmed:
+            console.print("[dim]Left alone.[/dim]")
+            raise typer.Exit(0)
+
+    removed = asyncio.run(_remove())
+    if removed:
+        console.print(f"[green]Forgot agent {agent_id}; its credential is revoked[/green]")
+    else:
+        err_console.print(f"[yellow]No agent '{agent_id}' to forget[/yellow]")
         raise typer.Exit(1)

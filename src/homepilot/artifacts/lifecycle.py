@@ -123,6 +123,19 @@ class ArtifactLifecycle:
             except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
                 logger.exception("DB sync failed for artifact %s: %s", id_str, exc)
 
+        # Propose wrote an event and a git commit and NO audit row (#433), so the
+        # one action that starts every change was the one action missing from the
+        # durable trail an operator reads. Every other transition logs one.
+        try:
+            await self._log_audit(
+                "propose",
+                id_str,
+                (fm.get("produced_by") or {}).get("user"),
+                {"kind": fm.get("kind"), "intent": fm.get("intent", "")[:200]},
+            )
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+            logger.exception("Audit log failed for propose %s: %s", id_str, exc)
+
         try:
             await emit_event(
                 "artifact_proposed",

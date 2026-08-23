@@ -46,11 +46,11 @@ longer the way in.
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=2.8.0 docker compose pull
+HP_IMAGE_TAG=2.9.0 docker compose pull
 docker compose up -d
 ```
 
-Available tags: `latest`, `2.8.0`, `2.7`, `2` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
+Available tags: `latest`, `2.9.0`, `2.9`, `2` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
 
 ## Services
 
@@ -173,6 +173,12 @@ export HP_AGENT_TLS_PIN=sha256:<hub_cert_sha256>
 hp-agent
 ```
 
+`hp-agent --version` prints the binary's build stamp, and the agent reports it
+on every register, so the **Agents** page and `hp agent list` show which binary
+each host runs. A binary built by hand reports `dev`; release builds carry the
+release tag. (Before #430 the release passed `-X main.version` against a symbol
+that did not exist, so every released binary was silently unversioned.)
+
 `scripts/install-agent.sh` is the supported installer: it writes
 `/etc/homepilot/agent.env` **and** the matching systemd unit, so the two cannot
 disagree. `agent/hp-agent.service` is a reference copy of the unprivileged unit.
@@ -281,7 +287,7 @@ All require API authentication. Endpoints marked **(admin)** require admin scope
 | GET | `/api/agents/` | read | List connected agents |
 | GET | `/api/agents/token` | admin | Get hub auth token for agent config |
 | GET | `/api/agents/bootstrap` | admin | Generate one-time bootstrap token |
-| GET | `/api/agents/audit` | admin | Query audit log |
+| GET | `/api/agents/audit` | admin | Query audit log (`agent_id`, `action`, `limit`) |
 | GET | `/api/agents/hostname/{hostname}/connected` | read | Check if agent is connected |
 | POST | `/api/agents/host/exec` | admin | Execute an allowlisted command on a host via its connected agent |
 | POST | `/api/agents/host/read-file` | admin | Read file from host |
@@ -289,6 +295,8 @@ All require API authentication. Endpoints marked **(admin)** require admin scope
 | POST | `/api/agents/{agent_id}/exec` | admin | Execute command on specific agent |
 | POST | `/api/agents/{agent_id}/read-file` | admin | Read file from specific agent |
 | POST | `/api/agents/{agent_id}/write-file` | admin | Write file to specific agent |
+| POST | `/api/agents/{agent_id}/revoke` | admin | Revoke an agent's credential **and close its live channel** |
+| DELETE | `/api/agents/{agent_id}` | admin | Forget a decommissioned agent: revoke its credential, then delete the row (409 while connected) |
 
 ### Metrics API endpoints
 
@@ -317,6 +325,8 @@ recent-metrics panel live.
 hp agent token          # Show hub auth token
 hp agent bootstrap      # Generate one-time bootstrap token
 hp agent list           # List connected agents
+hp agent revoke <id>    # Revoke an agent's per-agent credential
+hp agent remove <id>    # Forget a decommissioned agent (revoke, then delete)
 ```
 
 ## CLI
@@ -332,7 +342,7 @@ hp artifacts list             # list artifacts
 hp artifacts show <id>        # show artifact detail
 hp artifacts approve <id>     # approve a proposed artifact
 hp artifacts reject <id>      # reject a proposed artifact
-hp artifacts apply <id>       # apply an approved artifact
+hp artifacts apply <id>       # apply an approved artifact (via the backend's executor)
 hp artifacts edit <id>        # open artifact in editor
 hp artifacts revoke <id>      # revoke an applied artifact
 hp artifacts replay <id>      # re-apply an already-applied artifact
@@ -367,6 +377,7 @@ hp agent token                # show hub auth token for agent config
 hp agent bootstrap            # generate one-time bootstrap token
 hp agent list                 # list connected agents
 hp agent revoke               # revoke an agent's per-agent credential
+hp agent remove <id>          # forget a decommissioned agent (revokes its credential, then deletes the row)
 ```
 
 ## MCP Server
@@ -453,6 +464,245 @@ HP_TEST_TOKEN=hp_... pytest tests/test_e2e.py -v
 ```
 
 See [`docs/testing.md`](docs/testing.md) for the full testing guide including manual smoke test checklist and dev server details.
+
+## Day-2 operations
+
+**Retention.** `audit_log`, `agent_audit`, finished `tasks` and
+`webhook_deliveries` are pruned past `HP_RETENTION_DAYS` (default 90) by a
+reconciler, and freed pages are returned to the filesystem afterwards - a
+delete-only policy shrinks nothing an operator can see. Nothing was pruned at all
+before: each of those gains a row per operation, and a year on a homelab VM is a
+multi-GB SQLite file and a backup too big to move.
+
+Not pruned, deliberately: **artifacts** (the record of intent), **hosts /
+services / agents** (the estate, not its history), **drift_checks** (one upserted
+row per artifact, already bounded), and **metrics** (its own pruner, its own
+horizon - the right retention for a time series is not the right retention for an
+audit log). A **stuck** task - pending or running past the horizon - is never
+pruned either: deleting it would hide the problem.
+
+**Logging.** `HP_LOG_LEVEL` is applied at startup. It was defined, documented and
+read by nothing, so every `logger.debug` diagnostic was invisible in production
+and could not be turned on.
+
+**One backend per data directory.** The backend takes an advisory lock on
+`<data_dir>/homepilot.lock` for its lifetime. A second backend used to run the
+orphan sweep and mark the first one's pending/running tasks failed while they
+carried on running. The kernel releases the lock if the process dies, so a crash
+never leaves a stale one. CLI commands that migrate the schema refuse while that
+lock is held, rather than migrating under a running server.
+
+## Secrets in artifacts
+
+`host-provision` config content and `shell-script` bodies resolve
+`{{ vault.<name>.<field> }}` at execute time, in memory, immediately before the
+value reaches the host. The stored body holds only the reference.
+
+This matters because the artifact store is a **git repository designed to be
+pushed**: before this, vault was wired into `http_sequence` and `proxmox_api`
+only, so a password in a config file or a token in a script had to be committed,
+and `git push` is a one-way door.
+
+- The resolved value never reaches an execution log, a task result or a failure
+  reason - all three are read back by an operator, and the execution log is
+  persisted on purpose.
+- A missing credential is a REFUSAL, not an empty substitution: a config written
+  with an empty password is a working-looking file that fails at 3am.
+- Propose refuses a body that appears to carry a literal credential, because that
+  is the last moment before it is in history.
+
+## Knowledge base
+
+Semantic search works. It never had: sqlite-vec requires the `k` constraint on
+the vec0 table's own query - a `LIMIT` on an outer join does not count - so every
+search raised `A LIMIT or 'k = ?' constraint is required on vec0 knn queries`,
+which the handler turned into a keyword fallback and a debug-level warning.
+
+A doc with no embedding is never hidden. `vec_docs` is written by the kb-note
+artifact executor, so ingested documentation and observed-state notes had none -
+and the vector query joins that table, which meant those docs were returned ONLY
+by the fallback that runs when the embedding service is DOWN. Vector hits keep
+their order and their scores; keyword hits fill in behind them. Ingest embeds as
+it writes, and `reindex` sweeps everything still missing an embedding rather than
+re-walking artifact notes alone.
+
+## Reviewing
+
+The approval screen shows the plan (what changes on the host), the artifact body,
+and the **policies** the operator recorded for that host - `kind: "policy"` KB
+entries for the target - so approving is an informed decision rather than reading
+YAML the AI wrote. A KB that is down never blocks the plan.
+
+The queue supports **bulk approve/reject** with an inline two-step confirm, the
+same pattern as every other destructive action here (Approve used to raise a
+native `confirm()` in one place and nothing in another). One refusal does not
+abandon the batch, and the toast names which artifacts did not go through.
+
+The sidebar shows **"Live updates offline"** while the SSE stream is
+disconnected. It reconnects silently with backoff, so the UI used to just stop
+updating - and "nothing is happening" and "I am not being told what is happening"
+are opposite conclusions on an ops console. The Tokens page shows each token's
+expiry, which the API had always returned and nothing rendered.
+
+## What the AI can see over MCP
+
+The agent half of "AI-first" has to be able to close its loop:
+
+- **`get_artifact`** returns the whole artifact - frontmatter AND body. The
+  execution log is appended to the body on apply, so this is how an agent sees
+  what happened when its own artifact ran, and how it uses a prior artifact as a
+  pattern. `get_artifact_status` returns a status string and nothing else.
+- **`get_task_result`** returns the outcome of an apply/replay/revoke by task id
+  or by artifact id, with the execution log the runner kept.
+- **`check_host_reachable`** answers, from the hub's live registry, whether a host
+  has a connected agent - so an agent can find out BEFORE proposing work that an
+  artifact targeting that host would fail at apply.
+- **`propose_artifact`** names `host-provision` in its schema. It is the native
+  provisioning kind with a real pre-apply plan and a captured rollback, and an
+  agent reading the schema could not previously know it existed.
+- **`get_environment_doc`** now calls the service implementation, so it includes
+  the knowledge base its own description has always advertised.
+
+## Operator intent is pinned
+
+A `PATCH /inventory/{host_id}` is an operator deciding, so the fields it writes
+are recorded in `hosts.pinned_fields` and every sync and enrich pass goes through
+one `update_host_from_automation()` door that leaves them alone. Before this,
+editing a description or a status in the UI lasted until the next reconciler
+cycle, and `PATCH status` was simply a lie.
+
+Automation never writes `role_source: "user"` or `ip_source: "user"`. A sync that
+stamps an operator's provenance over its own guess defeats the guard AND hides
+the UI badge that says a value was inferred - it is a lie about who decided.
+
+## Drift is tri-state
+
+A drift check answers `in_spec`, `drifted` or **`unknown`**, with a reason.
+`drifted` used to be a boolean, so every unverifiable path - no spec, no host, no
+executor, a timeout, a raised exception, a sequence whose every step was skipped
+- returned `false`, and the UI painted it green. The dashboard's headline was
+`(total - drifted) / total`, inflated by exactly the artifacts nobody had looked
+at; it is now a percentage of what was actually CHECKED, with the unknown count
+beside it.
+
+`unknown` is the default, on purpose: a path that forgets to say reads as "not
+established" rather than as a clean bill of health.
+
+**Ansible drift checking is not implemented and now says so.** The verifier
+called `executor.ssh.exec(...)` on an attribute that went with the jump server,
+so it raised on every run into a handler that returned "no drift" - every applied
+ansible artifact reported in-spec forever, having checked nothing. Reviving it
+needs a real playbook transport (#388), not a rename.
+
+## Rollback truth
+
+`rollback` in an artifact's frontmatter is a FACT about the body, not a switch:
+ARTIFACT_SPEC defines it as "true if a rollback section exists in the body", and
+it is now derived at propose from the fenced rollback block the artifact's own
+executor would run. A `## Rollback` heading with prose under it is not a rollback
+- nothing can execute it.
+
+A `rollback: true` that cannot be honoured is refused at propose, rather than
+discovered on revoke: the operator has already decided to undo something by
+then.
+
+`host-provision` has no rollback section to write - its inverse comes from a
+capture taken at apply time (prior package presence, prior service state, prior
+file bytes and mode), stored per artifact. Revoking restores what it can and
+NAMES what it cannot: the agent has no package-removal or file-deletion verb, so
+a package that was absent stays installed and a config file that did not exist
+stays on disk. Guessing at those - `apt-get remove`, `rm` - is how an undo takes
+out a dependency or a file somebody else wrote.
+
+Revoking returns whether the host was actually put back. **`revoked` describes
+the ARTIFACT and says nothing about the machine** - a rollback that was skipped,
+that no-op'd, or that failed used to be indistinguishable from one that worked.
+The journal now records `outcome: reversed` or `outcome: relabelled` with the
+reason, and the task result carries the same. A composite whose sub-artifacts
+were only relabelled reports a failed rollback rather than a clean success.
+
+## One apply engine
+
+`apply`, `replay` and `revoke` all run through `ArtifactExecutor` in the backend
+process - from the UI, from MCP, and from the CLI. There used to be a second,
+weaker engine behind `hp artifacts apply|replay|revoke` with no pre-apply
+snapshot, no approved-body tamper check, no task row, no host-provision support
+and no rollback (on revoke it printed "Rollback spec exists in artifact body" and
+executed nothing). `hp artifacts replay` therefore also bypassed the
+`replay_safe: false` and replay-only guards the spec promises.
+
+The CLI now calls `POST /artifacts/{id}/apply`, `POST /artifacts/{id}/replay` and
+`DELETE /artifacts/{id}` with `sync=true` and reports the task's real outcome, so
+it cannot return before the host has been touched. The executor, its agent
+transport, its snapshots and its task rows live in the backend; a separate
+process cannot honestly have any of them.
+
+## The management UI
+
+One token layer (`web/src/app.css`) decides colour, type and spacing; nothing in
+the markup carries a raw palette value. HomePilot belongs to the estate's
+civic/data house: a deep near-black field, ONE restrained accent (muted copper),
+a serif reading register for text and sans for chrome, data and numbers. Red,
+amber, green and teal mean status and are never decoration. Every text/background
+pair is asserted against WCAG AA by `web/src/lib/tokens.test.ts`.
+
+The shell is responsive: below `md` the sidebar collapses behind a nav bar (it is
+a fixed 176px column otherwise, which on a phone ate the width the tables need),
+and it closes on Escape, on navigation, and on picking a link. Table row density
+lives in `.data-table` rather than on individual cells, so it is tunable in one
+place. `make gate-web` runs `svelte-check --fail-on-warnings`, so an
+unassociated label or a click handler on a non-interactive element fails the
+build rather than accumulating as a note.
+
+## Inventory paging
+
+`GET /inventory` returns a real `COUNT(*)` as `total`, not the page size, and the
+Inventory page has a pager. It used to return `len(hosts)`, which capped the UI at
+100 rows with no way to reach page 2 and told the operator their estate was
+smaller than it is. The filter clauses live in one builder shared by the list and
+the count, so the two cannot disagree about which rows they describe.
+
+The inventory reconciler pages through every host rather than reading the default
+first 100: its absent/changed sets were computed from an arbitrary page on any
+estate larger than that.
+
+## Inventory lifecycle
+
+Inventory is not only Proxmox guests:
+
+- **Add a host by hand** (`POST /inventory`, "+ Add host" on the Inventory page)
+  for the NAS, the router, the Pi - anything the hypervisor has never heard of.
+  It is recorded as `source: "manual"` and adopted immediately, and a Proxmox
+  sync will never mark it absent, because Proxmox never looked for it.
+- **A guest that disappears from Proxmox is stamped `absent_since`** and shown as
+  **gone**, instead of keeping its last-known status forever and looking exactly
+  like a machine that is merely powered off. The stamp is set once (so "gone
+  since Tuesday" survives) and cleared the moment the host is seen again. Only a
+  FULL sync marks absence - a scoped, single-node sync never sees the other
+  nodes' guests.
+- **Forget a host** (`DELETE /inventory/{host_id}`) removes it with its services
+  and its as-found observation note. Refused with 409 while the hypervisor still
+  reports the host: the next sync would bring it straight back, and the operator
+  would believe it was gone. Destroy the guest in Proxmox, or set its import
+  state to `ignored`, instead.
+
+## Search
+
+`GET /artifacts`, `GET /inventory` and `GET /audit` all take a `q` free-text
+parameter, and the Artifacts, Inventory and Journal pages each have a search box
+that uses it. The query is evaluated on the SERVER on purpose: those lists are
+paginated (and the artifact list is capped), so a filter applied in the browser
+could only ever search the rows already fetched and would confidently report "no
+match" for something on the next page.
+
+| Endpoint | `q` matches |
+|---|---|
+| `/artifacts` | id, intent, kind, status, target, tags, produced_by |
+| `/inventory` | hostname, fqdn, ip address, node, role, tags, description, owner, os |
+| `/audit` | artifact id, target host/service, command, actor, action, details |
+
+`q` composes with the existing filters (they narrow together), and on `/audit`
+the reported `total` counts the search, so the pager never offers empty pages.
 
 ## Events & Webhooks
 

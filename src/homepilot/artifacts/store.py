@@ -74,6 +74,30 @@ def _classify_stderr(stderr: str) -> GitOperationErrorCategory:
     return GitOperationErrorCategory.UNKNOWN
 
 
+# The frontmatter fields an operator would recognise an artifact by. Nested
+# values (target, produced_by, tags) are flattened to text before matching, so
+# searching "web01" finds the artifact that targets web01.
+_ARTIFACT_SEARCH_FIELDS: tuple[str, ...] = (
+    "id",
+    "intent",
+    "kind",
+    "status",
+    "target",
+    "tags",
+    "produced_by",
+)
+
+
+def _artifact_matches(fm: dict[str, Any], needle: str) -> bool:
+    for field in _ARTIFACT_SEARCH_FIELDS:
+        value = fm.get(field)
+        if value is None:
+            continue
+        if needle in str(value).lower():
+            return True
+    return False
+
+
 class ArtifactStore:
     def __init__(self, artifacts_dir: Path, remote: str = "", ssh_key: str = ""):
         self.root = Path(artifacts_dir)
@@ -317,8 +341,19 @@ class ArtifactStore:
         fm = yaml.safe_load(fm_text) or {}
         return fm, body
 
-    def list(self, status: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
+    def list(
+        self, status: str | None = None, kind: str | None = None, q: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Artifacts, optionally narrowed by status/kind and by free text.
+
+        ``q`` matches the frontmatter an operator would recognise an artifact by -
+        its id, its intent, its kind, its target and its tags - case-insensitively.
+        The BODY is deliberately not searched here: that is what the knowledge
+        base index is for, and reading every file's body on every list call would
+        turn a cheap listing into a full-corpus scan (#445 A4).
+        """
         results: list[dict[str, Any]] = []
+        needle = q.strip().lower() if q else ""
         for year_dir in sorted(self.root.iterdir()):
             if not year_dir.is_dir() or not re.match(r"^\d{4}$", year_dir.name):
                 continue
@@ -335,6 +370,8 @@ class ArtifactStore:
                     if status is not None and fm.get("status") != status:
                         continue
                     if kind is not None and fm.get("kind") != kind:
+                        continue
+                    if needle and not _artifact_matches(fm, needle):
                         continue
                     results.append(fm)
         return results

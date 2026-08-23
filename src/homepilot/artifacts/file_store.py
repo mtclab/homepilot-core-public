@@ -4,6 +4,7 @@ import fcntl
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -13,7 +14,21 @@ from .store import ArtifactStore
 
 @contextmanager
 def _file_lock(path: Any) -> Generator[None, None, None]:
-    fd = os.open(str(path), os.O_CREAT | os.O_RDONLY)
+    """Lock a SIDECAR, never the artifact itself (#388).
+
+    This used to `os.open(artifact_path, O_CREAT)`, so merely taking the lock
+    created the file. Approving an unknown id therefore wrote a zero-byte
+    artifact, `store.read` raised "missing frontmatter delimiter" (a ValueError
+    the router's FileNotFoundError handler does not catch, hence a 500), and the
+    id was PERMANENTLY POISONED: `store.exists()` was now true, so propose
+    refused to reuse it.
+
+    A `.lock` sidecar gives the same mutual exclusion without the artifact path
+    ever being created as a side effect of reading it.
+    """
+    lock_path = Path(f"{path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

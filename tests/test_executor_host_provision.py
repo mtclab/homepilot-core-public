@@ -40,6 +40,11 @@ def _apply_agent() -> AsyncMock:
     agent.install_package = AsyncMock(return_value={"changed": True, "detail": "installed"})
     agent.manage_service = AsyncMock(return_value={"changed": True, "detail": "started"})
     agent.write_config = AsyncMock(return_value={"changed": True, "detail": "written"})
+    # Apply now READS the host before it writes, to capture what a rollback would
+    # have to put back (#426). A bare AsyncMock returns a MagicMock from
+    # exec_readonly, which does not unpack into (rc, stdout, stderr).
+    agent.exec_readonly = AsyncMock(return_value=(1, "", ""))
+    agent.read_file = AsyncMock(side_effect=FileNotFoundError("absent"))
     return agent
 
 
@@ -97,15 +102,103 @@ class TestHostProvisionApply:
         assert result["failure_reason"] == "forbidden target"
         agent.install_package.assert_not_awaited()
 
-    async def test_rollback_is_documented_noop(self, make_frontmatter):
+    async def test_rollback_without_a_capture_refuses_rather_than_claiming_success(
+        self, make_frontmatter
+    ):
+        """This test used to assert `success is True` for a rollback that did
+        NOTHING - the defect written down as the requirement (#426). A revoke
+        with nothing to invert to must say so, because the caller turns that
+        answer into "reversed" or "relabelled" for the operator.
+        """
         agent = _apply_agent()
         fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
 
-        result = await host_provision_execute(fm, GOOD_BODY, fm["target"], agent, rollback=True)
+        result = await host_provision_execute(
+            fm, GOOD_BODY, fm["target"], agent, rollback=True, pre_state=None
+        )
+
+        assert result["success"] is False
+        assert "captured" in result["execution_log"]
+        agent.install_package.assert_not_awaited()
+
+    async def test_rollback_restores_a_config_file_it_overwrote(self, make_frontmatter):
+        agent = _apply_agent()
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+        captured = [
+            {
+                "kind": "config",
+                "name": "/etc/nginx/conf.d/app.conf",
+                "existed": True,
+                "prior_content": "the original bytes",
+                "prior_mode": "0600",
+            }
+        ]
+
+        result = await host_provision_execute(
+            fm, GOOD_BODY, fm["target"], agent, rollback=True, pre_state=captured
+        )
 
         assert result["success"] is True
-        assert "rollback" in result["execution_log"].lower()
-        agent.install_package.assert_not_awaited()
+        agent.write_config.assert_awaited_once_with(
+            "web1", "/etc/nginx/conf.d/app.conf", "the original bytes", "0600"
+        )
+
+    async def test_rollback_reports_what_it_cannot_undo(self, make_frontmatter):
+        """The agent has no package-removal or file-deletion verb. Guessing at
+        them - `apt-get remove`, `rm` - is how an undo takes out a dependency or
+        a file somebody else wrote."""
+        agent = _apply_agent()
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+        captured = [
+            {"kind": "package", "name": "nginx", "was_installed": False},
+            {"kind": "config", "name": "/etc/nginx/conf.d/app.conf", "existed": False},
+        ]
+
+        result = await host_provision_execute(
+            fm, GOOD_BODY, fm["target"], agent, rollback=True, pre_state=captured
+        )
+
+        assert result["success"] is False
+        assert "nginx" in result["failure_reason"]
+        assert "app.conf" in result["failure_reason"]
+
+    async def test_rollback_puts_a_service_back_the_way_it_was(self, make_frontmatter):
+        agent = _apply_agent()
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+        captured = [
+            {
+                "kind": "service",
+                "name": "nginx",
+                "desired": "started",
+                "was_active": "inactive",
+                "was_enabled": "disabled",
+            }
+        ]
+
+        result = await host_provision_execute(
+            fm, GOOD_BODY, fm["target"], agent, rollback=True, pre_state=captured
+        )
+
+        assert result["success"] is True
+        states = [call.args[2] for call in agent.manage_service.await_args_list]
+        assert "stopped" in states, "a service that was inactive was left running"
+        assert "disabled" in states, "a service that was disabled was left enabled"
+
+    async def test_apply_captures_the_prior_state(self, make_frontmatter):
+        """Nothing else records it, and after the apply the prior bytes are gone."""
+        agent = _apply_agent()
+        agent.read_file = AsyncMock(return_value="original config")
+        agent.exec_readonly = AsyncMock(return_value=(0, "install ok installed", ""))
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+
+        result = await host_provision_execute(fm, GOOD_BODY, fm["target"], agent)
+
+        # Keyed by (kind, name): the package and the service are both "nginx".
+        captured = {(item["kind"], item["name"]): item for item in result["pre_state"]}
+        assert captured[("package", "nginx")]["was_installed"] is True
+        assert (
+            captured[("config", "/etc/nginx/conf.d/app.conf")]["prior_content"] == "original config"
+        )
 
 
 class TestHostProvisionSpecValidation:

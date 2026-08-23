@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from .connection import Database
+
+logger = logging.getLogger(__name__)
 
 _HOST_COLUMN_TYPES: dict[str, type] = {
     "proxmox_id": int,
@@ -33,6 +36,8 @@ _HOST_COLUMN_TYPES: dict[str, type] = {
     "role_source": str,
     "ip_source": str,
     "owner": str,
+    "absent_since": str,
+    "pinned_fields": str,
 }
 
 _SERVICE_COLUMN_TYPES: dict[str, type] = {
@@ -82,6 +87,8 @@ _HOST_COLUMNS: frozenset[str] = frozenset(
         "role_source",
         "ip_source",
         "owner",
+        "absent_since",
+        "pinned_fields",
     }
 )
 
@@ -130,6 +137,21 @@ def _validated_set_clause(
     parts = ", ".join(f"{k} = ?" for k in columns)
     values = list(columns.values())
     return parts, values
+
+
+# What "find that box" means: the name, where it runs, how to reach it, what it
+# is for. A constant tuple, never caller text - it is interpolated into SQL.
+_HOST_SEARCH_COLUMNS: tuple[str, ...] = (
+    "hostname",
+    "fqdn",
+    "ip_address",
+    "node",
+    "role",
+    "tags",
+    "description",
+    "owner",
+    "os_info",
+)
 
 
 def now() -> str:
@@ -258,7 +280,14 @@ class Repository:
                  connected=excluded.connected,
                  connected_at=excluded.connected_at,
                  last_heartbeat=excluded.last_heartbeat,
-                 disconnected_at=NULL""",
+                 disconnected_at=NULL,
+                 -- An agent that is BACK has no outstanding reason to explain
+                 -- (#430). Clearing it here rather than in a second statement
+                 -- keeps "connected" and "no last error" one atomic fact, so a
+                 -- fleet list can never show a live agent still carrying the
+                 -- revocation it was re-enrolled out of.
+                 last_error=NULL,
+                 last_error_at=NULL""",
             (
                 agent_id,
                 hostname,
@@ -286,12 +315,51 @@ class Repository:
             )
         await self.db.conn.commit()
 
-    async def mark_agent_disconnected(self, agent_id: str) -> None:
-        await self.db.execute(
-            "UPDATE agents SET connected = 0, disconnected_at = ? WHERE agent_id = ?",
-            (now(), agent_id),
-        )
+    async def mark_agent_disconnected(self, agent_id: str, reason: str | None = None) -> None:
+        """Mark an agent disconnected, optionally recording WHY (#430).
+
+        ``reason`` is stored as the agent's last error so a dark host can explain
+        itself. It is only written when given: an ordinary clean disconnect
+        should not erase the rejection reason that a later reconnect attempt
+        recorded, and vice versa.
+        """
+        if reason:
+            await self.db.execute(
+                "UPDATE agents SET connected = 0, disconnected_at = ?, "
+                "last_error = ?, last_error_at = ? WHERE agent_id = ?",
+                (now(), reason, now(), agent_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE agents SET connected = 0, disconnected_at = ? WHERE agent_id = ?",
+                (now(), agent_id),
+            )
         await self.db.conn.commit()
+
+    async def record_agent_error(
+        self, agent_id: str, reason: str, hostname: str | None = None
+    ) -> bool:
+        """Record why the hub refused an agent (#430). Returns True if a row matched.
+
+        Matches on ``agent_id`` first and falls back to ``hostname``, because the
+        interesting rejections are exactly the ones where the claimed id is NOT
+        the one the hub knows - a host that came back with a fresh id, or one
+        replaying someone else's. Nothing is inserted for an unknown agent: a
+        rejected stranger must not be able to grow the agents table (that table
+        is the credential store), so an unmatched rejection lives only in the
+        audit log.
+        """
+        cursor = await self.db.execute(
+            "UPDATE agents SET last_error = ?, last_error_at = ? WHERE agent_id = ?",
+            (reason, now(), agent_id),
+        )
+        if cursor.rowcount == 0 and hostname:
+            cursor = await self.db.execute(
+                "UPDATE agents SET last_error = ?, last_error_at = ? WHERE hostname = ?",
+                (reason, now(), hostname),
+            )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
 
     async def set_agent_credential(
         self, agent_id: str, hostname: str, credential_hash: str
@@ -399,6 +467,20 @@ class Repository:
             "WHERE agent_id = ? AND credential_hash IS NOT NULL AND revoked_at IS NULL",
             (now(), agent_id),
         )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+
+    async def delete_agent(self, agent_id: str) -> bool:
+        """Forget an agent entirely. Returns ``True`` if a row was removed.
+
+        Deleting the ROW is what makes this a real removal rather than a hidden
+        one: the `agents` table doubles as the per-agent credential store
+        (#362 slice 2), so a decommissioned host whose row survives keeps a
+        credential that still authenticates. Revoking alone leaves the row - and
+        its hostname - available to the credential-rebind path (#418), which is
+        exactly the door a scrapped box should not still have (#415).
+        """
+        cursor = await self.db.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
         await self.db.conn.commit()
         return cursor.rowcount > 0
 
@@ -562,9 +644,40 @@ class Repository:
         status: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        q: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(limit, 1000)
         offset = max(offset, 0)
+        where, params = self._host_where(
+            managed=managed,
+            status=status,
+            role=role,
+            source=source,
+            import_state=import_state,
+            pve_status=pve_status,
+            q=q,
+        )
+        params.extend([limit, offset])
+        rows = await self.db.fetchall(f"SELECT * FROM hosts{where} LIMIT ? OFFSET ?", params)
+        return [dict(r) for r in rows]
+
+    @classmethod
+    def _host_where(
+        cls,
+        managed: bool | None = None,
+        status: str | None = None,
+        role: str | None = None,
+        source: str | None = None,
+        import_state: str | None = None,
+        pve_status: str | None = None,
+        q: str | None = None,
+    ) -> tuple[str, list[Any]]:
+        """The filter clauses, in ONE place, for both the list and the count.
+
+        Two copies drifting is a lie the pager tells: `items` and `total` come
+        from different queries, so a filter applied to one and not the other
+        reports a count for a different set of rows than the page shows.
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if managed is not None:
@@ -585,10 +698,41 @@ class Repository:
         if pve_status is not None:
             clauses.append("pve_status = ?")
             params.append(pve_status)
+        if q:
+            # Free text over what an operator types when looking for a machine:
+            # its name, where it lives, what it is for. Searched in SQL rather
+            # than in the page so a match on host 400 of 500 is findable at all -
+            # the list is paginated, and a client-side filter can only ever see
+            # the page it already has (#445 A4). The column list is a constant.
+            like = f"%{q}%"
+            ors = " OR ".join(f"{c} LIKE ?" for c in _HOST_SEARCH_COLUMNS)
+            clauses.append(f"({ors})")
+            params.extend([like] * len(_HOST_SEARCH_COLUMNS))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.extend([limit, offset])
-        rows = await self.db.fetchall(f"SELECT * FROM hosts{where} LIMIT ? OFFSET ?", params)
-        return [dict(r) for r in rows]
+        return where, params
+
+    async def count_hosts(self, **filters: Any) -> int:
+        """How many hosts match, ignoring pagination (#428).
+
+        `list_hosts()` pages, so `len(list_hosts(...))` is the PAGE SIZE. The
+        inventory route returned that as `total`, which capped the UI at 100 with
+        no way to reach page 2 and told the operator their estate was smaller
+        than it is.
+        """
+        where, params = self._host_where(**filters)
+        row = await self.db.fetchone(f"SELECT COUNT(*) as cnt FROM hosts{where}", params)
+        return int(row["cnt"]) if row else 0
+
+    async def all_host_ids(self) -> set[str]:
+        """Every host id, unpaginated (#428).
+
+        The inventory reconciler compared "what exists" against "what Proxmox
+        reported" using `list_hosts()`, whose default limit is 100 - so on an
+        estate with more than a hundred hosts the absent/changed sets were
+        computed from an arbitrary first page.
+        """
+        rows = await self.db.fetchall("SELECT id FROM hosts")
+        return {str(r["id"]) for r in rows}
 
     async def get_host(self, host_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM hosts WHERE id = ?", (host_id,))
@@ -610,9 +754,128 @@ class Repository:
         await self.db.execute(f"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?", vals)
         await self.db.conn.commit()
 
+    # Fields an operator can set by hand, and which automation must therefore not
+    # overwrite once they have. `status` is here because `PATCH /inventory/{id}`
+    # accepts it - enrich re-derived it every cycle, which made that PATCH field
+    # a lie (#424).
+    PINNABLE_HOST_FIELDS: frozenset[str] = frozenset(
+        {"role", "ip_address", "description", "status", "tags", "owner", "fqdn"}
+    )
+
+    async def pin_host_fields(self, host_id: str, fields: set[str]) -> None:
+        """Record that an operator set these fields (#424)."""
+        import json as _json
+
+        pinnable = {f for f in fields if f in self.PINNABLE_HOST_FIELDS}
+        if not pinnable:
+            return
+        host = await self.get_host(host_id)
+        if host is None:
+            return
+        current = self._pinned_fields(host)
+        merged = sorted(current | pinnable)
+        await self.db.execute(
+            "UPDATE hosts SET pinned_fields = ?, updated_at = ? WHERE id = ?",
+            (_json.dumps(merged), now(), host_id),
+        )
+        await self.db.conn.commit()
+
+    @staticmethod
+    def _pinned_fields(host: dict[str, Any]) -> set[str]:
+        import json as _json
+
+        raw = host.get("pinned_fields")
+        if not raw:
+            return set()
+        try:
+            values = _json.loads(raw)
+        except (ValueError, TypeError):
+            return set()
+        return {str(v) for v in values} if isinstance(values, list) else set()
+
+    async def update_host_from_automation(self, host_id: str, **kwargs: Any) -> list[str]:
+        """Update a host from a sync/enrich pass, LEAVING pinned fields alone.
+
+        The single door automation goes through (#424). Before this, refresh and
+        enrich each wrote whatever they had computed: a node refresh overwrote an
+        operator's role and ip_address (and stamped `role_source="user"` over its
+        own guess), every cycle clobbered an operator's description with the PVE
+        blurb, and enrich re-derived `status` over anything set by PATCH.
+
+        Returns the field names it skipped, so a caller can log what it did not
+        touch instead of silently doing nothing.
+        """
+        host = await self.get_host(host_id)
+        if host is None:
+            return []
+        pinned = self._pinned_fields(host)
+        skipped = sorted(f for f in kwargs if f in pinned)
+        allowed = {k: v for k, v in kwargs.items() if k not in pinned}
+        # Automation never claims a value came from a person. `role_source="user"`
+        # written by a sync is the exact forgery #424 names.
+        # `role_source` is constrained to inferred/user/artifact, so automation's
+        # value is "inferred" - it decided, a person did not. `ip_source` has its
+        # own vocabulary where "pve" is the automation answer.
+        if allowed.get("role_source") == "user":
+            allowed["role_source"] = "inferred"
+        if allowed.get("ip_source") == "user":
+            allowed["ip_source"] = "pve"
+        if allowed:
+            await self.update_host(host_id, **allowed)
+        return skipped
+
     async def delete_host(self, host_id: str) -> None:
+        """Remove a host and everything that only exists because of it (#445 A5).
+
+        The services and the as-found observation note exist only because of the
+        host; deleting the host alone leaves rows pointing at an id nothing
+        resolves, which is how a "forgotten" machine keeps showing up in service
+        listings and coverage counts. One commit, so a partial delete cannot
+        leave that state.
+        """
+        await self.db.execute("DELETE FROM services WHERE host_id = ?", (host_id,))
+        # The as-found observation note is keyed `introspect:<host_id>` in its
+        # SOURCE (its target is the hostname), so that is what identifies it -
+        # matching on the hostname alone would take out unrelated notes about a
+        # machine that merely shares a name.
+        await self.db.execute(
+            "DELETE FROM doc_metadata WHERE source = ?", (f"introspect:{host_id}",)
+        )
         await self.db.execute("DELETE FROM hosts WHERE id = ?", (host_id,))
         await self.db.conn.commit()
+
+    async def mark_hosts_absent(self, seen_ids: set[str], sources: tuple[str, ...]) -> int:
+        """Stamp hosts the hypervisor no longer reports, clear the ones it does.
+
+        Only hosts whose ``source`` is in ``sources`` are considered: Proxmox has
+        no opinion about a machine an operator added by hand, so a manual host
+        must never be marked absent by a sync that never looked for it (#445 A5).
+
+        Returns the number newly marked. ``absent_since`` is set ONCE - a host
+        that has been gone for a week must keep the date it went missing, not be
+        restamped every cycle - and cleared the moment it is seen again.
+        """
+        placeholders = ", ".join("?" for _ in sources)
+        seen = list(seen_ids)
+        seen_clause = ""
+        params: list[Any] = list(sources)
+        if seen:
+            seen_clause = f" AND id NOT IN ({', '.join('?' for _ in seen)})"
+            params.extend(seen)
+        cursor = await self.db.execute(
+            f"UPDATE hosts SET absent_since = ?, updated_at = ? "
+            f"WHERE source IN ({placeholders}) AND absent_since IS NULL{seen_clause}",
+            [now(), now(), *params],
+        )
+        newly_absent = cursor.rowcount
+        if seen:
+            await self.db.execute(
+                f"UPDATE hosts SET absent_since = NULL, updated_at = ? "
+                f"WHERE absent_since IS NOT NULL AND id IN ({', '.join('?' for _ in seen)})",
+                [now(), *seen],
+            )
+        await self.db.conn.commit()
+        return newly_absent
 
     async def create_service(
         self,
@@ -694,17 +957,29 @@ class Repository:
         )
         await self.db.conn.commit()
 
-    async def query_audit_log(
-        self,
-        action: str | None = None,
-        artifact_id: str | None = None,
-        target_host: str | None = None,
-        source: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        limit = min(limit, 10000)
-        offset = max(offset, 0)
+    # The audit filter clauses live in ONE place because two copies drifting is a
+    # lie the UI shows the operator: `items` and `total` come from different
+    # queries, so a filter added to the list and forgotten in the count reports
+    # "50 of 4000" for a search that matched 50 things (#445 A4).
+    _AUDIT_SEARCH_COLUMNS = (
+        "artifact_id",
+        "target_host",
+        "target_service",
+        "command",
+        "user_id",
+        "action",
+        "details_json",
+    )
+
+    @classmethod
+    def _audit_where(
+        cls,
+        action: str | None,
+        artifact_id: str | None,
+        target_host: str | None,
+        source: str | None,
+        q: str | None,
+    ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if action is not None:
@@ -719,7 +994,29 @@ class Repository:
         if source is not None:
             clauses.append("source = ?")
             params.append(source)
+        if q:
+            # Free text over the columns an operator would recognise an entry by.
+            # The column list is a constant, never caller text.
+            like = f"%{q}%"
+            ors = " OR ".join(f"{c} LIKE ?" for c in cls._AUDIT_SEARCH_COLUMNS)
+            clauses.append(f"({ors})")
+            params.extend([like] * len(cls._AUDIT_SEARCH_COLUMNS))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where, params
+
+    async def query_audit_log(
+        self,
+        action: str | None = None,
+        artifact_id: str | None = None,
+        target_host: str | None = None,
+        source: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        q: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = min(limit, 10000)
+        offset = max(offset, 0)
+        where, params = self._audit_where(action, artifact_id, target_host, source, q)
         params.extend([limit, offset])
         rows = await self.db.fetchall(
             f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -733,22 +1030,9 @@ class Repository:
         artifact_id: str | None = None,
         target_host: str | None = None,
         source: str | None = None,
+        q: str | None = None,
     ) -> int:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if action is not None:
-            clauses.append("action = ?")
-            params.append(action)
-        if artifact_id is not None:
-            clauses.append("artifact_id = ?")
-            params.append(artifact_id)
-        if target_host is not None:
-            clauses.append("target_host = ?")
-            params.append(target_host)
-        if source is not None:
-            clauses.append("source = ?")
-            params.append(source)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where, params = self._audit_where(action, artifact_id, target_host, source, q)
         row = await self.db.fetchone(f"SELECT COUNT(*) as cnt FROM audit_log{where}", params)
         return row["cnt"] if row else 0
 
@@ -1013,17 +1297,114 @@ class Repository:
         artifact_id: str,
         drifted: bool,
         details_json: str | None = None,
+        state: str = "unknown",
     ) -> None:
+        """Record a drift check. ``state`` is the real answer (#425).
+
+        ``drifted`` is kept because it is what the existing filters and indexes
+        read, but it cannot answer "was this checked at all" - which is the
+        question a green tick was silently getting wrong. ``state`` defaults to
+        ``unknown`` so a caller that does not say cannot accidentally assert
+        health.
+        """
         await self.db.execute(
-            """INSERT INTO drift_checks (artifact_id, drifted, checked_at, details_json)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO drift_checks (artifact_id, drifted, checked_at, details_json, state)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(artifact_id) DO UPDATE SET
                    drifted = excluded.drifted,
                    checked_at = excluded.checked_at,
-                   details_json = excluded.details_json""",
-            (artifact_id, int(drifted), now(), details_json),
+                   details_json = excluded.details_json,
+                   state = excluded.state""",
+            (artifact_id, int(drifted), now(), details_json, state),
         )
         await self.db.conn.commit()
+
+    async def save_host_state_capture(self, artifact_id: str, items_json: str) -> None:
+        """Store what a host looked like before an artifact was applied (#426)."""
+        await self.db.execute(
+            """INSERT INTO host_state_captures (artifact_id, captured_at, items_json)
+               VALUES (?, ?, ?)
+               ON CONFLICT(artifact_id) DO UPDATE SET
+                   captured_at = excluded.captured_at,
+                   items_json = excluded.items_json""",
+            (artifact_id, now(), items_json),
+        )
+        await self.db.conn.commit()
+
+    async def get_host_state_capture(self, artifact_id: str) -> list[dict[str, Any]] | None:
+        """The pre-apply capture for an artifact, or None if there is not one.
+
+        None means "nothing to roll back to" - which a revoke must report rather
+        than treat as "nothing to do".
+        """
+        import json as _json
+
+        row = await self.db.fetchone(
+            "SELECT items_json FROM host_state_captures WHERE artifact_id = ?",
+            (artifact_id,),
+        )
+        if row is None:
+            return None
+        try:
+            items: list[dict[str, Any]] = _json.loads(row["items_json"])
+        except (ValueError, TypeError):
+            return None
+        return items
+
+    # Tables the retention reconciler may prune, and the column it prunes on.
+    # A hardcoded allowlist because the table name is interpolated into SQL: it
+    # must never be able to come from anywhere but this module.
+    _PRUNABLE: ClassVar[dict[str, str]] = {
+        "audit_log": "timestamp",
+        "agent_audit": "ts",
+        "webhook_deliveries": "created_at",
+    }
+
+    async def prune_before(self, table: str, column: str, cutoff: str) -> int:
+        """Delete rows in `table` older than `cutoff`. Returns the row count.
+
+        Nothing was ever pruned (#431): audit_log, agent_audit and
+        webhook_deliveries gain a row per operation and per event, and a year of
+        that is a multi-GB SQLite file and a backup too big to move.
+        """
+        if self._PRUNABLE.get(table) != column:
+            raise ValueError(f"refusing to prune unknown table/column: {table}.{column}")
+        cursor = await self.db.execute(
+            f"DELETE FROM {table} WHERE {column} IS NOT NULL AND {column} < ?", (cutoff,)
+        )
+        await self.db.conn.commit()
+        return int(cursor.rowcount or 0)
+
+    async def prune_finished_tasks(self, cutoff: str, states: tuple[str, ...]) -> int:
+        """Delete FINISHED tasks older than `cutoff`.
+
+        Only finished ones: a pending or running task older than the horizon is a
+        STUCK task, and deleting it would hide the problem and strand whatever is
+        waiting on it.
+        """
+        placeholders = ", ".join("?" for _ in states)
+        cursor = await self.db.execute(
+            f"DELETE FROM tasks WHERE status IN ({placeholders}) AND created_at < ?",
+            (*states, cutoff),
+        )
+        await self.db.conn.commit()
+        return int(cursor.rowcount or 0)
+
+    async def reclaim_free_pages(self) -> None:
+        """Return freed pages to the filesystem.
+
+        SQLite keeps them in the file otherwise, so a delete-only retention
+        policy shrinks nothing an operator can see - which is the whole reason
+        they asked for retention. `incremental_vacuum` is a no-op unless the
+        database is in `auto_vacuum=INCREMENTAL`, so a plain `VACUUM` is the
+        fallback; both are best-effort because neither is worth failing a
+        reconciler cycle over.
+        """
+        try:
+            await self.db.execute("PRAGMA incremental_vacuum")
+            await self.db.conn.commit()
+        except Exception as exc:
+            logger.debug("incremental_vacuum unavailable: %s", exc)
 
     async def get_drift_checks(
         self,

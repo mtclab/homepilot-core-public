@@ -113,7 +113,14 @@ async def update_rule(request: Request, rule_id: str, body: AlertRuleUpdate) -> 
     if not await repo.set_rule_enabled(rule_id, body.enabled):
         raise HTTPException(status_code=404, detail=f"Alert rule not found: {rule_id}")
     rule = await repo.get_rule(rule_id)
-    assert rule is not None
+    if rule is None:
+        # See #481: an assert here vanishes under `python -O`, turning a clear
+        # failure into a None returned from a dict-typed endpoint. The update
+        # above already confirmed the rule exists, so reaching this is a real
+        # fault and should say so.
+        raise HTTPException(
+            status_code=404, detail=f"Alert rule vanished while updating it: {rule_id}"
+        )
     return rule
 
 

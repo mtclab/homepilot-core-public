@@ -29,13 +29,21 @@ def test_bootstrap_help_is_the_one_time_impl() -> None:
     assert "one-time" in result.output.lower()
 
 
-def test_bootstrap_requires_running_hub() -> None:
-    """The resolved impl needs a running hub: with the hub disabled it errors
-    (exit 1, "Agent hub not enabled") instead of printing an unusable token.
+def test_bootstrap_requires_a_reachable_backend() -> None:
+    """The resolved impl needs the running backend: with none reachable it errors
+    (exit 1) instead of printing an unusable token.
+
+    This test used to assert the string "Agent hub not enabled", which was the
+    shape of the #430 defect rather than a requirement - the registry it read is
+    only ever set inside the FastAPI lifespan, so a standalone `hp` process could
+    never print anything else. The command now goes through the API, so what has
+    to hold is: no backend, no token, and a message that says which of the two
+    things is missing.
 
     Revert-check: restore the shadowed stub as the resolved command and this
-    fails — it would mint a token and exit 0 without any hub."""
-    with patch("homepilot.app_state.get_agent_registry", return_value=None):
+    fails - it would mint a token and exit 0 without any hub."""
+    with patch("homepilot.cli.main._mint_token_via_api", return_value=(None, None)):
         result = runner.invoke(app, ["agent", "bootstrap"])
     assert result.exit_code == 1, result.output
-    assert "not enabled" in result.output.lower()
+    assert "not reachable" in result.output.lower()
+    assert "hp_" not in result.output, "a token was printed without a hub to honour it"

@@ -23,9 +23,28 @@ class InventoryReconciler(Reconciler):
         self.inventory_service = inventory_service
         self.repo = repo
 
+    # One page's worth per round-trip; the reconciler needs every host, and a
+    # single unbounded SELECT on a large estate is the other way to get this
+    # wrong.
+    _PAGE = 500
+
+    async def _all_hosts(self) -> list[dict[str, Any]]:
+        """Every host, paged through rather than truncated at the default 100."""
+        out: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = await self.repo.list_hosts(limit=self._PAGE, offset=offset)
+            out.extend(page)
+            if len(page) < self._PAGE:
+                return out
+            offset += self._PAGE
+
     async def run(self) -> ReconcilerResult:
         try:
-            existing_hosts = await self.repo.list_hosts()
+            # UNPAGINATED. `list_hosts()` defaults to 100 rows, so on an estate
+            # with more than a hundred hosts the absent/changed sets below were
+            # computed from an arbitrary first page (#428).
+            existing_hosts = await self._all_hosts()
             pre_ids: set[str] = {h["id"] for h in existing_hosts}
             pre_checksums: dict[str, str] = {
                 h["id"]: self._host_checksum(h) for h in existing_hosts
@@ -50,7 +69,7 @@ class InventoryReconciler(Reconciler):
             new_ids = proxmox_ids - pre_ids
             changed_ids: set[str] = set()
 
-            updated_hosts = await self.repo.list_hosts()
+            updated_hosts = await self._all_hosts()
             for h in updated_hosts:
                 hid = h["id"]
                 if hid in pre_checksums and self._host_checksum(h) != pre_checksums[hid]:

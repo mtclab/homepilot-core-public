@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from .audit import AuditLog
 from .replay import ReplaySession
 
@@ -58,6 +59,8 @@ class AgentRegistry:
         # Optional MetricsRepository. None in unit tests that build a bare
         # registry; metric frames are then validated and acked but not stored.
         self.metrics_repo = metrics_repo
+        # Outstanding fire-and-forget persistence writes (#496).
+        self._persist_tasks: set[asyncio.Task[Any]] = set()
 
     def _persist(self, coro: Any) -> None:
         if self._repo is None:
@@ -69,12 +72,26 @@ class AgentRegistry:
             coro.close()  # no running loop (e.g. unit test) — skip
             return
         task = loop.create_task(coro)
+        # TRACKED, not merely fired: an untracked write still in aiosqlite's queue
+        # when the database is closed can leave that close waiting forever (#496).
+        # `drain()` is what lets a shutdown - or a test teardown - wait for these
+        # instead of racing them.
+        self._persist_tasks.add(task)
 
         def _log_err(t: asyncio.Task[Any]) -> None:
+            self._persist_tasks.discard(t)
             if not t.cancelled() and t.exception():
                 logger.warning("agent persistence failed: %s", t.exception())
 
         task.add_done_callback(_log_err)
+
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Wait for outstanding persistence writes, then give up on the rest.
+
+        Called before the hub's database goes away.
+        """
+        await drain_tasks(self._persist_tasks, "agent persistence write(s)", timeout)
+        await self.audit_log.drain(timeout)
 
     def register(
         self,
@@ -148,8 +165,15 @@ class AgentRegistry:
             )
         return True
 
-    def unregister(self, agent_id: str, conn_id: str | None = None) -> None:
+    def unregister(
+        self, agent_id: str, conn_id: str | None = None, reason: str | None = None
+    ) -> None:
         """Remove an agent, but only if the caller owns the current connection.
+
+        ``reason`` is why the connection ended, persisted as the agent's last
+        error so a dark host can explain itself (#430). It is optional because
+        the operator-driven paths (forget an agent) are not a disconnect anyone
+        needs a reason for.
 
         Compare-and-delete: when ``conn_id`` is supplied it must match the id
         stored on the current registration. A stale/half-open socket closing must
@@ -176,7 +200,36 @@ class AgentRegistry:
                     fut.set_exception(ConnectionError(f"agent {agent_id} disconnected"))
             logger.info("unregistered agent %s", agent_id)
             if self._repo is not None:
-                self._persist(self._repo.mark_agent_disconnected(agent_id))
+                self._persist(self._repo.mark_agent_disconnected(agent_id, reason))
+
+    def disconnect(self, agent_id: str, reason: str) -> bool:
+        """Close an agent's live channel now. Returns True if one was open (#430).
+
+        Revocation used to take effect only on the agent's NEXT connect - and the
+        connection is long-lived by design, so "next" could be never. A revoked
+        agent therefore kept a fleet-root exec/write channel open for as long as
+        its socket survived, which is the opposite of what an operator pressing
+        Revoke is asking for.
+
+        Closing the writer is what ends the channel; the connection's own
+        teardown then runs `unregister`, so the reason recorded here is the one
+        the fleet list shows. The in-memory entry is dropped immediately so the
+        agent reads as gone the moment the operator acts, rather than when the
+        socket finishes closing."""
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            return False
+        writer = agent.writer
+        self.unregister(agent_id, reason=reason)
+        if writer is None or not _conn_is_live(writer):
+            return False
+        try:
+            writer.close()
+        except Exception as exc:  # pragma: no cover - a closed transport is fine
+            logger.warning("could not close the channel for agent %s: %s", agent_id, exc)
+            return False
+        logger.warning("closed the live channel for agent %s: %s", agent_id, reason)
+        return True
 
     def get(self, agent_id: str) -> ConnectedAgent | None:
         return self._agents.get(agent_id)

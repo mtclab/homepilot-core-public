@@ -18,7 +18,7 @@
 		artifact: Artifact;
 		target: string;
 		matchedHost: Host | null;
-		driftStatus: 'drifted' | 'not-drifted' | 'unchecked';
+		driftStatus: 'drifted' | 'in-spec' | 'unknown' | 'unchecked';
 		driftCheck: DriftCheck | null;
 	}
 
@@ -71,9 +71,18 @@
 			const target = artifactTarget(a);
 			const matchedHost = target ? (hostByName.get(target) ?? null) : null;
 			const dc = getDriftStatus(a.id);
-			let driftStatus: 'drifted' | 'not-drifted' | 'unchecked' = 'unchecked';
+			let driftStatus: 'drifted' | 'in-spec' | 'unknown' | 'unchecked' = 'unchecked';
 			if (dc) {
-				driftStatus = dc.drifted ? 'drifted' : 'not-drifted';
+				// A check that ran and could not establish anything is NOT ok
+				// (#425): "no spec", "no host", "the executor errored" and the
+				// whole ansible path all stored `drifted: false`, and this line
+				// used to paint every one of them green.
+				driftStatus =
+					dc.state === 'drifted'
+						? 'drifted'
+						: dc.state === 'in_spec'
+							? 'in-spec'
+							: 'unknown';
 			}
 			return { artifact: a, target, matchedHost, driftStatus, driftCheck: dc };
 		});
@@ -125,9 +134,30 @@
 
 	const DRIFT_COLORS: Record<string, string> = {
 		drifted: 'text-danger bg-danger-tint border-danger-border',
-		'not-drifted': 'text-ok bg-ok-tint border-ok-border',
+		'in-spec': 'text-ok bg-ok-tint border-ok-border',
+		// Amber, not green and not red: something is unresolved and an operator
+		// should go and look, which is exactly what a grey "unchecked" does not say.
+		unknown: 'text-warn bg-warn-tint border-warn-border',
 		unchecked: 'text-muted bg-raised border-border-strong',
 	};
+
+	const DRIFT_LABELS: Record<string, string> = {
+		drifted: '⚠ drifted',
+		'in-spec': '✓ in spec',
+		unknown: '? not established',
+		unchecked: '— unchecked',
+	};
+
+	/** Why a check could not establish anything - the operator's next step. */
+	function driftReason(dc: DriftCheck | null): string {
+		if (!dc || dc.state !== 'unknown') return '';
+		try {
+			const details = dc.details_json ? JSON.parse(dc.details_json) : {};
+			return typeof details.reason === 'string' ? details.reason.replace(/_/g, ' ') : '';
+		} catch {
+			return '';
+		}
+	}
 
 	function fmtDate(s: string): string {
 		return s ? new Date(s).toLocaleDateString() : '—';
@@ -192,24 +222,24 @@
 				<table class="data-table text-xs">
 					<thead>
 						<tr>
-							<th class="text-left pb-1 pr-4">Intent</th>
-							<th class="text-left pb-1 pr-4">Kind</th>
-							<th class="text-left pb-1 pr-4">Status</th>
-							<th class="text-left pb-1 pr-4">Target</th>
-							<th class="text-left pb-1 pr-4">Drift</th>
+							<th class="text-left pb-1">Intent</th>
+							<th class="text-left pb-1">Kind</th>
+							<th class="text-left pb-1">Status</th>
+							<th class="text-left pb-1">Target</th>
+							<th class="text-left pb-1">Drift</th>
 							<th class="text-left pb-1">Date</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each orphanRows as r}
 							<tr class="border-b border-divider">
-								<td class="py-1.5 pr-4 text-ink truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1.5 pr-4 text-muted">{r.artifact.kind}</td>
-								<td class="py-1.5 pr-4"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
-								<td class="py-1.5 pr-4 text-warn font-mono">{r.target || '(global)'}</td>
-								<td class="py-1.5 pr-4">
+								<td class="py-1.5 text-ink truncate max-w-xs">{r.artifact.intent}</td>
+								<td class="py-1.5 text-muted">{r.artifact.kind}</td>
+								<td class="py-1.5"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
+								<td class="py-1.5 text-warn font-mono">{r.target || '(global)'}</td>
+								<td class="py-1.5">
 									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
-										{r.driftStatus === 'drifted' ? '⚠ drifted' : r.driftStatus === 'not-drifted' ? '✓ ok' : '— unchecked'}
+										{DRIFT_LABELS[r.driftStatus]}{#if driftReason(r.driftCheck)}<span class="text-muted"> ({driftReason(r.driftCheck)})</span>{/if}
 									</span>
 									{#if rechecking && recheckingId === r.artifact.id}
 										<span class="text-muted ml-1 animate-pulse">checking…</span>
@@ -234,22 +264,22 @@
 				<table class="data-table text-xs">
 					<thead>
 						<tr>
-							<th class="text-left pb-1 pr-4">Intent</th>
-							<th class="text-left pb-1 pr-4">Kind</th>
-							<th class="text-left pb-1 pr-4">Status</th>
-							<th class="text-left pb-1 pr-4">Drift</th>
+							<th class="text-left pb-1">Intent</th>
+							<th class="text-left pb-1">Kind</th>
+							<th class="text-left pb-1">Status</th>
+							<th class="text-left pb-1">Drift</th>
 							<th class="text-left pb-1">Host</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each coveredRows as r}
 							<tr class="border-b border-divider">
-								<td class="py-1 pr-4 text-ink truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1 pr-4 text-muted">{r.artifact.kind}</td>
-								<td class="py-1 pr-4"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
-								<td class="py-1 pr-4">
+								<td class="py-1 text-ink truncate max-w-xs">{r.artifact.intent}</td>
+								<td class="py-1 text-muted">{r.artifact.kind}</td>
+								<td class="py-1"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
+								<td class="py-1">
 									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
-										{r.driftStatus === 'drifted' ? '⚠ drifted' : r.driftStatus === 'not-drifted' ? '✓ ok' : '— unchecked'}
+										{DRIFT_LABELS[r.driftStatus]}{#if driftReason(r.driftCheck)}<span class="text-muted"> ({driftReason(r.driftCheck)})</span>{/if}
 									</span>
 									{#if rechecking && recheckingId === r.artifact.id}
 										<span class="text-muted ml-1 animate-pulse">checking…</span>

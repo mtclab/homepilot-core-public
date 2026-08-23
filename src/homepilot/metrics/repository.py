@@ -226,7 +226,13 @@ class MetricsRepository:
         )
         await self.db.conn.commit()
         rule = await self.get_rule(rule_id)
-        assert rule is not None
+        if rule is None:
+            # A raise, not an assert: `python -O` strips asserts, and this one
+            # narrows a type. Under it the function would return None from
+            # something declared to return a dict, surfacing later as a confusing
+            # TypeError instead of naming the row that vanished between the write
+            # and the read (#481; same reasoning as #326).
+            raise RuntimeError(f"alert rule {rule_id} disappeared immediately after being written")
         return rule
 
     async def get_rule(self, rule_id: str) -> dict[str, Any] | None:

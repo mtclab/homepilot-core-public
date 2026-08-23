@@ -127,6 +127,7 @@ class TestReadRoutesEnforceReadScope:
         app.include_router(inventory_router, prefix="/inventory")
         app.state.repo = MagicMock()
         app.state.repo.list_hosts = AsyncMock(return_value=[])
+        app.state.repo.count_hosts = AsyncMock(return_value=0)
         app.state.inventory_service = MagicMock()
         return app
 

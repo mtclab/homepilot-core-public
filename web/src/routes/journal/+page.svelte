@@ -3,6 +3,7 @@
 	import { api, type AuditEntry } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
+	import { debounce } from '$lib/debounce';
 
 	let entries: AuditEntry[] = [];
 	let loading = true;
@@ -10,11 +11,28 @@
 	let filterAction = '';
 	let filterSource = '';
 	let filterArtifactId = '';
+	// Free text across the whole trail, searched on the SERVER: the journal is
+	// paginated 50 at a time, so anything else searches one page (#445 A4).
+	let search = '';
 	let page = 0;
 	let total = 0;
 	const PAGE_SIZE = 50;
 
-	const ACTIONS = ['', 'propose', 'approve', 'apply', 'revoke', 'reject', 'replay', 'drift_check'];
+	const ACTIONS = [
+		'',
+		'propose',
+		'approve',
+		'apply',
+		'revoke',
+		'reject',
+		'replay',
+		'drift_check',
+		// Inventory lifecycle (#445 A5): adding and forgetting a host are
+		// operator decisions about what the estate IS, so they belong in the
+		// trail as first-class actions rather than as unfilterable strays.
+		'host_added',
+		'host_forgotten',
+	];
 	const SOURCES = ['', 'cli', 'ui', 'mcp', 'reconciler', 'system'];
 
 	const ACTION_COLORS: Record<string, string> = {
@@ -25,6 +43,8 @@
 		reject: 'badge-rejected',
 		replay: 'badge-superseded',
 		drift_check: 'bg-info-tint text-info',
+		host_added: 'badge-approved',
+		host_forgotten: 'badge-revoked',
 	};
 
 	const SOURCE_COLORS: Record<string, string> = {
@@ -46,6 +66,7 @@
 				action: filterAction || undefined,
 				artifact_id: filterArtifactId || undefined,
 				source: filterSource || undefined,
+				q: search.trim() || undefined,
 				limit: PAGE_SIZE,
 				offset: page * PAGE_SIZE,
 			});
@@ -93,12 +114,24 @@
 		}
 	}
 
-	$: hasActiveFilters = filterAction !== '' || filterSource !== '' || filterArtifactId !== '';
+	$: hasActiveFilters =
+		filterAction !== '' ||
+		filterSource !== '' ||
+		filterArtifactId !== '' ||
+		search.trim() !== '';
+
+	// A new query is a new result set, so it always restarts at page 1 - leaving
+	// the offset behind would show page 3 of a 1-page result: an empty table.
+	const searchAgain = debounce(() => {
+		page = 0;
+		load();
+	}, 300);
 
 	function clearFilters() {
 		filterAction = '';
 		filterSource = '';
 		filterArtifactId = '';
+		search = '';
 		page = 0;
 		load();
 	}
@@ -117,6 +150,16 @@
 	</div>
 
 	<div class="flex gap-3 flex-wrap items-center">
+		<label class="flex items-center gap-2">
+			<span class="sr-only">Search the journal</span>
+			<input
+				class="input text-xs w-64"
+				type="search"
+				placeholder="Search artifact, host, command, actor…"
+				bind:value={search}
+				on:input={searchAgain}
+			/>
+		</label>
 		<select class="input text-xs" bind:value={filterAction} on:change={() => { page = 0; load(); }}>
 			{#each ACTIONS as a}
 				<option value={a}>{a || 'All actions'}</option>
@@ -162,23 +205,23 @@
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left pb-2 pr-4">Time</th>
-						<th class="text-left pb-2 pr-4">Action</th>
-						<th class="text-left pb-2 pr-4">Source</th>
-						<th class="text-left pb-2 pr-4">User</th>
-						<th class="text-left pb-2 pr-4">Artifact</th>
-						<th class="text-left pb-2 pr-4">Host</th>
-						<th class="text-left pb-2">Details</th>
+						<th class="text-left">Time</th>
+						<th class="text-left">Action</th>
+						<th class="text-left">Source</th>
+						<th class="text-left">User</th>
+						<th class="text-left">Artifact</th>
+						<th class="text-left">Host</th>
+						<th class="text-left">Details</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each entries as e}
 						<tr class="border-b border-divider hover:bg-raised transition-colors">
-							<td class="py-1.5 pr-4 text-muted whitespace-nowrap">{fmtTs(e.timestamp)}</td>
-							<td class="py-1.5 pr-4"><span class="badge {actionClass(e.action)}">{e.action}</span></td>
-							<td class="py-1.5 pr-4 {sourceClass(e.source)}">{e.source}</td>
-							<td class="py-1.5 pr-4 text-ink">{e.user_id || '—'}</td>
-							<td class="py-1.5 pr-4 font-mono whitespace-nowrap">
+							<td class="py-1.5 text-muted whitespace-nowrap">{fmtTs(e.timestamp)}</td>
+							<td class="py-1.5"><span class="badge {actionClass(e.action)}">{e.action}</span></td>
+							<td class="py-1.5 {sourceClass(e.source)}">{e.source}</td>
+							<td class="py-1.5 text-ink">{e.user_id || '—'}</td>
+							<td class="py-1.5 font-mono whitespace-nowrap">
 								{#if e.artifact_id}
 									<a
 										href="{base}/artifacts/{e.artifact_id}"
@@ -194,7 +237,7 @@
 									<span class="text-muted">—</span>
 								{/if}
 							</td>
-							<td class="py-1.5 pr-4 text-muted font-mono">{e.target_host || '—'}</td>
+							<td class="py-1.5 text-muted font-mono">{e.target_host || '—'}</td>
 							<td class="py-1.5 text-muted truncate max-w-xs">{parseDetails(e.details_json)}</td>
 						</tr>
 					{/each}

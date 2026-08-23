@@ -284,3 +284,38 @@ def make_frontmatter():
         return fm
 
     return _make
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_leftover_db_worker_threads():
+    """Fail the run if a suite leaves an aiosqlite worker thread alive (#496).
+
+    Those threads are NON-DAEMON, so CPython joins them at interpreter exit: one
+    left behind means pytest prints "1934 passed" and then never returns. That
+    is not a test failure anyone can see - it looks like a frozen CI job, and it
+    cost hours of exactly that before it was understood. Asserting it here turns
+    it back into a normal red run.
+    """
+    yield
+    import threading
+    import time
+
+    def _leftovers():
+        return [
+            t
+            for t in threading.enumerate()
+            if t.is_alive() and "_connection_worker_thread" in t.name
+        ]
+
+    # A worker that is on its way out is fine; one that is still there after a
+    # grace period is what wedges the exit.
+    deadline = time.monotonic() + 10
+    while _leftovers() and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+    stuck = _leftovers()
+    assert not stuck, (
+        f"{len(stuck)} aiosqlite worker thread(s) outlived the suite: "
+        f"{[t.name for t in stuck]}. They are non-daemon, so the process cannot exit - "
+        "a Database was closed in a way that never ended its worker, or never closed."
+    )

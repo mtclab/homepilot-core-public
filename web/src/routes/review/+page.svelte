@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, sessionStore, type Artifact } from '$lib/api';
+	import { api, sessionStore, type Artifact, type ArtifactPlan } from '$lib/api';
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
+	import { pruneSelection } from '$lib/selection';
 	import { base } from '$app/paths';
 
 	let items: Artifact[] = [];
@@ -14,6 +15,9 @@
 	let expanded: string | null = null;
 	let bodies: Record<string, string> = {};
 	let rejectReasons: Record<string, string> = {};
+	let plans: Record<string, ArtifactPlan> = {};
+	let planErrors: Record<string, string> = {};
+	let planLoading: Record<string, boolean> = {};
 
 	const STATUS_CLASSES: Record<string, string> = {
 		proposed: 'badge-proposed',
@@ -34,6 +38,7 @@
 		try {
 			const res = await api.listArtifacts({ status: 'proposed', limit: 200 });
 			items = res.items;
+			selected = pruneSelection(selected, items);
 		} catch (e) {
 			// A toast alone left the last-good (or empty) list on screen with no way
 			// back — the queue looked empty when it had simply failed to load.
@@ -56,10 +61,74 @@
 				bodies[id] = '(failed to load body)';
 			}
 		}
+		loadPlan(id);
+	}
+
+	// What applying this would do to the HOST (#445 A1). Approval used to show
+	// only the artifact text, so the decision was made blind. Safe to run on
+	// expand: the endpoint is read-only by construction.
+	async function loadPlan(id: string) {
+		if (plans[id] || planErrors[id] || planLoading[id]) return;
+		planLoading = { ...planLoading, [id]: true };
+		try {
+			plans = { ...plans, [id]: await api.planArtifact(id) };
+		} catch (e) {
+			// Shown inline, not as a toast: "we could not tell you what this will
+			// do" has to stay on screen next to the Approve button.
+			planErrors = { ...planErrors, [id]: e instanceof Error ? e.message : String(e) };
+		} finally {
+			planLoading = { ...planLoading, [id]: false };
+		}
+	}
+
+	// Selection for bulk actions. Pruned on every reload so "3 selected -> Approve"
+	// can never act on rows the operator can no longer see - the same rule the
+	// inventory table follows.
+	let selected: Set<string> = new Set();
+	let bulkConfirm: 'approve' | 'reject' | null = null;
+	let bulkRunning = false;
+
+	function toggle(id: string) {
+		const next = new Set(selected);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		selected = next;
+	}
+
+	function toggleAll() {
+		selected = selected.size === items.length ? new Set() : new Set(items.map((a) => a.id));
+	}
+
+	/** Approve or reject everything selected, reporting per-artifact outcomes. */
+	async function runBulk(action: 'approve' | 'reject') {
+		bulkRunning = true;
+		const ids = items.filter((a) => selected.has(a.id)).map((a) => a.id);
+		let done = 0;
+		const failed: string[] = [];
+		for (const id of ids) {
+			try {
+				if (action === 'approve') await api.approveArtifact(id);
+				else await api.rejectArtifact(id, 'web', (rejectReasons[id] ?? '').trim() || undefined);
+				done += 1;
+				items = items.filter((a) => a.id !== id);
+			} catch {
+				// One refusal must not abandon the rest of the batch, and the
+				// operator has to be told WHICH ones did not go through.
+				failed.push(id.slice(-8));
+			}
+		}
+		selected = new Set();
+		bulkConfirm = null;
+		bulkRunning = false;
+		notify(
+			failed.length
+				? `${action === 'approve' ? 'Approved' : 'Rejected'} ${done}; failed: ${failed.join(', ')}`
+				: `${action === 'approve' ? 'Approved' : 'Rejected'} ${done}`,
+			failed.length ? 'err' : 'ok'
+		);
 	}
 
 	async function approve(id: string) {
-		if (!confirm(`Approve artifact ${id.slice(-8)}? This will allow it to be applied.`)) return;
 		working = { ...working, [id]: true };
 		try {
 			await api.approveArtifact(id);
@@ -74,7 +143,6 @@
 
 	async function reject(id: string) {
 		const reason = (rejectReasons[id] ?? '').trim() || undefined;
-		if (!confirm(`Reject artifact ${id.slice(-8)}?${reason ? ` Reason: "${reason}"` : ''}`)) return;
 		working = { ...working, [id]: true };
 		try {
 			await api.rejectArtifact(id, 'web', reason);
@@ -107,6 +175,49 @@
 			<button class="btn btn-ghost text-xs" on:click={load}>↻ Refresh</button>
 		</div>
 	</div>
+
+	{#if canWrite && items.length > 0}
+		<!-- Bulk approve/reject (#435). Inventory has had checkboxes and bulk
+		     actions for a while; the review queue - the page where a backlog
+		     actually piles up - had none, and every decision was one mouse round
+		     trip. The confirm is inline and two-step, the same as every other
+		     destructive action here: a native confirm() in one place and nothing
+		     in another was the inconsistency the issue names. -->
+		<div class="flex items-center gap-3 flex-wrap">
+			<label class="flex items-center gap-2 text-xs text-muted">
+				<input
+					type="checkbox"
+					checked={selected.size > 0 && selected.size === items.length}
+					on:change={toggleAll}
+				/>
+				Select all
+			</label>
+			{#if selected.size > 0}
+				<span class="text-xs text-ink">{selected.size} selected</span>
+				{#if bulkConfirm}
+					<span class="text-xs text-warn">
+						{bulkConfirm === 'approve' ? 'Approve' : 'Reject'} {selected.size} artifact{selected.size ===
+						1
+							? ''
+							: 's'}?
+					</span>
+					<button
+						class="btn text-xs {bulkConfirm === 'approve' ? 'btn-success' : 'btn-danger'}"
+						disabled={bulkRunning}
+						on:click={() => runBulk(bulkConfirm === 'approve' ? 'approve' : 'reject')}
+					>{bulkRunning ? 'Working…' : 'Confirm'}</button>
+					<button class="btn btn-ghost text-xs" on:click={() => (bulkConfirm = null)}>Cancel</button>
+				{:else}
+					<button class="btn btn-success text-xs" on:click={() => (bulkConfirm = 'approve')}
+						>✓ Approve selected</button
+					>
+					<button class="btn btn-danger text-xs" on:click={() => (bulkConfirm = 'reject')}
+						>✗ Reject selected</button
+					>
+				{/if}
+			{/if}
+		</div>
+	{/if}
 
 	{#if loading}
 		<p class="text-muted text-sm">Loading…</p>
@@ -153,6 +264,14 @@
 						</div>
 						<!-- Actions -->
 						{#if canWrite}
+							<label class="shrink-0 self-start pt-1">
+								<span class="sr-only">Select {a.id}</span>
+								<input
+									type="checkbox"
+									checked={selected.has(a.id)}
+									on:change={() => toggle(a.id)}
+								/>
+							</label>
 							<div class="flex gap-2 shrink-0">
 								<button
 									class="btn btn-success text-xs"
@@ -171,6 +290,55 @@
 					<!-- Expanded body -->
 					{#if expanded === a.id}
 						<div class="ml-7 space-y-2">
+							<!-- The plan comes FIRST: what happens to the host is the
+							     decision, the artifact text is the reference. -->
+							{#if planLoading[a.id]}
+								<p class="text-xs text-muted">Checking {targetStr(a)} …</p>
+							{:else if planErrors[a.id]}
+								<div class="rounded border border-warn/40 bg-warn/5 p-2 space-y-1">
+									<p class="text-xs text-ink-strong font-medium">
+										Cannot show what this would change
+									</p>
+									<p class="text-xs text-muted">{planErrors[a.id]}</p>
+									<button
+										class="text-xs text-accent hover:text-accent-strong"
+										on:click={() => { planErrors = { ...planErrors, [a.id]: '' }; loadPlan(a.id); }}
+									>Retry</button>
+								</div>
+							{:else if plans[a.id]}
+								<div class="space-y-1">
+									<p class="text-xs text-ink-strong font-medium">{plans[a.id].summary}</p>
+									<table class="w-full text-xs">
+										<tbody>
+											{#each plans[a.id].items as item}
+												<tr class="border-t border-line/60">
+													<td class="py-1 pr-2 text-muted w-16">{item.kind}</td>
+													<td class="py-1 pr-2 font-mono text-ink-strong">{item.name}</td>
+													<td class="py-1 pr-2 text-muted">{item.observed}</td>
+													<td class="py-1 pr-2 text-muted">
+														{#if item.changes}→ {item.desired}{:else}unchanged{/if}
+													</td>
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+									{#if plans[a.id].policies?.length}
+										<!-- The rules the operator wrote about this host, beside
+										     what is about to happen to it (#429). Approving is
+										     meant to be an informed decision. -->
+										<div class="mt-2 border-l-2 border-warn-border pl-3 space-y-1">
+											<p class="text-xs text-warn font-medium">
+												Policies for {plans[a.id].host}
+											</p>
+											{#each plans[a.id].policies ?? [] as policy}
+												<p class="prose-note text-xs">
+													<span class="text-ink">{policy.title}</span> — {policy.content}
+												</p>
+											{/each}
+										</div>
+									{/if}
+								</div>
+							{/if}
 							{#if bodies[a.id]}
 								<pre class="code-block text-xs overflow-x-auto whitespace-pre-wrap max-h-64">{bodies[a.id]}</pre>
 							{:else}

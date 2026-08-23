@@ -198,6 +198,48 @@
 		return firing.filter((f) => f.hostname === hostname);
 	}
 
+	// Forgetting is destructive and irreversible (the credential goes with the
+	// row), so it is a two-step confirm inline rather than a browser confirm().
+	let forgetConfirm: string | null = null;
+	let forgetting: string | null = null;
+
+	async function forget(a: AgentInfo) {
+		forgetting = a.agent_id;
+		try {
+			await api.forgetAgent(a.agent_id);
+			notify(`Forgot ${a.hostname} — its credential is revoked`);
+			forgetConfirm = null;
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			forgetting = null;
+		}
+	}
+
+	// Revoking is destructive too - it kills the credential AND the open channel -
+	// so it gets the same two-step confirm as Forget.
+	let revokeConfirm: string | null = null;
+	let revoking: string | null = null;
+
+	async function revoke(a: AgentInfo) {
+		revoking = a.agent_id;
+		try {
+			const res = await api.revokeAgent(a.agent_id);
+			notify(
+				res.channel_closed
+					? `Revoked ${a.hostname} and closed its open channel`
+					: `Revoked ${a.hostname}; it had no open channel`
+			);
+			revokeConfirm = null;
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			revoking = null;
+		}
+	}
+
 	async function load() {
 		loading = true;
 		loadError = '';
@@ -281,6 +323,17 @@
 		if (a.connected === false) return 'disconnected';
 		return (a.stale_seconds ?? 0) < 90 ? 'connected' : 'stale';
 	}
+	/**
+	 * The agent's own build stamp, or null when it predates the stamp (#430).
+	 * Never invent a value: "unknown" is the honest answer for a binary built
+	 * before `main.version` existed, and it is exactly the fleet an upgrade hunt
+	 * is looking for.
+	 */
+	function agentVersion(a: AgentInfo): string | null {
+		const v = (a.system_info as Record<string, unknown> | undefined)?.agent_version;
+		return typeof v === 'string' && v ? v : null;
+	}
+
 	const statusDot: Record<AgentStatus, string> = {
 		connected: 'bg-ok',
 		stale: 'bg-warn',
@@ -462,31 +515,31 @@
 				<table class="data-table text-xs">
 					<thead>
 						<tr>
-							<th class="text-left pb-2 pr-4">Rule</th>
-							<th class="text-left pb-2 pr-4">Condition</th>
-							<th class="text-left pb-2 pr-4">Hosts</th>
-							<th class="text-left pb-2 pr-4">State</th>
-							<th class="text-left pb-2">Actions</th>
+							<th class="text-left">Rule</th>
+							<th class="text-left">Condition</th>
+							<th class="text-left">Hosts</th>
+							<th class="text-left">State</th>
+							<th class="text-left">Actions</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each rules as r}
 							<tr class="border-b border-divider">
-								<td class="py-2 pr-4 text-ink">{r.name}</td>
-								<td class="py-2 pr-4 text-muted">
+								<td class="text-ink">{r.name}</td>
+								<td class="text-muted">
 									{metricLabel(r.metric)} {COMPARISON_LABELS[r.comparison]}
 									<span class="num text-ink">{r.threshold}</span>
 									for {Math.round(r.for_seconds / 60)} min
 								</td>
-								<td class="py-2 pr-4 text-muted font-mono">{r.host_filter}</td>
-								<td class="py-2 pr-4">
+								<td class="text-muted font-mono">{r.host_filter}</td>
+								<td>
 									{#if r.enabled}
 										<span class="text-ok">enabled</span>
 									{:else}
 										<span class="text-muted">silenced</span>
 									{/if}
 								</td>
-								<td class="py-2 space-x-1">
+								<td class="space-x-1">
 									<button class="btn btn-ghost btn-xs" on:click={() => toggleRule(r)}>
 										{r.enabled ? 'Silence' : 'Enable'}
 									</button>
@@ -522,25 +575,39 @@
 			<table class="data-table text-xs">
 <thead>
 					<tr>
-						<th class="text-left pb-2 pr-4">Hostname</th>
-						<th class="text-left pb-2 pr-4">Agent ID</th>
-						<th class="text-left pb-2 pr-4">State</th>
-						<th class="text-left pb-2 pr-4">Load (1h)</th>
-						<th class="text-left pb-2 pr-4">Connected</th>
-						<th class="text-left pb-2 pr-4">Last Heartbeat</th>
-						<th class="text-left pb-2">Actions</th>
+						<th class="text-left">Hostname</th>
+						<th class="text-left">Agent ID</th>
+						<th class="text-left">Version</th>
+						<th class="text-left">State</th>
+						<th class="text-left">Load (1h)</th>
+						<th class="text-left">Connected</th>
+						<th class="text-left">Last Heartbeat</th>
+						<th class="text-left">Actions</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each agents as a}
 						<tr class="border-b border-divider hover:bg-raised">
-							<td class="py-2 pr-4 text-ink font-mono">{a.hostname}</td>
-							<td class="py-2 pr-4 text-muted font-mono text-[11px]">{a.agent_id.slice(0, 8)}…</td>
-							<td class="py-2 pr-4">
+							<td class="text-ink font-mono">{a.hostname}</td>
+							<td class="text-muted font-mono text-[11px]">{a.agent_id.slice(0, 8)}…</td>
+							<td class="font-mono text-[11px]" class:text-muted={!agentVersion(a)}>
+								{agentVersion(a) ?? 'unknown'}
+							</td>
+							<td>
 								<span class="inline-flex items-center gap-1">
 									<span class="w-1.5 h-1.5 rounded-full {statusDot[agentStatus(a)]}"></span>
 									<span class={statusText[agentStatus(a)]}>{agentStatus(a)}</span>
 								</span>
+								{#if !a.connected && a.last_error}
+									<!-- The whole point of #430: a revoked agent, a banned peer
+									     and a powered-off box were the same grey dot. -->
+									<div class="text-[11px] text-danger mt-0.5 max-w-[28rem]">
+										{a.last_error}
+										{#if a.last_error_at}
+											<span class="text-muted">({fmtDate(a.last_error_at)})</span>
+										{/if}
+									</div>
+								{/if}
 								{#each alertsFor(a.hostname) as f}
 									<span
 										class="badge badge-failed ml-1"
@@ -548,7 +615,7 @@
 									>{f.name}</span>
 								{/each}
 							</td>
-							<td class="py-2 pr-4">
+							<td>
 								{#if rowSeries[a.hostname]}
 									<Sparkline
 										points={rowSeries[a.hostname]?.points ?? []}
@@ -561,12 +628,53 @@
 									<span class="text-muted">—</span>
 								{/if}
 							</td>
-							<td class="py-2 pr-4 text-muted">{fmtDate(a.connected_at)}</td>
-							<td class="py-2 pr-4 text-muted">{fmtDate(a.last_heartbeat)}</td>
-							<td class="py-2">
+							<td class="text-muted">{fmtDate(a.connected_at)}</td>
+							<td class="text-muted">{fmtDate(a.last_heartbeat)}</td>
+							<td class="space-x-1 whitespace-nowrap">
 								<button class="btn btn-ghost text-xs" on:click={() => toggleDetails(a)}>
 									{selectedAgent?.agent_id === a.agent_id ? 'Hide' : 'Details'}
 								</button>
+								{#if isAdmin}
+									{#if revokeConfirm === a.agent_id}
+										<button
+											class="btn btn-danger text-xs"
+											disabled={revoking === a.agent_id}
+											on:click={() => revoke(a)}
+										>{revoking === a.agent_id ? 'Revoking…' : 'Confirm revoke'}</button>
+										<button
+											class="btn btn-ghost text-xs"
+											on:click={() => (revokeConfirm = null)}
+										>Cancel</button>
+									{:else}
+										<button
+											class="btn btn-ghost text-xs text-danger"
+											title="Revoke this agent's credential and close its live channel"
+											on:click={() => (revokeConfirm = a.agent_id)}
+										>Revoke</button>
+									{/if}
+								{/if}
+								{#if agentStatus(a) !== 'connected'}
+									<!-- Only for an agent that is NOT connected: removing a live
+									     one would pull its credential out from under an open
+									     channel, and the API refuses it anyway (#415). -->
+									{#if forgetConfirm === a.agent_id}
+										<button
+											class="btn btn-danger text-xs"
+											disabled={forgetting === a.agent_id}
+											on:click={() => forget(a)}
+										>{forgetting === a.agent_id ? 'Forgetting…' : 'Confirm'}</button>
+										<button
+											class="btn btn-ghost text-xs"
+											on:click={() => (forgetConfirm = null)}
+										>Cancel</button>
+									{:else}
+										<button
+											class="btn btn-ghost text-xs text-danger"
+											title="Remove this agent and revoke its credential"
+											on:click={() => (forgetConfirm = a.agent_id)}
+										>Forget</button>
+									{/if}
+								{/if}
 							</td>
 						</tr>
 						{#if selectedAgent?.agent_id === a.agent_id}

@@ -56,9 +56,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "spec": {
                     "type": "string",
                     "description": (
-                        "JSON artifact spec. Must include: id, kind (ansible-playbook, "
-                        "proxmox-api-sequence, http-sequence, composite, shell-script, kb-note), "
-                        "intent, body, produced_by. If kind != kb-note: target and idempotence."
+                        "JSON artifact spec. Must include: id, kind (host-provision, "
+                        "ansible-playbook, proxmox-api-sequence, http-sequence, composite, "
+                        "shell-script, kb-note), intent, body, produced_by. If kind != kb-note: "
+                        "target and idempotence. host-provision is the native, working way to "
+                        "install packages, manage services and write config on a managed host "
+                        "(it runs over the agent and is the only kind with a real pre-apply plan "
+                        "and a captured rollback); prefer it for host configuration."
                     ),
                 },
             },
@@ -161,7 +165,72 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["id", "kind", "status"],
         },
     },
+    {
+        "name": "get_artifact",
+        "description": (
+            "Read a whole artifact: its frontmatter AND its body, including the execution "
+            "log appended when it was applied. This is how an agent sees what actually "
+            "happened to something it proposed - `get_artifact_status` returns a status "
+            "string and nothing else. Also the way to use a prior artifact as a pattern. "
+            "Requires read scope."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact ID to read"},
+            },
+            "required": ["artifact_id"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "kind": {"type": "string"},
+                "status": {"type": "string"},
+                "frontmatter": {"type": "object"},
+                "body": {"type": "string"},
+                "truncated": {"type": "boolean"},
+            },
+            "required": ["id", "body"],
+        },
+    },
+    {
+        "name": "get_task_result",
+        "description": (
+            "The outcome of an apply/replay/revoke: status, error and the execution log "
+            "the runner kept. Pass a task_id, or an artifact_id to get its most recent "
+            "task. Without this an agent can propose work and never learn whether it "
+            "succeeded. Requires read scope."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Task ID"},
+                "artifact_id": {
+                    "type": "string",
+                    "description": "Artifact ID - returns its most recent task",
+                },
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "artifact_id": {"type": "string"},
+                "action": {"type": "string"},
+                "status": {"type": "string"},
+                "error": {"type": ["string", "null"]},
+                "execution_log": {"type": "string"},
+            },
+            "required": ["id", "status"],
+        },
+    },
 ]
+
+# An artifact body carries the execution log, which can be long. Truncate from the
+# FRONT: the end of a log is where the failure is (the same rule the task runner
+# applies when it stores one).
+_MAX_BODY_CHARS = 40000
 
 
 def _check_approve_ratelimit(caller_id: str) -> None:
@@ -297,4 +366,77 @@ async def handle_get_artifact_status(
         "intent": fm.get("intent", ""),
         "last_updated": fm.get("approved_at") or fm.get("created_at", ""),
         "target": fm.get("target"),
+    }
+
+
+async def handle_get_artifact(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """The whole artifact, body included (#427).
+
+    An agent could propose an artifact and then never read it back: the execution
+    log is appended to the BODY on apply, and no MCP tool returned a body. So the
+    AI half of "AI-first" could not see what happened when its own artifact ran,
+    and could not use a prior artifact as a pattern.
+    """
+    artifact_id = arguments["artifact_id"]
+    try:
+        fm, body = await asyncio.to_thread(ctx["store"].read, artifact_id)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Artifact not found: {artifact_id}") from exc
+
+    truncated = len(body) > _MAX_BODY_CHARS
+    if truncated:
+        body = (
+            f"[earlier content truncated, showing the last {_MAX_BODY_CHARS} chars]\n"
+            + body[-_MAX_BODY_CHARS:]
+        )
+    return {
+        "id": fm.get("id", artifact_id),
+        "kind": fm.get("kind", ""),
+        "status": fm.get("status", ""),
+        "frontmatter": fm,
+        "body": body,
+        "truncated": truncated,
+    }
+
+
+async def handle_get_task_result(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """What an apply/replay/revoke actually did (#427).
+
+    Task results lived only under /tasks with no MCP equivalent, so an agent could
+    start work and never learn the outcome.
+    """
+    task_repo = ctx.get("task_repo")
+    if task_repo is None:
+        raise RuntimeError("Task repository not configured")
+
+    task_id = arguments.get("task_id")
+    artifact_id = arguments.get("artifact_id")
+    if not task_id and not artifact_id:
+        raise ValueError("pass task_id or artifact_id")
+
+    task = None
+    if task_id:
+        task = await task_repo.get_task(task_id)
+    else:
+        tasks = await task_repo.list_tasks(artifact_id=artifact_id, limit=1)
+        task = tasks[0] if tasks else None
+        if task is not None:
+            task = await task_repo.get_task(task["id"])
+    if task is None:
+        raise ValueError(f"Task not found: {task_id or artifact_id}")
+
+    execution_log = ""
+    raw = task.get("result_json")
+    if raw:
+        try:
+            execution_log = str(json.loads(raw).get("execution_log", ""))
+        except (ValueError, TypeError):
+            execution_log = ""
+    return {
+        "id": task.get("id", ""),
+        "artifact_id": task.get("artifact_id", ""),
+        "action": task.get("action", ""),
+        "status": task.get("status", ""),
+        "error": task.get("error"),
+        "execution_log": execution_log,
     }

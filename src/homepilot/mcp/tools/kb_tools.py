@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
+
+logger = logging.getLogger(__name__)
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -124,4 +127,16 @@ async def handle_record_fact(arguments: dict[str, Any], ctx: dict[str, Any]) -> 
         spec["supersedes"] = [supersedes]
 
     artifact_id = await lifecycle.propose(spec)
+
+    # Index it NOW (#388). A kb-note is marked `applied` on propose, and this
+    # path never reindexed - so an agent recorded a fact, was told
+    # `{"status": "applied"}`, and an immediate `search_kb` found nothing until
+    # the process restarted. "Recorded" that cannot be read back is not recorded.
+    kb_service = ctx.get("kb_service")
+    if kb_service is not None:
+        try:
+            await kb_service.reindex_if_needed(reason="record_fact")
+        except Exception:
+            logger.warning("could not index the recorded fact %s", artifact_id, exc_info=True)
+
     return {"id": artifact_id, "status": "applied", "kind": kind}

@@ -141,6 +141,51 @@ def validate_propose_spec(spec: dict[str, Any], store: ArtifactStore) -> tuple[d
         if opt_key in spec:
             fm[opt_key] = spec[opt_key]
 
+    # `rollback` is DERIVED, per ARTIFACT_SPEC: "true if a rollback section exists
+    # in the body". Nothing derived it, and the executor gates rollback on this
+    # field - so a body carrying a perfectly good rollback section and no
+    # `rollback: true` line silently never rolled back, and revoke relabelled the
+    # artifact while the host kept the change (#426).
+    #
+    # A claim that cannot be honoured is refused HERE rather than discovered on
+    # revoke, which is the worst possible moment: the operator has already decided
+    # to undo something.
+    if kind != ArtifactKind.KB_NOTE:
+        # Imported here, not at module scope: `executor` imports the artifact
+        # models, so a top-level import would close a package cycle.
+        from homepilot.executor.rollback import derive_rollback, kind_can_roll_back
+
+        claimed = spec.get("rollback")
+        derived = derive_rollback(kind, body)
+        if claimed and not derived:
+            if not kind_can_roll_back(kind):
+                raise LifecycleError(
+                    f"rollback: true is not possible for kind '{kind.value}' - it has no "
+                    "way to reverse itself, so revoking would relabel the artifact and "
+                    "leave the host changed"
+                )
+            raise LifecycleError(
+                f"rollback: true but the body carries no rollback section for kind "
+                f"'{kind.value}' - add one, or drop the claim"
+            )
+        fm["rollback"] = derived
+
+    # A credential written out in full, in a body about to be committed to a git
+    # repository designed to be pushed (#505). Refused at propose because that is
+    # the last moment before it is in history, and history is a one-way door.
+    if kind in (ArtifactKind.HOST_PROVISION, ArtifactKind.SHELL_SCRIPT):
+        from homepilot.executor.secrets import literal_secrets
+
+        leaked = literal_secrets(body)
+        if leaked:
+            raise LifecycleError(
+                "this body appears to contain a literal credential ("
+                + ", ".join(leaked)
+                + "). Store it with `hp vault set` and reference it as "
+                "{{ vault.<name>.<field> }} - the artifact store is a git "
+                "repository, so a committed secret cannot be taken back."
+            )
+
     expr_errors = validate_artifact_expressions(fm, body)
     if expr_errors:
         raise LifecycleError("; ".join(expr_errors))

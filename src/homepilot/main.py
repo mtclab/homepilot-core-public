@@ -23,12 +23,13 @@ from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, generate_latest
 
 from . import __version__
-from .app_state import create_app_state
+from .app_state import create_app_state, get_agent_registry
 from .auth.deps import SCOPE_ENFORCER_ATTR, require_token
 from .auth.tokens import validate_token as _validate_token
 from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
+from .instance_lock import InstanceLock
 from .selfcheck import mcp_transport_running, schedule_boot_selfcheck
 
 logger = logging.getLogger(__name__)
@@ -113,9 +114,37 @@ def _cleanup_rate_window() -> None:
             del _RATE_WINDOW[ip]
 
 
+def configure_logging(level: str) -> None:
+    """Apply `HP_LOG_LEVEL` (#431).
+
+    `settings.log_level` was defined, documented in `.env.example`, and READ BY
+    NOTHING: there was no `basicConfig` anywhere outside the MCP entrypoints. So
+    every `logger.debug` in `/health`, the vault fallbacks and the app-state
+    secret resolution was invisible in production and could not be turned on -
+    the diagnostics existed and the switch did not.
+
+    `force=True` because uvicorn installs its own handlers first; without it this
+    call is a no-op under the shipped entrypoint, which is the only place it
+    matters.
+    """
+    resolved = getattr(logging, str(level).upper(), None)
+    if not isinstance(resolved, int):
+        resolved = logging.INFO
+        logging.getLogger(__name__).warning(
+            "HP_LOG_LEVEL=%r is not a level name; using INFO", level
+        )
+    logging.basicConfig(
+        level=resolved,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    logging.getLogger("homepilot").setLevel(resolved)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
+    configure_logging(settings.log_level)
     state = await create_app_state(settings)
 
     for cidr in (settings.trusted_proxies or _HP_TRUSTED_PROXIES_ENV).split(","):
@@ -130,9 +159,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.db = state.database
     app.state.repo = state.repo
 
+    # ONE backend per data directory (#431). The sweep below marks every
+    # pending/running task failed, so a second backend - a rolling restart, a
+    # stray `docker compose up` - used to kill the first one's in-flight work
+    # while it carried on running. Held for the process lifetime; the kernel
+    # drops it if we die, so a crash never leaves a stale lock.
+    instance_lock = InstanceLock(settings.data_dir)
+    instance_lock.acquire()
+    app.state.instance_lock = instance_lock
+
     from .tasks.repository import TaskRepository
 
     task_repo = TaskRepository(state.database)
+    # Correct ONLY because we hold the lock: any pending/running task now really
+    # is orphaned, because no other backend exists to be running it.
     await task_repo.fail_orphaned_tasks()
     app.state.task_repo = task_repo
 
@@ -243,6 +283,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         startup_delay=60.0,
     )
     app.state.metrics_pruner = metrics_pruner
+
+    # Operational history has its own horizon and its own reconciler: the right
+    # retention for an audit trail is not the right retention for a time series
+    # (#431). Unconditional, for the same reason the metrics pruner is - a
+    # pruner that only runs when something else is configured is how an
+    # unbounded table happens.
+    from .reconciler.retention import RetentionReconciler
+
+    retention_reconciler = RetentionReconciler(state.repo, settings.retention_days)
+    reconciler_scheduler.register(
+        retention_reconciler,
+        interval=float(settings.retention_interval_seconds),
+        startup_delay=120.0,
+    )
+    app.state.retention_reconciler = retention_reconciler
     alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo)
     reconciler_scheduler.register(
         alert_evaluator,
@@ -402,6 +457,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "task_repo": task_repo,
                 "agent_adapter": mcp_agent,
                 "drift_reconciler": drift_reconciler,
+                # The hub's live registry, for `check_host_reachable` (#427).
+                "agent_registry": get_agent_registry(),
             }
         )
 
@@ -456,15 +513,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         agent_hub = getattr(app.state, "agent_hub", None)
         if agent_hub is not None:
             try:
-                await asyncio.wait_for(agent_hub.stop(), timeout=10.0)
+                # Comfortably above the hub's own internal budget. If this guard
+                # fires first it cancels stop() midway and its registry.drain()
+                # never runs - leaving exactly the un-drained writes that close
+                # the database under themselves (#496).
+                await asyncio.wait_for(agent_hub.stop(), timeout=20.0)
                 logger.info("Agent hub stopped")
             except TimeoutError:
-                logger.warning("Agent hub stop timed out after 10s — proceeding")
+                logger.warning("Agent hub stop timed out after 20s — proceeding")
+            except Exception as exc:
+                # Never out of the shutdown `finally`: an exception here would
+                # skip the reconciler stop, every drain, the database close and
+                # the MCP teardown below.
+                logger.warning("Agent hub stop error: %s", exc)
 
         try:
             await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
         except TimeoutError:
             logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
+
+        # Background jobs run behind an already-accepted request, so nothing else
+        # awaits them. Drain them BEFORE the database closes (#496): a write that
+        # outlives its loop kills aiosqlite's worker thread, and the close then
+        # queues onto a thread that will never pick it up. It also stops a
+        # provision from being remembered as "running" forever.
+        drainable = (
+            ("task runner", getattr(app.state, "task_runner", None)),
+            ("provision service", getattr(app.state, "provision_service", None)),
+            ("agent enrolment service", getattr(app.state, "agent_enroll_service", None)),
+            # Also drained inside agent_hub.stop(), but the registry outlives a
+            # DISABLED hub: create_app_state leaves agent_hub None when the
+            # transport check fails (#468's upgrade case) while the registry
+            # stays live and still writes. Draining twice is a no-op.
+            ("agent registry", getattr(app.state, "agent_registry", None)),
+        )
+        for label, service in drainable:
+            drain = getattr(service, "drain", None)
+            if drain is None:
+                continue
+            try:
+                await asyncio.wait_for(drain(), timeout=10.0)
+            except TimeoutError:
+                logger.warning("%s drain timed out after 10s — proceeding", label)
+            except Exception as exc:
+                logger.warning("%s drain error: %s", label, exc)
+
         try:
             await asyncio.wait_for(state.database.close(), timeout=10.0)
         except TimeoutError:
@@ -479,6 +572,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # is cleared — so create_http_app's lifespan cleanup finds nothing to close
         # and cannot double-close the DB/Proxmox handles already closed above.
         await mcp_lifespan_stack.aclose()
+        # Released LAST: while it is held, nothing else may start against this
+        # data directory and run the orphan sweep over our tasks.
+        instance_lock.release()
         logger.info("HomePilot v2 shut down")
 
 
