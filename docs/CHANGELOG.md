@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.0.1 (2026-08-23)
+
+Hotfix for the first real 3.0.0 install. **If you ever re-ran
+`install-agent.sh` on the box that also runs the backend, check your data
+directory's ownership** - the installer used to `chown -R` its write prefixes,
+and on a control-plane box that handed the backend's database, vault and
+`.env` to `hp-agent`. Recovery: `chown -R 999:999` the directory mounted at
+`/home/homepilot/.hp`, restart the backend.
+
+* `install-agent.sh` takes ownership only of directories it CREATES. A write
+  prefix grants the agent permission to write inside it - it is not a claim on
+  the ownership of what others put there.
+* An unreadable `.env` in the data directory no longer crash-loops the backend
+  with a raw traceback: it is skipped with a loud error naming the file, the
+  uid, and the exact chown to run. Environment-variable configuration keeps
+  working throughout.
+
 ## v3.0.0 (2026-08-23)
 
 The operator console. The UI's nouns now match the operator's world - my
@@ -558,7 +575,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 ### Fixes
 
 - **AGENTS.md model assignments**: Updated to match current `~/.config/opencode/agents/roles.md` (deepseek-v4-pro removed, kimi-k2.6 now primary for CoreSquad/ToolingSquad/QATester).
-- **matrix_server.py default URL**: Changed from `example.com` to `matrix.mtcchat.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
+- **matrix_server.py default URL**: Changed from `example.com` to `matrix.example.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
 
 ## v2.2.3 (2026-05-25)
 
@@ -575,7 +592,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 - **Auto-generate vault passphrase**: When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the system generates a 256-bit passphrase using `secrets.token_urlsafe(32)` and persists it to `{data_dir}/.vault_passphrase` (mode `0o600`). On subsequent starts, the persisted passphrase is loaded automatically. This enables zero-secrets deployment where `.env` contains no HomePilot secrets.
 - **`_try_vault_secret` multi-key extraction**: The configuration resolver now attempts multiple keys when extracting secrets from the vault: `value` → `secret` → `key` → `token` → first value. This accommodates different vault secret formats (e.g., `pve-token` stored as `{"token": "..."}` vs `secret-key` stored as `{"value": "..."}`).
-- **Zero-secrets deployment verified**: Production dev server (your-server.local:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
+- **Zero-secrets deployment verified**: Production dev server (homepilot.example.com:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
 
 ### Bug Fixes
 

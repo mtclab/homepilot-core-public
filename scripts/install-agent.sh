@@ -331,12 +331,21 @@ if [ "$PRIVILEGED" = "true" ]; then
 else
     OWNER="hp-agent:hp-agent"
 fi
+# Ownership is taken ONLY of directories this installer CREATES. A recursive
+# chown of an existing prefix seized whatever already lived there - on a box
+# where /opt/homepilot is the CONTROL PLANE's deployment, re-running this
+# installer handed the backend's database, vault and .env to hp-agent and
+# crash-looped the backend (found live on prod, 2026-08-23). A write PREFIX
+# grants the agent permission to write inside it; it is not a claim on the
+# ownership of what others put there.
 for p in $WRITE_PREFIXES; do
     case "$p" in
         /etc/homepilot|/opt/homepilot|/tmp/homepilot)
-            $SUDO mkdir -p "$p"
-            $SUDO chmod 750 "$p"
-            $SUDO chown -R "$OWNER" "$p" 2>/dev/null || true
+            if [ ! -e "$p" ]; then
+                $SUDO mkdir -p "$p"
+                $SUDO chmod 750 "$p"
+                $SUDO chown "$OWNER" "$p" 2>/dev/null || true
+            fi
             ;;
     esac
 done
