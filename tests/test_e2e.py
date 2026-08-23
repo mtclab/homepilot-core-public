@@ -205,8 +205,10 @@ class TestAuthRedirect:
         assert login_resp.ok, f"Login failed: {login_resp.status}"
         cookies = {c["name"]: c["value"] for c in page.context.cookies()}
         assert "hp_token" in cookies or "hp_csrf" in cookies
+        # /artifacts is a pre-S4 address; the client-side redirect lands on
+        # /changes (#514 S4). The journey asserts the DESTINATION works.
         page.goto(UI + "/artifacts", wait_until="networkidle")
-        assert "/artifacts" in page.url
+        assert "/changes" in page.url
 
 
 # ---------------------------------------------------------------------------
@@ -266,8 +268,10 @@ class TestUIPages:
         assert auth_page.locator("nav").count() > 0
 
     def test_inventory_page_loads(self, auth_page):
+        # Old address on purpose: this doubles as the redirect gate on the
+        # shipped artifact (#514 S4) - /inventory must land on /hosts.
         auth_page.goto(f"{UI}/inventory", wait_until="networkidle")
-        assert "inventory" in auth_page.url.lower()
+        assert "/hosts" in auth_page.url.lower()
 
     def test_settings_page_shows_active_session(self, auth_page):
         auth_page.goto(f"{UI}/settings", wait_until="networkidle")

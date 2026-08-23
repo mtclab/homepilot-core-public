@@ -72,7 +72,7 @@ describe('App shell: the small-screen nav', () => {
 		const toggle = await screen.findByRole('button', { name: /open navigation/i });
 		await fireEvent.click(toggle);
 
-		await fireEvent.click(screen.getByRole('link', { name: 'Artifacts' }));
+		await fireEvent.click(screen.getByRole('link', { name: 'Changes' }));
 
 		await waitFor(() =>
 			expect(screen.getByRole('button', { name: /open navigation/i })).toBeInTheDocument()

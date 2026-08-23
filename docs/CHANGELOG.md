@@ -1,5 +1,61 @@
 # Changelog
 
+## v3.0.0 (2026-08-23)
+
+The operator console. The UI's nouns now match the operator's world - my
+machines, and what HomePilot does to them - instead of the implementation's.
+A major version because addresses and names changed; **nothing else did**:
+no schema surprises beyond one additive migration, no API removals, no agent
+changes. Upgrading is pulling the image.
+
+### REQUIRED READING BEFORE UPGRADING
+
+**Old bookmarks keep working.** Eleven tabs became five - Overview, Hosts,
+Changes, Records, Settings - and every pre-move URL redirects: `/ui/inventory`
+and `/ui/agents` land on Hosts, `/ui/artifacts` / `/ui/review` / `/ui/drift`
+on Changes, `/ui/tasks` / `/ui/journal` / `/ui/kb` on Records, `/ui/tokens`
+on Settings.
+
+**Enrolled agents' machines appear in inventory on their own.** Migration 25
+links every agent to a host row (creating one where none exists, source
+`agent`). After the upgrade your Hosts page may show MORE machines than
+Inventory did - those are the agent-carrying hosts that were invisible before.
+Coverage counts them as covered, so that number can jump. Neither is a defect;
+both are the point.
+
+### One noun: Host
+An enrolled agent's machine is a host - enrolment creates-or-links the row,
+the agent's report fills the gaps (never overwriting what Proxmox or an
+operator set), and the host's status follows the agent's channel unless an
+operator pinned it.
+
+### A real host page
+`/ui/hosts/{id}`: identity and facts, metrics with range switching (this is
+where a machine's stats live now), the changes and journal scoped to the
+machine, and the agent's version, channel state and last refusal reason -
+with adopt, zero-touch install, edits, revoke and forget on the same page.
+The old details dump (raw JSON, values floating at the table edge) is gone.
+
+### Fleet operations
+Select the disconnected half of a fleet in one click, forget or revoke the
+whole batch behind ONE dialog that names every machine, and watch rows update
+in place - no reloads, no buttons swapping under the cursor.
+
+### Honest numbers
+"In spec" shows a dash until something has actually been checked. Coverage
+counts machines HomePilot has a live channel onto. Empty states name a door
+that is actually open on this install.
+
+### Relocations
+Alert rules live in Settings -> Monitoring (firing alerts still show on the
+Overview and the affected host); API tokens live in Settings.
+
+### Rate limit
+The authenticated per-IP request limit default rises 120 -> 300/min
+(`HP_AUTH_RATE_LIMIT`): the richer console legitimately makes more API calls
+per page, and at 120 a busy operator could rate-limit themselves. The
+anonymous limit is unchanged at 60.
+
 ## v2.9.0 (2026-08-23)
 
 The release that makes the web UI enough to run HomePilot with, and closes the
@@ -502,7 +558,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 ### Fixes
 
 - **AGENTS.md model assignments**: Updated to match current `~/.config/opencode/agents/roles.md` (deepseek-v4-pro removed, kimi-k2.6 now primary for CoreSquad/ToolingSquad/QATester).
-- **matrix_server.py default URL**: Changed from `example.com` to `matrix.example.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
+- **matrix_server.py default URL**: Changed from `example.com` to `matrix.mtcchat.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
 
 ## v2.2.3 (2026-05-25)
 
@@ -519,7 +575,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 - **Auto-generate vault passphrase**: When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the system generates a 256-bit passphrase using `secrets.token_urlsafe(32)` and persists it to `{data_dir}/.vault_passphrase` (mode `0o600`). On subsequent starts, the persisted passphrase is loaded automatically. This enables zero-secrets deployment where `.env` contains no HomePilot secrets.
 - **`_try_vault_secret` multi-key extraction**: The configuration resolver now attempts multiple keys when extracting secrets from the vault: `value` → `secret` → `key` → `token` → first value. This accommodates different vault secret formats (e.g., `pve-token` stored as `{"token": "..."}` vs `secret-key` stored as `{"value": "..."}`).
-- **Zero-secrets deployment verified**: Production dev server (homepilot.example.com:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
+- **Zero-secrets deployment verified**: Production dev server (your-server.local:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
 
 ### Bug Fixes
 

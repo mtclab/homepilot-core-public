@@ -151,23 +151,31 @@
 				value="{d.inventory.coverage_pct}%"
 				sub="{d.inventory.managed}/{d.inventory.total} hosts managed"
 				accent={d.inventory.coverage_pct >= 80 ? 'ok' : 'warn'}
-				href="{base}/inventory"
+				href="{base}/hosts"
 			/>
 			<StatCard
 				label="Uncovered hosts"
 				value={d.inventory.uncovered}
 				sub="discovered, pending adoption"
 				accent={d.inventory.uncovered === 0 ? 'ok' : 'warn'}
-				href="{base}/inventory"
+				href="{base}/hosts"
 			/>
 			<StatCard
 				label="In spec"
-				value="{d.drift.in_spec_pct}%"
-				sub={d.drift.unknown
-					? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established`
-					: `${d.drift.drifted} drifting / ${d.drift.checked} checked`}
-				accent={d.drift.drifted > 0 ? 'danger' : d.drift.unknown > 0 ? 'warn' : 'ok'}
-				href="{base}/drift"
+				value={d.drift.checked > 0 ? `${d.drift.in_spec_pct}%` : '—'}
+				sub={d.drift.checked === 0
+					? 'nothing checked yet'
+					: d.drift.unknown
+						? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established`
+						: `${d.drift.drifted} drifting / ${d.drift.checked} checked`}
+				accent={d.drift.checked === 0
+					? 'neutral'
+					: d.drift.drifted > 0
+						? 'danger'
+						: d.drift.unknown > 0
+							? 'warn'
+							: 'ok'}
+				href="{base}/changes/drift"
 			/>
 			<StatCard
 				label="Agents"
@@ -214,13 +222,13 @@
 		</div>
 
 		<a
-			href="{base}/agents"
+			href="{base}/hosts"
 			class="card flex items-center justify-between hover:border-accent transition-colors"
 		>
 			<div>
 				<div class="section-title">Monitoring &amp; history</div>
 				<div class="text-xs text-muted">
-					Agents report system metrics over the hub. Kept for {d.metrics.retention_days} days.
+					Each host's page carries its charts. Metrics kept for {d.metrics.retention_days} days.
 				</div>
 			</div>
 			<span class="flex items-center gap-3 text-sm">
@@ -231,7 +239,7 @@
 				{:else}
 					<span class="text-muted text-xs">No alerts firing</span>
 				{/if}
-				<span class="text-accent">Host metrics →</span>
+				<span class="text-accent">Hosts →</span>
 			</span>
 		</a>
 	{/if}

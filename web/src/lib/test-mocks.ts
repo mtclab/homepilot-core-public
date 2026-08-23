@@ -69,9 +69,6 @@ vi.mock('$lib/api', async () => {
 			addHost: vi.fn(),
 			forgetHost: vi.fn().mockResolvedValue({ forgotten: true }),
 			refreshInventory: vi.fn(),
-			enrichInventory: vi.fn(),
-			adoptHost: vi.fn(),
-			ignoreHost: vi.fn(),
 			bulkHosts: vi.fn(),
 			listAgents: vi.fn().mockResolvedValue([]),
 			listFiringAlerts: vi.fn().mockResolvedValue({ items: [] }),
@@ -84,6 +81,17 @@ vi.mock('$lib/api', async () => {
 			getBootstrapToken: vi.fn(),
 			revokeAgent: vi.fn().mockResolvedValue({ revoked: true, channel_closed: true }),
 			forgetAgent: vi.fn().mockResolvedValue({ forgotten: true }),
+			// The host page (#514 S2, S4).
+			getHost: vi.fn(),
+			agentInstallEligibility: vi.fn().mockResolvedValue({ eligible: false, message: 'not in test' }),
+			installAgent: vi.fn(),
+			getTask: vi.fn(),
+			adoptHost: vi.fn(),
+			ignoreHost: vi.fn(),
+			enrichInventory: vi.fn(),
+			getHostLatest: vi.fn().mockResolvedValue({ hostname: '', metrics: [] }),
+			listAudit: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			updateHost: vi.fn(),
 		},
 		// Pages gate their write controls off the session's capability list, so a
 		// page test cannot render without this. Admin by default: a test about

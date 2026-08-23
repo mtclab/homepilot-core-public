@@ -26,7 +26,7 @@
 
 	function landing(): string {
 		const params = new URLSearchParams(window.location.search);
-		return safeReturnTo(params.get('returnTo'), base, `${base}/artifacts`);
+		return safeReturnTo(params.get('returnTo'), base, `${base}/changes`);
 	}
 
 	onMount(async () => {

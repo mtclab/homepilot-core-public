@@ -91,7 +91,7 @@ describe('Login page (unclaimed, reached from its own network)', () => {
 		await waitFor(() => expect(setToken).toHaveBeenCalledWith('hp_minted-by-the-claim'));
 		expect(claimInstance).toHaveBeenCalledWith(expect.objectContaining({ code: undefined }));
 		expect(api.login).toHaveBeenCalledWith('hp_minted-by-the-claim');
-		expect(goto).toHaveBeenCalledWith('/ui/artifacts');
+		expect(goto).toHaveBeenCalledWith('/ui/changes');
 	});
 
 	it('passes the Proxmox details through when they are filled in', async () => {

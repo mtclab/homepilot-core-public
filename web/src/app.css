@@ -227,6 +227,15 @@
 		padding-bottom: var(--space-2);
 	}
 
+	/* A number INSIDE a sentence or a definition list stays left-anchored -
+	   right-aligning it floats the value to the container's far edge, which is
+	   exactly the detail-dump defect #514 S2 removed. Use .num only in table
+	   columns where numbers are compared down the page. */
+	.num-inline {
+		font-family: var(--font-sans);
+		font-variant-numeric: tabular-nums;
+	}
+
 	/* Numbers read right-aligned and tabular wherever they are compared. */
 	.num {
 		font-family: var(--font-sans);

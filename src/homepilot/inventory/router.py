@@ -184,6 +184,27 @@ async def list_inventory(
     # with no way to reach page 2 and told the operator their estate was smaller
     # than it is.
     total = await repo.count_hosts(**filters)
+    # The agent is a property of the host (#514 S1): a fleet list that cannot
+    # say "this machine has a live channel" forces a second tab to answer it.
+    agent_ids = [h["agent_id"] for h in hosts if h.get("agent_id")]
+    if agent_ids:
+        marks = ",".join("?" * len(agent_ids))
+        agents = await repo.db.fetchall(
+            # nosec B608 - only `?` placeholders are interpolated (one per id);
+            # every VALUE goes through bound parameters. Bandit sees an f-string
+            # near SQL and cannot tell placeholders from data.
+            f"SELECT agent_id, connected, system_info FROM agents WHERE agent_id IN ({marks})",  # nosec B608
+            agent_ids,
+        )
+        by_id = {a["agent_id"]: a for a in agents}
+        for h in hosts:
+            a = by_id.get(h.get("agent_id") or "")
+            if a is not None:
+                h["agent_connected"] = bool(a["connected"])
+                try:
+                    h["agent_version"] = _json.loads(a["system_info"] or "{}").get("agent_version")
+                except (ValueError, TypeError):
+                    h["agent_version"] = None
     return {"items": hosts, "total": total}
 
 
@@ -280,6 +301,36 @@ async def get_host(request: Request, host_id: str) -> dict[str, Any]:
     host_dict = dict(host)
     services = await repo.list_services(host_id=host_id)
     host_dict["services"] = [dict(s) for s in services]
+    # The agent is a property of the host (#514 S2). The host page must answer
+    # "is the channel live, which version, and WHY was it last refused" without
+    # sending the operator to a second tab.
+    if host_dict.get("agent_id"):
+        agent = await repo.db.fetchone(
+            "SELECT agent_id, hostname, connected, first_seen, connected_at, "
+            "       last_heartbeat, disconnected_at, last_error, last_error_at, "
+            "       system_info, credential_set_at, revoked_at "
+            "FROM agents WHERE agent_id = ?",
+            (host_dict["agent_id"],),
+        )
+        if agent is not None:
+            info: dict[str, Any] = {}
+            with contextlib.suppress(ValueError, TypeError):
+                info = _json.loads(agent["system_info"] or "{}")
+            host_dict["agent"] = {
+                "agent_id": agent["agent_id"],
+                "connected": bool(agent["connected"]),
+                "version": info.get("agent_version"),
+                "arch": info.get("arch"),
+                "runtime": info.get("runtime"),
+                "first_seen": agent["first_seen"],
+                "connected_at": agent["connected_at"],
+                "last_heartbeat": agent["last_heartbeat"],
+                "disconnected_at": agent["disconnected_at"],
+                "last_error": agent["last_error"],
+                "last_error_at": agent["last_error_at"],
+                "credential_set_at": agent["credential_set_at"],
+                "revoked_at": agent["revoked_at"],
+            }
     return host_dict
 
 

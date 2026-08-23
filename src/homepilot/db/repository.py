@@ -300,6 +300,125 @@ class Repository:
             ),
         )
         await self.db.conn.commit()
+        # One noun: Host (#514 S1). An enrolled agent's machine must exist in
+        # inventory - "connected agent, empty Inventory, Coverage 0%" was the
+        # walk's headline defect. Same transaction boundary as the agent row so
+        # the two facts cannot drift apart.
+        await self.link_agent_host(agent_id, hostname, system_info)
+
+    async def link_agent_host(
+        self,
+        agent_id: str,
+        hostname: str,
+        system_info: dict[str, Any] | None = None,
+    ) -> str:
+        """Create-or-link the host row for an enrolled agent. Returns the host id.
+
+        Link rules, in order:
+        * a host already carrying this agent_id wins (re-registration);
+        * else an UNAMBIGUOUS hostname match is linked (two hosts with the same
+          hostname = link nothing rather than guess);
+        * else a new host row is created with source='agent'.
+
+        Only `agent_id` (and, on create, agent-derived facts) are written.
+        Role, description, status and every operator-settable field are left
+        alone - automation must never overwrite operator intent (#424).
+        """
+        info = system_info or {}
+
+        row = await self.db.fetchone("SELECT id FROM hosts WHERE agent_id = ?", (agent_id,))
+        if row is not None:
+            await self._sync_agent_facts(str(row["id"]), info, connected=True)
+            return str(row["id"])
+
+        matches = await self.db.fetchall(
+            "SELECT id, agent_id FROM hosts WHERE hostname = ?", (hostname,)
+        )
+        if len(matches) == 1 and matches[0]["agent_id"] in (None, agent_id):
+            await self.db.execute(
+                "UPDATE hosts SET agent_id = ?, updated_at = ? WHERE id = ?",
+                (agent_id, now(), matches[0]["id"]),
+            )
+            await self.db.conn.commit()
+            await self._sync_agent_facts(str(matches[0]["id"]), info, connected=True)
+            return str(matches[0]["id"])
+        if matches:
+            # Ambiguous or already claimed by a different agent: refuse to guess.
+            return ""
+
+        os_name = info.get("os") or None
+        os_version = info.get("os_version") or None
+        os_info = f"{os_name} {os_version}".strip() if (os_name or os_version) else None
+        cpu = info.get("cpu_count")
+        mem_gb = None
+        memory = info.get("memory")
+        if isinstance(memory, dict):
+            mem_gb = memory.get("total_gb")
+        host_id = await self.create_host(
+            hostname=hostname,
+            host_type="physical",
+            managed_by="agent",
+            source="agent",
+            os_info=os_info,
+            cpu_cores=int(cpu) if isinstance(cpu, (int, float)) else None,
+            memory_mb=int(float(mem_gb) * 1024) if isinstance(mem_gb, (int, float)) else None,
+        )
+        await self.db.execute(
+            "UPDATE hosts SET agent_id = ?, updated_at = ? WHERE id = ?",
+            (agent_id, now(), host_id),
+        )
+        await self.db.conn.commit()
+        await self._sync_agent_facts(host_id, info, connected=True)
+        return host_id
+
+    async def _sync_agent_facts(
+        self, host_id: str, info: dict[str, Any], *, connected: bool | None = None
+    ) -> None:
+        """Let the agent's report fill what nothing else has claimed.
+
+        Two rules keep this on the right side of #424:
+        * facts (os/cpu/memory) are written only into NULL columns - the agent
+          fills gaps, it never overwrites Proxmox's or an operator's answer;
+        * status follows the agent's channel only when 'status' is not pinned
+          by an operator. "unknown" next to a green "agent connected" chip is
+          the kind of lie P6 exists to kill.
+        """
+        host = await self.get_host(host_id)
+        if host is None:
+            return
+        host = dict(host)
+        updates: dict[str, Any] = {}
+
+        os_name = info.get("os") or None
+        os_version = info.get("os_version") or None
+        os_info = f"{os_name} {os_version}".strip() if (os_name or os_version) else None
+        if host.get("os_info") in (None, "") and os_info:
+            updates["os_info"] = os_info
+        cpu = info.get("cpu_count")
+        if host.get("cpu_cores") is None and isinstance(cpu, (int, float)):
+            updates["cpu_cores"] = int(cpu)
+        memory = info.get("memory")
+        mem_gb = memory.get("total_gb") if isinstance(memory, dict) else None
+        if host.get("memory_mb") is None and isinstance(mem_gb, (int, float)):
+            updates["memory_mb"] = int(float(mem_gb) * 1024)
+        disk = info.get("disk")
+        disk_gb = disk.get("total_gb") if isinstance(disk, dict) else None
+        if host.get("disk_gb") is None and isinstance(disk_gb, (int, float)):
+            updates["disk_gb"] = int(float(disk_gb))
+
+        if connected is not None and "status" not in self._pinned_fields(host):
+            wanted = "online" if connected else "offline"
+            if host.get("status") != wanted:
+                updates["status"] = wanted
+
+        if not updates:
+            return
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        await self.db.execute(
+            f"UPDATE hosts SET {sets}, updated_at = ? WHERE id = ?",
+            (*updates.values(), now(), host_id),
+        )
+        await self.db.conn.commit()
 
     async def touch_agent(self, agent_id: str, state: dict[str, Any] | None = None) -> None:
         import json as _json
@@ -335,6 +454,10 @@ class Repository:
                 (now(), agent_id),
             )
         await self.db.conn.commit()
+        # The linked host's status follows the channel (#514 S2), pinning respected.
+        linked = await self.db.fetchone("SELECT id FROM hosts WHERE agent_id = ?", (agent_id,))
+        if linked is not None:
+            await self._sync_agent_facts(str(linked["id"]), {}, connected=False)
 
     async def record_agent_error(
         self, agent_id: str, reason: str, hostname: str | None = None
@@ -481,6 +604,24 @@ class Repository:
         exactly the door a scrapped box should not still have (#415).
         """
         cursor = await self.db.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
+        # The host outlives the agent, but not the LINK (#514 S3): a dangling
+        # agent_id makes the fleet list claim "agent enrolled, not connected"
+        # about a credential that no longer exists. The host also stops
+        # pretending to be online on the strength of a deleted channel -
+        # unless an operator pinned status.
+        host = await self.db.fetchone(
+            "SELECT id, status, pinned_fields FROM hosts WHERE agent_id = ?", (agent_id,)
+        )
+        if host is not None:
+            await self.db.execute(
+                "UPDATE hosts SET agent_id = NULL, updated_at = ? WHERE id = ?",
+                (now(), host["id"]),
+            )
+            if host["status"] == "online" and "status" not in self._pinned_fields(dict(host)):
+                await self.db.execute(
+                    "UPDATE hosts SET status = 'unknown', updated_at = ? WHERE id = ?",
+                    (now(), host["id"]),
+                )
         await self.db.conn.commit()
         return cursor.rowcount > 0
 

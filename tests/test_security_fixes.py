@@ -251,6 +251,12 @@ class TestRateLimiterExcludesUiRoutes:
         req.app.state.repo = repo
         import time as _time
 
+        from homepilot.main import _RATE_WINDOW_AUTH as _AW
+
+        # Two-lane limiter (#518): junk credentials fall back to the anonymous
+        # lane once verification fires. Seed both lanes so the fallback is what
+        # gets tested.
+        _AW["1.2.3.4"] = [_time.time()] * 200
         _RATE_WINDOW["1.2.3.4"] = [_time.time()] * 200
         resp = await rate_limit_middleware(req, MagicMock(return_value=MagicMock(status_code=200)))
         assert resp.status_code == 429
@@ -287,17 +293,21 @@ class TestRateLimiterExcludesUiRoutes:
         req.app.state.repo = repo
         import time as _time
 
-        # Authenticated limit is higher: requests up to auth limit should pass
-        _RATE_WINDOW["1.2.3.4"] = [_time.time()] * _RATE_LIMIT
+        # Two-lane limiter (#518): credentialed traffic is counted in its own
+        # window. Up to the auth limit passes ...
+        from homepilot.main import _RATE_WINDOW_AUTH
+
+        _RATE_WINDOW_AUTH["1.2.3.4"] = [_time.time()] * _RATE_LIMIT
         resp = await rate_limit_middleware(req, call_next)
         assert resp.status_code == 200
         assert calls == ["/inventory"]
 
-        # But exceeding the authenticated limit still gets 429
-        _RATE_WINDOW["1.2.3.4"] = [_time.time()] * _AUTH_RATE_LIMIT
+        # ... but exceeding the authenticated limit still gets 429
+        _RATE_WINDOW_AUTH["1.2.3.4"] = [_time.time()] * _AUTH_RATE_LIMIT
         resp = await rate_limit_middleware(req, MagicMock(return_value=MagicMock(status_code=200)))
         assert resp.status_code == 429
         _RATE_WINDOW.clear()
+        _RATE_WINDOW_AUTH.clear()
 
     async def test_csrf_token_header_does_not_bypass_rate_limiter(self):
         from homepilot.main import _RATE_WINDOW, rate_limit_middleware
@@ -349,18 +359,21 @@ class TestRateLimiterExcludesUiRoutes:
         req.app.state.repo = repo
         import time as _time
 
-        # Within auth limit → allowed
+        from homepilot.main import _RATE_WINDOW_AUTH
+
+        # Within auth limit → allowed (two-lane limiter: the credentialed lane)
         req.method = "GET"
-        _RATE_WINDOW["1.2.3.4"] = [_time.time()] * _RATE_LIMIT
+        _RATE_WINDOW_AUTH["1.2.3.4"] = [_time.time()] * _RATE_LIMIT
         resp = await rate_limit_middleware(req, call_next)
         assert resp.status_code == 200
 
         # Exceeding auth limit → 429
         calls.clear()
-        _RATE_WINDOW["1.2.3.4"] = [_time.time()] * _AUTH_RATE_LIMIT
+        _RATE_WINDOW_AUTH["1.2.3.4"] = [_time.time()] * _AUTH_RATE_LIMIT
         resp = await rate_limit_middleware(req, MagicMock(return_value=MagicMock(status_code=200)))
         assert resp.status_code == 429
         _RATE_WINDOW.clear()
+        _RATE_WINDOW_AUTH.clear()
 
     async def test_cookie_auth_without_csrf_still_rate_limited(self):
         from homepilot.main import _RATE_WINDOW, rate_limit_middleware
@@ -381,6 +394,12 @@ class TestRateLimiterExcludesUiRoutes:
         req.app.state.repo = repo
         import time as _time
 
+        from homepilot.main import _RATE_WINDOW_AUTH as _AW
+
+        # Two-lane limiter (#518): junk credentials fall back to the anonymous
+        # lane once verification fires. Seed both lanes so the fallback is what
+        # gets tested.
+        _AW["1.2.3.4"] = [_time.time()] * 200
         _RATE_WINDOW["1.2.3.4"] = [_time.time()] * 200
         resp = await rate_limit_middleware(req, MagicMock(return_value=MagicMock(status_code=200)))
         assert resp.status_code == 429
@@ -400,6 +419,12 @@ class TestRateLimiterExcludesUiRoutes:
         req.app.state.repo = repo
         import time as _time
 
+        from homepilot.main import _RATE_WINDOW_AUTH as _AW
+
+        # Two-lane limiter (#518): junk credentials fall back to the anonymous
+        # lane once verification fires. Seed both lanes so the fallback is what
+        # gets tested.
+        _AW["1.2.3.4"] = [_time.time()] * 200
         _RATE_WINDOW["1.2.3.4"] = [_time.time()] * 200
         resp = await rate_limit_middleware(req, MagicMock(return_value=MagicMock(status_code=200)))
         assert resp.status_code == 429
