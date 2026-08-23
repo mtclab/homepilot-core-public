@@ -190,7 +190,10 @@ async def list_inventory(
     if agent_ids:
         marks = ",".join("?" * len(agent_ids))
         agents = await repo.db.fetchall(
-            f"SELECT agent_id, connected, system_info FROM agents WHERE agent_id IN ({marks})",
+            # nosec B608 - only `?` placeholders are interpolated (one per id);
+            # every VALUE goes through bound parameters. Bandit sees an f-string
+            # near SQL and cannot tell placeholders from data.
+            f"SELECT agent_id, connected, system_info FROM agents WHERE agent_id IN ({marks})",  # nosec B608
             agent_ids,
         )
         by_id = {a["agent_id"]: a for a in agents}
