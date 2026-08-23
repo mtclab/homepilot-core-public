@@ -1,5 +1,86 @@
 # Changelog
 
+## v2.9.0 (2026-08-23)
+
+The release that makes the web UI enough to run HomePilot with, and closes the
+2026-08-16 five-lens review: the features that could not work on a real install
+now work, the ones that reported success without doing anything now tell the
+truth, and the fleet can explain itself.
+
+### REQUIRED READING BEFORE UPGRADING
+
+**One backend per data directory, enforced.** A second process touching a live
+install used to mark the first one's in-flight tasks failed, and a CLI command
+could migrate the schema under a running server. An advisory lock now refuses
+the second process instead (#431). If you run `hp` commands against the same
+data directory as a running backend, they will now say so rather than corrupt
+it - stop the backend first. The lock is released by the kernel, so a crashed
+backend never leaves a stale one behind.
+
+**History is pruned from now on.** `audit_log`, `agent_audit`, finished tasks and
+webhook deliveries were never pruned; a year of them is a multi-GB SQLite file.
+They are now swept on a schedule, default 90 days:
+
+```env
+HP_RETENTION_DAYS=90                 # audit trail, finished tasks, deliveries
+HP_RETENTION_INTERVAL_SECONDS=21600  # how often the sweep runs
+```
+
+Artifacts are **never** pruned - they are the record of intent, not history. Set
+`HP_RETENTION_DAYS` higher before first start if you need a longer trail; the
+first sweep runs shortly after boot.
+
+**Schema migrations include a `hosts` table rebuild.** Migrations have been
+per-version transactional with a pre-migration backup since 2.8.0 (#420), so a
+failure rolls back rather than half-applying - but take your own backup anyway,
+as with any release that touches table shape.
+
+### The UI can run the product (#445)
+
+* Approval shows what will actually change on the host, not a diff of the file.
+* Propose an artifact from the UI; read a task's execution log.
+* Search across artifacts, hosts and the journal.
+* Add a host by hand, notice one that is gone, forget it - a non-Proxmox
+  homelab is representable now.
+* A first-run path from an empty install to a managed change.
+* The shell works on a phone and with a keyboard, and a failed knowledge-base
+  search no longer looks like an empty knowledge base.
+
+### Agents you can operate (#415, #430, #464)
+
+* Forget a decommissioned agent, credential and all - a scrapped box's token no
+  longer authenticates.
+* The fleet explains itself: agent version, the REASON a connection was refused
+  (revoked credential, wrong host, banned peer) instead of an identical grey
+  dot, and a revoke that closes the live channel now.
+* HomePilot serves the agent payload itself, so enrolment needs no external
+  download.
+
+### The review epic's dangerous defects (#423-#433)
+
+* **One** engine applies, replays and revokes - the shadow CLI path that skipped
+  snapshots, hash checks and rollback is gone.
+* Drift never reports "in spec" for something it did not check; the Ansible
+  verifier that had been silently dead is fixed.
+* Rollback is derived rather than claimed, and reported honestly when it is not
+  possible.
+* Automation stops overwriting what an operator set.
+* The AI can read back what it did and check before it proposes.
+* Semantic knowledge-base search actually runs, and stops hiding what you put in.
+* A credential in an artifact is a reference, never the value.
+
+### Shutdown and the gate (#496)
+
+Background work can no longer outlive the database it writes to. An in-flight
+write whose event loop went away killed aiosqlite's worker thread, after which
+every later operation - the close included - queued to a thread that would never
+pick it up, and the timeouts meant to catch that deadlocked inside it. The agent
+hub also waited on live connections that had not hung up, so a shutdown could
+ignore SIGTERM until Docker killed it. Both fixed; provision, enrolment,
+artifact runs and the audit trail are now drained before the database closes,
+and a close that has to be abandoned is abandoned somewhere that cannot hold up
+the process exiting.
+
 ## v2.8.0 (2026-08-20)
 
 The zero-touch install (ADR-004): a fresh HomePilot is claimed from a browser

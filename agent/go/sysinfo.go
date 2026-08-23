@@ -13,15 +13,19 @@ import (
 func collectSystemInfo() map[string]any {
 	host, _ := os.Hostname()
 	info := map[string]any{
-		"hostname":   host,
-		"os":         "Linux",
-		"os_version": kernelRelease(),
-		"arch":       runtime.GOARCH,
-		"runtime":    "go " + runtime.Version(),
-		"cpu_count":  runtime.NumCPU(),
-		"disk":       diskInfo(),
-		"memory":     memInfo(),
-		"load":       loadInfo(),
+		"hostname": host,
+		"os":       "Linux",
+		// The agent's OWN build stamp, alongside the kernel's. Reported on every
+		// register, so the hub can answer "which hosts still run the broken
+		// binary" from the fleet list instead of an SSH sweep (#430).
+		"agent_version": agentVersion(),
+		"os_version":    kernelRelease(),
+		"arch":          runtime.GOARCH,
+		"runtime":       "go " + runtime.Version(),
+		"cpu_count":     runtime.NumCPU(),
+		"disk":          diskInfo(),
+		"memory":        memInfo(),
+		"load":          loadInfo(),
 	}
 	return info
 }

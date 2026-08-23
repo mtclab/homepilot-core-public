@@ -5,6 +5,8 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from homepilot.executor.secrets import SecretResolutionError, redact, resolve
+
 if TYPE_CHECKING:
     from homepilot.adapters import HostAdapter
 
@@ -59,6 +61,7 @@ async def execute(
     host_adapter: object,
     pve_nodes: list[str] | None = None,
     rollback: bool = False,
+    vault: object | None = None,
 ) -> dict[str, Any]:
 
     ssh_adapter: HostAdapter = cast("HostAdapter", host_adapter)
@@ -107,6 +110,19 @@ async def execute(
                     "failure_reason": "forbidden target",
                 }
 
+    # Resolve `{{ vault.name.field }}` in the SCRIPT, in memory, immediately
+    # before it is shipped (#505). Without this the only way to use a credential
+    # in a script was to commit it to the artifact git store.
+    secret_values: list[str] = []
+    try:
+        script, secret_values = await resolve(script, vault)
+    except SecretResolutionError as exc:
+        return {
+            "success": False,
+            "execution_log": str(exc),
+            "failure_reason": str(exc),
+        }
+
     log_lines: list[str] = []
     start = time.monotonic()
 
@@ -120,8 +136,8 @@ async def execute(
     except Exception as e:
         return {
             "success": False,
-            "execution_log": f"host write error: {e}",
-            "failure_reason": str(e),
+            "execution_log": redact(f"host write error: {e}", secret_values),
+            "failure_reason": redact(str(e), secret_values),
         }
     log_lines.append(f"$ write {remote_path}  # {label}")
 
@@ -132,8 +148,8 @@ async def execute(
     except Exception as e:
         return {
             "success": False,
-            "execution_log": f"host exec error: {e}",
-            "failure_reason": str(e),
+            "execution_log": redact(f"host exec error: {e}", secret_values),
+            "failure_reason": redact(str(e), secret_values),
         }
 
     log_lines.append(f"exit={rc}")
@@ -144,10 +160,10 @@ async def execute(
     log_lines.append(f"duration={elapsed:.1f}s")
 
     if rc == 0:
-        return {"success": True, "execution_log": "\n".join(log_lines)}
+        return {"success": True, "execution_log": redact("\n".join(log_lines), secret_values)}
     else:
         return {
             "success": False,
-            "execution_log": "\n".join(log_lines),
+            "execution_log": redact("\n".join(log_lines), secret_values),
             "failure_reason": f"script exited with rc={rc}",
         }

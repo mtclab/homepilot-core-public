@@ -143,6 +143,7 @@ class DriftReconciler(Reconciler):
                 artifact_id=artifact_id,
                 drifted=result.drifted,
                 details_json=details_json,
+                state=result.state.value,
             )
 
             try:
@@ -154,6 +155,7 @@ class DriftReconciler(Reconciler):
                     details_json=json.dumps(
                         {
                             "drifted": result.drifted,
+                            "state": result.state.value,
                             "log": result.verification_log[:500],
                         }
                     ),

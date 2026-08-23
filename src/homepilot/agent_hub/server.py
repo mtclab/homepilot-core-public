@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import ipaddress
 import json
@@ -222,6 +223,12 @@ class AgentHubServer:
         self._preauth_count = 0
         # Register-frame freshness state for replay-protected connections.
         self._nonce_cache = NonceCache()
+        # Live connection handlers, by conn_id (#496). Python 3.12's
+        # Server.wait_closed() waits for every handler to RETURN, so a shutdown
+        # has to hang up on live connections itself rather than wait them out -
+        # a registered agent sits in a 300s read, and an idle one that never
+        # sends again would hold the wait for the full timeout.
+        self._connections: dict[str, tuple[asyncio.Task[Any], asyncio.StreamWriter]] = {}
 
     @property
     def tls_enabled(self) -> bool:
@@ -343,9 +350,18 @@ class AgentHubServer:
                 return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
         return None
 
-    async def _verify_auth(self, request: dict[str, Any]) -> AuthResult | None:
+    async def _verify_auth(
+        self, request: dict[str, Any], deny: list[str] | None = None
+    ) -> AuthResult | None:
         """Authenticate a register frame. Returns an :class:`AuthResult` or
         ``None`` on failure.
+
+        ``deny`` is an out-parameter: on failure the SPECIFIC reason is appended
+        to it. It is a list rather than a richer return type because the reason
+        is diagnostic, not part of the auth decision - every caller still branches
+        on ``None``. Without it the four distinct refusals here collapse into one
+        "invalid auth_token" on the wire, which is exactly the hole #430 names:
+        a revoked agent, a stolen token and a typo are indistinguishable.
 
         Precedence:
           1. ``"per-agent"`` — the presented token's sha256 hash matches the
@@ -365,8 +381,14 @@ class AgentHubServer:
           2. ``"shared"`` — the fleet-wide shared token (enrollment only).
           3. ``"bootstrap"`` — a consumed one-time enrollment token.
         """
+
+        def _deny(reason: str) -> None:
+            if deny is not None:
+                deny.append(reason)
+
         token = request.get("auth_token", "")
         if not token:
+            _deny("register carried no auth token")
             return None
 
         claimed_agent_id = request.get("agent_id", "")
@@ -379,6 +401,7 @@ class AgentHubServer:
                 # The token IS this agent's per-agent credential.
                 if row.get("revoked_at"):
                     logger.warning("rejecting revoked credential for agent %s", claimed_agent_id)
+                    _deny("credential revoked by an operator; re-enrol this host to restore it")
                     return None
                 # Bind check: the credential is tied to the hostname it was issued
                 # to. A token replayed from a different host is rejected.
@@ -390,6 +413,10 @@ class AgentHubServer:
                         claimed_agent_id,
                         bound_host,
                         claimed_hostname,
+                    )
+                    _deny(
+                        f"credential is bound to host {bound_host} but was presented "
+                        f"from {claimed_hostname}"
                     )
                     return None
                 return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
@@ -407,7 +434,53 @@ class AgentHubServer:
             return AuthResult(kind="shared")
         if await self._token_store.consume(token):
             return AuthResult(kind="bootstrap")
+        _deny("auth token matched no per-agent credential, the shared token or a bootstrap token")
         return None
+
+    async def _record_rejection(
+        self,
+        *,
+        reason: str,
+        peer_host: str,
+        agent_id: str = "",
+        hostname: str | None = None,
+    ) -> None:
+        """Make a refusal visible instead of only logging it (#430).
+
+        Every rejection path used to be `logger.warning` and nothing else, so an
+        operator looking at the UI could not tell a revoked agent from a banned
+        peer from a powered-off box - all three are a grey dot. A refusal now
+        lands in two places with different jobs: the AUDIT LOG keeps the durable,
+        append-only history of who was turned away and why, and the agent row
+        keeps the LAST reason, which is the one the fleet list has to show.
+
+        Best-effort by construction: a hub that cannot write the reason down must
+        still refuse the connection, so a storage failure is logged, not raised.
+        """
+        logger.warning(
+            "agent rejected from %s (agent=%s host=%s): %s",
+            peer_host,
+            agent_id or "?",
+            hostname or "?",
+            reason,
+        )
+        try:
+            self.registry.audit_log.log(
+                agent_id=agent_id,
+                action="register_rejected",
+                command_or_path=f"peer={peer_host}: {reason}",
+                result="blocked",
+                hostname=hostname,
+                caller="system",
+            )
+        except Exception as exc:  # pragma: no cover - audit must never break auth
+            logger.warning("could not audit the rejection: %s", exc)
+        if self._repo is None:
+            return
+        try:
+            await self._repo.record_agent_error(agent_id, reason, hostname)
+        except Exception as exc:
+            logger.warning("could not record the rejection reason: %s", exc)
 
     def _record_auth_failure(self, peer_host: str, loop: asyncio.AbstractEventLoop) -> None:
         """Track consecutive failed registrations from a peer and temp-ban after
@@ -517,14 +590,41 @@ class AgentHubServer:
         agent_id: str | None = None
         conn_id = str(uuid.uuid4())
         registered = False
+        # Why this connection ended, in the operator's words (#430). A plain
+        # socket drop and a fail-closed protocol kill look identical from the UI
+        # otherwise, and the second one is the one worth waking up for.
+        disconnect_reason = "connection closed"
         loop = asyncio.get_running_loop()
+
+        # Tracked so a shutdown can hang up on this connection (#496). Registered
+        # BEFORE the auth-flood guards below, which can return early - an
+        # untracked handler is one wait_closed() can still wait on.
+        handler = asyncio.current_task()
+        if handler is not None:
+            self._connections[conn_id] = (handler, writer)
 
         # Auth-flood guards, evaluated before we read or trust anything.
         ban_until = self._auth_bans.get(peer_host)
         if ban_until is not None and loop.time() < ban_until:
-            logger.warning("rejecting connection from banned peer %s", peer_host)
-            writer.close()
-            await writer.wait_closed()
+            # No handshake has been read, so the only identity is the peer: match
+            # the reason onto whatever agent the hub knows at this address by
+            # hostname only if one is claimed later. Here it is audit-only.
+            await self._record_rejection(
+                reason=(
+                    f"peer temporarily banned after {MAX_AUTH_FAILURES} failed "
+                    f"registrations; retry in {AUTH_BAN_SECONDS:.0f}s"
+                ),
+                peer_host=peer_host,
+            )
+            try:
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                # In a finally: a peer that resets while banned makes
+                # wait_closed() raise, and an entry left behind here would leak
+                # for the life of the process - under exactly the flood this
+                # guard exists for.
+                self._connections.pop(conn_id, None)
             return
         if self._preauth_count >= MAX_PREAUTH_CONNECTIONS:
             logger.warning(
@@ -532,8 +632,11 @@ class AgentHubServer:
                 MAX_PREAUTH_CONNECTIONS,
                 peer_host,
             )
-            writer.close()
-            await writer.wait_closed()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                self._connections.pop(conn_id, None)
             return
 
         self._preauth_count += 1
@@ -553,10 +656,17 @@ class AgentHubServer:
             except (TimeoutError, ConnectionError, ProtocolError, OversizeMessageError):
                 return
 
-            auth_result = await self._verify_auth(handshake)
+            deny: list[str] = []
+            auth_result = await self._verify_auth(handshake, deny)
             if auth_result is None:
                 self._record_auth_failure(peer_host, loop)
                 _release_preauth()
+                await self._record_rejection(
+                    reason=deny[0] if deny else "invalid auth token",
+                    peer_host=peer_host,
+                    agent_id=str(handshake.get("agent_id", "")),
+                    hostname=str(handshake.get("hostname", "")) or None,
+                )
                 writer.write(
                     _encode(
                         {
@@ -602,11 +712,11 @@ class AgentHubServer:
             if replay_enabled:
                 reason = self._check_register_freshness(agent_id, handshake)
                 if reason is not None:
-                    logger.warning(
-                        "rejecting replayed/stale register from %s (agent %s): %s",
-                        peer_host,
-                        agent_id,
-                        reason,
+                    await self._record_rejection(
+                        reason=f"register frame rejected as replayed or stale: {reason}",
+                        peer_host=peer_host,
+                        agent_id=agent_id,
+                        hostname=hostname,
                     )
                     writer.write(
                         _encode(
@@ -629,11 +739,14 @@ class AgentHubServer:
                 conn_id=conn_id,
             )
             if not accepted:
-                logger.warning(
-                    "register rejected for agent %s (host=%s) from %s",
-                    agent_id,
-                    hostname,
-                    peer_host,
+                await self._record_rejection(
+                    reason=(
+                        "identity already claimed by a live connection - another agent "
+                        "holds this hostname or agent id"
+                    ),
+                    peer_host=peer_host,
+                    agent_id=agent_id,
+                    hostname=hostname,
                 )
                 writer.write(
                     _encode(
@@ -694,7 +807,11 @@ class AgentHubServer:
             while True:
                 try:
                     msg = await asyncio.wait_for(_read_message(reader), timeout=300)
-                except (TimeoutError, ConnectionError):
+                except TimeoutError:
+                    disconnect_reason = "no frame for 300s; hub closed the idle connection"
+                    break
+                except ConnectionError as exc:
+                    disconnect_reason = f"transport error: {exc}" if str(exc) else "connection lost"
                     break
                 except OversizeMessageError as exc:
                     if replay_session is not None:
@@ -703,6 +820,9 @@ class AgentHubServer:
                         logger.warning(
                             "oversize frame on replay-protected connection %s; closing",
                             agent_id,
+                        )
+                        disconnect_reason = (
+                            "oversize frame on a replay-protected connection; closed fail-closed"
                         )
                         break
                     # One oversize frame is a per-request failure, not a transport
@@ -717,6 +837,7 @@ class AgentHubServer:
                             agent_id,
                             exc,
                         )
+                        disconnect_reason = f"protocol error on a protected connection: {exc}"
                         break
                     writer.write(_encode({"error": f"protocol error: {exc}", "request_id": ""}))
                     await writer.drain()
@@ -733,6 +854,7 @@ class AgentHubServer:
                             agent_id,
                             exc,
                         )
+                        disconnect_reason = f"replay check failed: {exc}"
                         break
 
                 request_id = msg.get("request_id", "")
@@ -765,9 +887,11 @@ class AgentHubServer:
                         {"error": f"unknown action: {msg_action}", "request_id": request_id},
                     )
 
-        except Exception:
+        except Exception as exc:
             logger.exception("error handling agent %s", agent_id or peer)
+            disconnect_reason = f"hub error while handling this agent: {exc}"
         finally:
+            self._connections.pop(conn_id, None)
             _release_preauth()
             if registered and agent_id:
                 # Lifecycle audit before eviction so the durable trail records the
@@ -783,8 +907,8 @@ class AgentHubServer:
                 )
                 # Compare-and-delete: only evict if THIS connection still owns the
                 # registration (a reconnect may have replaced us already).
-                self.registry.unregister(agent_id, conn_id)
-                logger.info("agent disconnected: %s", agent_id)
+                self.registry.unregister(agent_id, conn_id, reason=disconnect_reason)
+                logger.info("agent disconnected: %s (%s)", agent_id, disconnect_reason)
             writer.close()
             await writer.wait_closed()
 
@@ -874,12 +998,80 @@ class AgentHubServer:
         await stop.wait()
         await self.stop()
 
-    async def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+    # A shutdown that cannot complete is a shutdown that never happens (#496).
+    # Sized so the WHOLE of stop() - hang-up wait, cancellation unwind, then
+    # wait_closed - fits inside the budget main.lifespan allows it. If stop()
+    # can outlast its caller, the caller's guard cancels it midway and
+    # registry.drain() below never runs, which is the #496 precondition again.
+    _STOP_TIMEOUT_SECONDS = 3.0
+
+    async def stop(self, timeout: float | None = None) -> None:
+        """Stop listening, hang up on every live agent, and never wait forever.
+
+        Since Python 3.12 ``Server.wait_closed()`` returns only once every
+        connection HANDLER has finished, not merely when the listening socket is
+        shut. Our handler sits in a 300s read waiting for the agent's next frame,
+        so a plain ``close() + wait_closed()`` waits up to five minutes per
+        connected agent - and forever if a peer never hangs up at all. That is
+        the deadlock that wedged a fixture teardown and took `make gate` with it,
+        and in production it is a backend that ignores SIGTERM until Docker kills
+        it. So: close the listener, hang up on the live connections ourselves,
+        and bound what is left.
+        """
+        limit = self._STOP_TIMEOUT_SECONDS if timeout is None else timeout
+        # Claimed up front. stop() now awaits between the close and the
+        # wait_closed, so a second concurrent caller (serve_forever's signal
+        # handler racing the lifespan shutdown) would otherwise find
+        # self._server set to None mid-flight and raise AttributeError - out of
+        # a lifespan `finally`, which would skip every later shutdown step.
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.close()
+            await self._close_live_connections(limit)
+            try:
+                await asyncio.wait_for(server.wait_closed(), limit)
+            except TimeoutError:
+                logger.warning(
+                    "agent hub: %d connection handler(s) still running after %.0fs; "
+                    "abandoning the wait rather than blocking the shutdown",
+                    len(self._connections),
+                    limit,
+                )
             logger.info("agent hub stopped")
+        # Let the registry's fire-and-forget writes finish before whoever called
+        # us closes the database under them (#496). Bounded; a write that cannot
+        # finish must not stop a shutdown.
+        await self.registry.drain()
+
+    async def _close_live_connections(self, timeout: float) -> None:
+        """Hang up on every tracked connection, then cancel what does not finish.
+
+        Closing the writer is the polite half: the handler's next read raises and
+        it runs its own disconnect path (audit entry, unregister, reason). The
+        cancel is for a handler that is blocked somewhere a closed socket does
+        not reach.
+        """
+        live = list(self._connections.values())
+        if not live:
+            return
+        logger.info("agent hub: hanging up on %d live agent connection(s)", len(live))
+        for _task, writer in live:
+            with contextlib.suppress(Exception):
+                writer.close()
+        tasks = [t for t, _w in live if not t.done()]
+        if not tasks:
+            return
+        # Two thirds to wait, one third to unwind: the whole of this call has to
+        # fit in `timeout`, because stop() spends the rest on wait_closed().
+        _done, pending = await asyncio.wait(tasks, timeout=timeout * 2 / 3)
+        for task in pending:
+            task.cancel()
+        if pending:
+            # Give the cancellations a turn to unwind so wait_closed() is not
+            # left waiting on a handler that is already on its way out.
+            with contextlib.suppress(Exception):
+                await asyncio.wait(pending, timeout=timeout / 3)
 
     def _finalize_result(
         self,

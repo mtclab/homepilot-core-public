@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json as _json
 import logging
+import re
 import sqlite3
 from typing import Any
 
@@ -94,6 +95,57 @@ class HostPatchRequest(BaseModel):
         return v
 
 
+# A hostname or a bare IPv4 address. A manually added host is written into
+# inventory and later reached over SSH/the agent, so what an operator types has
+# to be a name something could actually resolve - not a URL, not a shell string.
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
+    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
+)
+
+
+class HostCreateRequest(BaseModel):
+    """A host that exists but Proxmox has never heard of (#445 A5).
+
+    A homelab is not only Proxmox guests: the NAS, the router, the Raspberry Pi
+    and the old tower in the cupboard were all unrepresentable, which meant they
+    could not be documented, adopted, given an agent, or carry an artifact.
+    """
+
+    hostname: str
+    ip_address: str | None = None
+    role: str = "guest"
+    host_type: str = "baremetal"
+    description: str | None = None
+    tags: str | None = None
+    fqdn: str | None = None
+
+    @field_validator("hostname")
+    @classmethod
+    def validate_hostname(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not _HOSTNAME_RE.match(v):
+            raise ValueError("hostname must be a DNS hostname or an IPv4 address")
+        return v
+
+    @field_validator("ip_address", "fqdn")
+    @classmethod
+    def validate_optional_address(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        v = v.strip()
+        if not _HOSTNAME_RE.match(v):
+            raise ValueError("must be a DNS hostname or an IPv4 address")
+        return v
+
+    @field_validator("tags")
+    @classmethod
+    def normalise_tags(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v if isinstance(v, str) else _json.dumps(v)
+
+
 def _get_service(request: Request) -> InventoryService:
     svc: InventoryService = request.app.state.inventory_service
     return svc
@@ -113,21 +165,110 @@ async def list_inventory(
     source: str | None = Query(None),
     import_state: str | None = Query(None),
     pve_status: str | None = Query(None),
+    q: str | None = Query(None, description="Free text over hostname, address, role, tags"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     repo = request.app.state.repo
-    hosts = await repo.list_hosts(
-        managed=managed,
-        role=role,
-        source=source,
-        import_state=import_state,
-        pve_status=pve_status,
-        status=status,
-        limit=limit,
-        offset=offset,
+    filters = {
+        "q": q,
+        "managed": managed,
+        "role": role,
+        "source": source,
+        "import_state": import_state,
+        "pve_status": pve_status,
+        "status": status,
+    }
+    hosts = await repo.list_hosts(limit=limit, offset=offset, **filters)
+    # A real COUNT, not the page size (#428). `len(hosts)` capped the UI at 100
+    # with no way to reach page 2 and told the operator their estate was smaller
+    # than it is.
+    total = await repo.count_hosts(**filters)
+    return {"items": hosts, "total": total}
+
+
+@router.post("", status_code=201, dependencies=[Depends(require_scope("write"))])
+async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[str, Any]:
+    """Add a host HomePilot could not otherwise know about (#445 A5).
+
+    Inventory could only ever be filled by a Proxmox sync, so a homelab that is
+    not entirely Proxmox guests - the NAS, the router, the Pi, the old tower -
+    was literally unrepresentable, and everything downstream (docs, adoption,
+    agent install, artifacts targeting a host) was closed to those machines.
+
+    Recorded as `source="manual"` and adopted on the spot: a machine an operator
+    typed in by hand is not a discovery awaiting triage. That source is also what
+    keeps a Proxmox sync from ever declaring it absent - the hypervisor never
+    looked for it.
+    """
+    repo = request.app.state.repo
+    existing = await repo.get_host_by_hostname(body.hostname)
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A host named {body.hostname} is already in inventory "
+                f"(id {existing['id']}, source {existing.get('source')})"
+            ),
+        )
+    host_id = await repo.create_host(
+        hostname=body.hostname,
+        host_type=body.host_type,
+        role=body.role,
+        ip_address=body.ip_address,
+        fqdn=body.fqdn,
+        description=body.description,
+        tags=body.tags,
+        source="manual",
+        import_state="adopted",
+        managed=True,
+        managed_by="user",
+        # Typed by a person, so neither value is a guess the enricher may
+        # overwrite (#416: an enrich pass demotes anything marked "inferred").
+        role_source="user",
+        ip_source="user" if body.ip_address else None,
+        status="unknown",
     )
-    return {"items": hosts, "total": len(hosts)}
+    host = await repo.get_host(host_id)
+    await repo.log_audit(
+        user_id="ui",
+        source="ui",
+        action="host_added",
+        target_host=body.hostname,
+    )
+    return dict(host) if host else {"id": host_id}
+
+
+@router.delete("/{host_id}", dependencies=[Depends(require_scope("write"))])
+async def forget_host(request: Request, host_id: str) -> dict[str, Any]:
+    """Remove a host from inventory, with its services and observation note.
+
+    Refused for a host the hypervisor still reports: deleting it would be undone
+    by the next sync, which is worse than refusing - the operator would believe
+    it was gone. Destroy the guest in Proxmox, or Ignore it, instead.
+    """
+    repo = request.app.state.repo
+    host = await repo.get_host(host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+    source = host.get("source")
+    if source != "manual" and not host.get("absent_since"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{host.get('hostname')} is still reported by the hypervisor, so the next "
+                "sync would bring it straight back. Destroy the guest in Proxmox, or set "
+                "its import state to 'ignored' to keep it out of the way."
+            ),
+        )
+    await repo.delete_host(host_id)
+    await repo.log_audit(
+        user_id="ui",
+        source="ui",
+        action="host_forgotten",
+        target_host=str(host.get("hostname") or ""),
+    )
+    return {"id": host_id, "forgotten": True}
 
 
 @router.get("/{host_id}", dependencies=[Depends(require_scope("read"))])
@@ -191,6 +332,10 @@ async def update_host(request: Request, host_id: str, body: HostPatchRequest) ->
     if not updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     await repo.update_host(host_id, **updates)
+    # A PATCH is an operator deciding, so the fields it wrote are PINNED: the
+    # next sync or enrich pass leaves them alone (#424). Without this, editing a
+    # description or a status in the UI lasted until the next reconciler cycle.
+    await repo.pin_host_fields(host_id, set(updates))
     updated = await repo.get_host(host_id)
     return dict(updated)
 

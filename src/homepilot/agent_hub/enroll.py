@@ -30,6 +30,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..adapters.proxmox import ProxmoxClient
+from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
 
@@ -125,6 +126,16 @@ class AgentEnrollService:
         # Hold a strong reference until completion: asyncio keeps only a weak one.
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
+
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Let in-flight jobs finish before the database goes away (#496).
+
+        These run behind an already-accepted HTTP request, so nothing else
+        awaits them; a shutdown that closes the database under one leaves the
+        task row it was about to finish saying "running" forever - and can kill
+        aiosqlite's worker thread mid-write.
+        """
+        await drain_tasks(self._running_tasks, "agent enrolment job(s)", timeout)
 
     def is_inflight(self, host_id: str) -> bool:
         return host_id in self._inflight_hosts
@@ -276,7 +287,14 @@ class AgentEnrollService:
             pin = str(getattr(hub, "cert_fingerprint", "") or "")
 
             step = "stage_credentials"
-            env_body = _env_file(hub_host, hub_port, token, tls, pin)
+            # The guest reaches HomePilot's API on the same host it reaches the
+            # hub on - that address is already resolved for this guest's network -
+            # so the binary comes from the control plane rather than the internet
+            # (#464). A guest on an egress-limited VLAN can then still enrol.
+            from ..config import get_settings
+
+            api_base = f"http://{hub_host}:{get_settings().daemon_port}"
+            env_body = _env_file(hub_host, hub_port, token, tls, pin, api_base)
             await proxmox.agent_write_file(node, vmid, _ENV_PATH, env_body)
 
             step = "install"
@@ -409,13 +427,19 @@ def _assert_shell_safe(name: str, value: str) -> str:
     return value
 
 
-def _env_file(hub_host: str, hub_port: int, token: str, tls: bool, pin: str) -> str:
+def _env_file(
+    hub_host: str, hub_port: int, token: str, tls: bool, pin: str, api_base: str = ""
+) -> str:
     """The env file the guest sources. Every value is shell-safe by validation,
     because `.` EXECUTES this file rather than parsing it."""
     lines = [
         f"HUB={_assert_shell_safe('hub host', f'{hub_host}:{hub_port}')}",
         f"TOKEN={_assert_shell_safe('enrollment token', token)}",
     ]
+    if api_base:
+        # Points the installer at THIS control plane for the binary, so a guest
+        # with no internet still enrols and the agent matches the hub (#464).
+        lines.append(f"HP_API={_assert_shell_safe('control plane address', api_base)}")
     if tls:
         lines.append("USE_TLS=true")
         if pin:
@@ -439,7 +463,14 @@ def _install_script() -> str:
         f". {_ENV_PATH}; "
         "set +a; "
         f"rm -f {_ENV_PATH}; "
-        f"curl -fsSL {INSTALLER_URL} -o {_INSTALLER_PATH}; "
+        # The installer comes from the control plane too when one is reachable,
+        # for the same reason the binary does: an isolated guest has no route to
+        # GitHub, and this way the script and the agent it installs are from one
+        # image (#464). $HP_API and $TOKEN are set by the sourced env file.
+        f'if [ -n "${{HP_API:-}}" ]; then '
+        f'curl -fsSL -H "x-hp-agent-token: $TOKEN" "$HP_API/agents/dist/install-agent.sh" '
+        f"-o {_INSTALLER_PATH}; else "
+        f"curl -fsSL {INSTALLER_URL} -o {_INSTALLER_PATH}; fi; "
         f"bash {_INSTALLER_PATH}; "
         f"rm -f {_INSTALLER_PATH}; "
         f"printf '{_AGENT_ID_MARKER}%s\\n' \"$(cat /etc/homepilot/agent.id)\""

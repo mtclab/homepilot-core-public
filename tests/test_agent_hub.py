@@ -469,7 +469,7 @@ class _Hub:
         for w in self._writers:
             w.close()
             with contextlib.suppress(Exception):
-                await w.wait_closed()
+                await asyncio.wait_for(w.wait_closed(), timeout=5)
         await self.srv.stop()
 
 
@@ -1246,7 +1246,7 @@ class TestLifecycleAudit:
             assert reg_rows[0]["caller"] == "system"
 
             w.close()
-            await w.wait_closed()
+            await asyncio.wait_for(w.wait_closed(), timeout=5)
             await asyncio.sleep(0.1)
 
             rows2 = await repo.query_agent_audit(limit=50)

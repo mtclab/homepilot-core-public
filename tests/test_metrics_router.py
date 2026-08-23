@@ -161,3 +161,58 @@ class TestAlertRuleApi:
         assert item["hostname"] == "web01"
         assert item["name"] == "load high"
         assert item["threshold"] == 4.0
+
+
+class TestInvariantsSurviveOptimisedPython:
+    """The rule-write paths must not depend on `assert` (#481).
+
+    `python -O` strips asserts. The two that narrowed a type here would then have
+    returned None from a function declared to return a dict - a confusing
+    TypeError somewhere downstream instead of a failure naming the row that
+    vanished. This repo has made the same change once before, in #326.
+
+    Teeth: put either `assert rule is not None` back and this test fails, because
+    the compiled-without-asserts source no longer contains the raise.
+    """
+
+    def test_the_rule_paths_raise_rather_than_assert(self):
+        import inspect
+
+        from homepilot.metrics import repository, router
+
+        for module in (repository, router):
+            source = inspect.getsource(module)
+            assert "assert rule is not None" not in source, (
+                f"{module.__name__} narrows a type with an assert, which `python -O` "
+                "removes - raise instead"
+            )
+
+    async def test_a_vanished_rule_is_reported_not_silently_returned(self, api, monkeypatch):
+        """The behaviour the raise buys: an impossible state is named, with a
+        status an operator can act on, rather than a None flowing onward."""
+        client, _ = api
+        created = client.post(
+            "/monitoring/rules",
+            json={
+                "name": "load high",
+                "metric": "load.1m",
+                "comparison": "gt",
+                "threshold": 4.0,
+                "for_seconds": 300,
+                "host_filter": "*",
+            },
+        )
+        assert created.status_code == 201, created.text
+        rule_id = created.json()["id"]
+
+        # The row disappears between the update and the read-back - the state
+        # the stripped assert used to "handle" by returning None.
+        from unittest.mock import AsyncMock
+
+        from homepilot.metrics.repository import MetricsRepository
+
+        monkeypatch.setattr(MetricsRepository, "get_rule", AsyncMock(return_value=None))
+
+        resp = client.patch(f"/monitoring/rules/{rule_id}", json={"enabled": False})
+        assert resp.status_code == 404
+        assert rule_id in resp.json()["detail"]

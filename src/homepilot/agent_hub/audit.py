@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
+
 logger = logging.getLogger(__name__)
 
 ActionType = Literal[
@@ -15,6 +17,7 @@ ActionType = Literal[
     "read_file",
     "write_file",
     "register",
+    "register_rejected",
     "disconnect",
     # #397 phase-B1 native provisioning actions.
     "install_package",
@@ -67,6 +70,9 @@ class AuditLog:
         # caller attribution. With no repo (or no running loop) the log is
         # in-memory only, unchanged.
         self._repo = repo
+        # Outstanding fire-and-forget audit writes, so a shutdown can drain them
+        # rather than close the database under them (#496).
+        self._persist_tasks: set[asyncio.Task[Any]] = set()
 
     def log(
         self,
@@ -129,12 +135,23 @@ class AuditLog:
             ts=entry.timestamp,
         )
         task = loop.create_task(coro)
+        # TRACKED, like the registry's writes (#496). An audit write is a DB
+        # write like any other: left in flight when the loop goes away it kills
+        # aiosqlite's worker thread. Most survive incidentally because a
+        # registry write is queued behind them and drained - but a rejection
+        # audit on a banned peer has no registry write to hide behind.
+        self._persist_tasks.add(task)
 
         def _log_err(t: asyncio.Task[Any]) -> None:
+            self._persist_tasks.discard(t)
             if not t.cancelled() and t.exception():
                 logger.warning("agent audit persistence failed: %s", t.exception())
 
         task.add_done_callback(_log_err)
+
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Wait for outstanding audit writes before the database goes away."""
+        await drain_tasks(self._persist_tasks, "agent audit write(s)", timeout)
 
     def _entry_to_dict(self, e: AuditEntry) -> dict[str, Any]:
         return {
@@ -155,13 +172,24 @@ class AuditLog:
         recent = entries[-limit:]
         return [self._entry_to_dict(e) for e in recent]
 
-    async def query_persisted(self, limit: int = 100) -> list[dict[str, Any]]:
+    async def query_persisted(
+        self,
+        limit: int = 100,
+        agent_id: str | None = None,
+        action: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return audit entries, newest-first, preferring the durable DB record
         when a repo is available (so the trail survives a restart). Falls back to
-        the in-memory deque when there is no repo or the DB read fails."""
+        the in-memory deque when there is no repo or the DB read fails.
+
+        ``agent_id`` / ``action`` narrow the trail. The repository has always
+        implemented them and nothing passed them through (#430), which is why
+        "why did THIS host get turned away" meant reading 100 mixed rows."""
         if self._repo is not None:
             try:
-                rows = await self._repo.query_agent_audit(limit=limit)
+                rows = await self._repo.query_agent_audit(
+                    limit=limit, agent_id=agent_id, action=action
+                )
             except Exception as exc:  # pragma: no cover - defensive fallback
                 logger.warning("agent audit DB query failed, using in-memory log: %s", exc)
             else:
@@ -178,8 +206,15 @@ class AuditLog:
                     }
                     for r in rows
                 ]
-        # No repo (or DB read failed): newest-first view of the deque.
-        entries = list(self._entries)
+        # No repo (or DB read failed): newest-first view of the deque. Filter
+        # BEFORE the limit, so a narrowed query returns `limit` matching rows and
+        # not "however many of the last `limit` rows happened to match".
+        entries = [
+            e
+            for e in self._entries
+            if (agent_id is None or e.agent_id == agent_id)
+            and (action is None or e.action == action)
+        ]
         recent = entries[-limit:]
         return [self._entry_to_dict(e) for e in reversed(recent)]
 

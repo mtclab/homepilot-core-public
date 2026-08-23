@@ -541,6 +541,15 @@ func (a *Agent) run() {
 func main() {
 	log.SetFlags(log.LstdFlags)
 	log.SetPrefix("[hp-agent] ")
+	// Answer "which binary is this?" without a hub, a token or a network: after
+	// the 2.6.0 regression the only way to find the hosts still running the
+	// broken binary was to SSH each one (#430).
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-version" || arg == "-v" {
+			fmt.Printf("hp-agent %s\n", agentVersion())
+			return
+		}
+	}
 	cfg := ConfigFromEnv()
 	// Fail closed, at startup, loudly: an agent that was TOLD to be privileged but
 	// cannot do privileged work must say so now, not fail opaquely on the first

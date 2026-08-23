@@ -76,6 +76,17 @@ class Settings(BaseSettings):
 
     daemon_port: int = Field(default=8000, validation_alias="HP_PORT")
     log_level: str = "info"
+
+    # How long operational HISTORY is kept: audit_log, agent_audit, finished
+    # tasks and webhook deliveries. Nothing pruned any of them (#431), and each
+    # gains a row per operation - a year on a homelab VM is a multi-GB SQLite
+    # file and a backup too big to move.
+    #
+    # 90 days rather than the metrics window (7): an audit trail answers "who
+    # changed this, and when" months later, which a time series does not have to.
+    # Artifacts are never pruned - they are the record of intent, not history.
+    retention_days: int = 90
+    retention_interval_seconds: int = 21600
     # Host management is the product, so the hub is on unless an operator turned
     # it off (ADR-004 S3). Everything it needs that an operator would otherwise
     # have to decide - the shared token below, the TLS certificate - generates
@@ -276,7 +287,23 @@ class Settings(BaseSettings):
                 if isinstance(first_val, str) and first_val:
                     return first_val
             return ""
-        except Exception:
+        except FileNotFoundError:
+            # Genuinely "not configured": there is no such secret.
+            return ""
+        except Exception as exc:
+            # A bare `except: return ""` made a WRONG PASSPHRASE or a corrupt
+            # identity indistinguishable from "not configured" (#431), so
+            # admin_secret came back silently empty and the operator saw a 403
+            # with nothing in the log to explain it. Still best-effort - config
+            # must load - but no longer silent.
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "vault lookup for %r failed (%s: %s); continuing without it",
+                name,
+                type(exc).__name__,
+                exc,
+            )
             return ""
 
     def model_post_init(self, __context: object) -> None:
@@ -335,7 +362,13 @@ class Settings(BaseSettings):
         _secret_key_auto_generated = False
 
         if not self.secret_key:
-            secret_key_file = _os.environ.get("HP_SECRET_KEY_FILE", "")
+            # The PARSED field, not the raw env var (#431). Reading os.environ
+            # directly ignored `secret_key_file` however it was set - the
+            # documented Docker-secrets pattern silently did nothing, a key was
+            # auto-generated instead, and every token was invalidated on a fresh
+            # volume. `_os.environ` stays as the fallback for the same name so
+            # nothing that worked before stops working.
+            secret_key_file = self.secret_key_file or _os.environ.get("HP_SECRET_KEY_FILE", "")
             if secret_key_file:
                 try:
                     self.secret_key = Path(secret_key_file).read_text().strip()

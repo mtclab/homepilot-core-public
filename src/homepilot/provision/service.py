@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from ..adapters.proxmox import ProxmoxClient
+from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
 from .models import ProvisionRequest
@@ -63,6 +64,16 @@ class ProvisionService:
         # so an untracked background task can be garbage-collected mid-flight.
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
+
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Let in-flight jobs finish before the database goes away (#496).
+
+        These run behind an already-accepted HTTP request, so nothing else
+        awaits them; a shutdown that closes the database under one leaves the
+        task row it was about to finish saying "running" forever - and can kill
+        aiosqlite's worker thread mid-write.
+        """
+        await drain_tasks(self._running_tasks, "provision job(s)", timeout)
 
     def is_inflight(self, name: str) -> bool:
         return name in self._inflight_names

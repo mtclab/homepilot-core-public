@@ -37,11 +37,28 @@ _DML_RE = re.compile(r"\b(INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 
 
 def _string_constants(node: ast.AST) -> list[str]:
-    """All string literal constants anywhere under ``node`` (incl. f-strings)."""
+    """All string literal constants under ``node``, EXCLUDING its docstring.
+
+    The docstring is prose, and prose says things like "Update a host from a sync
+    pass" - which `\bUPDATE\b` matches case-insensitively. A method that only
+    DESCRIBES an update was reported as issuing one and demanded a commit it has
+    no write to commit. A docstring cannot execute SQL, so skipping it costs the
+    gate nothing.
+    """
+    body = list(node.body) if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) else [node]
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+
     out: list[str] = []
-    for child in ast.walk(node):
-        if isinstance(child, ast.Constant) and isinstance(child.value, str):
-            out.append(child.value)
+    for stmt in body:
+        for child in ast.walk(stmt):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                out.append(child.value)
     return out
 
 

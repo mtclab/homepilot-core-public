@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from ..auth.deps import require_scope
+from ..auth.deps import SCOPE_ENFORCER_ATTR, require_scope
 from .audit import set_audit_caller
 from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
 from .registry import AgentRegistry
@@ -276,7 +279,13 @@ async def list_agents(request: Request) -> list[dict[str, Any]]:
     mid-reconnect after a backend restart show as known/disconnected rather than
     vanishing (and inventory coverage doesn't flap to 'uncovered')."""
     registry = _get_registry()
-    live = {a["agent_id"]: {**a, "connected": True} for a in registry.list_connected()}
+    # A live agent has no outstanding failure by definition - upsert_agent clears
+    # the reason on a successful register - so the key is present and null rather
+    # than absent, and the UI has one shape to render (#430).
+    live = {
+        a["agent_id"]: {**a, "connected": True, "last_error": None, "last_error_at": None}
+        for a in registry.list_connected()
+    }
 
     repo = getattr(request.app.state, "repo", None)
     if repo is not None:
@@ -292,6 +301,9 @@ async def list_agents(request: Request) -> list[dict[str, Any]]:
                 "last_heartbeat": row.get("last_heartbeat"),
                 "connected": False,
                 "disconnected_at": row.get("disconnected_at"),
+                # WHY it is not here, not just that it is not here (#430).
+                "last_error": row.get("last_error"),
+                "last_error_at": row.get("last_error_at"),
             }
     return list(live.values())
 
@@ -317,6 +329,106 @@ class MigrateTLSRequest(BaseModel):
     # into one: force means "flip even though these agents will need re-enrolling
     # by hand", which is a sentence an operator should have to write down.
     force: bool = False
+
+
+async def _enrolment_credential(request: Request) -> None:
+    """Accept the hub's enrolment token, or any valid API token.
+
+    The guest fetching this payload holds exactly the enrolment token and nothing
+    else - that is the whole reason the control plane serves it (#464) - so that
+    is the credential this route is built around. An API token is also accepted,
+    for the operator running the one-liner by hand.
+
+    Compared in constant time, and refused outright when the hub has no token
+    configured, so a misconfiguration cannot quietly become an open download.
+    """
+    import secrets
+
+    presented = (request.headers.get("x-hp-agent-token") or "").strip()
+    if not presented:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+    if not presented:
+        raise HTTPException(status_code=401, detail="Missing enrolment credential")
+
+    registry = getattr(request.app.state, "agent_registry", None)
+    hub = getattr(registry, "hub_server", None) if registry is not None else None
+    hub_token = str(getattr(hub, "auth_token", "") or "")
+    if hub_token and secrets.compare_digest(presented, hub_token):
+        return
+
+    repo = getattr(request.app.state, "repo", None)
+    if repo is not None:
+        from ..auth.tokens import validate_token as _validate_api_token
+
+        row = await repo.get_token_by_prefix(presented[:16])
+        if row is not None and _validate_api_token(presented, row["hash"]):
+            return
+    raise HTTPException(status_code=401, detail="Invalid enrolment credential")
+
+
+# Marked as a scope enforcer so the startup guard (#405) sees these routes as
+# GUARDED rather than unscoped. They are not public - they demand the hub's
+# enrolment token or an API token - they simply enforce a credential the scope
+# system does not model, because the caller is a guest being enrolled and holds
+# nothing else. Listing them as public instead would have been a lie the guard
+# would then have stopped checking.
+setattr(_enrolment_credential, SCOPE_ENFORCER_ATTR, True)
+_enrolment_only = Depends(_enrolment_credential)
+
+
+@router.get("/dist", dependencies=[_admin_only])
+async def agent_dist_manifest() -> dict[str, Any]:
+    """What agent payload this image can hand to a guest, with digests (#464)."""
+    from .dist import manifest
+
+    return {"artifacts": manifest()}
+
+
+def _dist_response(path: Path, media_type: str) -> FileResponse:
+    """Serve a payload file with its digest in a header.
+
+    The digest travels WITH the bytes so the installer can verify what it just
+    received without a second round trip - and so a proxy that rewrites one
+    cannot leave the other looking right.
+    """
+    from .dist import sha256
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=path.name,
+        headers={"x-hp-sha256": sha256(path)},
+    )
+
+
+@router.get("/dist/install-agent.sh", dependencies=[_enrolment_only])
+async def agent_installer() -> FileResponse:
+    """The installer, served by the control plane doing the enrolling.
+
+    Authenticated by the hub's own enrolment token rather than an operator
+    session: the guest fetching this has exactly that token and nothing else,
+    which is the whole point of serving it here (#464). An admin token works too,
+    for the operator running the one-liner by hand.
+    """
+    from .dist import DistUnavailableError, installer
+
+    try:
+        return _dist_response(installer(), "text/x-shellscript")
+    except DistUnavailableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/dist/hp-agent-linux-{arch}", dependencies=[_enrolment_only])
+async def agent_binary_download(arch: str) -> FileResponse:
+    """The architecture-matched agent binary, from this image."""
+    from .dist import DistUnavailableError, agent_binary
+
+    try:
+        return _dist_response(agent_binary(arch), "application/octet-stream")
+    except DistUnavailableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/migrate-tls", dependencies=[_admin_only])
@@ -471,11 +583,17 @@ async def install_agent_on_host(
 
 
 @router.get("/audit", dependencies=[_admin_only])
-async def get_audit_log(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
+async def get_audit_log(
+    limit: int = Query(default=100, ge=1, le=1000),
+    agent_id: str | None = Query(default=None, description="Only this agent's trail"),
+    action: str | None = Query(
+        default=None, description="Only this action, e.g. register_rejected"
+    ),
+) -> list[dict[str, Any]]:
     registry = _get_registry()
     # Prefer the durable DB trail (survives restart, carries caller attribution);
     # falls back to the in-memory deque when no repo is wired.
-    return await registry.audit_log.query_persisted(limit=limit)
+    return await registry.audit_log.query_persisted(limit=limit, agent_id=agent_id, action=action)
 
 
 @router.get("/hostname/{hostname}", dependencies=[_admin_only])
@@ -570,9 +688,13 @@ async def revoke_agent(agent_id: str, request: Request) -> dict[str, Any]:
     """Revoke an agent's per-agent credential (admin only).
 
     A revoked credential fails hub authentication, so the agent cannot reconnect
-    until it is re-enrolled with a fresh bootstrap/shared token. Any currently
-    live connection is left in place; the block takes effect on the next
-    (re)connect."""
+    until it is re-enrolled with a fresh bootstrap/shared token.
+
+    The live channel is closed too (#430). The hub connection is long-lived by
+    design, so leaving it open meant a revoked - possibly compromised - agent
+    kept a fleet-root exec/write channel until it happened to reconnect, which
+    may be never. Revoke now means revoked, not "revoked from the next connect".
+    """
     repo = getattr(request.app.state, "repo", None)
     if repo is None:
         raise HTTPException(status_code=503, detail="Agent credential store not available")
@@ -582,7 +704,62 @@ async def revoke_agent(agent_id: str, request: Request) -> dict[str, Any]:
             status_code=404,
             detail=f"No active credential to revoke for agent {agent_id}",
         )
-    return {"agent_id": agent_id, "revoked": True}
+    # Evict AFTER the credential is dead, so the agent cannot win a reconnect
+    # race against its own revocation.
+    registry = getattr(request.app.state, "agent_registry", None)
+    evicted = False
+    if registry is not None:
+        evicted = registry.disconnect(
+            agent_id, "credential revoked by an operator; the live channel was closed"
+        )
+    return {"agent_id": agent_id, "revoked": True, "channel_closed": evicted}
+
+
+@router.delete("/{agent_id}", dependencies=[_admin_only])
+async def forget_agent(agent_id: str, request: Request) -> dict[str, Any]:
+    """Forget a decommissioned agent entirely (#415).
+
+    There was no way to remove one. `unregister()` only drops an in-memory entry
+    for a LIVE connection, and since #343 agents are persisted and listed
+    overlaid, so a scrapped host stayed in the list forever and kept being
+    counted as known.
+
+    Worse than untidy: the `agents` table doubles as the per-agent credential
+    store, so that row is a credential a decommissioned box can still
+    authenticate with. Removal therefore REVOKES first and then deletes - if the
+    delete were to fail, the credential is already dead rather than the reverse.
+
+    Refuses while the agent is connected. Removing a live agent would delete the
+    credential out from under an open channel and leave it reconnecting into a
+    hub that no longer knows it; stop or revoke it first, deliberately.
+    """
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="Agent store not available")
+
+    registry = getattr(request.app.state, "agent_registry", None)
+    live = {a["agent_id"] for a in registry.list_connected()} if registry is not None else set()
+    if agent_id in live:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Agent {agent_id} is connected right now. Revoke it or stop the agent "
+                "first - removing a live agent would pull its credential out from under "
+                "an open connection."
+            ),
+        )
+
+    await repo.revoke_agent_credential(agent_id)
+    deleted = await repo.delete_agent(agent_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
+    if registry is not None:
+        # Drop any stale in-memory record too, so the list does not resurrect it
+        # from the live overlay until the next restart.
+        with contextlib.suppress(Exception):
+            registry.unregister(agent_id)
+    logger.warning("Agent %s forgotten by an operator; its credential is revoked", agent_id)
+    return {"agent_id": agent_id, "forgotten": True}
 
 
 @router.get("/{agent_id}", dependencies=[_admin_only])

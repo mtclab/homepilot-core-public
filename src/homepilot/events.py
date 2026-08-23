@@ -14,6 +14,10 @@ from .webhooks.send import sign_payload
 
 logger = logging.getLogger(__name__)
 
+# Strong references to in-flight webhook deliveries. Without these the event loop
+# can collect a task mid-delivery (#431).
+_IN_FLIGHT_DELIVERIES: set[asyncio.Task[Any]] = set()
+
 RETRY_DELAYS: list[float] = [1.0, 5.0, 30.0]
 
 
@@ -25,7 +29,13 @@ async def deliver_with_retry(
     delivery_id: int | None = None,
     repo: Any | None = None,
     db: Any | None = None,
-) -> None:
+) -> bool:
+    """Deliver a webhook payload, retrying. Returns True if it was accepted.
+
+    It used to return None on total failure exactly as on success, so `hp webhook
+    test` printed "Test event sent" and exited 0 for an endpoint that never
+    answered (#388) - the one command whose entire job is to tell you whether
+    delivery works."""
     payload_bytes = json.dumps(payload).encode()
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if secret:
@@ -42,7 +52,7 @@ async def deliver_with_retry(
                     await repo.update_webhook_delivery(delivery_id, "success", attempts)
                     if db:
                         await db.conn.commit()
-                return
+                return True
             logger.warning(
                 "Webhook returned status=%d for url=%s attempt=%d",
                 resp.status_code,
@@ -69,6 +79,8 @@ async def deliver_with_retry(
         attempts,
         url,
     )
+
+    return False
 
 
 async def emit_event(
@@ -129,7 +141,14 @@ async def emit_event(
                         db=db_obj,
                     )
                 )
-                _ = task  # prevent RUF006 warning
+                # HELD, not merely assigned (#431). asyncio keeps only a WEAK
+                # reference to a running task, so `_ = task` let an in-flight
+                # delivery be garbage-collected mid-flight - and nothing ever
+                # redrives a row left `pending`, so that webhook was simply never
+                # sent and the delivery table quietly recorded it as pending
+                # forever.
+                _IN_FLIGHT_DELIVERIES.add(task)
+                task.add_done_callback(_IN_FLIGHT_DELIVERIES.discard)
         except (
             httpx.HTTPError,
             httpx.TimeoutException,

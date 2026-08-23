@@ -117,17 +117,37 @@ async def execute(
                         applied_ids.add(sub_artifact_id)
                 except FileNotFoundError:
                     pass
+        not_reversed: list[str] = []
         for step in reversed(ordered):
             sid = step.get("id", "unknown")
             sub_artifact_id = step.get("artifact", "")
             if sub_artifact_id in applied_ids:
                 log_lines.append(f"[{sid}] rollback sub-artifact {sub_artifact_id}")
                 try:
-                    await executor.revoke(
+                    outcome = await executor.revoke(
                         sub_artifact_id, user="composite-rollback", reason="composite rollback"
                     )
                 except Exception as e:
                     log_lines.append(f"[{sid}] rollback failed (best-effort): {e}")
+                    not_reversed.append(sub_artifact_id)
+                else:
+                    # A sub-revoke that only RELABELLED its artifact is not a
+                    # rollback, and a composite that reports success over a pile
+                    # of those is the same lie one level up (#426).
+                    log_lines.append(
+                        f"[{sid}] {'reversed' if outcome.rolled_back else 'NOT reversed'}: "
+                        f"{outcome.reason}"
+                    )
+                    if not outcome.rolled_back:
+                        not_reversed.append(sub_artifact_id)
+        if not_reversed:
+            return {
+                "success": False,
+                "execution_log": "\n".join(log_lines),
+                "failure_reason": (
+                    "these sub-artifacts were not reversed: " + ", ".join(not_reversed)
+                ),
+            }
 
     success = not failed
     return {"success": success, "execution_log": "\n".join(log_lines)}

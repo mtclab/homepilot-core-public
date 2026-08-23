@@ -39,11 +39,14 @@ class TestInventoryRouter:
 
     def test_list_inventory_with_new_filters(self, client):
         client.app.state.repo.list_hosts = AsyncMock(return_value=[])
+        # The route returns a real COUNT alongside the page (#428).
+        client.app.state.repo.count_hosts = AsyncMock(return_value=0)
         resp = client.get("/inventory?source=discovered&import_state=pending&pve_status=running")
         assert resp.status_code == 200
         data = resp.json()
         assert data["items"] == []
         client.app.state.repo.list_hosts.assert_awaited_once_with(
+            q=None,
             managed=None,
             role=None,
             source="discovered",
@@ -58,6 +61,8 @@ class TestInventoryRouter:
         # Regression (#390): the router accepted ?status= but silently dropped it,
         # so filtering by status returned everything. It must reach list_hosts.
         client.app.state.repo.list_hosts = AsyncMock(return_value=[])
+        # The route returns a real COUNT alongside the page (#428).
+        client.app.state.repo.count_hosts = AsyncMock(return_value=0)
         resp = client.get("/inventory?status=running")
         assert resp.status_code == 200
         _, kwargs = client.app.state.repo.list_hosts.await_args
@@ -74,6 +79,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.patch("/inventory/h1", json={"role": "web-server"})
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with(
@@ -90,6 +97,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.patch("/inventory/h1", json={"ip_address": "10.0.0.5"})
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with(
@@ -104,6 +113,8 @@ class TestInventoryRouter:
             return_value={"id": "h1", "hostname": "vm1", "import_state": "ignored"}
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.patch("/inventory/h1", json={"import_state": "pending"})
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with("h1", import_state="pending")
@@ -113,6 +124,8 @@ class TestInventoryRouter:
             return_value={"id": "h1", "hostname": "vm1", "status": "stopped"}
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.patch("/inventory/h1", json={"status": "running"})
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with("h1", status="running")
@@ -124,6 +137,8 @@ class TestInventoryRouter:
             return_value={"id": "h1", "hostname": "vm1", "import_state": "ignored"}
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.patch("/inventory/h1", json={"import_state": "bogus"})
         assert resp.status_code == 422
         client.app.state.repo.update_host.assert_not_awaited()
@@ -139,6 +154,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.post("/inventory/h1/adopt")
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with(
@@ -157,6 +174,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.post("/inventory/h1/ignore")
         assert resp.status_code == 200
         client.app.state.repo.update_host.assert_awaited_once_with("h1", import_state="ignored")
@@ -170,6 +189,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.post(
             "/inventory/bulk",
             json={"action": "adopt", "host_ids": ["h1"]},
@@ -188,6 +209,8 @@ class TestInventoryRouter:
             }
         )
         client.app.state.repo.update_host = AsyncMock(return_value=None)
+        # The PATCH pins what it wrote, so a later sync leaves it alone (#424).
+        client.app.state.repo.pin_host_fields = AsyncMock(return_value=None)
         resp = client.post(
             "/inventory/bulk",
             json={"action": "ignore", "host_ids": ["h1"]},

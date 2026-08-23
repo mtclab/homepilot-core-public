@@ -4,9 +4,16 @@
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import { pruneSelection } from '$lib/selection';
+	import { debounce } from '$lib/debounce';
 	import { base } from '$app/paths';
 
 	let items: Host[] = [];
+	// The list is paged. It used to cap at 100 rows with `total` reporting the
+	// PAGE SIZE, so an estate with more hosts than that simply had no page 2
+	// (#428).
+	let total = 0;
+	let page = 0;
+	const PAGE_SIZE = 100;
 	let loading = true;
 	let loadError = '';
 	let syncing = false;
@@ -15,10 +22,94 @@
 	let filterStatus = '';
 	let filterSource = '';
 	let filterImportState = '';
+	// Searched on the SERVER: the list is paginated, so a filter applied in the
+	// browser could only ever search the page already on screen (#445 A4).
+	let search = '';
+
+	// The role vocabulary the BACKEND uses: `node` and `guest` are what the sync
+	// writes, and the rest are what `ROLE_PATTERNS` in inventory/service.py can
+	// infer. One list, used by both the filter and the add form, so the UI cannot
+	// offer a role nothing will ever match (#424).
+	const ROLES = [
+		'node',
+		'guest',
+		'database',
+		'web-server',
+		'api-server',
+		'monitoring',
+		'control-plane',
+		'worker',
+	];
 	let selectedIds: Set<string> = new Set();
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+
+	// Forgetting is irreversible (services and the observation note go with the
+	// host), so it is a two-step confirm inline.
+	let forgetConfirm: string | null = null;
+	let forgetting: string | null = null;
+
+	async function forgetOne(h: Host) {
+		forgetting = h.id;
+		try {
+			await api.forgetHost(h.id);
+			notify(`Removed ${h.hostname} from inventory`);
+			forgetConfirm = null;
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			forgetting = null;
+		}
+	}
+
+	function fmtDate(s: string | null | undefined): string {
+		if (!s) return '—';
+		try {
+			return new Date(s).toLocaleDateString();
+		} catch {
+			return s;
+		}
+	}
+
+	// Adding a host by hand: the only way a non-Proxmox machine can enter
+	// inventory at all (#445 A5).
+	let showAdd = false;
+	let adding = false;
+	let addForm = { hostname: '', ip_address: '', role: 'guest', description: '' };
+
+	async function submitAdd() {
+		adding = true;
+		try {
+			const host = await api.addHost({
+				hostname: addForm.hostname.trim(),
+				ip_address: addForm.ip_address.trim() || undefined,
+				role: addForm.role,
+				description: addForm.description.trim() || undefined,
+			});
+			notify(`Added ${host.hostname}`);
+			showAdd = false;
+			addForm = { hostname: '', ip_address: '', role: 'guest', description: '' };
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			adding = false;
+		}
+	}
+
+	// One request per pause in typing, not one per keystroke - the query goes to
+	// the server.
+	const searchAgain = debounce(() => {
+		page = 0;
+		load();
+	}, 300);
+
+	function firstPage() {
+		page = 0;
+		return load();
+	}
 
 	async function load() {
 		loading = true;
@@ -29,8 +120,12 @@
 				status: filterStatus || undefined,
 				source: filterSource || undefined,
 				import_state: filterImportState || undefined,
+				q: search.trim() || undefined,
+				limit: PAGE_SIZE,
+				offset: page * PAGE_SIZE,
 			});
 			items = res.items;
+			total = res.total;
 			// The selection must never outlive the rows it was made on: a filter
 			// change used to leave off-screen hosts selected, so "3 selected →
 			// Adopt" acted on hosts the user could not see.
@@ -70,13 +165,19 @@
 	}
 
 	$: hasActiveFilters =
-		filterRole !== '' || filterStatus !== '' || filterSource !== '' || filterImportState !== '';
+		filterRole !== '' ||
+		filterStatus !== '' ||
+		filterSource !== '' ||
+		filterImportState !== '' ||
+		search.trim() !== '';
 
 	function clearFilters() {
 		filterRole = '';
 		filterStatus = '';
 		filterSource = '';
 		filterImportState = '';
+		search = '';
+		page = 0;
 		load();
 	}
 
@@ -161,6 +262,9 @@
 		<div class="flex gap-2">
 			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}>↻ Reload</button>
 			{#if canWrite}
+				<button class="btn btn-primary text-xs" on:click={() => (showAdd = !showAdd)}>
+					{showAdd ? 'Cancel' : '+ Add host'}
+				</button>
 				<button class="btn btn-ghost text-xs" on:click={sync} disabled={syncing}>
 					{syncing ? 'Syncing…' : '⟳ Sync from Proxmox'}
 				</button>
@@ -168,33 +272,81 @@
 		</div>
 	</div>
 
+	{#if showAdd}
+		<!-- Inventory could only be filled by a Proxmox sync, so the NAS, the
+		     router and the Pi were literally unrepresentable (#445 A5). -->
+		<form class="card space-y-3" on:submit|preventDefault={submitAdd}>
+			<div class="grid gap-3 sm:grid-cols-2">
+				<label class="space-y-1">
+					<span class="text-xs text-muted">Hostname</span>
+					<input
+						class="input w-full text-sm"
+						bind:value={addForm.hostname}
+						placeholder="nas01"
+						required
+					/>
+				</label>
+				<label class="space-y-1">
+					<span class="text-xs text-muted">IP address (optional)</span>
+					<input class="input w-full text-sm" bind:value={addForm.ip_address} placeholder="10.0.0.4" />
+				</label>
+				<label class="space-y-1">
+					<span class="text-xs text-muted">Role</span>
+					<select class="input w-full text-sm" bind:value={addForm.role}>
+						{#each ROLES as role}<option value={role}>{role}</option>{/each}
+					</select>
+				</label>
+				<label class="space-y-1">
+					<span class="text-xs text-muted">Description (optional)</span>
+					<input
+						class="input w-full text-sm"
+						bind:value={addForm.description}
+						placeholder="Synology NAS in the cupboard"
+					/>
+				</label>
+			</div>
+			<p class="prose-note text-xs">
+				Added by hand, so it is recorded as a manual host and adopted straight away - and a
+				Proxmox sync will never mark it gone, because Proxmox never looked for it.
+			</p>
+			<button class="btn btn-primary text-xs" type="submit" disabled={adding || !addForm.hostname.trim()}>
+				{adding ? 'Adding…' : 'Add host'}
+			</button>
+		</form>
+	{/if}
+
 	<div class="flex gap-3 flex-wrap">
-		<select class="input text-xs" bind:value={filterRole} on:change={load}>
+		<label class="flex items-center gap-2">
+			<span class="sr-only">Search hosts</span>
+			<input
+				class="input text-xs w-64"
+				type="search"
+				placeholder="Search name, address, role, tags…"
+				bind:value={search}
+				on:input={searchAgain}
+			/>
+		</label>
+		<select class="input text-xs" bind:value={filterRole} on:change={firstPage}>
+			<!-- Exactly the roles the code writes (#424). It used to offer
+			     hypervisor / vm / container / service - none of which anything
+			     ever writes - while omitting `node` and `guest`, the two that
+			     actually exist. Filtering by them returned nothing, forever. -->
 			<option value="">All roles</option>
-			<option value="hypervisor">hypervisor</option>
-			<option value="vm">vm</option>
-			<option value="container">container</option>
-			<option value="service">service</option>
-			<option value="database">database</option>
-			<option value="web-server">web-server</option>
-			<option value="api-server">api-server</option>
-			<option value="monitoring">monitoring</option>
-			<option value="control-plane">control-plane</option>
-			<option value="worker">worker</option>
+			{#each ROLES as role}<option value={role}>{role}</option>{/each}
 		</select>
-		<select class="input text-xs" bind:value={filterStatus} on:change={load}>
+		<select class="input text-xs" bind:value={filterStatus} on:change={firstPage}>
 			<option value="">All statuses</option>
 			<option value="online">online</option>
 			<option value="offline">offline</option>
 			<option value="unknown">unknown</option>
 		</select>
-		<select class="input text-xs" bind:value={filterSource} on:change={load}>
+		<select class="input text-xs" bind:value={filterSource} on:change={firstPage}>
 			<option value="">All sources</option>
 			<option value="hp_created">HP-Created</option>
 			<option value="discovered">Discovered</option>
 			<option value="imported">Imported</option>
 		</select>
-		<select class="input text-xs" bind:value={filterImportState} on:change={load}>
+		<select class="input text-xs" bind:value={filterImportState} on:change={firstPage}>
 			<option value="">All import states</option>
 			<option value="pending">Pending</option>
 			<option value="adopted">Adopted</option>
@@ -203,7 +355,13 @@
 		{#if hasActiveFilters}
 			<button class="btn btn-ghost text-xs self-center" on:click={clearFilters}>Clear filters</button>
 		{/if}
-		<span class="text-muted text-xs self-center">{items.length} hosts</span>
+		<span class="text-muted text-xs self-center">
+			{#if total > items.length}
+				{page * PAGE_SIZE + 1}-{page * PAGE_SIZE + items.length} of {total} hosts
+			{:else}
+				{total} host{total === 1 ? '' : 's'}
+			{/if}
+		</span>
 	</div>
 
 	{#if selectedIds.size > 0}
@@ -241,40 +399,48 @@
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left pb-2 pr-2"><input type="checkbox" on:change={toggleSelectAll} checked={selectedIds.size > 0 && selectedIds.size === items.length} /></th>
-						<th class="text-left pb-2 pr-4">Hostname</th>
-						<th class="text-left pb-2 pr-4">IP</th>
-						<th class="text-left pb-2 pr-4">Role</th>
-						<th class="text-left pb-2 pr-4">Status</th>
-						<th class="text-left pb-2 pr-4">Source</th>
-						<th class="text-left pb-2 pr-4">Actions</th>
-						<th class="text-left pb-2">Node</th>
+						<th class="text-left pr-2"><input type="checkbox" on:change={toggleSelectAll} checked={selectedIds.size > 0 && selectedIds.size === items.length} /></th>
+						<th class="text-left">Hostname</th>
+						<th class="text-left">IP</th>
+						<th class="text-left">Role</th>
+						<th class="text-left">Status</th>
+						<th class="text-left">Source</th>
+						<th class="text-left">Actions</th>
+						<th class="text-left">Node</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each items as h}
 						<tr class="border-b border-divider hover:bg-raised transition-colors">
-							<td class="py-2 pr-2"><input type="checkbox" checked={selectedIds.has(h.id)} on:change={() => toggleSelect(h.id)} /></td>
-							<td class="py-2 pr-4">
+							<td class="pr-2"><input type="checkbox" checked={selectedIds.has(h.id)} on:change={() => toggleSelect(h.id)} /></td>
+							<td>
 								<a
 									href="{base}/inventory/{h.id}"
 									class="text-accent hover:text-accent-strong font-mono"
 								>{h.hostname}</a>
+								{#if h.absent_since}
+									<!-- A destroyed guest used to look exactly like a powered-off
+									     one: the row simply stopped being updated (#445 A5). -->
+									<span
+										class="badge badge-failed ml-1"
+										title="Proxmox stopped reporting this host on {fmtDate(h.absent_since)}"
+									>gone</span>
+								{/if}
 							</td>
-							<td class="py-2 pr-4 text-muted font-mono">{h.ip_address || '—'}</td>
-							<td class="py-2 pr-4 text-ink">
+							<td class="text-muted font-mono">{h.ip_address || '—'}</td>
+							<td class="text-ink">
 								{h.role ?? '—'}
 								{#if h.role_source === 'inferred'}<span class="text-warn" title="Inferred">?</span>{/if}
 							</td>
-							<td class="py-2 pr-4 {statusColor(h.status)}">{h.status ?? 'unknown'}</td>
-							<td class="py-2 pr-4">
+							<td class="{statusColor(h.status)}">{h.status ?? 'unknown'}</td>
+							<td>
 								{#if h.source}
 									<span class="px-1.5 py-0.5 rounded text-[10px] font-medium {sourceClass(h.source)}">{sourceBadge(h.source)}</span>
 								{:else}
 									<span class="text-muted">—</span>
 								{/if}
 							</td>
-							<td class="py-2 pr-4">
+							<td>
 								{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored'}
 									<button class="btn btn-xs text-[10px]" on:click={() => adoptOne(h)}>Adopt</button>
 									<button class="btn btn-xs text-[10px]" on:click={() => ignoreOne(h)}>Ignore</button>
@@ -282,6 +448,25 @@
 									<span class="text-muted">Ignored</span>
 								{:else}
 									<span class="text-muted">—</span>
+								{/if}
+								{#if canWrite && (h.source === 'manual' || h.absent_since)}
+									{#if forgetConfirm === h.id}
+										<button
+											class="btn btn-danger btn-xs text-[10px]"
+											disabled={forgetting === h.id}
+											on:click={() => forgetOne(h)}
+										>{forgetting === h.id ? 'Removing…' : 'Confirm'}</button>
+										<button
+											class="btn btn-ghost btn-xs text-[10px]"
+											on:click={() => (forgetConfirm = null)}
+										>Cancel</button>
+									{:else}
+										<button
+											class="btn btn-xs text-[10px] text-danger"
+											title="Remove this host from inventory, with its services and observation note"
+											on:click={() => (forgetConfirm = h.id)}
+										>Forget</button>
+									{/if}
 								{/if}
 								{#if h.hostname}
 									<a
@@ -291,11 +476,34 @@
 									>
 								{/if}
 							</td>
-							<td class="py-2 text-muted">{h.node ?? '—'}</td>
+							<td class="text-muted">{h.node ?? '—'}</td>
 						</tr>
 					{/each}
 				</tbody>
 			</table>
 		</div>
+		{#if total > PAGE_SIZE}
+			<div class="flex gap-2 items-center justify-end">
+				<button
+					class="btn btn-ghost text-xs"
+					disabled={page === 0}
+					on:click={() => {
+						page -= 1;
+						load();
+					}}>← Previous</button
+				>
+				<span class="text-xs text-muted">
+					Page {page + 1} of {Math.ceil(total / PAGE_SIZE)}
+				</span>
+				<button
+					class="btn btn-ghost text-xs"
+					disabled={(page + 1) * PAGE_SIZE >= total}
+					on:click={() => {
+						page += 1;
+						load();
+					}}>Next →</button
+				>
+			</div>
+		{/if}
 	{/if}
 </div>

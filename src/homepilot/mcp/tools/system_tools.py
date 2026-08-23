@@ -182,6 +182,32 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["exit_code", "stdout", "stderr"],
         },
     },
+    {
+        "name": "check_host_reachable",
+        "description": (
+            "Is a host reachable through a connected hp-agent RIGHT NOW? An artifact "
+            "targeting a host with no connected agent fails at apply, so check this "
+            "BEFORE proposing host-provision or shell-script work for it. Read-only: "
+            "it inspects the hub's live registry and touches nothing on the host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Hostname to check"},
+            },
+            "required": ["host"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "reachable": {"type": "boolean"},
+                "reason": {"type": "string"},
+                "agent_version": {"type": ["string", "null"]},
+            },
+            "required": ["host", "reachable"],
+        },
+    },
 ]
 
 
@@ -287,3 +313,47 @@ async def handle_exec_on_guest_readonly(
     command = arguments["command"]
     exit_code, stdout, stderr = await agent_adapter.exec_readonly(host, command)
     return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
+
+
+async def handle_check_host_reachable(
+    arguments: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Can a change actually REACH this host? (#427)
+
+    An artifact targeting a host with no connected agent fails at apply, and the
+    AI had no way to find that out before proposing - so it proposed work that
+    could not run and learned about it from a failure.
+
+    Answers from the hub's live registry rather than by touching the host: the
+    question is whether the control plane can reach it, and a check that itself
+    needs the host to be up cannot answer that.
+    """
+    host = arguments["host"]
+    registry = ctx.get("agent_registry")
+    if registry is None:
+        from homepilot.app_state import get_agent_registry
+
+        registry = get_agent_registry()
+    if registry is None:
+        return {
+            "host": host,
+            "reachable": False,
+            "reason": "the agent hub is not running in this process, so reachability is unknown",
+            "agent_version": None,
+        }
+
+    agent = registry.get_by_hostname(host)
+    if agent is None:
+        return {
+            "host": host,
+            "reachable": False,
+            "reason": "no agent is connected for this host right now",
+            "agent_version": None,
+        }
+    version = (agent.system_info or {}).get("agent_version")
+    return {
+        "host": host,
+        "reachable": True,
+        "reason": "an agent is connected",
+        "agent_version": str(version) if version else None,
+    }

@@ -283,16 +283,16 @@
 				<table class="data-table text-xs">
 					<thead>
 						<tr>
-							<th class="text-left pb-1 pr-4">Name</th>
-							<th class="num pb-1 pr-4">Port</th>
+							<th class="text-left pb-1">Name</th>
+							<th class="num pb-1">Port</th>
 							<th class="text-left pb-1">Status</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each doc.services as s}
 							<tr class="border-b border-divider">
-								<td class="py-1 pr-4 text-ink">{s.name}</td>
-								<td class="num py-1 pr-4 text-muted font-mono">{s.port ?? '—'}</td>
+								<td class="py-1 text-ink">{s.name}</td>
+								<td class="num py-1 text-muted font-mono">{s.port ?? '—'}</td>
 								<td class="py-1 text-muted">{s.status ?? '—'}</td>
 							</tr>
 						{/each}
@@ -324,18 +324,18 @@
 				<table class="data-table text-xs">
 					<thead>
 						<tr>
-							<th class="text-left pb-1 pr-4">Intent</th>
-							<th class="text-left pb-1 pr-4">Kind</th>
-							<th class="text-left pb-1 pr-4">Status</th>
+							<th class="text-left pb-1">Intent</th>
+							<th class="text-left pb-1">Kind</th>
+							<th class="text-left pb-1">Status</th>
 							<th class="text-left pb-1">Date</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each doc.artifact_history as a}
 							<tr class="border-b border-divider">
-								<td class="py-1 pr-4 text-ink max-w-xs truncate">{a.intent}</td>
-								<td class="py-1 pr-4 text-muted">{a.kind}</td>
-								<td class="py-1 pr-4">
+								<td class="py-1 text-ink max-w-xs truncate">{a.intent}</td>
+								<td class="py-1 text-muted">{a.kind}</td>
+								<td class="py-1">
 									<span class="badge {statusClass(a.status)}">{a.status}</span>
 								</td>
 								<td class="py-1 text-muted">{a.created_at}</td>

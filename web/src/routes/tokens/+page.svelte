@@ -86,6 +86,26 @@
 		}
 	}
 
+	/** A token nobody can see the expiry of is a token that fails without warning. */
+	function expiryLabel(expiresAt: string | null): string {
+		if (!expiresAt) return 'never';
+		const when = new Date(expiresAt);
+		if (Number.isNaN(when.getTime())) return expiresAt;
+		const days = Math.floor((when.getTime() - Date.now()) / 86_400_000);
+		if (days < 0) return `expired ${when.toLocaleDateString()}`;
+		if (days === 0) return 'today';
+		return `in ${days} day${days === 1 ? '' : 's'}`;
+	}
+
+	function expiryClass(expiresAt: string | null): string {
+		if (!expiresAt) return 'text-muted';
+		const when = new Date(expiresAt);
+		if (Number.isNaN(when.getTime())) return 'text-muted';
+		const days = Math.floor((when.getTime() - Date.now()) / 86_400_000);
+		if (days < 0) return 'text-danger';
+		return days <= 7 ? 'text-warn' : 'text-muted';
+	}
+
 	function fmtDate(s: string | null): string {
 		if (!s) return '—';
 		return new Date(s).toLocaleString();
@@ -120,32 +140,38 @@
 
 			<div class="flex gap-3 flex-wrap">
 				<div class="flex-1 min-w-[160px]">
-					<label class="field-label block mb-1">Label</label>
-					<input
-						class="input text-sm w-full"
-						placeholder="e.g. ci-bot, admin"
-						bind:value={newLabel}
-					/>
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Label</span>
+						<input
+							class="input text-sm w-full"
+							placeholder="e.g. ci-bot, admin"
+							bind:value={newLabel}
+						/>
+					</label>
 				</div>
 				<div>
-					<label class="field-label block mb-1">Scope</label>
-					<select class="input text-sm" bind:value={newScope}>
-						<option value="read_only">read_only</option>
-						<option value="full">full</option>
-						<option value="admin">admin</option>
-					</select>
+					<label class="field-label block mb-1">
+						<span class="block mb-1">Scope</span>
+						<select class="input text-sm" bind:value={newScope}>
+							<option value="read_only">read_only</option>
+							<option value="full">full</option>
+							<option value="admin">admin</option>
+						</select>
+					</label>
 				</div>
 			</div>
 
 			<div>
-				<label class="field-label block mb-1">Admin Secret (HP_VAULT_PASSPHRASE)</label>
-				<input
-					type="password"
-					class="input text-sm w-full font-mono"
-					placeholder="Required to create tokens"
-					bind:value={adminSecret}
-					required
-				/>
+				<label class="field-label block mb-1">
+					<span class="block mb-1">Admin Secret (HP_VAULT_PASSPHRASE)</span>
+					<input
+						type="password"
+						class="input text-sm w-full font-mono"
+						placeholder="Required to create tokens"
+						bind:value={adminSecret}
+						required
+					/>
+				</label>
 				<p class="prose-note text-xs mt-1">Find this in your server's HP_VAULT_PASSPHRASE env var.</p>
 			</div>
 
@@ -183,34 +209,41 @@
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left pb-2 pr-4">Prefix</th>
-						<th class="text-left pb-2 pr-4">Label</th>
-						<th class="text-left pb-2 pr-4">Scope</th>
-						<th class="text-left pb-2 pr-4">Role</th>
-						<th class="text-left pb-2 pr-4">Created</th>
-						<th class="text-left pb-2 pr-4">Last Used</th>
-						<th class="text-left pb-2">Actions</th>
+						<th class="text-left">Prefix</th>
+						<th class="text-left">Label</th>
+						<th class="text-left">Scope</th>
+						<th class="text-left">Role</th>
+						<th class="text-left">Created</th>
+						<th class="text-left">Last Used</th>
+						<th class="text-left">Expires</th>
+						<th class="text-left">Actions</th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each tokens as t}
 						<tr class="border-b border-divider">
-							<td class="py-2 pr-4 font-mono text-accent">
+							<td class="font-mono text-accent">
 								{t.prefix}
 								{#if currentPrefix && t.prefix === currentPrefix}
 									<span class="ml-1 text-[10px] text-warn" title="This token backs your current session">(current)</span>
 								{/if}
 							</td>
-							<td class="py-2 pr-4 text-ink">{t.label || '—'}</td>
-							<td class="py-2 pr-4">
+							<td class="text-ink">{t.label || '—'}</td>
+							<td>
 								<span class="badge {t.scope === '*' || t.scope === 'full' ? 'badge-applied' : t.scope === 'read_only' ? 'badge-proposed' : 'badge-failed'}">
 									{scopeDisplay(t.scope, t.role)}
 								</span>
 							</td>
-							<td class="py-2 pr-4 text-muted">{t.role || '—'}</td>
-							<td class="py-2 pr-4 text-muted">{fmtDate(t.created_at)}</td>
-							<td class="py-2 pr-4 text-muted">{fmtDate(t.last_used_at)}</td>
-							<td class="py-2">
+							<td class="text-muted">{t.role || '—'}</td>
+							<td class="text-muted">{fmtDate(t.created_at)}</td>
+							<td class="text-muted">{fmtDate(t.last_used_at)}</td>
+							<td class={expiryClass(t.expires_at)}>
+								<!-- `expires_at` came back from the API and was rendered
+								     nowhere, so a token that had stopped working looked
+								     identical to one that had not (#435). -->
+								{expiryLabel(t.expires_at)}
+							</td>
+							<td>
 								<button
 									class="btn btn-danger text-xs"
 									disabled={revoking === t.prefix}

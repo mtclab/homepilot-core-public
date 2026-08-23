@@ -215,12 +215,33 @@ class TestUnknownToolRaises:
 
 
 class TestGetEnvironmentDocTextOnly:
+    """The doc now comes from `InventoryService.get_environment_doc` (#427).
+
+    These tests used to stub `repo.get_host_by_hostname`, which is what the MCP
+    handler's OWN lesser re-implementation called - the one that rendered no KB
+    at all while the tool description advertised "inventory facts, KB intent, and
+    artifact history". They drive the service now, because that is what the
+    handler asks.
+    """
+
+    @staticmethod
+    def _service(doc: dict) -> AsyncMock:
+        service = AsyncMock()
+        service.get_environment_doc = AsyncMock(return_value=doc)
+        return service
+
     @pytest.mark.asyncio
     async def test_returns_textcontent_with_host(self, ctx):
         from mcp.types import TextContent
 
-        ctx["repo"].get_host_by_hostname = AsyncMock(
-            return_value={"id": 1, "hostname": "pve1", "node": "node1", "proxmox_id": 100}
+        ctx["inventory_service"] = self._service(
+            {
+                "target": "pve1",
+                "hosts": [{"hostname": "pve1", "node": "node1", "proxmox_id": 100}],
+                "services": [],
+                "kb_entries": [],
+                "artifact_history": [],
+            }
         )
         result = await call("get_environment_doc", {"target": "pve1"}, ctx)
         assert isinstance(result, list)
@@ -228,10 +249,37 @@ class TestGetEnvironmentDocTextOnly:
         assert "pve1" in result[0].text
 
     @pytest.mark.asyncio
+    async def test_the_kb_is_included(self, ctx):
+        """The whole point of the fix: the AI is the caller this tool exists for,
+        and it was the one getting the answer without the knowledge base."""
+        ctx["inventory_service"] = self._service(
+            {
+                "target": "pve1",
+                "hosts": [],
+                "services": [],
+                "kb_entries": [
+                    {"title": "nginx policy", "content": "always reload, never restart"}
+                ],
+                "artifact_history": [],
+            }
+        )
+        result = await call("get_environment_doc", {"target": "pve1"}, ctx)
+        assert "nginx policy" in result[0].text
+        assert "always reload" in result[0].text
+
+    @pytest.mark.asyncio
     async def test_no_host_found_still_returns_text(self, ctx):
         from mcp.types import TextContent
 
-        ctx["repo"].get_host_by_hostname = AsyncMock(return_value=None)
+        ctx["inventory_service"] = self._service(
+            {
+                "target": "unknown-host",
+                "hosts": [],
+                "services": [],
+                "kb_entries": [],
+                "artifact_history": [],
+            }
+        )
         result = await call("get_environment_doc", {"target": "unknown-host"}, ctx)
         assert isinstance(result, list)
         assert isinstance(result[0], TextContent)
@@ -239,9 +287,9 @@ class TestGetEnvironmentDocTextOnly:
 
     @pytest.mark.asyncio
     async def test_repo_error_propagates(self, ctx):
-        ctx["repo"].get_host_by_hostname = AsyncMock(
-            side_effect=sqlite3.OperationalError("db error")
-        )
+        service = AsyncMock()
+        service.get_environment_doc = AsyncMock(side_effect=sqlite3.OperationalError("db error"))
+        ctx["inventory_service"] = service
         with pytest.raises(sqlite3.OperationalError, match="db error"):
             await call("get_environment_doc", {"target": "pve1"}, ctx)
 

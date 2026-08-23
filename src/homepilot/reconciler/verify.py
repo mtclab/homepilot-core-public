@@ -4,10 +4,8 @@ import asyncio
 import contextlib
 import logging
 import re
-import shlex
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from enum import StrEnum
 from typing import Any
 
 import httpx
@@ -26,12 +24,39 @@ _MAX_VERIFY_DEPTH = 10
 _HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$")
 
 
+class DriftState(StrEnum):
+    """What a drift check actually established (#425).
+
+    `drifted` was a BOOLEAN, so every unverifiable path and every errored one
+    returned `drifted=False` - which the UI rendered as a green "in spec" for
+    things that were never checked. "I looked and it matches" and "I could not
+    look" are different answers, and an infrastructure tool that conflates them
+    is confidently wrong exactly where it matters.
+    """
+
+    IN_SPEC = "in_spec"
+    DRIFTED = "drifted"
+    UNKNOWN = "unknown"
+
+
 @dataclass
 class VerifyResult:
     artifact_id: str
     drifted: bool = False
     verification_log: str = ""
     details: dict[str, Any] = field(default_factory=dict)
+    # UNKNOWN by default ON PURPOSE: it is the fail-safe direction. A path that
+    # forgets to set a state reads as "not established" rather than as a green
+    # tick, which is the inverse of the bug this field exists to kill.
+    state: DriftState = DriftState.UNKNOWN
+
+    def __post_init__(self) -> None:
+        # One fact, two names: `drifted` stays for storage and for every existing
+        # caller, and it can never disagree with the state.
+        if self.state is DriftState.DRIFTED:
+            self.drifted = True
+        elif self.state is DriftState.IN_SPEC:
+            self.drifted = False
 
 
 async def verify_artifact(
@@ -177,80 +202,45 @@ async def _verify_ansible(
             details={"reason": "invalid_host"},
         )
 
+    # The PVE-node refusal stays AHEAD of the "not implemented" answer: it is a
+    # real safety check about the target, and it must keep its own reason. An
+    # operator pointing a playbook at a hypervisor should be told that, not told
+    # the checker is missing.
     pve_nodes: list[str] = getattr(executor, "pve_nodes", []) or []
-    # Same dead guard as the ansible executor, but UNGUARDED here: `executor.ssh`
-    # does not exist (the orchestrator exposes .agent / .host_adapter), and
-    # `_validate_guest_only` does not exist either, so this raised AttributeError
-    # - which the `except GuestHostError` did not catch - whenever pve_nodes was
-    # configured. It also imported GuestHostError from adapters.ssh, a different
-    # class from the one the agent adapter raises (#388).
     if pve_nodes and is_pve_node(host, pve_nodes):
         return VerifyResult(
             artifact_id=artifact_id,
-            drifted=False,
+            state=DriftState.UNKNOWN,
             verification_log=f"PVE node '{host}' - use the Proxmox API instead",
             details={"reason": "forbidden_host"},
         )
 
-    inventory_content = (
-        f"[target]\n"
-        # The jump server was decommissioned in #327; the ProxyCommand here
-        # pointed at a host that no longer resolves (#388). NOTE: this does
-        # not make the ansible path work - it is structurally dead (temp
-        # inventory written on the control plane, ansible-playbook run on the
-        # remote host where neither the files nor ansible exist). That is the
-        # first item of #388 and needs a real transport design.
-        f"{host} ansible_connection=ssh\n"
+    # The ansible drift check is NOT implemented, and now says so (#425).
+    #
+    # What stood here called `executor.ssh.exec(...)` and
+    # `executor.ssh._validate_guest_only(...)`. `ArtifactExecutor` has no `.ssh`
+    # attribute - it went with the jump server - so every call raised
+    # AttributeError, which the broad handler below swallowed into
+    # `drifted=False`. EVERY applied ansible artifact therefore reported "in
+    # spec" forever, in green, having checked nothing.
+    #
+    # It was structurally dead beyond the missing attribute: it wrote a temporary
+    # inventory and playbook on the CONTROL PLANE and then ran ansible-playbook
+    # on the REMOTE host, where neither the files nor ansible exist. Reviving it
+    # needs a real transport design, which is #388's first item - not a rename.
+    #
+    # So: no check, and the honest answer for "did this drift" is that nobody
+    # knows. That is exactly what UNKNOWN is for; before the tri-state existed
+    # there was no way to say it.
+    return VerifyResult(
+        artifact_id=artifact_id,
+        state=DriftState.UNKNOWN,
+        verification_log=(
+            "ansible drift checking is not implemented: the playbook transport was "
+            "removed with the jump server (#388). This artifact has NOT been checked."
+        ),
+        details={"reason": "ansible_unverifiable"},
     )
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yml", delete=False, prefix="hp-drift-inv-"
-    ) as invf:
-        invf.write(inventory_content)
-        inventory_path = invf.name
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yml", delete=False, prefix="hp-drift-play-"
-    ) as pf:
-        pf.write(spec_yaml)
-        playbook_path = pf.name
-
-    try:
-        async with _ansible_semaphore:
-            try:
-                inv = shlex.quote(inventory_path)
-                play = shlex.quote(playbook_path)
-                cmd = f"ansible-playbook --check --diff -i {inv} {play}"
-                _, stdout, _ = await asyncio.wait_for(
-                    executor.ssh.exec(host, cmd, timeout=60),
-                    timeout=60,
-                )
-            except TimeoutError:
-                return VerifyResult(
-                    artifact_id=artifact_id,
-                    drifted=False,
-                    verification_log="ansible check timed out",
-                    details={"reason": "timeout"},
-                )
-
-            changed = _ansible_output_has_changes(stdout)
-            return VerifyResult(
-                artifact_id=artifact_id,
-                drifted=changed,
-                verification_log=stdout[:2000],
-                details={"changed": changed},
-            )
-    except Exception as exc:
-        logger.warning("ansible drift check failed for %s: %s", artifact_id, exc)
-        return VerifyResult(
-            artifact_id=artifact_id,
-            drifted=False,
-            verification_log=f"ansible check error: {exc}",
-            details={"reason": "error"},
-        )
-    finally:
-        Path(inventory_path).unlink(missing_ok=True)
-        Path(playbook_path).unlink(missing_ok=True)
 
 
 async def _verify_proxmox_api(
@@ -332,12 +322,38 @@ async def _verify_proxmox_api(
 
     drifted = len(drifted_steps) > 0
     verification_log = f"drifted_steps={drifted_steps}, skipped_steps={skipped_steps}"
+    # "every step was skipped" is not "in spec" (#425). Steps are skipped when
+    # they carry no precheck, when the precheck is not a GET, and when the call
+    # to it FAILED - so an unreachable target produced a clean green tick with
+    # nothing checked at all.
+    if not drifted and not _evaluated(drifted_steps, skipped_steps, steps):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=verification_log[:2000],
+            details={
+                "reason": "nothing_evaluated",
+                "drifted_steps": drifted_steps,
+                "skipped_steps": skipped_steps,
+            },
+        )
     return VerifyResult(
         artifact_id=artifact_id,
-        drifted=drifted,
+        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
         verification_log=verification_log[:2000],
         details={"drifted_steps": drifted_steps, "skipped_steps": skipped_steps},
     )
+
+
+def _evaluated(
+    drifted_steps: list[str], skipped_steps: list[str], steps: list[dict[str, Any]]
+) -> bool:
+    """Did any step actually get compared against the target?
+
+    A verifier that skipped everything knows nothing. Reporting that as "in spec"
+    is the same false green the boolean verdict produced everywhere else (#425).
+    """
+    return len(drifted_steps) > 0 or len(skipped_steps) < len(steps)
 
 
 async def _verify_http_sequence(
@@ -451,9 +467,24 @@ async def _verify_http_sequence(
 
     drifted = len(drifted_steps) > 0
     verification_log = f"drifted_steps={drifted_steps}, skipped_steps={skipped_steps}"
+    # "every step was skipped" is not "in spec" (#425). Steps are skipped when
+    # they carry no precheck, when the precheck is not a GET, and when the call
+    # to it FAILED - so an unreachable target produced a clean green tick with
+    # nothing checked at all.
+    if not drifted and not _evaluated(drifted_steps, skipped_steps, steps):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=verification_log[:2000],
+            details={
+                "reason": "nothing_evaluated",
+                "drifted_steps": drifted_steps,
+                "skipped_steps": skipped_steps,
+            },
+        )
     return VerifyResult(
         artifact_id=artifact_id,
-        drifted=drifted,
+        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
         verification_log=verification_log[:2000],
         details={"drifted_steps": drifted_steps, "skipped_steps": skipped_steps},
     )
@@ -507,7 +538,7 @@ async def _verify_host_provision(
     drifted_items: list[str] = result["drifted_items"]
     return VerifyResult(
         artifact_id=artifact_id,
-        drifted=bool(result["drifted"]),
+        state=DriftState.DRIFTED if result["drifted"] else DriftState.IN_SPEC,
         verification_log=(result["log"] or "all items in desired state")[:2000],
         details={"drifted_items": drifted_items},
     )
@@ -564,7 +595,7 @@ async def _verify_composite(
     verification_log = f"drifted_subs={drifted_subs}, skipped_subs={skipped_subs}"
     return VerifyResult(
         artifact_id=artifact_id,
-        drifted=drifted,
+        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
         verification_log=verification_log[:2000],
         details={"drifted_subs": drifted_subs, "skipped_subs": skipped_subs},
     )

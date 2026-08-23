@@ -68,9 +68,12 @@ def _make_spec(kind="ansible-playbook", body=None, target=None, **overrides):
         "target": target or {"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"},
         "idempotence": "via-precheck",
         "produced_by": {"session": "s1", "agent": "a1", "user": "u1"},
-        "rollback": True,
     }
     spec.update(overrides)
+    # `rollback` is DERIVED from the body now (#426), so the old blanket
+    # `"rollback": True` here was a claim the default body could not honour and
+    # propose refuses it. Tests that want a rollback pass a body that HAS one.
+    spec.pop("rollback", None)
     return spec
 
 
@@ -208,6 +211,10 @@ class TestFullLifecycleHostProvision:
         mock_agent.install_package = AsyncMock(return_value={"changed": True, "detail": "ok"})
         mock_agent.manage_service = AsyncMock(return_value={"changed": True, "detail": "ok"})
         mock_agent.write_config = AsyncMock(return_value={"changed": False, "detail": "same"})
+        # Apply READS the host first, to capture what a rollback would put back
+        # (#426); a bare AsyncMock returns a MagicMock, which does not unpack.
+        mock_agent.exec_readonly = AsyncMock(return_value=(1, "", ""))
+        mock_agent.read_file = AsyncMock(side_effect=FileNotFoundError("absent"))
         mock_proxmox = AsyncMock()
         mock_proxmox.snapshot = AsyncMock(return_value={"data": "snap1"})
         mock_repo = AsyncMock()
@@ -804,7 +811,6 @@ echo "sub"
             "body": sub_body,
             "target": {"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"},
             "idempotence": "via-precheck",
-            "rollback": True,
             "produced_by": {"session": "s1", "agent": "a1", "user": "u1"},
         }
         sub_aid = await lifecycle.propose(sub_spec)
@@ -828,7 +834,6 @@ steps:
             "body": composite_body,
             "target": {"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"},
             "idempotence": "via-precheck",
-            "rollback": True,
             "produced_by": {"session": "s1", "agent": "a1", "user": "u1"},
         }
         aid = await lifecycle.propose(spec)

@@ -174,6 +174,13 @@ class KBService:
                         skipped += 1
                     else:
                         created += 1
+                        # Embed on ingest. Without this an ingested doc is
+                        # keyword-only forever, which is the same defect one step
+                        # earlier: the KB holds it and semantic search cannot see
+                        # it (#433). Best-effort - a doc that failed to embed is
+                        # still found by the keyword pass, which the merge above
+                        # guarantees runs.
+                        await self._embed_doc(doc_id, f"{title}\n{content}")
                 except (sqlite3.OperationalError, sqlite3.IntegrityError, ValueError) as exc:
                     logger.exception("Failed to insert ingested doc: %s: %s", rel_path, exc)
                     errors += 1
@@ -185,6 +192,45 @@ class KBService:
             "errors": errors,
             "errors_detail": errors_detail,
         }
+
+    async def _embed_doc(self, doc_id: int, text: str) -> bool:
+        """Store an embedding for a doc. Returns False if none could be made."""
+        from homepilot.executor.kb_note import _store_embedding
+
+        try:
+            embedding = await _get_embedding(text)
+        except Exception as exc:
+            logger.debug("No embedding for doc %s: %s", doc_id, exc)
+            return False
+        if not embedding:
+            return False
+        try:
+            await _store_embedding(self.repo, doc_id, embedding)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError, ValueError) as exc:
+            logger.warning("Could not store embedding for doc %s: %s", doc_id, exc)
+            return False
+        return True
+
+    async def embed_missing(self) -> dict[str, int]:
+        """Embed every doc that has none (#433).
+
+        `reindex` only ever re-walked `source LIKE 'artifact:%'`, so a KB full of
+        ingested documentation and observed-state notes stayed unembedded no
+        matter how many times an operator reindexed.
+        """
+        rows = await self.repo.db.fetchall(
+            "SELECT dm.id, dm.title, dm.content FROM doc_metadata dm "
+            "LEFT JOIN vec_docs v ON dm.id = v.id WHERE v.id IS NULL"
+        )
+        embedded = 0
+        failed = 0
+        for row in rows:
+            text = f"{row.get('title') or ''}\n{row.get('content') or ''}"
+            if await self._embed_doc(int(row["id"]), text):
+                embedded += 1
+            else:
+                failed += 1
+        return {"embedded": embedded, "failed": failed}
 
     @staticmethod
     def _walk_dir(directory_path: str) -> list[tuple[str, str]]:
@@ -256,11 +302,19 @@ class KBService:
                         logger.warning("Reindex failed for %s: %s", artifact_id, exc)
                         errors += 1
 
+                # Everything else that has no embedding, too: reindex only ever
+                # re-walked artifact notes, so ingested docs and observed-state
+                # notes stayed keyword-only however often it was run (#433).
+                swept = {"embedded": 0, "failed": 0}
+                if not no_embeddings:
+                    swept = await self.embed_missing()
+
                 return {
                     "status": "completed",
                     "deleted": deleted,
                     "reindexed": reindexed,
                     "errors": errors,
+                    "embedded_missing": swept["embedded"],
                 }
             finally:
                 self._reindexing = False
@@ -276,15 +330,29 @@ class KBService:
         if embedding:
             vec_bytes = _embedding_to_bytes(embedding)
             try:
+                # sqlite-vec REQUIRES the k constraint on the vec0 table's own
+                # query - a `LIMIT` on an outer join does not count. The previous
+                # shape (JOIN doc_metadata ... WHERE v.embedding MATCH ? ORDER BY
+                # v.distance LIMIT ?) raised
+                #   "A LIMIT or 'k = ?' constraint is required on vec0 knn queries"
+                # on EVERY search, which the handler below turned into a keyword
+                # fallback and a debug-level warning. Semantic search has
+                # therefore never actually run (#433).
+                #
+                # k over-fetches because the `kind` filter is applied AFTER the
+                # nearest-neighbour cut: filtering inside the vec query is not
+                # possible, so asking for exactly `limit` neighbours and then
+                # discarding some would silently return short.
+                k = min(max(limit * 5, limit), 200)
                 base_sql = (
                     "SELECT dm.id, dm.source, dm.kind, dm.target, dm.title, dm.content, "
-                    "v.distance FROM doc_metadata dm "
-                    "JOIN vec_docs v ON dm.id = v.id "
-                    "WHERE v.embedding MATCH ? "
+                    "v.distance FROM ("
+                    "  SELECT id, distance FROM vec_docs WHERE embedding MATCH ? AND k = ?"
+                    ") v JOIN doc_metadata dm ON dm.id = v.id "
                 )
-                params: list[Any] = [vec_bytes]
+                params: list[Any] = [vec_bytes, k]
                 if kind:
-                    base_sql += "AND dm.kind = ? "
+                    base_sql += "WHERE dm.kind = ? "
                     params.append(kind)
                 base_sql += "ORDER BY v.distance LIMIT ?"
                 params.append(limit)
@@ -304,11 +372,45 @@ class KBService:
                         }
                     )
                 results.sort(key=lambda x: x.get("score", 0), reverse=True)
-                return results
+                # A doc with no embedding cannot appear above - the vector query
+                # joins vec_docs - and only `kb-note` ARTIFACTS are embedded.
+                # Ingested documentation and observed-state notes go straight to
+                # doc_metadata, so they were returned ONLY by the fallback that
+                # runs when the embedding service is DOWN: the KB hid what you
+                # put into it precisely when it was configured correctly (#433).
+                #
+                # Vector hits keep their order and their scores; keyword hits
+                # fill in behind them, which is also the honest ranking - one is
+                # a semantic match and the other is a substring.
+                return await self._merge_keyword_matches(results, query, kind, limit)
             except (sqlite3.OperationalError, ValueError) as e:
                 logger.warning("Vector search failed, falling back to keyword: %s", e)
 
         return await self._keyword_search(query, kind, limit)
+
+    async def _merge_keyword_matches(
+        self,
+        results: list[dict[str, Any]],
+        query: str,
+        kind: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Append keyword matches the vector search could not have found."""
+        if len(results) >= limit:
+            return results[:limit]
+        seen = {r.get("id") for r in results}
+        try:
+            keyword = await self._keyword_search(query, kind, limit)
+        except (sqlite3.OperationalError, ValueError) as exc:
+            logger.warning("Keyword pass failed alongside vector search: %s", exc)
+            return results
+        for row in keyword:
+            if row.get("id") in seen:
+                continue
+            results.append(row)
+            if len(results) >= limit:
+                break
+        return results
 
     async def _keyword_search(
         self, query: str, kind: str | None = None, limit: int = 10

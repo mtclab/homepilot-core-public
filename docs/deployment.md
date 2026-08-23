@@ -751,6 +751,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_AGENT_HUB_ENABLED` | `true` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
 | `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |
+| `HP_AGENT_DIST_DIR` | `/app/agent-dist` | Where the agent payload HomePilot serves to guests lives (installer + per-arch binaries, baked into the image). Override only when running from a source checkout, which has none until they are built |
 | `HP_AGENT_HUB_AUTH_TOKEN` | auto-generated | Shared secret for agent authentication (vault `agent-hub-token`, else `<data_dir>/.agent_hub_token`) |
 | `HP_AGENT_HUB_TLS` | `true` | Enable TLS on the hub (required for non-loopback binds) |
 | `HP_AGENT_HUB_TLS_CERT` / `_KEY` | auto-generated | Hub server certificate and private key; self-signed pair written to `<data_dir>/hub/` when unset |
@@ -765,6 +766,8 @@ If the restore was wrong, everything it replaced is under
 | `HP_COOKIE_SECURE` | `true` | Set `false` only for plain-HTTP local dev |
 | `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs trusted for `X-Forwarded-For` |
 | `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
+| `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
+| `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |
 | `HP_PORTAL_CN_HEADER` | `ssl-client-subject-dn` | Header the mTLS proxy sets with the client-certificate subject DN (see [portal.md](portal.md)) |

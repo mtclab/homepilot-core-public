@@ -85,7 +85,7 @@ async def wired(tmp_path: Path):
     for w in writers:
         w.close()
         with contextlib.suppress(Exception):
-            await w.wait_closed()
+            await asyncio.wait_for(w.wait_closed(), timeout=5)
     await srv.stop()
     await db.close()
 

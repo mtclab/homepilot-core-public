@@ -16,6 +16,7 @@ async def list_audit(
     artifact_id: str | None = Query(None),
     target_host: str | None = Query(None),
     source: str | None = Query(None),
+    q: str | None = Query(None, description="Free text over artifact, host, command, actor"),
     limit: int = Query(100, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -25,13 +26,17 @@ async def list_audit(
         artifact_id=artifact_id,
         target_host=target_host,
         source=source,
+        q=q,
         limit=limit,
         offset=offset,
     )
+    # Same filters, same helper: `total` is what the pager shows, and a count
+    # that ignores the search would report "50 of 4000" for a 50-row search.
     total = await repo.count_audit_log(
         action=action,
         artifact_id=artifact_id,
         target_host=target_host,
         source=source,
+        q=q,
     )
     return {"items": rows, "total": total}

@@ -92,12 +92,16 @@ async def create_app_state(settings: Any | None = None) -> AppState:
     proxmox: Any = None
 
     pve_token_source = ""
+    # Bound BEFORE the try (#431). It was assigned inside, and line 426 reads it
+    # after the except - so on the ImportError path the backend died with a
+    # NameError naming the wrong thing entirely, instead of the import that
+    # actually failed.
+    proxmox_host = settings.proxmox_host
 
     try:
         from .adapters.proxmox import ProxmoxClient
 
         # Resolve Proxmox config: vault overrides env
-        proxmox_host = settings.proxmox_host
         proxmox_port = settings.proxmox_port
         proxmox_verify_ssl = settings.proxmox_verify_ssl
         if vault:

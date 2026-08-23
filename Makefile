@@ -46,7 +46,14 @@ gate-web:
 	# exactly that once (an unsatisfiable transitive picomatch pin) and it was
 	# caught by CI on a release sync rather than here.
 	cd web && npm ci --dry-run >/dev/null
-	cd web && npm run build && npx svelte-check && npx vitest run
+	# `--fail-on-warnings`, NOT `--threshold warning`: the threshold flag only
+	# filters what is PRINTED and still exits 0, so it looks like a gate and is
+	# not one (found by reverting a fixed label and watching the "gate" pass).
+	# The warnings here are the a11y ones - an unassociated <label>, a click
+	# handler on a non-interactive element. Eleven had accumulated silently
+	# because the gate only failed on errors, which is how "accessible" quietly
+	# stops being true (#445 B5).
+	cd web && npm run build && npx svelte-check --fail-on-warnings && npx vitest run
 
 gate-go:
 	cd agent/go && $(GO_ENV) $(GO_BIN) vet ./... && $(GO_ENV) $(GO_BIN) test ./...

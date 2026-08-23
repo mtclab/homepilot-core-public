@@ -14,6 +14,7 @@ the database and the transition table.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -141,3 +142,81 @@ class TestApplyJourney:
         # actor, because then "who applied this" has two answers.
         with_actor = [r["user_id"] for r in rows if r["user_id"] not in ("", "system", None)]
         assert with_actor == ["operator"], f"expected one actor-bearing apply row, got {with_actor}"
+
+
+class TestTheExecutionLogSurvivesTheTask:
+    """What happened on the host must outlive the apply that did it (#445 A3).
+
+    The executor produces an `execution_log` for every apply and the runner used
+    to drop it: the one artefact describing what actually happened existed for
+    the length of one function call and was then unrecoverable. A failed apply
+    left an operator with a one-line `error` and nothing to diagnose from, which
+    is why the epic listed "execution output exists and is unviewable" - it was
+    worse than that, it was not kept at all.
+
+    Teeth: remove `result_json=payload` from `_record_outcome` and both tests
+    here fail, because the task finishes with no record of what it did.
+    """
+
+    async def test_a_successful_apply_keeps_its_output(self, journey):
+        runner, task_repo, _store, lifecycle = journey
+        artifact_id = await lifecycle.propose(_spec("2026-08-21-log-success-aa11bb"))
+        await lifecycle.approve(artifact_id, "operator")
+
+        started = await runner.start_apply(artifact_id, approved_by="operator")
+        await runner.await_task(started["task_id"], timeout=10.0)
+
+        task = await task_repo.get_task(started["task_id"])
+        assert task["status"] == "succeeded"
+        assert task["result_json"], "the task kept no record of what it did"
+        assert json.loads(task["result_json"])["execution_log"] == "stub: applied"
+
+    async def test_a_failed_apply_keeps_its_output(self, journey):
+        """The case that matters most: a failure an operator has to diagnose."""
+        runner, task_repo, _store, lifecycle = journey
+        executor = runner.executor
+        executor._dispatch = AsyncMock(
+            return_value=ExecutionResult(
+                success=False,
+                execution_log="step 1: ok\nstep 2: connection refused",
+                failure_reason="step 2 failed",
+            )
+        )
+        artifact_id = await lifecycle.propose(_spec("2026-08-21-log-failure-cc22dd"))
+        await lifecycle.approve(artifact_id, "operator")
+
+        started = await runner.start_apply(artifact_id, approved_by="operator")
+        await runner.await_task(started["task_id"], timeout=10.0)
+
+        task = await task_repo.get_task(started["task_id"])
+        assert task["status"] == "failed"
+        assert task["error"], "a failed task must still say why in one line"
+        log = json.loads(task["result_json"])["execution_log"]
+        assert "connection refused" in log, (
+            "the failure detail was discarded - the one-line error is all an "
+            "operator would have to work from"
+        )
+
+    async def test_a_very_long_log_keeps_the_end(self, journey):
+        """Truncation must keep the tail: the end of a log is where the failure
+        is, so trimming from the back would throw away the reason."""
+        runner, task_repo, _store, lifecycle = journey
+        tail = "the actual failure line"
+        runner.executor._dispatch = AsyncMock(
+            return_value=ExecutionResult(
+                success=False,
+                execution_log=("x" * 60000) + tail,
+                failure_reason="boom",
+            )
+        )
+        artifact_id = await lifecycle.propose(_spec("2026-08-21-log-long-ee33ff"))
+        await lifecycle.approve(artifact_id, "operator")
+
+        started = await runner.start_apply(artifact_id, approved_by="operator")
+        await runner.await_task(started["task_id"], timeout=10.0)
+
+        task = await task_repo.get_task(started["task_id"])
+        log = json.loads(task["result_json"])["execution_log"]
+        assert log.endswith(tail), "truncation dropped the end, which is where the reason is"
+        assert "truncated" in log, "a truncated log must say that it was truncated"
+        assert len(log) < 60000

@@ -1,3 +1,5 @@
+import { writable, type Writable } from 'svelte/store';
+
 import { getApiBase } from './apiBase';
 
 // The API lives at the origin root (see api.ts) — NOT under the UI `base`
@@ -63,6 +65,16 @@ export function onArtifactEvent(handler: Handler): () => void {
 	};
 }
 
+/**
+ * Whether the live-update stream is currently connected (#435).
+ *
+ * The stream reconnected silently with backoff, so when it was down the UI just
+ * quietly stopped updating - with no badge, and no way for an operator to tell
+ * "nothing is happening" from "I am not being told what is happening". On an
+ * ops console those are opposite conclusions.
+ */
+export const streamConnected: Writable<boolean> = writable(false);
+
 let es: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let attempt = 0;
@@ -117,11 +129,13 @@ function open(): void {
 	}
 	es.onopen = () => {
 		attempt = 0;
+		streamConnected.set(true);
 	};
 	for (const t of ARTIFACT_EVENT_TYPES) {
 		es.addEventListener(t, (ev) => dispatch(t, (ev as MessageEvent).data));
 	}
 	es.onerror = () => {
+		streamConnected.set(false);
 		// A native EventSource retries on its own at a fixed cadence; we take over
 		// so a flapping backend backs off (and we respect the server's per-IP
 		// connection cap) instead of hammering it.
@@ -145,6 +159,7 @@ export function startEventStream(): void {
 // Closes the stream and cancels any pending reconnect. Call on logout.
 export function stopEventStream(): void {
 	started = false;
+	streamConnected.set(false);
 	clearReconnect();
 	if (es) {
 		es.close();

@@ -57,6 +57,21 @@
 		}
 	}
 
+	// Which row has its execution log open. One at a time: these are long, and
+	// the point is reading one carefully, not scanning many.
+	let openLog: string | null = null;
+
+	/** The execution output for a task, or '' when it kept none (#445 A3). */
+	function executionLog(t: Task): string {
+		if (!t.result_json) return '';
+		try {
+			const r = JSON.parse(t.result_json) as { execution_log?: string };
+			return r.execution_log ?? '';
+		} catch {
+			return '';
+		}
+	}
+
 	// A provision or install_agent task has no artifact to link to; its identity
 	// is the guest it acted on, which only exists in result_json.
 	function resultSummary(t: Task): string {
@@ -147,21 +162,21 @@
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left pb-2 pr-4">Task</th>
-						<th class="text-left pb-2 pr-4">Artifact</th>
-						<th class="text-left pb-2 pr-4">Action</th>
-						<th class="text-left pb-2 pr-4">Status</th>
-						<th class="text-left pb-2 pr-4">Started</th>
-						<th class="text-left pb-2 pr-4">Finished</th>
-						<th class="text-left pb-2 pr-4">Detail</th>
-						<th class="text-left pb-2"></th>
+						<th class="text-left">Task</th>
+						<th class="text-left">Artifact</th>
+						<th class="text-left">Action</th>
+						<th class="text-left">Status</th>
+						<th class="text-left">Started</th>
+						<th class="text-left">Finished</th>
+						<th class="text-left">Detail</th>
+						<th class="text-left"></th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each tasks as t (t.id)}
 						<tr class="border-b border-divider align-top">
-							<td class="py-2 pr-4 font-mono text-muted" title={t.id}>{shortTaskId(t.id)}</td>
-							<td class="py-2 pr-4">
+							<td class="font-mono text-muted" title={t.id}>{shortTaskId(t.id)}</td>
+							<td>
 								{#if t.artifact_id}
 									<a
 										href="{base}/artifacts/{t.artifact_id}"
@@ -171,16 +186,16 @@
 									<span class="text-muted">—</span>
 								{/if}
 							</td>
-							<td class="py-2 pr-4 text-ink">{t.action}</td>
-							<td class="py-2 pr-4">
+							<td class="text-ink">{t.action}</td>
+							<td>
 								<span class="badge {taskStatusClass(t.status)}">
 									{t.status}
 									{#if t.status === 'running'}<span class="animate-pulse">…</span>{/if}
 								</span>
 							</td>
-							<td class="py-2 pr-4 text-muted whitespace-nowrap">{fmtTs(t.created_at)}</td>
-							<td class="py-2 pr-4 text-muted whitespace-nowrap">{fmtTs(t.finished_at)}</td>
-							<td class="py-2 pr-4 max-w-xs">
+							<td class="text-muted whitespace-nowrap">{fmtTs(t.created_at)}</td>
+							<td class="text-muted whitespace-nowrap">{fmtTs(t.finished_at)}</td>
+							<td class="max-w-xs">
 								{#if t.status === 'failed' && t.error}
 									<span class="text-danger break-words">{t.error}</span>
 								{:else if resultSummary(t)}
@@ -189,7 +204,14 @@
 									<span class="text-muted">—</span>
 								{/if}
 							</td>
-							<td class="py-2">
+							<td class="whitespace-nowrap">
+								{#if executionLog(t)}
+									<button
+										class="text-xs text-accent hover:text-accent-strong mr-2"
+										aria-expanded={openLog === t.id}
+										on:click={() => (openLog = openLog === t.id ? null : t.id)}
+									>{openLog === t.id ? 'Hide log' : 'Log'}</button>
+								{/if}
 								{#if canWrite && isCancellable(t.status)}
 									<button
 										class="btn btn-danger text-xs px-2 py-0.5"
@@ -199,6 +221,18 @@
 								{/if}
 							</td>
 						</tr>
+						{#if openLog === t.id}
+							<!-- What actually happened on the host. The executor has always
+							     produced this; until #445 A3 the runner discarded it, so a
+							     failed apply left only a one-line error to diagnose from. -->
+							<tr class="border-b border-divider">
+								<td colspan="8">
+									<pre
+										class="code-block text-xs overflow-x-auto whitespace-pre-wrap max-h-80"
+									>{executionLog(t)}</pre>
+								</td>
+							</tr>
+						{/if}
 					{/each}
 				</tbody>
 			</table>
