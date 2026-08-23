@@ -55,6 +55,11 @@ _MAX_TRACKED_IPS = 10000
 
 _RATE_LIMIT_BACKEND = os.environ.get("HP_RATE_LIMIT_BACKEND", "memory")
 _RATE_WINDOW: dict[str, list[float]] = defaultdict(list)
+# Credentialed traffic gets its OWN window (#514/#518 follow-up). One shared
+# window starved login: every UI call landed in it, and /auth/login - always
+# held to the anonymous limit - found it full. 60 authenticated requests a
+# minute made logging in impossible from that IP.
+_RATE_WINDOW_AUTH: dict[str, list[float]] = defaultdict(list)
 _RATE_LOCK = asyncio.Lock()
 
 # NOTE: In-memory rate limiting stores request timestamps per IP in a process-local
@@ -105,20 +110,21 @@ def _get_client_ip(request: Request, trusted_proxies: _ProxyNetworks) -> str:
 
 def _cleanup_rate_window() -> None:
     now = time.time()
-    expired = []
-    for ip, timestamps in _RATE_WINDOW.items():
-        _RATE_WINDOW[ip] = [ts for ts in timestamps if now - ts < _RATE_WINDOW_SEC]
-        if not _RATE_WINDOW[ip]:
-            expired.append(ip)
-    for ip in expired:
-        del _RATE_WINDOW[ip]
-    if len(_RATE_WINDOW) > _MAX_TRACKED_IPS:
-        sorted_ips = sorted(
-            _RATE_WINDOW,
-            key=lambda k: _RATE_WINDOW[k][-1] if _RATE_WINDOW[k] else 0,
-        )
-        for ip in sorted_ips[: len(_RATE_WINDOW) - _MAX_TRACKED_IPS]:
-            del _RATE_WINDOW[ip]
+    for store in (_RATE_WINDOW, _RATE_WINDOW_AUTH):
+        expired = []
+        for ip, timestamps in store.items():
+            store[ip] = [ts for ts in timestamps if now - ts < _RATE_WINDOW_SEC]
+            if not store[ip]:
+                expired.append(ip)
+        for ip in expired:
+            del store[ip]
+        if len(store) > _MAX_TRACKED_IPS:
+            sorted_ips = sorted(
+                store,
+                key=lambda k: store[k][-1] if store[k] else 0,
+            )
+            for ip in sorted_ips[: len(store) - _MAX_TRACKED_IPS]:
+                del store[ip]
 
 
 def configure_logging(level: str) -> None:
@@ -636,41 +642,70 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
     client_ip = _get_client_ip(request, _trusted_proxy_networks)
     now = time.time()
 
-    # Cheap tier first: count against the unauthenticated limit WITHOUT a token
-    # lookup, so an anonymous flood never costs a DB round-trip per request. The
-    # token lookup (to grant the higher authenticated limit) happens only when
-    # the cheap window is already full — bounding the amplification to one
-    # lookup per IP per minute past the anonymous cap.
-    async with _RATE_LOCK:
-        window = [ts for ts in _RATE_WINDOW[client_ip] if now - ts < _RATE_WINDOW_SEC]
-        _RATE_WINDOW[client_ip] = window
-        count = len(window)
+    # Two windows per IP, routed by whether the request CARRIES credentials
+    # (a header check - no DB): credentialed traffic competes only with itself
+    # for the authenticated limit, and login/anonymous traffic only with itself
+    # for the anonymous one. The old single window starved /auth/login - held
+    # to the anonymous limit but sharing a window the UI's own calls filled.
+    #
+    # Cheap tier preserved: presence of credentials is taken at face value
+    # until that window passes the ANONYMOUS limit; only then is the token
+    # actually verified - so junk-cookie floods cost one DB lookup per request
+    # only past the anonymous cap, and unverifiable credentials fall back to
+    # the anonymous window (and its limit) rather than buying the higher one.
+    carries_creds = request.url.path != "/auth/login" and (
+        request.headers.get("authorization", "").startswith("Bearer ")
+        or "hp_token" in request.cookies
+    )
 
-    over_anon = count >= _RATE_LIMIT
-    authenticated = False
-    if over_anon and request.url.path != "/auth/login":
-        authenticated = await _is_authenticated(request)
-    limit = _AUTH_RATE_LIMIT if authenticated else _RATE_LIMIT
+    if carries_creds:
+        async with _RATE_LOCK:
+            auth_window = [
+                ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC
+            ]
+            _RATE_WINDOW_AUTH[client_ip] = auth_window
+            auth_count = len(auth_window)
+        if auth_count >= _RATE_LIMIT and not await _is_authenticated(request):
+            carries_creds = False  # junk credentials: back to the anonymous lane
 
-    async with _RATE_LOCK:
-        # Re-read under lock: another request may have advanced the window.
-        window = [ts for ts in _RATE_WINDOW[client_ip] if now - ts < _RATE_WINDOW_SEC]
-        if len(window) >= limit:
+    if carries_creds:
+        async with _RATE_LOCK:
+            auth_window = [
+                ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC
+            ]
+            if len(auth_window) >= _AUTH_RATE_LIMIT:
+                _RATE_WINDOW_AUTH[client_ip] = auth_window
+                logger.debug(
+                    "rate_limited path=%s client_ip=%s authenticated=True",
+                    request.url.path,
+                    client_ip,
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                    headers={"Retry-After": str(_RATE_WINDOW_SEC)},
+                )
+            auth_window.append(now)
+            _RATE_WINDOW_AUTH[client_ip] = auth_window
+            _cleanup_rate_window()
+    else:
+        async with _RATE_LOCK:
+            window = [ts for ts in _RATE_WINDOW[client_ip] if now - ts < _RATE_WINDOW_SEC]
+            if len(window) >= _RATE_LIMIT:
+                _RATE_WINDOW[client_ip] = window
+                logger.debug(
+                    "rate_limited path=%s client_ip=%s authenticated=False",
+                    request.url.path,
+                    client_ip,
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                    headers={"Retry-After": str(_RATE_WINDOW_SEC)},
+                )
+            window.append(now)
             _RATE_WINDOW[client_ip] = window
-            logger.debug(
-                "rate_limited path=%s client_ip=%s authenticated=%s",
-                request.url.path,
-                client_ip,
-                authenticated,
-            )
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "rate limit exceeded"},
-                headers={"Retry-After": str(_RATE_WINDOW_SEC)},
-            )
-        window.append(now)
-        _RATE_WINDOW[client_ip] = window
-        _cleanup_rate_window()
+            _cleanup_rate_window()
     response = cast(Response, await call_next(request))
     elapsed = time.time() - start
     # Metric label is the ROUTE TEMPLATE (e.g. /agents/{agent_id}), not the raw
