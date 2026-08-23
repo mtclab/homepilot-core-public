@@ -18,7 +18,7 @@
 services:
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.0.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.0.1}
     build:
       context: ./repo
       dockerfile: Dockerfile

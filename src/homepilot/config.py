@@ -19,11 +19,32 @@ def _env_files() -> list[str]:
         str(Path(_os.environ.get("HP_DATA_DIR", str(Path.home() / ".hp"))) / ".env"),
         ".env",
     ]
-    files = [f for f in dict.fromkeys(candidates) if Path(f).exists()]
-    if files:
-        import logging as _logging
+    import logging as _logging
 
-        _logging.getLogger(__name__).debug("Loading config from: %s", ", ".join(files))
+    log = _logging.getLogger(__name__)
+    files = []
+    for f in dict.fromkeys(candidates):
+        if not Path(f).exists():
+            continue
+        # An unreadable dotenv must not brick the boot with a raw traceback
+        # (seen live: a root-owned .env in the data volume - written by a root
+        # `docker exec` - stopped the 3.0.0 container from ever starting).
+        # The file's SETTINGS are skipped, and that is worth shouting about,
+        # but a config file the process cannot read is the operator's to fix,
+        # not a reason to refuse to serve everything configured via env vars.
+        if not _os.access(f, _os.R_OK):
+            log.error(
+                "Config file %s exists but is NOT READABLE by this process "
+                "(uid %s) - its settings are being IGNORED. Fix the ownership "
+                "(e.g. `chown homepilot:homepilot %s` in the container).",
+                f,
+                _os.getuid(),
+                f,
+            )
+            continue
+        files.append(f)
+    if files:
+        log.debug("Loading config from: %s", ", ".join(files))
     return files
 
 
