@@ -2141,7 +2141,13 @@ def webhook_list(
     if output == "json":
         # The HMAC signing key is redacted, exactly as the table branch omits it
         # (#388). `--output json` is what gets piped into CI logs.
-        redacted = [{**c, "secret": "***"} if c.get("secret") else dict(c) for c in configs]
+        # nosec B105 - "***" is the redaction MARKER that replaces the signing
+        # key, not a credential. Flagged as a hardcoded password by bandit,
+        # which cannot tell the two apart.
+        redacted = [
+            {**c, "secret": "***"} if c.get("secret") else dict(c)  # nosec B105
+            for c in configs
+        ]
         console.print(json.dumps(redacted, default=str))
         return
 
