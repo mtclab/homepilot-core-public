@@ -660,9 +660,7 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
 
     if carries_creds:
         async with _RATE_LOCK:
-            auth_window = [
-                ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC
-            ]
+            auth_window = [ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC]
             _RATE_WINDOW_AUTH[client_ip] = auth_window
             auth_count = len(auth_window)
         if auth_count >= _RATE_LIMIT and not await _is_authenticated(request):
@@ -670,9 +668,7 @@ async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
 
     if carries_creds:
         async with _RATE_LOCK:
-            auth_window = [
-                ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC
-            ]
+            auth_window = [ts for ts in _RATE_WINDOW_AUTH[client_ip] if now - ts < _RATE_WINDOW_SEC]
             if len(auth_window) >= _AUTH_RATE_LIMIT:
                 _RATE_WINDOW_AUTH[client_ip] = auth_window
                 logger.debug(
