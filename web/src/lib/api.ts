@@ -386,12 +386,38 @@ export interface Host {
 	import_state?: string;
 	role_source?: string;
 	ip_source?: string;
+	proxmox_id?: number | null;
+	os_info?: string | null;
+	cpu_cores?: number | null;
+	memory_mb?: number | null;
+	disk_gb?: number | null;
 	/**
 	 * When the hypervisor stopped reporting this host (#445 A5). Null for a host
 	 * Proxmox still sees, and for every manually added host - Proxmox never
 	 * looked for those, so it has no standing to call them gone.
 	 */
 	absent_since?: string | null;
+	/** The agent enrolled on this machine (#514 S1) - the live channel. */
+	agent_id?: string | null;
+	agent_connected?: boolean;
+	agent_version?: string | null;
+}
+
+/** The host page's Agent section (#514 S2): the channel, and why it last broke. */
+export interface AgentOnHost {
+	agent_id: string;
+	connected: boolean;
+	version?: string | null;
+	arch?: string | null;
+	runtime?: string | null;
+	first_seen?: string | null;
+	connected_at?: string | null;
+	last_heartbeat?: string | null;
+	disconnected_at?: string | null;
+	last_error?: string | null;
+	last_error_at?: string | null;
+	credential_set_at?: string | null;
+	revoked_at?: string | null;
 }
 
 export interface DriftCheck {
@@ -601,7 +627,7 @@ export const api = {
 	},
 
 	// --- Audit ---
-	listAudit(params: { action?: string; artifact_id?: string; source?: string; q?: string; limit?: number; offset?: number } = {}) {
+	listAudit(params: { action?: string; artifact_id?: string; source?: string; target_host?: string; q?: string; limit?: number; offset?: number } = {}) {
 		return req<{ items: AuditEntry[]; total: number }>('/audit' + qs(params as Record<string, string | number | boolean | undefined>));
 	},
 
@@ -649,6 +675,9 @@ export const api = {
 			method: 'POST',
 			body: JSON.stringify({ action, host_ids: hostIds }),
 		});
+	},
+	getHost(id: string) {
+		return req<Host & { services: Service[]; agent?: AgentOnHost }>(`/inventory/${id}`);
 	},
 	getHostDoc(id: string) {
 		return req<HostDoc>(`/inventory/${id}/doc`);
@@ -867,10 +896,12 @@ export async function refreshSession(): Promise<MeInfo | null> {
 		return null;
 	}
 }
-// Link to a host's own metrics inside HomePilot. The Agents page reads the
-// `host` query parameter and opens that host's recent panel, so the link lands
-// on the data rather than on a list the operator has to search.
-export function hostMetricsUrl(base: string, hostname: string): string {
+// Link to a host's own metrics inside HomePilot (#514 S2): the host page is
+// where a machine's stats live now. Takes the host ID when the caller has it;
+// hostname fallback resolves through the list for callers that don't.
+export function hostMetricsUrl(base: string, hostname: string, hostId?: string): string {
+	if (hostId) return `${base}/hosts/${encodeURIComponent(hostId)}`;
 	if (!hostname) return '';
-	return `${base}/agents?host=${encodeURIComponent(hostname)}`;
+	// No id in hand: land on the filtered fleet list (S4 renames it to Hosts).
+	return `${base}/inventory?q=${encodeURIComponent(hostname)}`;
 }

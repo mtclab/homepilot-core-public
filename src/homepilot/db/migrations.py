@@ -693,6 +693,93 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         # migration - only the PATCH that writes it.
         ("ALTER TABLE hosts ADD COLUMN pinned_fields TEXT", "hosts", "pinned_fields"),
     ],
+    25: [
+        # One noun: Host (#514 S1). A machine carrying a connected agent was not
+        # a host in the product's own model - Inventory said "No hosts" and
+        # Coverage said 0% while an enrolled agent sat one tab over. Enrolment
+        # now creates-or-links a host row, which needs (a) 'agent' as a legal
+        # `source`, and (b) an explicit `agent_id` link so the join is a fact,
+        # not a hostname coincidence.
+        #
+        # Table rebuild because the source CHECK cannot be altered in place.
+        # Same rename-into-place dance as migration 21, for the same
+        # services.host_id foreign-key reason documented there.
+        """CREATE TABLE hosts_new (
+            id              TEXT PRIMARY KEY,
+            proxmox_id      INTEGER,
+            hostname        TEXT NOT NULL,
+            node            TEXT,
+            host_type       TEXT NOT NULL,
+            role            TEXT NOT NULL DEFAULT 'guest',
+            ip_address      TEXT,
+            fqdn            TEXT,
+            status          TEXT NOT NULL DEFAULT 'unknown',
+            tags            TEXT,
+            managed_by      TEXT NOT NULL DEFAULT 'user',
+            managed         INTEGER NOT NULL DEFAULT 0,
+            storage_pool    TEXT,
+            os_info         TEXT,
+            cpu_cores       INTEGER,
+            memory_mb       INTEGER,
+            disk_gb         INTEGER,
+            network_bridge  TEXT,
+            vlan_id         INTEGER,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            pve_status      TEXT,
+            source          TEXT NOT NULL DEFAULT 'discovered'
+                            CHECK(source IN
+                              ('hp_created','discovered','imported','manual','agent')),
+            description     TEXT,
+            artifact_id     TEXT,
+            import_state    TEXT CHECK(import_state IN ('pending','adopted','ignored')),
+            role_source     TEXT DEFAULT 'inferred'
+                            CHECK(role_source IN ('inferred','user','artifact')),
+            ip_source       TEXT CHECK(ip_source IN ('pve','dhcp','user','dns')),
+            owner           TEXT,
+            absent_since    TEXT,
+            pinned_fields   TEXT,
+            agent_id        TEXT
+        )""",
+        """INSERT INTO hosts_new (
+            id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
+            tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
+            disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
+            source, description, artifact_id, import_state, role_source, ip_source,
+            owner, absent_since, pinned_fields
+        ) SELECT
+            id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
+            tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
+            disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
+            source, description, artifact_id, import_state, role_source, ip_source,
+            owner, absent_since, pinned_fields
+        FROM hosts""",
+        "DROP TABLE hosts",
+        "ALTER TABLE hosts_new RENAME TO hosts",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_hosts_agent ON hosts(agent_id)",
+        # Backfill: machines whose agent enrolled BEFORE this migration. Link by
+        # exact hostname where that is unambiguous; where a hostname matches no
+        # host, create the row the enrolment would have created.
+        """UPDATE hosts SET agent_id = (
+            SELECT a.agent_id FROM agents a WHERE a.hostname = hosts.hostname
+        ) WHERE agent_id IS NULL
+          AND (SELECT COUNT(*) FROM agents a WHERE a.hostname = hosts.hostname) = 1""",
+        """INSERT INTO hosts (id, hostname, host_type, role, status, managed_by,
+                              managed, source, role_source, agent_id,
+                              created_at, updated_at)
+            SELECT lower(hex(randomblob(16))), a.hostname, 'physical', 'guest',
+                   'unknown', 'agent', 0, 'agent', 'inferred', a.agent_id,
+                   COALESCE(a.first_seen, strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                   COALESCE(a.first_seen, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            FROM agents a
+            WHERE NOT EXISTS (SELECT 1 FROM hosts h WHERE h.hostname = a.hostname)""",
+    ],
 }
 
 

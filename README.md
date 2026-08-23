@@ -46,11 +46,11 @@ longer the way in.
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=2.9.0 docker compose pull
+HP_IMAGE_TAG=3.0.0 docker compose pull
 docker compose up -d
 ```
 
-Available tags: `latest`, `2.9.0`, `2.9`, `2` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
+Available tags: `latest`, `3.0.0`, `3.0`, `3` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
 
 ## Services
 

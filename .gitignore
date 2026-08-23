@@ -19,3 +19,4 @@ AGENTS.md
 .pip_packages/
 *.so
 agent_cli.py
+.claude/

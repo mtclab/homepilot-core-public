@@ -42,7 +42,12 @@ async def summary(request: Request) -> dict[str, Any]:
     by_status = await grouped("SELECT status, COUNT(*) FROM hosts GROUP BY status")
     by_role = await grouped("SELECT role, COUNT(*) FROM hosts GROUP BY role")
     by_type = await grouped("SELECT host_type, COUNT(*) FROM hosts GROUP BY host_type")
-    managed = (await db.fetchone("SELECT COUNT(*) c FROM hosts WHERE managed = 1"))["c"]
+    # A host with a linked agent IS managed for coverage purposes (#514 S1):
+    # HomePilot has a live channel onto it, which is what "covered" means to an
+    # operator. The `managed` flag keeps its adoption semantics elsewhere.
+    managed = (
+        await db.fetchone("SELECT COUNT(*) c FROM hosts WHERE managed = 1 OR agent_id IS NOT NULL")
+    )["c"]
     # "uncovered" = a discovered guest still pending adoption (not yet managed).
     uncovered = (
         await db.fetchone(

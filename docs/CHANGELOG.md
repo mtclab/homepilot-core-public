@@ -1,5 +1,55 @@
 # Changelog
 
+## v3.0.0 (2026-08-23)
+
+The operator console. The UI's nouns now match the operator's world - my
+machines, and what HomePilot does to them - instead of the implementation's.
+A major version because addresses and names changed; **nothing else did**:
+no schema surprises beyond one additive migration, no API removals, no agent
+changes. Upgrading is pulling the image.
+
+### REQUIRED READING BEFORE UPGRADING
+
+**Old bookmarks keep working.** Eleven tabs became five - Overview, Hosts,
+Changes, Records, Settings - and every pre-move URL redirects: `/ui/inventory`
+and `/ui/agents` land on Hosts, `/ui/artifacts` / `/ui/review` / `/ui/drift`
+on Changes, `/ui/tasks` / `/ui/journal` / `/ui/kb` on Records, `/ui/tokens`
+on Settings.
+
+**Enrolled agents' machines appear in inventory on their own.** Migration 25
+links every agent to a host row (creating one where none exists, source
+`agent`). After the upgrade your Hosts page may show MORE machines than
+Inventory did - those are the agent-carrying hosts that were invisible before.
+Coverage counts them as covered, so that number can jump. Neither is a defect;
+both are the point.
+
+### One noun: Host
+An enrolled agent's machine is a host - enrolment creates-or-links the row,
+the agent's report fills the gaps (never overwriting what Proxmox or an
+operator set), and the host's status follows the agent's channel unless an
+operator pinned it.
+
+### A real host page
+`/ui/hosts/{id}`: identity and facts, metrics with range switching (this is
+where a machine's stats live now), the changes and journal scoped to the
+machine, and the agent's version, channel state and last refusal reason -
+with adopt, zero-touch install, edits, revoke and forget on the same page.
+The old details dump (raw JSON, values floating at the table edge) is gone.
+
+### Fleet operations
+Select the disconnected half of a fleet in one click, forget or revoke the
+whole batch behind ONE dialog that names every machine, and watch rows update
+in place - no reloads, no buttons swapping under the cursor.
+
+### Honest numbers
+"In spec" shows a dash until something has actually been checked. Coverage
+counts machines HomePilot has a live channel onto. Empty states name a door
+that is actually open on this install.
+
+### Relocations
+Alert rules live in Settings -> Monitoring (firing alerts still show on the
+Overview and the affected host); API tokens live in Settings.
+
 ## v2.9.0 (2026-08-23)
 
 The release that makes the web UI enough to run HomePilot with, and closes the

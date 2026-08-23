@@ -6,7 +6,7 @@
 	import { base } from '$app/paths';
 	import { toast } from '$lib/stores';
 	import { hasCookieSession, getToken, api, sessionStore, refreshSession, setToken } from '$lib/api';
-	import { isAdmin as capIsAdmin } from '$lib/capabilities';
+	
 	import { startEventStream, stopEventStream, streamConnected } from '$lib/events';
 
 	// `admin: true` items lead to admin-only endpoints (/agents/, /auth/tokens).
@@ -14,24 +14,21 @@
 	// page 403s. Settings deliberately stays open to everyone: it holds the API
 	// base URL, the token field and health, which a read-only operator needs;
 	// the admin-only Proxmox section inside it is gated there instead.
+	// Five groups (#514 S4, decided 2026-08-23): glance / my machines / what
+	// HomePilot does / what happened / plumbing. Eleven flat tabs mixed four
+	// different jobs; Changes and Records carry their views as in-page tabs.
 	const nav = [
-		{ href: '/',          label: 'Overview' },
-		{ href: '/artifacts', label: 'Artifacts' },
-		{ href: '/review',    label: 'Review' },
-		{ href: '/inventory', label: 'Inventory' },
-		{ href: '/kb',        label: 'KB' },
-		{ href: '/agents',    label: 'Agents',  admin: true },
-		{ href: '/tokens',    label: 'Tokens',  admin: true },
-		{ href: '/drift',     label: 'Drift' },
-		{ href: '/tasks',     label: 'Tasks' },
-		{ href: '/journal',   label: 'Journal' },
-		{ href: '/settings',  label: 'Settings' },
+		{ href: '/',         label: 'Overview' },
+		{ href: '/hosts',    label: 'Hosts' },
+		{ href: '/changes',  label: 'Changes' },
+		{ href: '/records',  label: 'Records' },
+		{ href: '/settings', label: 'Settings' },
 	];
 
-	// Default-deny while the session is still loading, so admin entries never
-	// flash for a read-only operator.
-	$: adminUser = capIsAdmin($sessionStore?.capabilities);
-	$: visibleNav = nav.filter((item) => !item.admin || adminUser);
+	// No admin-gated entries remain: the admin-only surfaces (tokens, alert
+	// rules, fleet credentials) live inside Settings and Hosts, which gate
+	// their own controls.
+	$: visibleNav = nav;
 
 	$: current = $page.url.pathname;
 

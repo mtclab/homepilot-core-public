@@ -2,7 +2,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 // test-mocks MUST come before the component, or the component resolves the real
 // $lib/api and never sees the mock.
-import '../../lib/test-mocks';
+import '../../../lib/test-mocks';
 import Review from './+page.svelte';
 import { api } from '$lib/api';
 
