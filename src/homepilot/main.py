@@ -42,7 +42,14 @@ _REQUEST_DURATION = Histogram(
 )
 
 _RATE_LIMIT = int(os.environ.get("HP_RATE_LIMIT", "60"))
-_AUTH_RATE_LIMIT = int(os.environ.get("HP_AUTH_RATE_LIMIT", "120"))
+# 300, up from 120 (#514): the operator console legitimately fans out - a host
+# page load fires the host, doc, journal, eligibility, latest-metrics and one
+# series call per metric, and refreshes metrics every 30s. At 120/min a real
+# operator with two tabs open could rate-limit THEMSELVES (the mirror's live-
+# browser e2e did exactly that). The anonymous limit stays at 60: an
+# authenticated session is not a credential-guessing threat, and both remain
+# env-tunable.
+_AUTH_RATE_LIMIT = int(os.environ.get("HP_AUTH_RATE_LIMIT", "300"))
 _RATE_WINDOW_SEC = 60
 _MAX_TRACKED_IPS = 10000
 

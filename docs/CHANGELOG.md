@@ -50,6 +50,12 @@ that is actually open on this install.
 Alert rules live in Settings -> Monitoring (firing alerts still show on the
 Overview and the affected host); API tokens live in Settings.
 
+### Rate limit
+The authenticated per-IP request limit default rises 120 -> 300/min
+(`HP_AUTH_RATE_LIMIT`): the richer console legitimately makes more API calls
+per page, and at 120 a busy operator could rate-limit themselves. The
+anonymous limit is unchanged at 60.
+
 ## v2.9.0 (2026-08-23)
 
 The release that makes the web UI enough to run HomePilot with, and closes the
@@ -542,7 +548,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 ### Testing
 
-- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance at `10.0.0.1:8000`.
+- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance at `10.96.16.200:8000`.
 - **Rate limit resilience**: Session-scoped `session_auth` fixture pre-creates all tokens (session, revoke target, scope target, read-only, roundtrip) with 429 retry logic. Individual tests reuse pre-created tokens instead of creating new ones on the fly, eliminating rate-limit skips.
 - **Browser cookie auth**: `auth_page` fixture authenticates via browser UI login so cookies (`hp_token`, `hp_csrf`) are set correctly in the Playwright context.
 - **CSRF headers**: All cookie-authenticated mutations include `x-csrf-token` + `x-requested-with: XMLHttpRequest` headers.
@@ -552,7 +558,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 ### Fixes
 
 - **AGENTS.md model assignments**: Updated to match current `~/.config/opencode/agents/roles.md` (deepseek-v4-pro removed, kimi-k2.6 now primary for CoreSquad/ToolingSquad/QATester).
-- **matrix_server.py default URL**: Changed from `example.com` to `matrix.example.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
+- **matrix_server.py default URL**: Changed from `example.com` to `matrix.mtcchat.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
 
 ## v2.2.3 (2026-05-25)
 
@@ -569,7 +575,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 - **Auto-generate vault passphrase**: When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the system generates a 256-bit passphrase using `secrets.token_urlsafe(32)` and persists it to `{data_dir}/.vault_passphrase` (mode `0o600`). On subsequent starts, the persisted passphrase is loaded automatically. This enables zero-secrets deployment where `.env` contains no HomePilot secrets.
 - **`_try_vault_secret` multi-key extraction**: The configuration resolver now attempts multiple keys when extracting secrets from the vault: `value` → `secret` → `key` → `token` → first value. This accommodates different vault secret formats (e.g., `pve-token` stored as `{"token": "..."}` vs `secret-key` stored as `{"value": "..."}`).
-- **Zero-secrets deployment verified**: Production dev server (homepilot.example.com:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
+- **Zero-secrets deployment verified**: Production dev server (your-server.local:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
 
 ### Bug Fixes
 
