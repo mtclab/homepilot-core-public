@@ -553,6 +553,11 @@
 									<button class="btn btn-xs text-[10px]" on:click={() => ignoreOne(h)}>Ignore</button>
 								{:else if h.import_state === 'ignored'}
 									<span class="text-muted">Ignored</span>
+								{:else if h.agent_id}
+									<!-- An agent-carried host's actions live on its host page
+									     (revoke/forget/install); the row offers the door, not
+									     an adopt-era dash (#514 S5). -->
+									<a class="text-accent hover:text-accent-strong text-[10px]" href="{base}/hosts/{h.id}">Open</a>
 								{:else}
 									<span class="text-muted">—</span>
 								{/if}

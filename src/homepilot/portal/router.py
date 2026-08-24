@@ -92,6 +92,13 @@ def _client_cn(request: Request) -> str:
     return assert_trusted_cn(peer, request.headers, trust)
 
 
+def _hosts_repo(request: Request) -> Any:
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise PortalNotConfiguredError("The backend has not finished starting")
+    return repo
+
+
 def _repo(request: Request) -> InviteRepository:
     repo = getattr(request.app.state, "invite_repo", None)
     if not isinstance(repo, InviteRepository):
@@ -241,6 +248,30 @@ async def invite_redeem(request: Request, token: str) -> Any:
             status_code=503,
             heading="Cannot build machines right now",
             message="The lab's hypervisor connection is not available. Try again later.",
+        )
+
+    # Per-guest budget (#442 G1.5): the invite caps THIS machine, the quota
+    # caps the GUEST. Checked before the claim so a blocked redemption leaves
+    # the invite open - the friend can free resources and try again.
+    from ..guest.quota import check_provision
+
+    decision = await check_provision(
+        _hosts_repo(request),
+        cn,
+        cores=caps.cores or 0,
+        memory_mb=caps.memory_mb or 0,
+        disk_gb=caps.disk_gb or 0,
+    )
+    if not decision.allowed:
+        return render(
+            "message.html",
+            status_code=409,
+            heading="This would exceed your resource budget",
+            message=(
+                "Adding this machine would go over your allowance for: "
+                + ", ".join(decision.exceeded)
+                + ". Remove or shrink one of your machines, or ask for a bigger budget."
+            ),
         )
 
     name = identity.hostname or _default_name(cn, str(row["id"]))

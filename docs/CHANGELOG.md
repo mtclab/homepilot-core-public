@@ -1,5 +1,48 @@
 # Changelog
 
+## v3.1.0 (2026-08-24)
+
+The guest portal, as envisioned: same backend, a different client. A friend
+with a client certificate gets one page - their machines, power buttons, and
+their budget - and nothing else HomePilot has.
+
+### To turn it on
+
+1. Add the vhost block from `docs/guest-portal.md` to your public front
+   nginx - one proxy location for `/guest/*` and `/invite/*`, nothing else.
+   The portal page ships inside the backend and is served at `/guest/`;
+   nothing is copied anywhere.
+2. Set the four `HP_PORTAL_*` variables on the backend (unset = every guest
+   route answers 503, fail-closed).
+3. Mint invites and set budgets from **Settings -> Guests** in the console,
+   or `hp invite create` / `hp quota set`.
+
+### What a guest gets
+
+Their machines (state, address, size), start / stop / reboot behind a
+confirm, budget meters, invite redemption. Ownership is watertight by
+construction: every query loads by owner, another guest's machine answers
+exactly like a typo, no topology or hypervisor error text ever reaches a
+guest page.
+
+### Per-guest budgets
+
+`guest_quotas` (one additive migration): totals across ALL a guest's machines
+- count, cores, memory, disk. Redemption stops at the line and leaves the
+invite open; the portal shows the meters so the line is never a surprise.
+
+### Console
+
+Settings -> Guests: every guest's usage next to their limits, invite mint
+(the token is shown exactly once), revoke, budget editing. Overview gains a
+fleet-health strip - one chip per host, straight to its page.
+
+### Also
+
+Agent-carried rows on the Hosts list link to their host page instead of an
+adopt-era dash; the live-browser e2e now walks every route, proves all nine
+S4 redirects on the shipped artifact, and runs a phone-viewport journey.
+
 ## v3.0.1 (2026-08-23)
 
 Hotfix for the first real 3.0.0 install. **If you ever re-ran

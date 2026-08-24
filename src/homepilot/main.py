@@ -825,6 +825,16 @@ app.include_router(metrics_router, dependencies=[Depends(require_token)])
 # route (source address + shared secret + verify header + CN binding). nginx
 # publishes only this prefix on the public mTLS vhost - see docs/portal.md.
 app.include_router(portal_router, prefix="/invite", tags=["invite"])
+# The guest API (#442 G1): same trust model, same NO-token-dependency design -
+# authenticated by the proxy-asserted client certificate, fail-closed without
+# it. The public vhost publishes /invite/* and /guest/* and nothing else; the
+# separate guest client (G2) is its only intended consumer.
+from .guest.admin_router import router as guest_admin_router  # noqa: E402
+from .guest.router import router as guest_router  # noqa: E402
+
+app.include_router(guest_router, prefix="/guest", tags=["guest"])
+# Operator-side guest management (#442 G3): ordinary admin-scoped console API.
+app.include_router(guest_admin_router, dependencies=[Depends(require_token)])
 # The first-run claim carries NO token dependency by design: it is the path by
 # which the FIRST token comes into existence, so requiring one is a deadlock.
 # Its own credential is the claim code (constant-time compared, rate limited),
@@ -860,6 +870,14 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/invite/{token}"),
         ("POST", "/invite/{token}"),
         ("GET", "/invite/{token}/status"),
+        # Guest API (#442 G1): same mTLS trust model as the invite portal -
+        # every route re-derives the CN through portal.trust and scopes every
+        # query to hosts the CN owns. No API token exists on the guest side.
+        ("GET", "/guest/"),
+        ("GET", "/guest/vms"),
+        ("GET", "/guest/quota"),
+        ("GET", "/guest/vms/{host_id}"),
+        ("POST", "/guest/vms/{host_id}/power"),
         # First-run claim: the route that MINTS the first admin token cannot
         # require one. Its gate is the claim code - generated at first boot,
         # stored only as a sha256, constant-time compared and rate limited - and

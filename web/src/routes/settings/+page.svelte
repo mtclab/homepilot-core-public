@@ -1,5 +1,6 @@
 <script lang="ts">
 	import AlertRules from '$lib/components/AlertRules.svelte';
+	import GuestsPanel from '$lib/components/GuestsPanel.svelte';
 	import TokensPanel from '$lib/components/TokensPanel.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -503,6 +504,11 @@
 		{/if}
 	</div>
 	{/if}
+
+	<div class="card p-4 space-y-3">
+		<h2 class="section-title">Guests</h2>
+		<GuestsPanel />
+	</div>
 
 	<div class="card p-4 space-y-3">
 		<h2 class="section-title">Monitoring</h2>

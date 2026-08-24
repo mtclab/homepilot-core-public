@@ -61,6 +61,10 @@ app.add_typer(webhook_app, name="webhook")
 
 invite_app = typer.Typer(help="Self-service provisioning invites (#442 portal)")
 app.add_typer(invite_app, name="invite")
+quota_app = typer.Typer(
+    help="Per-guest resource budgets (#442): totals across ALL a guest's machines"
+)
+app.add_typer(quota_app, name="quota")
 
 
 def _vault_state(settings: Any) -> str:
@@ -2507,3 +2511,72 @@ def agent_remove(
     else:
         err_console.print(f"[yellow]No agent '{agent_id}' to forget[/yellow]")
         raise typer.Exit(1)
+
+
+@quota_app.command("set")
+def quota_set(
+    cn: str = typer.Option(..., "--cn", help="The guest's certificate CN"),
+    max_vms: int | None = typer.Option(None, "--max-vms", help="Most machines held at once"),
+    max_cores: int | None = typer.Option(
+        None, "--max-cores", help="Total CPU cores across machines"
+    ),
+    max_memory_mb: int | None = typer.Option(None, "--max-memory-mb", help="Total memory (MB)"),
+    max_disk_gb: int | None = typer.Option(None, "--max-disk-gb", help="Total disk (GB)"),
+) -> None:
+    """Set (or replace) a guest's resource budget. Unset axes are unlimited."""
+
+    async def _run() -> None:
+        from homepilot.db.repository import Repository
+        from homepilot.guest.quota import get_quota, set_quota, usage_for
+
+        database, _invites = await _open_invite_repo()
+        try:
+            repo = Repository(database)
+            await set_quota(
+                repo,
+                cn,
+                max_vms=max_vms,
+                max_cores=max_cores,
+                max_memory_mb=max_memory_mb,
+                max_disk_gb=max_disk_gb,
+            )
+            quota = await get_quota(repo, cn)
+            used = await usage_for(repo, cn)
+            console.print(f"Budget for [bold]{cn}[/bold]: {quota}")
+            console.print(
+                f"Current use: {used.vms} machines, {used.cores} cores, "
+                f"{used.memory_mb} MB memory, {used.disk_gb} GB disk"
+            )
+        finally:
+            await database.close()
+
+    asyncio.run(_run())
+
+
+@quota_app.command("list")
+def quota_list() -> None:
+    """Every guest budget, next to what each guest actually uses."""
+
+    async def _run() -> None:
+        from homepilot.db.repository import Repository
+        from homepilot.guest.quota import usage_for
+
+        database, _invites = await _open_invite_repo()
+        try:
+            repo = Repository(database)
+            rows = await database.fetchall("SELECT * FROM guest_quotas ORDER BY cn")
+            if not rows:
+                console.print("[dim]No guest budgets set — invites alone cap provisioning.[/dim]")
+                return
+            for r in rows:
+                used = await usage_for(repo, r["cn"])
+                console.print(
+                    f"[bold]{r['cn']}[/bold]: vms {used.vms}/{r['max_vms'] or '∞'} · "
+                    f"cores {used.cores}/{r['max_cores'] or '∞'} · "
+                    f"mem {used.memory_mb}/{r['max_memory_mb'] or '∞'} MB · "
+                    f"disk {used.disk_gb}/{r['max_disk_gb'] or '∞'} GB"
+                )
+        finally:
+            await database.close()
+
+    asyncio.run(_run())
