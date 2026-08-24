@@ -177,6 +177,32 @@ class ProxmoxClient:
                 )
             await asyncio.sleep(poll_interval)
 
+    async def stop_task(self, node: str, upid: str) -> dict[str, Any]:
+        """Ask PVE to stop an in-flight task (#452). Best-effort by nature.
+
+        A DELETE on a task that already finished is not distinguishable here
+        from a real failure, and either way the caller's next step is the same -
+        unwind whatever the task did - so callers treat any exception raised
+        from here as "could not stop it".
+        """
+        # A UPID contains ':' separators, which are path-illegal unescaped.
+        return await self.call("DELETE", f"/nodes/{node}/tasks/{quote(upid, safe='')}")
+
+    async def delete_vm(self, node: str, vmid: int) -> str:
+        """Destroy a guest, disks and all. Returns the UPID of the destroy task.
+
+        `purge` drops the VM from the jobs/pools/HA entries that reference it and
+        `destroy-unreferenced-disks` takes the disks PVE would otherwise leave on
+        storage - without both, unwinding a half-created guest leaves exactly the
+        debris the cancel was meant to remove.
+        """
+        result = await self.call(
+            "DELETE",
+            f"/nodes/{node}/qemu/{vmid}",
+            query={"purge": 1, "destroy-unreferenced-disks": 1},
+        )
+        return str(result.get("data", ""))
+
     async def set_vm_config(self, node: str, vmid: int, config: dict[str, Any]) -> dict[str, Any]:
         body = dict(config)
         # PVE declares the cloud-init `sshkeys` property with format 'urlencoded'

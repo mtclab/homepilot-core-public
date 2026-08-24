@@ -423,21 +423,17 @@ class TestPinnedTransportEdgeCases:
 class TestConfigAdminSecret:
     def test_default_empty(self):
         s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
             admin_secret="",
         )
         assert s.admin_secret == ""
 
     def test_set_via_env(self, monkeypatch):
         monkeypatch.setenv("HP_ADMIN_SECRET", "my-admin-secret")
-        s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
-        )
+        s = Settings()
         assert s.admin_secret == "my-admin-secret"
 
     def test_set_via_constructor(self):
         s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
             admin_secret="constructor-secret",
         )
         assert s.admin_secret == "constructor-secret"

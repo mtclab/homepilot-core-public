@@ -4,7 +4,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.2.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.3.0}
     build:
       context: .
       dockerfile: Dockerfile

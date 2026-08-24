@@ -47,13 +47,12 @@ docker compose exec backend hp init
 docker compose exec backend hp vault list
 ```
 
-`hp init` sets all 5 vault secrets and creates an admin API token in one step.
+`hp init` sets all 4 vault secrets and creates an admin API token in one step.
 
 ### Manual bootstrap (advanced)
 
 ```bash
 # Set each secret individually
-docker compose exec -it backend hp vault set secret-key
 docker compose exec -it backend hp vault set admin-secret
 docker compose exec -it backend hp vault set pve-token        # {"token": "admin@pam!tokenid=uuid"}
 # (optional) docker compose exec -it backend hp vault set pve-write-token
@@ -322,6 +321,45 @@ configuration. Nothing under an existing deployment is rewritten:
 - `HP_AGENT_HUB_TLS=false` set explicitly still means no TLS - and therefore
   still hits the fail-closed error below on a routable bind.
 
+### Enrolment window — who may join the fleet
+
+The shared hub token authenticates *enrolment*, and it never expires. Until the
+window existed, a copy of it (a stale `.env`, a shell history, a screenshot of
+the token panel) could add machines to the fleet indefinitely, and a fleet member
+gets fleet-root exec and file access on the hosts it claims to be.
+
+The rule the hub enforces at authentication time:
+
+> A shared-token register for a hostname this install has **never seen** is
+> accepted only when the install has **no agents at all** (a first rollout, which
+> must still need zero operator input) **or** an operator has an enrolment window
+> **open**.
+
+Unaffected: per-agent reconnects (they authenticate before this check), one-time
+bootstrap tokens (`POST /agents/bootstrap` — the sanctioned way to add a host
+later), and re-enrolment of a hostname the fleet already contains, which remains
+the recovery path for a host whose credential was revoked or lost.
+
+| Method | Path | Scope | Description |
+|---|---|---|---|
+| GET | `/agents/enrolment-window` | admin | `open`, `expires_at`, `seconds_remaining`, `fleet_empty` |
+| POST | `/agents/enrolment-window` | admin | Open or extend, `{"minutes": 15}` (1–1440, default 15) |
+| DELETE | `/agents/enrolment-window` | admin | Close it now |
+
+```bash
+hp agent enrolment-window status
+hp agent enrolment-window open --minutes 30
+hp agent enrolment-window close
+```
+
+The state is one row in the `settings` table (`agent_enrolment_window_expires_at`)
+compared at authentication time — a restart neither reopens nor extends it, and
+an unreadable value reads as **closed**. Opening and closing are audited with the
+operator who did it (`enrolment_window_opened` / `enrolment_window_closed`), and
+a refusal is audited as `register_rejected` naming the hostname that was claimed.
+The refused agent is told *why* and logs it: `enrolment refused: this hub is not
+accepting new hosts right now…`. No agent row is created for a refused stranger.
+
 ### Transport security (TLS) — fail closed
 
 The Agent Hub carries authentication tokens and privileged command/file traffic.
@@ -363,7 +401,7 @@ Which check applies depends on how the hub's certificate was obtained:
 | `HP_AGENT_TLS_CA=/path/ca.crt` | Standard chain + hostname verification against that CA. |
 | Neither | Standard verification against the system trust store. A self-signed hub certificate **cannot** satisfy this, which is why the pin exists. |
 
-The pin comes from the hub itself: `GET /agents/token` and `GET /agents/bootstrap`
+The pin comes from the hub itself: `GET /agents/token` and `POST /agents/bootstrap`
 return `hub_cert_sha256`, and the UI renders it into the install one-liner as
 `--tls-pin`. Because that value is fetched over the authenticated admin API, the
 trust decision is anchored in the operator's session rather than in
@@ -404,6 +442,13 @@ curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/downl
 agent falls back to the system trust store and the connection fails. The
 installer refuses anything that is not a sha256 fingerprint. See the Agent Hub
 documentation for the grant flags (`--privileged`, `--write-prefix`, …).
+
+The installed binary is always verified before it is put in place. Fetched from
+the control plane (`--hp-api`), the digest travels in the `x-hp-sha256` header
+served with the bytes; fetched from GitHub, it is checked against the release's
+`SHA256SUMS` asset. If no digest can be obtained the install **refuses** and
+names the manifest it looked for - `--allow-unverified` is the only override, and
+it means exactly what it says: a binary that will run as root, unchecked.
 
 ---
 
@@ -496,7 +541,7 @@ services:
 
 ### Zero-secrets `.env`
 
-The `.env` file contains **no HomePilot secrets**. All 5 secrets (`secret-key`, `admin-secret`, `pve-token`, `pve-write-token`, `webhook-secret`) are stored in the encrypted vault and resolved at runtime via `_try_vault_secret`.
+The `.env` file contains **no HomePilot secrets**. All 4 secrets (`admin-secret`, `pve-token`, `pve-write-token`, `webhook-secret`) are stored in the encrypted vault and resolved at runtime via `_try_vault_secret`.
 
 ### Manage secrets
 
@@ -646,9 +691,9 @@ tarball without secrets cannot bring a host back on its own.
 | `homepilot.db` (a `VACUUM INTO` snapshot — consistent, compacted, no `-wal`/`-shm`) | yes | yes |
 | `artifacts/` (the artifact Git repo, history included) | yes | yes |
 | `secrets/vault/identities/master.protected` (the vault identity) | **no** | yes |
-| `secrets/vault/secrets/*.age` (pve-token, secret-key, admin-secret, webhook secrets, …) | **no** | yes |
+| `secrets/vault/secrets/*.age` (pve-token, admin-secret, webhook secrets, …) | **no** | yes |
 | `secrets/.env`, `secrets/.vault_passphrase` (the passphrase that unwraps the identity) | **no** | yes |
-| `secrets/.secret_key`, `secrets/api-token` | **no** | yes |
+| `secrets/api-token` | **no** | yes |
 | `secrets/ssh/` (managed-host SSH keys) | **no** | yes |
 
 Never in a tarball: `homepilot.db-wal` / `homepilot.db-shm` (a stale journal
@@ -663,8 +708,8 @@ docker compose exec backend hp export -o /backups
 
 This prints a loud warning, and it means it: the tarball **cannot restore a
 working host**. The vault identity and the passphrase that unwraps it stay
-behind, so on a rebuilt host every vault secret — `pve-token`, `secret-key`,
-`admin-secret`, webhook secrets — is permanently undecryptable. Use the default
+behind, so on a rebuilt host every vault secret — `pve-token`, `admin-secret`,
+webhook secrets — is permanently undecryptable. Use the default
 form only when you already hold the vault material somewhere else (a secrets
 manager, Docker secrets, a passphrase file you back up separately).
 
@@ -736,11 +781,10 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `2.8.0` | Docker image tag for the backend container |
-| `HP_ENV` | — | Set to `production` to forbid auto-generated secret keys (fail closed) |
+| `HP_IMAGE_TAG` | `3.3.0` | Docker image tag for the backend container |
+| `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
-| `HP_SECRET_KEY` | — | Signs API tokens (required in production; auto-generated in dev if not set) |
 | `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred; must be non-empty to mint tokens) |
 | `HP_VAULT_PASSPHRASE` | — | Vault encryption passphrase (auto-generated if not set) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to file containing vault passphrase (overrides `HP_VAULT_PASSPHRASE`) |
@@ -754,7 +798,8 @@ If the restore was wrong, everything it replaced is under
 | `HP_AGENT_DIST_DIR` | `/app/agent-dist` | Where the agent payload HomePilot serves to guests lives (installer + per-arch binaries, baked into the image). Override only when running from a source checkout, which has none until they are built |
 | `HP_AGENT_HUB_AUTH_TOKEN` | auto-generated | Shared secret for agent authentication (vault `agent-hub-token`, else `<data_dir>/.agent_hub_token`) |
 | `HP_AGENT_HUB_TLS` | `true` | Enable TLS on the hub (required for non-loopback binds) |
-| `HP_AGENT_HUB_TLS_CERT` / `_KEY` | auto-generated | Hub server certificate and private key; self-signed pair written to `<data_dir>/hub/` when unset |
+| `HP_AGENT_HUB_TLS_CERT` | auto-generated | Hub server certificate; a self-signed pair is written to `<data_dir>/hub/` when unset |
+| `HP_AGENT_HUB_TLS_KEY` | auto-generated | Hub server private key; a self-signed pair is written to `<data_dir>/hub/` when unset |
 | `HP_AGENT_HUB_TLS_CA` | — | CA to verify agent client certs (enables mutual TLS) |
 | `HP_HUB_ALLOW_INSECURE` | `false` | Override fail-closed check: allow plaintext on a non-loopback bind (trusted networks only; logs a loud warning) |
 | `HP_AGENT_TLS_INSECURE` | `false` | **Agent side, test-only:** skip hub cert/hostname verification (`CERT_NONE`); exposes MITM. Never in production |
@@ -786,9 +831,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_EMBEDDING_FALLBACK_MODEL` | `nomic-embed-text` | Model name for fallback embedding service |
 | `HP_PORT` | `8000` | Port the CLI dials the local daemon on (`Settings.daemon_port`; distinct from `HP_DAEMON_PORT`, which is the Docker host mapping) |
 | `HP_LOG_LEVEL` | `info` | Log verbosity: `debug` \| `info` \| `warning` \| `error` |
-| `HP_SECRET_KEY_FILE` | — | Path to a file holding the secret key (Docker secrets; overrides `HP_SECRET_KEY`) |
 | `HP_VAULT_DIR` | `<HP_DATA_DIR>/vault` | Vault directory |
-| `HP_SSH_KEY_DIR` | `<HP_DATA_DIR>/ssh` | SSH key directory |
 | `HP_ARTIFACTS_DIR` | `<HP_DATA_DIR>/artifacts` | Artifact working directory |
 | `HP_ALLOWED_HTTP_DOMAINS` | — | Comma-separated allowlist for `http_call_read` (SSRF guard) |
 | `HP_AUTH_RATE_LIMIT` | `120` | Max authentication requests per IP per minute |

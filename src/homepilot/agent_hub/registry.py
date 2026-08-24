@@ -42,6 +42,17 @@ class ConnectedAgent:
     # stamp outbound frames with a seq+MAC; None on unprotected connections.
     replay: ReplaySession | None = None
     _result_futures: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
+    # The action each outstanding request was ISSUED as, keyed by request_id.
+    # Matching a reply on request_id alone makes the hub a confused deputy: any
+    # reply carrying that id resolves the future, whatever it actually did, and
+    # the caller reads it as the result of the command it sent (#381).
+    _result_actions: dict[str, str] = field(default_factory=dict)
+    # True when this connection's agent declared ``"result_action": 1`` in its
+    # register frame, i.e. it echoes the issued action back as ``for_action`` on
+    # every command_result. For such an agent a reply with NO ``for_action`` is
+    # rejected too - fail-closed. An older agent that never declared it is
+    # exempt, so a hub upgraded ahead of its fleet keeps working.
+    echoes_result_action: bool = False
 
 
 class AgentRegistry:
@@ -262,29 +273,79 @@ class AgentRegistry:
             if self._repo is not None:
                 self._persist(self._repo.touch_agent(agent_id, agent.state))
 
-    def store_command_result(self, agent_id: str, msg: dict[str, Any]) -> None:
+    def store_command_result(
+        self, agent_id: str, msg: dict[str, Any], *, verify_action: bool = True
+    ) -> None:
+        """Resolve the pending request this reply answers.
+
+        The reply must answer the request it claims to: a frame is accepted only
+        when the action it echoes back (``for_action``) is the action the hub
+        ISSUED under that ``request_id``. Matching on the id alone made the hub a
+        confused deputy - a reply to a ``read_file`` could resolve the future a
+        ``write_config`` was waiting on, and the caller would read the forged
+        payload as that command's result and act on it.
+
+        A mismatch is DROPPED and audit-logged; the connection is left alone (a
+        malformed or racing frame is not worth tearing down a fleet channel over)
+        and the caller's own timeout fires, which is the correct outcome: no
+        result arrived.
+
+        ``verify_action=False`` is for frames the HUB itself synthesises for a
+        pending request (the oversize-frame error), which carry no echo because
+        the agent never sent them."""
         agent = self._agents.get(agent_id)
         if not agent:
             return
         request_id = msg.get("request_id", "")
         if not request_id:
             return
+        issued = agent._result_actions.get(request_id, "")
+        if verify_action and issued:
+            echoed = str(msg.get("for_action") or "")
+            if echoed != issued and (echoed or agent.echoes_result_action):
+                logger.warning(
+                    "dropping command_result from %s for request %s: issued as %r, reply claims %r",
+                    agent_id,
+                    request_id,
+                    issued,
+                    echoed or "<none>",
+                )
+                self.audit_log.log(
+                    agent_id=agent_id,
+                    action=issued,  # type: ignore[arg-type]
+                    command_or_path=f"request {request_id}",
+                    result="blocked",
+                    hostname=agent.hostname,
+                    caller="system",
+                )
+                return
         fut = agent._result_futures.pop(request_id, None)
+        agent._result_actions.pop(request_id, None)
         if fut and not fut.done():
             fut.set_result(msg)
 
-    async def wait_for_result(self, agent_id: str, request_id: str) -> dict[str, Any]:
+    async def wait_for_result(
+        self, agent_id: str, request_id: str, action: str = ""
+    ) -> dict[str, Any]:
+        """Await the reply to ``request_id``.
+
+        ``action`` is the action the request was issued as; it is recorded with
+        the pending future so ``store_command_result`` can refuse a reply that
+        answers a different one."""
         agent = self._agents.get(agent_id)
         if not agent:
             raise ConnectionError(f"agent {agent_id} not connected")
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         agent._result_futures[request_id] = fut
+        if action:
+            agent._result_actions[request_id] = action
         try:
             return await fut
         finally:
             # Don't leak the future if the caller's timeout fired before a result
             agent._result_futures.pop(request_id, None)
+            agent._result_actions.pop(request_id, None)
 
     def list_connected(self) -> list[dict[str, Any]]:
         now = datetime.now(UTC)

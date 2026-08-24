@@ -56,6 +56,12 @@ On top of that:
 The point of the split is that **only** `/invite/` is public. Put this on the
 client-certificate vhost; leave every other path off it.
 
+> Deploying the guest portal too (`/guest/*`, #442)? Use the committed
+> **`deploy/portal/nginx-guest-portal.conf`** instead of the block below - one
+> vhost that publishes both prefixes and nothing else, linted by
+> `tests/test_guest_vhost_reference.py`. The block below stays as the
+> invite-only shape.
+
 ```nginx
 server {
     listen 443 ssl;

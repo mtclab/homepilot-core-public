@@ -23,7 +23,7 @@ runner = CliRunner()
 
 class TestTokenCreate:
     def test_creates_token_plain_output(self, tmp_path):
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["token", "create"])
         assert result.exit_code == 0, result.output
@@ -34,7 +34,7 @@ class TestTokenCreate:
     def test_creates_token_json_output(self, tmp_path):
         import json
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["token", "create", "--output", "json"])
         assert result.exit_code == 0, result.output
@@ -45,7 +45,7 @@ class TestTokenCreate:
     def test_custom_scope(self, tmp_path):
         import json
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["token", "create", "--scope", "*", "--output", "json"])
         assert result.exit_code == 0, result.output
@@ -53,7 +53,7 @@ class TestTokenCreate:
         assert data["scope"] == "*"
 
     def test_second_create_reuses_existing_user(self, tmp_path):
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             r1 = runner.invoke(app, ["token", "create"])
             r2 = runner.invoke(app, ["token", "create"])
@@ -71,7 +71,7 @@ class TestTokenCreate:
 
         from homepilot.auth.tokens import validate_token
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["token", "create"])
         assert result.exit_code == 0, result.output

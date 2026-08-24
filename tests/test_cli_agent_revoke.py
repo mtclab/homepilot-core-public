@@ -47,7 +47,7 @@ class TestAgentRevokeCLI:
 
         _seed_credential(tmp_path, "agent-1", "host1", "deadbeef")
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["agent", "revoke", "agent-1"])
         assert result.exit_code == 0, result.output
@@ -66,7 +66,7 @@ class TestAgentRevokeCLI:
 
         _seed_credential(tmp_path, "agent-1", "host1", "deadbeef")
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
         with patch.dict("os.environ", env):
             result = runner.invoke(app, ["agent", "revoke", "nope"])
         assert result.exit_code == 1, result.output

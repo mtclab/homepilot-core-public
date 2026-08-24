@@ -26,9 +26,9 @@ GO_BIN ?= go
 GOCACHE ?= /tmp/gocache
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-py gate-web gate-go gate-image
+.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image
 
-gate: gate-py gate-web gate-go
+gate: gate-py gate-web gate-go gate-go-race
 	@echo "gate: all sub-gates passed"
 
 gate-py:
@@ -57,6 +57,19 @@ gate-web:
 
 gate-go:
 	cd agent/go && $(GO_ENV) $(GO_BIN) vet ./... && $(GO_ENV) $(GO_BIN) test ./...
+
+# The agent is a concurrent program - a reconnect loop, a read loop, a heartbeat
+# ticker and a metrics flusher all touching one socket - so "the tests pass" is
+# not the same claim as "the shared state is actually guarded". `go test` alone
+# runs the reconnect test happily with an unsynchronised read of a.conn; only
+# -race reports it. Kept as its own target because the race detector roughly
+# doubles the run, and part of `gate` because a torn socket read is the kind of
+# defect that only ever shows up in production.
+#
+# This runs LOCALLY. It is deliberately not a GitHub workflow: this repo is
+# private and Actions minutes are billed.
+gate-go-race:
+	cd agent/go && $(GO_ENV) $(GO_BIN) test -race ./...
 
 gate-image:
 	bash scripts/smoke-image.sh

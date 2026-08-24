@@ -107,7 +107,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()
@@ -132,7 +131,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
                 events_webhook_secret="my-secret-value",
             )
@@ -157,7 +155,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
                 events_webhook_secret=None,
             )
@@ -180,7 +177,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url=None,
             )
 
@@ -198,7 +194,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()
@@ -217,7 +212,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()
@@ -247,7 +241,6 @@ class TestSendWebhook:
             patch("homepilot.webhooks.send.httpx.AsyncClient") as mock_client_cls,
         ):
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()

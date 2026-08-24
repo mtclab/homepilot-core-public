@@ -297,19 +297,19 @@ class TestConfigSettings:
     def test_inventory_interval_seconds_default(self):
         from homepilot.config import Settings
 
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.inventory_interval_seconds == 300
 
     def test_drift_interval_seconds_default(self):
         from homepilot.config import Settings
 
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.drift_interval_seconds == 1800
 
     def test_auto_apply_enabled_default(self):
         from homepilot.config import Settings
 
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.auto_apply_enabled is False
 
     def test_settings_env_prefix(self, monkeypatch):
@@ -318,7 +318,7 @@ class TestConfigSettings:
         monkeypatch.setenv("HP_INVENTORY_INTERVAL_SECONDS", "60")
         monkeypatch.setenv("HP_DRIFT_INTERVAL_SECONDS", "900")
         monkeypatch.setenv("HP_AUTO_APPLY_ENABLED", "true")
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.inventory_interval_seconds == 60
         assert settings.drift_interval_seconds == 900
         assert settings.auto_apply_enabled is True

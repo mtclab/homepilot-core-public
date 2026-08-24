@@ -47,7 +47,6 @@ def _env(data_dir: Path) -> dict[str, str]:
         "HP_DATA_DIR": str(data_dir),
         "HP_ARTIFACTS_DIR": str(data_dir / "artifacts"),
         "HP_VAULT_PASSPHRASE": PASSPHRASE,
-        "HP_SECRET_KEY": "test-secret-key-for-pytest-only-not-for-production",
     }
 
 
@@ -98,7 +97,6 @@ def _seed_host(data_dir: Path, hostname: str = "pve1.lan") -> None:
     (artifacts / "note.md").write_text("# artifact\n", encoding="utf-8")
 
     (data_dir / ".env").write_text(f"HP_VAULT_PASSPHRASE={PASSPHRASE}\n", encoding="utf-8")
-    (data_dir / ".secret_key").write_text("persisted-secret-key\n", encoding="utf-8")
     (data_dir / "api-token").write_text("hp_tok_abcdef\n", encoding="utf-8")
     (data_dir / "ssh").mkdir(exist_ok=True)
     (data_dir / "ssh" / "id_ed25519").write_text("PRIVATE KEY\n", encoding="utf-8")

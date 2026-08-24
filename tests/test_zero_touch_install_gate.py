@@ -73,7 +73,6 @@ def _settings(data_dir: str):
     from homepilot.config import Settings
 
     return Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir=data_dir,
         artifacts_dir=os.path.join(data_dir, "artifacts"),
         agent_hub_host="127.0.0.1",

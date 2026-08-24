@@ -195,6 +195,15 @@ export interface AgentInstallEligibility {
 	in_flight: boolean;
 }
 
+export interface EnrolmentWindow {
+	open: boolean;
+	expires_at: string | null;
+	seconds_remaining: number;
+	// An install with no agents at all enrols its first host with or without a
+	// window, so "closed" alone would misdescribe what happens next.
+	fleet_empty: boolean;
+}
+
 export interface OnboardingStep {
 	key: string;
 	title: string;
@@ -799,7 +808,21 @@ export const api = {
 			hub_port: number;
 			hub_tls: boolean;
 			hub_cert_sha256: string;
-		}>('/agents/bootstrap');
+		}>('/agents/bootstrap', { method: 'POST' });
+	},
+	// The enrolment window (#537): while it is closed, the shared hub token
+	// cannot enrol a host this install has never seen.
+	getEnrolmentWindow() {
+		return req<EnrolmentWindow>('/agents/enrolment-window');
+	},
+	openEnrolmentWindow(minutes: number) {
+		return req<EnrolmentWindow>('/agents/enrolment-window', {
+			method: 'POST',
+			body: JSON.stringify({ minutes }),
+		});
+	},
+	closeEnrolmentWindow() {
+		return req<EnrolmentWindow>('/agents/enrolment-window', { method: 'DELETE' });
 	},
 	getHubToken() {
 		return req<{

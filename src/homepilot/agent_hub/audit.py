@@ -27,6 +27,12 @@ ActionType = Literal[
     # Audited like any other fleet-wide instruction - it changes how a machine
     # authenticates its control plane, which is worth a record of who asked.
     "set_transport",
+    # #537: opening the enrolment window temporarily lets the shared fleet token
+    # add hosts the install has never seen. That is a deliberate widening of who
+    # may join the fleet, so who opened it - and who shut it again - is exactly
+    # the kind of thing the durable trail exists for.
+    "enrolment_window_opened",
+    "enrolment_window_closed",
 ]
 ResultType = Literal["success", "blocked", "error"]
 

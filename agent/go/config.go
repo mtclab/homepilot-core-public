@@ -179,10 +179,28 @@ func writeAgentIDFile(path, id string) error {
 	return writeAgentStateFile(path, id, ".agent.id-*")
 }
 
+// writeAgentTokenFile writes the durable per-agent hub credential atomically.
+//
+// It used to be a plain os.WriteFile, which TRUNCATES before it writes: a crash,
+// a power cut, or a full disk between those two steps leaves a zero-length or
+// half-written token file. The agent then presents a credential the hub has no
+// hash for, is rejected, and — since the shared enrolment token is normally gone
+// from the host by then — is locked out permanently, needing a hand re-enrol on
+// every affected box. Same failure class as a truncated agent id, same fix.
+func writeAgentTokenFile(path, token string) error {
+	return writeAgentStateFile(path, token, ".agent.token-*")
+}
+
 // writeAgentStateFile writes agent state atomically with 0600 permissions (temp
-// file in the same directory + rename). Shared by the id and the pushed
-// transport: a half-written pin is as unrecoverable as a truncated id, since
-// both are what the agent needs to get back to the hub at all.
+// file in the same directory + fsync + rename). Shared by the id, the durable
+// token and the pushed transport: a half-written pin is as unrecoverable as a
+// truncated id or token, since all three are what the agent needs to get back to
+// the hub at all.
+//
+// The fsync matters as much as the rename. A rename is atomic in the directory
+// entry, but on a crash the file's DATA can still be missing while the name is
+// already published — which is the very truncated-credential outcome this helper
+// exists to prevent.
 func writeAgentStateFile(path, content, tempPattern string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -199,6 +217,10 @@ func writeAgentStateFile(path, content, tempPattern string) error {
 		return err
 	}
 	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		return err
 	}

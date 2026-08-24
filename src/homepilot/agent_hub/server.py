@@ -17,6 +17,7 @@ from typing import Any, cast
 
 from ..metrics.repository import MAX_METRIC_NAME_LEN, METRIC_NAME_RE
 from .audit import ActionType
+from .enrolment_window import is_open as enrolment_window_is_open
 from .registry import AgentRegistry
 from .replay import (
     NONCE_MIN_HEX_LEN,
@@ -84,6 +85,37 @@ class AuthResult:
 
     kind: str
     agent_id: str | None = None
+
+
+# The generic wire refusal every failed register has always received. It says
+# nothing on purpose: a token-guessing peer learns nothing from it.
+GENERIC_AUTH_ERROR = "invalid auth_token"
+# The enrolment-window refusal, which DOES say what happened, because the peer
+# that hits it is an operator's own agent on a host they just installed and the
+# alternative is an unexplained silent failure (#537). It carries no secret: it
+# tells the holder of a valid shared token that the hub is not accepting new
+# hostnames right now. Deliberately free of the word "auth" - the Go agent
+# treats an auth-ish refusal as "try the other credential", and no credential
+# the agent holds would help here.
+ENROLMENT_WINDOW_CLOSED_ERROR = (
+    "enrolment refused: this hub is not accepting new hosts right now. Ask an "
+    "operator to open the enrolment window (or enrol with a bootstrap token)."
+)
+
+
+@dataclass
+class Denial:
+    """Why a register frame was refused, in the two shapes a refusal needs.
+
+    ``reason`` is the operator-facing sentence: it lands in the audit trail and
+    on the agent row as ``last_error`` (#430/#491), so the fleet list can say
+    WHY a host is not here. ``wire_error`` is what the refused peer is told,
+    which is normally the deliberately uninformative
+    :data:`GENERIC_AUTH_ERROR`.
+    """
+
+    reason: str
+    wire_error: str = GENERIC_AUTH_ERROR
 
 
 class ProtocolError(Exception):
@@ -350,8 +382,44 @@ class AgentHubServer:
                 return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
         return None
 
+    async def _enrolment_allowed(self, hostname: str) -> Denial | None:
+        """The shared-token enrolment rule (#537): ``None`` to allow, a
+        :class:`Denial` to refuse.
+
+        A shared token is a permanent fleet-wide credential, so on its own it
+        let anyone holding it add machines nobody asked for, for ever. It now
+        enrols a hostname this install has never seen only during an
+        operator-opened window - with one exemption that keeps the product's
+        promise intact: an install with NO agents at all is a first rollout,
+        which must still work with zero operator input (#458).
+
+        Not gated here, on purpose: per-agent reconnects (they authenticate
+        before this is reached), bootstrap tokens (single-use, expiring,
+        operator-minted - the sanctioned way to add one host later), and
+        re-enrolment of a hostname the fleet already contains.
+        """
+        repo = self._repo
+        if repo is None:
+            # No persistence: there is no window to store and no fleet to grow.
+            # A bare registry (unit tests, embedded use) keeps the old behaviour.
+            return None
+        if await repo.count_agents() == 0:
+            return None
+        if hostname and await repo.agent_hostname_known(hostname):
+            return None
+        if await enrolment_window_is_open(repo):
+            return None
+        return Denial(
+            reason=(
+                "shared-token enrolment refused: no enrolment window is open, so a "
+                f"host the fleet has never seen ({hostname or 'unnamed'}) cannot join. "
+                "Open a window or enrol it with a bootstrap token."
+            ),
+            wire_error=ENROLMENT_WINDOW_CLOSED_ERROR,
+        )
+
     async def _verify_auth(
-        self, request: dict[str, Any], deny: list[str] | None = None
+        self, request: dict[str, Any], deny: list[Denial] | None = None
     ) -> AuthResult | None:
         """Authenticate a register frame. Returns an :class:`AuthResult` or
         ``None`` on failure.
@@ -382,9 +450,9 @@ class AgentHubServer:
           3. ``"bootstrap"`` — a consumed one-time enrollment token.
         """
 
-        def _deny(reason: str) -> None:
+        def _deny(reason: str, wire_error: str = GENERIC_AUTH_ERROR) -> None:
             if deny is not None:
-                deny.append(reason)
+                deny.append(Denial(reason=reason, wire_error=wire_error))
 
         token = request.get("auth_token", "")
         if not token:
@@ -431,6 +499,10 @@ class AgentHubServer:
                 return rebound
 
         if self.auth_token and hmac.compare_digest(token, self.auth_token):
+            refusal = await self._enrolment_allowed(claimed_hostname)
+            if refusal is not None:
+                _deny(refusal.reason, refusal.wire_error)
+                return None
             return AuthResult(kind="shared")
         if await self._token_store.consume(token):
             return AuthResult(kind="bootstrap")
@@ -572,7 +644,8 @@ class AgentHubServer:
         # Route the failure to the caller waiting on this request (if any) so it
         # gets a clean error instead of timing out, then ack the agent.
         if request_id:
-            self.registry.store_command_result(agent_id, err)
+            # Hub-synthesised, so it carries no agent echo: deliver it directly.
+            self.registry.store_command_result(agent_id, err, verify_action=False)
         writer.write(_encode(err))
         await writer.drain()
         logger.warning(
@@ -656,13 +729,14 @@ class AgentHubServer:
             except (TimeoutError, ConnectionError, ProtocolError, OversizeMessageError):
                 return
 
-            deny: list[str] = []
+            deny: list[Denial] = []
             auth_result = await self._verify_auth(handshake, deny)
             if auth_result is None:
+                denial = deny[0] if deny else Denial(reason="invalid auth token")
                 self._record_auth_failure(peer_host, loop)
                 _release_preauth()
                 await self._record_rejection(
-                    reason=deny[0] if deny else "invalid auth token",
+                    reason=denial.reason,
                     peer_host=peer_host,
                     agent_id=str(handshake.get("agent_id", "")),
                     hostname=str(handshake.get("hostname", "")) or None,
@@ -670,7 +744,7 @@ class AgentHubServer:
                 writer.write(
                     _encode(
                         {
-                            "error": "invalid auth_token",
+                            "error": denial.wire_error,
                             "request_id": handshake.get("request_id", ""),
                         }
                     )
@@ -782,6 +856,14 @@ class AgentHubServer:
             if auth_result.kind in ("shared", "bootstrap"):
                 minted_token = await self._mint_agent_credential(agent_id, hostname)
 
+            # Does this agent echo the issued action back on every result? An
+            # agent that says it does is held to it: a reply with no ``for_action``
+            # is then refused rather than trusted (see
+            # AgentRegistry.store_command_result).
+            agent_rec = self.registry.get(agent_id)
+            if agent_rec is not None:
+                agent_rec.echoes_result_action = handshake.get("result_action") == 1
+
             # Establish the per-connection replay session (if negotiated) BEFORE the
             # ack so every subsequent frame in both directions is protected. It is
             # stored on the agent record so command dispatch (send_command et al.,
@@ -789,7 +871,6 @@ class AgentHubServer:
             replay_session: ReplaySession | None = None
             if replay_enabled:
                 replay_session = ReplaySession(handshake["auth_token"].encode("utf-8"))
-                agent_rec = self.registry.get(agent_id)
                 if agent_rec is not None:
                     agent_rec.replay = replay_session
 
@@ -1122,7 +1203,7 @@ class AgentHubServer:
         await self._emit(agent.writer, agent.replay, msg)
 
         result = await asyncio.wait_for(
-            self.registry.wait_for_result(agent_id, request_id),
+            self.registry.wait_for_result(agent_id, request_id, "exec"),
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, "exec", command, result)
@@ -1162,7 +1243,7 @@ class AgentHubServer:
         await self._emit(agent.writer, agent.replay, msg)
 
         result = await asyncio.wait_for(
-            self.registry.wait_for_result(agent_id, request_id),
+            self.registry.wait_for_result(agent_id, request_id, action),
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, action, target, result)
@@ -1185,7 +1266,7 @@ class AgentHubServer:
         await self._emit(agent.writer, agent.replay, msg)
 
         result = await asyncio.wait_for(
-            self.registry.wait_for_result(agent_id, request_id),
+            self.registry.wait_for_result(agent_id, request_id, "read_file"),
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, "read_file", path, result)
@@ -1210,7 +1291,7 @@ class AgentHubServer:
         await self._emit(agent.writer, agent.replay, msg)
 
         result = await asyncio.wait_for(
-            self.registry.wait_for_result(agent_id, request_id),
+            self.registry.wait_for_result(agent_id, request_id, "write_file"),
             timeout=timeout + RESULT_WAIT_MARGIN,
         )
         return self._finalize_result(agent_id, "write_file", path, result)

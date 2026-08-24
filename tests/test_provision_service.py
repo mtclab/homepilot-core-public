@@ -4,10 +4,18 @@ The gate that matters here is the terminal-state one (#386): every way the run
 can end must leave the task record in a terminal state. A provision stranded in
 'running' would sit in the operator's in-flight list forever and keep blocking
 its own name.
+
+The second gate is the cancel one (#452), in TestCancelReachesProxmox. It
+FORBIDS a cancel that does not reach the running coroutine: marking the row
+'cancelled' while the provision job keeps talking to Proxmox, so the job
+overwrites the row with 'succeeded'/'failed' afterwards and leaves a guest on
+the node that nobody asked for. Every case there asserts BOTH what the Proxmox
+client was actually asked to do and what the task row finally says.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -316,3 +324,281 @@ class TestInflightNames:
         await service.start(_request(name="web-02"))
         for task in list(service._running_tasks):
             await task
+
+
+class TestCancelReachesProxmox:
+    """#452 - the gate: a cancelled provision must actually be cancelled.
+
+    WHAT THIS FORBIDS: a cancel that only marks the row while the provision
+    coroutine keeps talking to Proxmox. The old behaviour marked the task
+    'cancelled' and then let the still-running job overwrite it with
+    'succeeded' seconds later, leaving a guest nobody asked for on the node.
+    So these tests assert the OUTCOME on both sides - what the Proxmox client
+    was actually asked to do, and what the task row finally says - and they let
+    the blocked run resume AFTER the cancel to prove it can never come back and
+    clobber the record.
+    """
+
+    @staticmethod
+    async def _spin(predicate, limit: int = 400) -> None:
+        """Give the loop turns until `predicate()` holds - never read the
+        pre-cancel state as the post-cancel one.
+
+        A real sleep, not `sleep(0)`: the run has database awaits in it, and
+        those resolve on aiosqlite's worker THREAD, which a bare loop turn does
+        not wait for."""
+        for _ in range(limit):
+            if predicate():
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError("condition never became true")
+
+    @staticmethod
+    async def _settle(service: ProvisionService) -> None:
+        """Wait out the run task AND the cleanup task it spawns."""
+        for _ in range(10):
+            pending = [t for t in service._running_tasks if not t.done()]
+            if not pending:
+                return
+            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+
+    @staticmethod
+    def _block_wait_for_task(proxmox: AsyncMock) -> asyncio.Event:
+        gate = asyncio.Event()
+
+        async def blocking_wait(*args, **kwargs):
+            await gate.wait()
+            return {"status": "stopped", "exitstatus": "OK"}
+
+        proxmox.wait_for_task = AsyncMock(side_effect=blocking_wait)
+        proxmox.stop_task = AsyncMock(return_value={"data": None})
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy:")
+        return gate
+
+    async def test_cancel_mid_clone_stops_the_task_and_destroys_the_guest(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        gate = self._block_wait_for_task(proxmox)
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+
+        row = await service.cancel(task_id)
+        assert row is not None and row["status"] == "cancelled"
+
+        # Release the clone wait AFTER the cancel: if the cancel had not reached
+        # the coroutine, this is where the run would march on and overwrite the
+        # record. It must not.
+        gate.set()
+        await self._settle(service)
+
+        proxmox.stop_task.assert_awaited_once_with("pve1", "UPID:pve1:clone:")
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        # The run never got past the clone wait.
+        proxmox.set_vm_config.assert_not_awaited()
+        proxmox.start_vm.assert_not_awaited()
+
+        final = await service.task_repo.get_task(task_id)
+        assert final["status"] == "cancelled", "a cancelled provision must stay cancelled"
+        assert final["error"] is None
+        assert json.loads(final["result_json"]) == {
+            "cancelled": True,
+            "vmid": 105,
+            "stop_task": "stopped",
+            "cleanup": "deleted",
+        }
+
+    async def test_cancel_writes_an_audit_row_and_releases_the_name(
+        self, service: ProvisionService, proxmox: AsyncMock, db: Database
+    ):
+        gate = self._block_wait_for_task(proxmox)
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        assert not service.is_inflight("web-01")
+        rows = await Repository(db).query_audit_log(action="provision_cancelled")
+        assert len(rows) == 1
+        assert rows[0]["target_host"] == "web-01"
+        assert rows[0]["user_id"] == "tester"
+        assert json.loads(rows[0]["details_json"])["cleanup"] == "deleted"
+
+    async def test_a_failed_audit_write_does_not_lose_the_cancel_outcome(
+        self, service: ProvisionService, proxmox: AsyncMock, monkeypatch
+    ):
+        gate = self._block_wait_for_task(proxmox)
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("audit table is gone")
+
+        monkeypatch.setattr(service.repo, "log_audit", boom)
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        final = await service.task_repo.get_task(task_id)
+        assert final["status"] == "cancelled"
+        assert json.loads(final["result_json"])["cleanup"] == "deleted"
+
+    async def test_cleanup_failure_names_the_guest_that_may_be_left_behind(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        gate = self._block_wait_for_task(proxmox)
+        proxmox.delete_vm = AsyncMock(
+            side_effect=ProxmoxError("DELETE", "/nodes/pve1/qemu/105", 500, "storage busy")
+        )
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        final = await service.task_repo.get_task(task_id)
+        assert final["status"] == "cancelled"
+        # The operator has to be able to go and look: vmid AND node, in words.
+        assert "delete_vm" in final["error"]
+        assert "105" in final["error"]
+        assert "pve1" in final["error"]
+        assert "may remain" in final["error"]
+        assert json.loads(final["result_json"])["cleanup"] == "failed"
+
+    async def test_a_stop_task_failure_still_destroys_the_guest(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        gate = self._block_wait_for_task(proxmox)
+        proxmox.stop_task = AsyncMock(
+            side_effect=ProxmoxError("DELETE", "/nodes/pve1/tasks/x", 500, "already stopped")
+        )
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        result = json.loads((await service.task_repo.get_task(task_id))["result_json"])
+        assert result["stop_task"] == "failed"
+        assert result["cleanup"] == "deleted"
+
+    async def test_cancel_before_any_pve_work_creates_nothing_to_unwind(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        gate = asyncio.Event()
+
+        async def blocking_next_vmid(node):
+            await gate.wait()
+            return 105
+
+        proxmox.next_vmid = AsyncMock(side_effect=blocking_next_vmid)
+        proxmox.stop_task = AsyncMock(return_value={"data": None})
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy:")
+
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.next_vmid.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        proxmox.clone_vm.assert_not_awaited()
+        proxmox.stop_task.assert_not_awaited()
+        proxmox.delete_vm.assert_not_awaited()
+        final = await service.task_repo.get_task(task_id)
+        assert final["status"] == "cancelled"
+        assert json.loads(final["result_json"]) == {
+            "cancelled": True,
+            "cleanup": "nothing_created",
+        }
+
+    async def test_cancel_after_the_clone_finished_still_destroys_the_guest(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        gate = asyncio.Event()
+
+        async def blocking_config(*args, **kwargs):
+            await gate.wait()
+            return {"data": None}
+
+        proxmox.set_vm_config = AsyncMock(side_effect=blocking_config)
+        proxmox.stop_task = AsyncMock(return_value={"data": None})
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy:")
+
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.set_vm_config.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        # No PVE task was in flight at that point, but the guest exists.
+        proxmox.stop_task.assert_not_awaited()
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        result = json.loads((await service.task_repo.get_task(task_id))["result_json"])
+        assert result == {
+            "cancelled": True,
+            "vmid": 105,
+            "stop_task": "not_needed",
+            "cleanup": "deleted",
+        }
+
+    async def test_shutdown_drain_waits_for_the_cleanup(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """A cancel followed immediately by shutdown must not orphan the unwind."""
+        gate = self._block_wait_for_task(proxmox)
+        released = asyncio.Event()
+
+        async def slow_delete(node, vmid):
+            await asyncio.sleep(0)
+            released.set()
+            return "UPID:pve1:destroy:"
+
+        proxmox.delete_vm = AsyncMock(side_effect=slow_delete)
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+
+        await service.drain(timeout=5.0)
+
+        assert released.is_set(), "drain returned before the cleanup destroy ran"
+        final = await service.task_repo.get_task(task_id)
+        assert json.loads(final["result_json"])["cleanup"] == "deleted"
+
+    async def test_cancel_of_a_restart_orphan_says_the_state_is_unknown(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        # A row left 'running' by a process that is no longer here: this service
+        # never held the coroutine, so it cannot know what PVE did.
+        task_id = await service.task_repo.create_task(None, "provision")
+        await service.task_repo.update_task_status(task_id, "running")
+        proxmox.stop_task = AsyncMock(return_value={"data": None})
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy:")
+
+        row = await service.cancel(task_id)
+
+        assert row["status"] == "cancelled"
+        assert row["error"] == "process restarted; in-flight PVE state unknown"
+        assert row["result_json"] is None
+        proxmox.stop_task.assert_not_awaited()
+        proxmox.delete_vm.assert_not_awaited()
+        proxmox.clone_vm.assert_not_awaited()
+
+    async def test_cancel_of_a_succeeded_provision_is_a_noop(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        task = await _run_to_completion(service, _request())
+        assert task["status"] == "succeeded"
+        proxmox.stop_task = AsyncMock(return_value={"data": None})
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy:")
+
+        row = await service.cancel(task["id"])
+
+        assert row["status"] == "succeeded"
+        assert row["result_json"] == task["result_json"]
+        proxmox.stop_task.assert_not_awaited()
+        proxmox.delete_vm.assert_not_awaited()
+
+    async def test_cancel_of_an_unknown_task_returns_none(self, service: ProvisionService):
+        assert await service.cancel("no-such-task") is None

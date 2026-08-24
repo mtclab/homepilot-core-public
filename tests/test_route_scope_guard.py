@@ -15,13 +15,29 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
+from homepilot import main
 from homepilot.auth.deps import require_scope, require_token
+from homepilot.main import (
+    _walk_api_routes,
+    assert_all_routes_scoped,
+    find_unscoped_routes,
+)
 from homepilot.main import (
     app as real_app,
 )
-from homepilot.main import (
-    assert_all_routes_scoped,
-    find_unscoped_routes,
+
+# FastAPI < 0.137 flattens include_router into the parent's route list; 0.137+
+# keeps an _IncludedRouter wrapper. The guard handles both shapes, but the two
+# teeth tests below describe the WRAPPER shape specifically (there is nothing to
+# descend into, and no separate include-time dependencies, when the framework
+# has already flattened everything), so they are skipped on the older shape
+# rather than silently asserting nothing.
+_FASTAPI_KEEPS_INCLUDE_WRAPPERS = any(
+    main._include_wrapper_parts(route) is not None for route in real_app.routes
+)
+_wrapper_shape_only = pytest.mark.skipif(
+    not _FASTAPI_KEEPS_INCLUDE_WRAPPERS,
+    reason="this FastAPI flattens include_router; the wrapper-shape teeth do not apply",
 )
 
 
@@ -38,36 +54,170 @@ class TestRealAppFullyScoped:
         route behind an include, i.e. essentially the whole API - while
         `find_unscoped_routes` still returned `[]`. The suite stayed green because
         the teeth tests below build routes with a bare `@app.get`, a shape the
-        real app never uses.
+        real app never uses. #472 taught the guard to descend into the wrapper;
+        this asserts it still lands on the whole API.
 
-        So the count is asserted, not just the verdict. The floor is deliberately
-        far below the current number: this catches a guard going blind, not a
-        release that adds or removes a handful of routes.
+        The floor tracks the real route count (98 at 3.2.0) instead of the old
+        "> 50": at 5 visible routes the old floor was already an order of
+        magnitude away, so it has room to spare and still catches a guard going
+        blind rather than a release adding or removing a handful of routes.
         """
-        from fastapi.routing import APIRoute
-
-        inspected = [route for route in real_app.routes if isinstance(route, APIRoute)]
-        assert len(inspected) > 50, (
+        inspected = _walk_api_routes(list(real_app.routes))
+        assert len(inspected) >= 80, (
             f"the scope guard can only see {len(inspected)} routes on the shipped app - "
             "it is walking a route list that no longer holds the API, so its clean "
-            "verdict means nothing (see the fastapi bound in pyproject.toml)"
+            "verdict means nothing (see _walk_api_routes in main.py)"
         )
 
-    def test_a_route_added_by_include_router_is_inspected(self):
-        """The real app is built entirely from include_router, so the guard has to
-        work on THAT shape - the gap the version bump walked through."""
+    @_wrapper_shape_only
+    def test_without_wrapper_descent_the_guard_goes_blind(self, monkeypatch):
+        """Teeth for the headline fix: simulate the pre-#472 isinstance-only walk
+        (no descent into the include wrapper) and prove the floor above FAILS on
+        the installed FastAPI. If this ever stops failing, the count gate has
+        stopped proving anything."""
+        monkeypatch.setattr(main, "_include_wrapper_parts", lambda route: None)
+
+        blind = _walk_api_routes(list(real_app.routes))
+        assert len(blind) < 80, (
+            "the isinstance-only walk still sees the API - this FastAPI flattens "
+            "include_router again, so re-check what the count gate proves"
+        )
+        # ... and a blind guard reports a clean bill of health, which is the
+        # exact failure mode #472 exists to prevent.
+        assert main.find_unscoped_routes(real_app) == []
+
+    def test_public_routes_are_matched_by_their_full_path(self):
+        """_PUBLIC_ROUTES holds FULL paths. Routes behind an include carry
+        UNPREFIXED paths on 0.137+, so the guard has to rebuild the path from the
+        accumulated include prefixes - get that wrong and the allowlist silently
+        stops matching (routes wrongly flagged) or starts matching the wrong
+        thing (a route wrongly treated public)."""
+        walked = {path for path, _route, _deps in _walk_api_routes(list(real_app.routes))}
+
+        # portal_router is included with prefix="/invite" and this path is on the
+        # public allowlist by its full form.
+        assert ("GET", "/invite/{token}") in main._PUBLIC_ROUTES
+        assert "/invite/{token}" in walked
+        # The unprefixed form must NOT appear - that would mean the prefix was
+        # dropped and the allowlist is matching by accident, not by path.
+        assert "/{token}" not in walked
+
+    def test_nested_include_prefixes_accumulate(self):
         from fastapi import APIRouter
 
-        app = FastAPI()
-        router = APIRouter()
+        inner = APIRouter()
 
-        @router.get("/danger")
-        async def danger():  # forgot its scope dep, and lives behind an include
+        @inner.get("/leaf")
+        async def leaf():
             return {"ok": True}
 
-        app.include_router(router, prefix="/nested")
+        middle = APIRouter()
+        middle.include_router(inner, prefix="/inner")
+        app = FastAPI()
+        app.include_router(middle, prefix="/outer")
 
-        assert ("GET", "/nested/danger") in find_unscoped_routes(app)
+        walked = {path for path, _route, _deps in _walk_api_routes(list(app.routes))}
+        assert walked == {"/outer/inner/leaf"}
+        assert ("GET", "/outer/inner/leaf") in find_unscoped_routes(app)
+
+
+class TestScopeIsFoundWhereverItIsDeclared:
+    """A scope dependency counts no matter which of the four places it is
+    attached - and include-time scopes only exist as an `include_context`
+    attribute on 0.137+, never merged into the route's dependant."""
+
+    @staticmethod
+    def _scoped_router():
+        from fastapi import APIRouter
+
+        router = APIRouter()
+
+        @router.get("/x")
+        async def x():
+            return {"ok": True}
+
+        return router
+
+    def test_scope_on_the_route_itself(self):
+        from fastapi import APIRouter
+
+        router = APIRouter()
+
+        @router.get("/x", dependencies=[Depends(require_scope("read"))])
+        async def x():
+            return {"ok": True}
+
+        app = FastAPI()
+        app.include_router(router, prefix="/r")
+        assert find_unscoped_routes(app) == []
+
+    def test_scope_on_the_router(self):
+        from fastapi import APIRouter
+
+        router = APIRouter(dependencies=[Depends(require_scope("read"))])
+
+        @router.get("/x")
+        async def x():
+            return {"ok": True}
+
+        app = FastAPI()
+        app.include_router(router, prefix="/r")
+        assert find_unscoped_routes(app) == []
+
+    def test_scope_attached_at_include_time(self):
+        app = FastAPI()
+        app.include_router(
+            self._scoped_router(),
+            prefix="/r",
+            dependencies=[Depends(require_scope("read"))],
+        )
+        assert find_unscoped_routes(app) == []
+
+    def test_scope_attached_at_an_outer_include_covers_a_nested_router(self):
+        from fastapi import APIRouter
+
+        middle = APIRouter()
+        middle.include_router(self._scoped_router(), prefix="/inner")
+        app = FastAPI()
+        app.include_router(middle, prefix="/outer", dependencies=[Depends(require_scope("read"))])
+        assert find_unscoped_routes(app) == []
+
+    def test_indirect_include_time_scope_dep_counts(self):
+        """The include-time dependency need not BE the scope enforcer; it may
+        depend on one."""
+
+        async def wrapper(token=Depends(require_scope("read"))):  # noqa: B008
+            return token
+
+        app = FastAPI()
+        app.include_router(self._scoped_router(), prefix="/r", dependencies=[Depends(wrapper)])
+        assert find_unscoped_routes(app) == []
+
+    @_wrapper_shape_only
+    def test_teeth_without_include_dependency_reading_it_screams_false_positives(self, monkeypatch):
+        """Remove the include-time dependency reading and every one of the
+        include-scoped shapes above must be reported unscoped. This is what
+        proves that reading `include_context.dependencies` is load-bearing and
+        not decoration."""
+        monkeypatch.setattr(main, "_dependency_enforces_scope", lambda dep: False)
+
+        app = FastAPI()
+        app.include_router(
+            self._scoped_router(),
+            prefix="/r",
+            dependencies=[Depends(require_scope("read"))],
+        )
+        assert find_unscoped_routes(app) == [("GET", "/r/x")]
+
+        from fastapi import APIRouter
+
+        nested = FastAPI()
+        middle_parent = APIRouter()
+        middle_parent.include_router(self._scoped_router(), prefix="/inner")
+        nested.include_router(
+            middle_parent, prefix="/outer", dependencies=[Depends(require_scope("read"))]
+        )
+        assert find_unscoped_routes(nested) == [("GET", "/outer/inner/x")]
 
 
 class TestGuardHasTeeth:

@@ -124,7 +124,6 @@ HP_VAULT_PASSPHRASE=...
 
 # Stored in the vault by the first-run claim, the Settings page,
 # `hp vault set`, or `hp init`:
-#   secret-key      — JWT signing
 #   admin-secret    — Admin auth
 #   pve-token       — Proxmox read API
 #   pve-write-token — Proxmox write API (optional)

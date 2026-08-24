@@ -9,6 +9,7 @@ import pytest
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.kb.service import KBService
+from homepilot.main import _walk_api_routes
 
 
 @pytest.fixture
@@ -65,8 +66,12 @@ async def test_client(tmp_path: Path):
     kb_svc = KBService(repo=repo, store=store, lifecycle=lc)
 
     test_app = FastAPI()
-    for route in kb_router.routes:
-        for dep in getattr(route, "dependencies", []):
+    # Walk the router through the scope guard's walker: on FastAPI 0.137+ a
+    # nested include would hide its routes (and their deps) behind an
+    # _IncludedRouter wrapper, and the overrides below would silently miss them
+    # (#472).
+    for _path, route, include_deps in _walk_api_routes(list(kb_router.routes)):
+        for dep in [*getattr(route, "dependencies", []), *include_deps]:
             test_app.dependency_overrides[dep.dependency] = lambda: {
                 "user_id": "test-user",
                 "token_id": "test-token",

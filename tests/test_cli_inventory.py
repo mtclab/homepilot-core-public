@@ -22,7 +22,7 @@ def clear_settings_cache():
 
 @pytest.fixture
 def db_env(tmp_path: Path) -> dict[str, str]:
-    return {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+    return {"HP_DATA_DIR": str(tmp_path)}
 
 
 @pytest.fixture

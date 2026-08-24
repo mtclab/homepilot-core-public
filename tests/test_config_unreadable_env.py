@@ -24,7 +24,7 @@ def test_an_unreadable_env_file_is_skipped_loudly(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     env = data_dir / ".env"
-    env.write_text("HP_SECRET_KEY=whatever\n")
+    env.write_text("HP_ALLOWED_HTTP_DOMAINS=example.com\n")
     env.chmod(0o000)
     monkeypatch.setenv("HP_DATA_DIR", str(data_dir))
     try:
@@ -42,7 +42,7 @@ def test_an_unreadable_env_file_is_skipped_loudly(
 def test_a_readable_env_file_is_still_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / ".env").write_text("HP_SECRET_KEY=whatever\n")
+    (data_dir / ".env").write_text("HP_ALLOWED_HTTP_DOMAINS=example.com\n")
     monkeypatch.setenv("HP_DATA_DIR", str(data_dir))
 
     assert str(data_dir / ".env") in _env_files()

@@ -79,6 +79,16 @@ vi.mock('$lib/api', async () => {
 			getHostSeries: vi.fn().mockResolvedValue({ hostname: '', metric: '', points: [] }),
 			getHubToken: vi.fn(),
 			getBootstrapToken: vi.fn(),
+			// The enrolment window (#537): the enrol panel reads it on mount, so a
+			// default that resolves keeps every OTHER page test out of it.
+			getEnrolmentWindow: vi.fn().mockResolvedValue({
+				open: false,
+				expires_at: null,
+				seconds_remaining: 0,
+				fleet_empty: true,
+			}),
+			openEnrolmentWindow: vi.fn(),
+			closeEnrolmentWindow: vi.fn(),
 			revokeAgent: vi.fn().mockResolvedValue({ revoked: true, channel_closed: true }),
 			forgetAgent: vi.fn().mockResolvedValue({ forgotten: true }),
 			// The host page (#514 S2, S4).

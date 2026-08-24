@@ -244,8 +244,6 @@ def init(
     if not admin_secret:
         admin_secret = _secrets.token_urlsafe(32)
 
-    secret_key = _secrets.token_urlsafe(32)
-
     env_lines = [
         f"HP_VAULT_PASSPHRASE={passphrase}",
         f"HP_DATA_DIR={data_dir}",
@@ -265,6 +263,10 @@ def init(
     vault_dir = data_dir / "vault"
     vault_dir.mkdir(parents=True, exist_ok=True)
 
+    # A fixed, operator-managed location, NOT a configurable one: the
+    # `ssh_key_dir` setting lost its last reader with the jumpserver removal
+    # (#327) and was deleted in #394. Keys an operator puts here are archived
+    # by `hp export --include-secrets` (#421).
     ssh_dir = data_dir / "ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,7 +298,6 @@ def init(
 
         vault = VaultManager(data_dir, passphrase)
         await vault.ensure_master_identity()
-        await vault.store_secret("secret-key", {"value": secret_key})
         await vault.store_secret("admin-secret", {"value": admin_secret})
         if pve_token:
             await vault.store_secret("pve-token", {"token": pve_token})
@@ -320,7 +321,6 @@ def init(
 
     console.print(f"\n[green]HomePilot initialized at {data_dir}[/green]")
     console.print("[green]Vault secrets stored:[/green]")
-    console.print("  secret-key   → vault (used for JWT signing)")
     console.print("  admin-secret → vault (used for admin API auth)")
     if pve_token:
         console.print("  pve-token    → vault (used for Proxmox API)")
@@ -869,7 +869,6 @@ MANIFEST_NAME = "manifest.json"
 SECRET_PATHS: tuple[str, ...] = (
     ".env",
     ".vault_passphrase",
-    ".secret_key",
     "api-token",
     "vault/identities",
     "vault/secrets",
@@ -889,8 +888,8 @@ def _print_no_secrets_warning(missing: list[str]) -> None:
     for rel in missing:
         err_console.print(f"[yellow]  - {rel}[/yellow]")
     err_console.print("[yellow]Without them every vault secret stays[/yellow]")
-    err_console.print("[yellow]undecryptable: pve-token, secret-key,[/yellow]")
-    err_console.print("[yellow]admin-secret, webhook secrets.[/yellow]")
+    err_console.print("[yellow]undecryptable: pve-token, admin-secret,[/yellow]")
+    err_console.print("[yellow]webhook secrets.[/yellow]")
     err_console.print("[yellow]Re-run with --include-secrets for a[/yellow]")
     err_console.print("[yellow]restorable backup.[/yellow]")
 
@@ -2381,7 +2380,7 @@ def agent_bootstrap_cmd(
 ) -> None:
     """Generate a one-time bootstrap token for agent enrollment."""
     try:
-        data = asyncio.run(_backend_api("GET", "/agents/bootstrap"))
+        data = asyncio.run(_backend_api("POST", "/agents/bootstrap"))
     except RuntimeError as exc:
         err_console.print(f"[yellow]{exc}[/yellow]")
         raise typer.Exit(1) from None
@@ -2419,6 +2418,57 @@ def agent_bootstrap_cmd(
             f"hp-agent"
         )
         console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
+
+
+@agent_app.command("enrolment-window")
+def agent_enrolment_window(
+    action: str = typer.Argument(
+        "status", help="open | close | status (default: status)", metavar="<action>"
+    ),
+    minutes: int = typer.Option(
+        15, "--minutes", help="How long an opened window stays open (1-1440, default 15)"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Open, close, or inspect the shared-token enrolment window.
+
+    While the window is open, the shared fleet token may enrol a host this
+    install has never seen. While it is closed, only already-known hosts and
+    one-shot bootstrap tokens (`hp agent bootstrap`) can enrol - a leaked shared
+    token cannot grow the fleet behind your back. A brand-new install with no
+    agents at all is exempt, so the first zero-touch rollout still needs nothing.
+    """
+    verb = action.strip().lower()
+    if verb not in {"open", "close", "status"}:
+        err_console.print(f"[red]Unknown action '{action}' - use open, close or status[/red]")
+        raise typer.Exit(2)
+    method, path = {
+        "open": ("POST", "/agents/enrolment-window"),
+        "close": ("DELETE", "/agents/enrolment-window"),
+        "status": ("GET", "/agents/enrolment-window"),
+    }[verb]
+    body = {"minutes": minutes} if verb == "open" else None
+    try:
+        data = asyncio.run(_backend_api(method, path, body))
+    except RuntimeError as exc:
+        err_console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(1) from None
+    if not isinstance(data, dict):
+        err_console.print("[red]Unexpected response from /agents/enrolment-window[/red]")
+        raise typer.Exit(1)
+
+    if json_output:
+        console.print_json(data=data)
+        return
+    if data.get("open"):
+        console.print(f"[green]Enrolment window OPEN until {data.get('expires_at')}[/green]")
+    else:
+        console.print("[yellow]Enrolment window CLOSED[/yellow]")
+    if data.get("fleet_empty"):
+        console.print(
+            "[dim]This install has no agents yet, so the first host enrols with the "
+            "shared token either way.[/dim]"
+        )
 
 
 @agent_app.command("revoke")

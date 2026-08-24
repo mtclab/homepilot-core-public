@@ -72,7 +72,6 @@ Key settings:
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_SECRET_KEY` | — | **Required.** Random hex string |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to vault passphrase file (Docker secrets recommended) |
 | `HP_PROXMOX_HOST` | — | Proxmox VE hostname |
@@ -141,6 +140,38 @@ The host page states the reason when this path does not apply — the guest is
 stopped, it has no qemu-guest-agent, it is not a Proxmox QEMU guest, or it
 already has a live agent. Those hosts (and privileged installs, see below) use
 the manual installer, which remains fully supported.
+
+#### Enrolment window (who may join the fleet)
+
+The shared hub token is a permanent credential, so on its own it let anyone
+holding it add machines to the fleet for ever — and a fleet member gets
+fleet-root exec and file access. A **shared-token enrolment of a hostname this
+install has never seen** is therefore accepted only when either:
+
+- the install has **no agents at all** — a first rollout still needs zero
+  operator input, so zero-touch is untouched; or
+- an operator has an **enrolment window open** (default 15 min, capped at 24h).
+
+Everything else is unchanged on purpose:
+
+| Path | Needs a window? |
+|---|---|
+| An enrolled agent reconnecting with its per-agent credential | no |
+| A one-time bootstrap token (`hp agent bootstrap`, **Install agent**) | no — this is the sanctioned "add one host later" path |
+| The shared token, on a hostname the fleet already contains (re-enrolment after a revoke or a lost token) | no |
+| The shared token, on a hostname nobody has ever enrolled | **yes**, unless the install has no agents yet |
+
+Open it from **Inventory → Hub token**, or from the CLI:
+
+```bash
+hp agent enrolment-window status              # open? until when?
+hp agent enrolment-window open --minutes 30   # open (or extend) the window
+hp agent enrolment-window close               # shut it again
+```
+
+A refused agent is told why and logs it verbatim (`not accepting new hosts right
+now`), the hub audits the refusal with the hostname that was claimed, and no
+agent row is created for the stranger.
 
 #### Manual install
 
@@ -286,7 +317,7 @@ All require API authentication. Endpoints marked **(admin)** require admin scope
 |---|---|---|---|
 | GET | `/api/agents/` | read | List connected agents |
 | GET | `/api/agents/token` | admin | Get hub auth token for agent config |
-| GET | `/api/agents/bootstrap` | admin | Generate one-time bootstrap token |
+| POST | `/api/agents/bootstrap` | admin | Generate one-time bootstrap token (mints: POST so the CSRF gate applies) |
 | GET | `/api/agents/audit` | admin | Query audit log (`agent_id`, `action`, `limit`) |
 | GET | `/api/agents/hostname/{hostname}/connected` | read | Check if agent is connected |
 | POST | `/api/agents/host/exec` | admin | Execute an allowlisted command on a host via its connected agent |
@@ -324,6 +355,7 @@ recent-metrics panel live.
 ```bash
 hp agent token          # Show hub auth token
 hp agent bootstrap      # Generate one-time bootstrap token
+hp agent enrolment-window <action>   # open | close | status (see Enrolment window)
 hp agent list           # List connected agents
 hp agent revoke <id>    # Revoke an agent's per-agent credential
 hp agent remove <id>    # Forget a decommissioned agent (revoke, then delete)
@@ -377,6 +409,7 @@ hp webhook delete             # remove a webhook endpoint
 hp webhook test               # send a test event to a webhook
 hp agent token                # show hub auth token for agent config
 hp agent bootstrap            # generate one-time bootstrap token
+hp agent enrolment-window <action>  # open | close | status the shared-token enrolment window
 hp agent list                 # list connected agents
 hp agent revoke               # revoke an agent's per-agent credential
 hp agent remove <id>          # forget a decommissioned agent (revokes its credential, then deletes the row)
@@ -427,19 +460,26 @@ HP_VAULT_PASSPHRASE_FILE=/run/secrets/hp_vault_passphrase
 
 ## Releases
 
-Releases are cut by **manual workflow dispatch** on the public mirror — there is
-no tag-push trigger, and the release pipeline runs **no test/lint/type gate**
-(verification is the local `make gate`, run before promotion).
+Releases are cut **on the public mirror** (`mtclab/homepilot-core-public`), which
+is where the release workflows carry their triggers — the copies in this private
+repo are `workflow_dispatch`-only by design, so nothing here spends billed
+private-repo Actions minutes.
 
-The chain: sync the reviewed change to the public mirror's `main`, then dispatch
-`auto-tag.yml`. If `pyproject.toml`'s version has no matching tag, it creates and
-pushes `v<version>` and dispatches `release.yml`, which:
+The chain is a version bump, not a tag: sync the reviewed change to the mirror's
+`main`, and the push fires `auto-tag.yml` there. If `pyproject.toml`'s version has
+no matching tag it creates and pushes `v<version>`, then dispatches `release.yml`
+explicitly (a tag pushed with `GITHUB_TOKEN` does not fire the mirror's own
+`push: tags: v*` trigger — GitHub's recursion guard). `release.yml`:
 
 1. Builds and pushes the Docker image (**`linux/amd64` only**) to `ghcr.io/mtclab/homepilot-core-public`
 2. Cross-compiles the `hp-agent` Go binary for `linux/amd64` **and** `linux/arm64`
 3. Publishes a GitHub Release with auto-generated notes and the agent binaries
 
 Do not `git tag` by hand — `auto-tag.yml` owns tagging.
+
+Nothing in that chain gates on tests: the mirror's `ci.yml` runs on the same push
+but `release.yml` does not wait for it. Verification is the local `make gate`, run
+before promotion.
 
 ## Development
 
@@ -448,7 +488,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 # backend (uvicorn)
-HP_SECRET_KEY=dev uvicorn homepilot.main:app --reload
+uvicorn homepilot.main:app --reload
 
 # web UI (separate terminal)
 cd web && npm install && npm run dev
