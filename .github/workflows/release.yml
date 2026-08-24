@@ -34,7 +34,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
         with:
-          images: ghcr.io/${{ github.repository }}
+          # Pinned rather than derived from the github.repository context: this
+          # workflow is also dispatched from the private repo, where that context
+          # resolves to the private name and publishes an image nothing consumes,
+          # burning billed minutes.
+          images: ghcr.io/mtclab/homepilot-core-public
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -97,18 +101,41 @@ jobs:
           pattern: hp-agent-*
           merge-multiple: true
 
+      # The installer (scripts/install-agent.sh) REFUSES an unverified GitHub
+      # fallback download: it fetches this manifest and checks the binary against
+      # it, and aborts naming SHA256SUMS when the asset is absent. So the manifest
+      # is a release requirement, not a nicety.
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: sha256sum hp-agent-* > SHA256SUMS
+
+      # PROVENANCE names the private commit this mirror export was cut from. It is
+      # attached when present; guarded so a release cut before the next re-export
+      # still succeeds.
+      - name: Stage PROVENANCE if present
+        run: |
+          set -euo pipefail
+          if [ -f PROVENANCE ]; then
+            cp PROVENANCE dist/PROVENANCE
+            echo "PROVENANCE attached:"; cat PROVENANCE
+          else
+            echo "No PROVENANCE in this tree - skipping (pre-provenance export)."
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
           generate_release_notes: true
           files: |
             dist/hp-agent-*
+            dist/SHA256SUMS
+            dist/PROVENANCE
             scripts/install-agent.sh
           body: |
             ## Docker
 
             ```bash
-            docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            docker pull ghcr.io/mtclab/homepilot-core-public:${{ github.ref_name }}
             ```
 
             Or with docker compose — set `HP_IMAGE_TAG=${{ github.ref_name }}` in your `.env`.
@@ -119,10 +146,10 @@ jobs:
 
             ```bash
             # Linux amd64
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hp-agent-linux-amd64
+            curl -LO https://github.com/mtclab/homepilot-core-public/releases/download/${{ github.ref_name }}/hp-agent-linux-amd64
             chmod +x hp-agent-linux-amd64
             sudo mv hp-agent-linux-amd64 /usr/local/bin/hp-agent
 
             # Or use the install script
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install-agent.sh | bash
+            curl -fsSL https://raw.githubusercontent.com/mtclab/homepilot-core-public/main/scripts/install-agent.sh | bash
             ```
