@@ -21,32 +21,27 @@ friend's browser ──mTLS──> front nginx ── /guest/* + /invite/* ─�
 
 ## The vhost
 
+The vhost is a committed file, not a snippet in this page:
+**`deploy/portal/nginx-guest-portal.conf`** is the source of truth, and
+`tests/test_guest_vhost_reference.py` lints it (only `^/(guest|invite)` may
+proxy to the backend; `Authorization` and `Cookie` are stripped; the catch-all
+never reaches the app). Copy that file and adapt `<backend-host>`, `server_name`
+and the certificate paths - nothing else.
+
+The heart of it:
+
 ```nginx
-server {
-    listen 443 ssl;
-    server_name guests.example.net;
+location = / { return 302 /guest/; }
 
-    ssl_certificate         /etc/nginx/certs/guests.crt;
-    ssl_certificate_key     /etc/nginx/certs/guests.key;
-
-    # The friends' CA. `optional` so the page itself can render a clear
-    # "no certificate" message instead of a browser-level TLS failure;
-    # the backend refuses anything unverified regardless.
-    ssl_client_certificate  /etc/nginx/certs/friends-ca.crt;
-    ssl_verify_client       optional;
-
-    location = / { return 302 /guest/; }
-
-    # ONLY these two prefixes reach HomePilot. Everything else 404s here.
-    location ~ ^/(guest|invite)(/|$) {
-        proxy_pass http://<backend-host>:8000;
-        proxy_set_header X-Hp-Portal-Secret     "<value of HP_PORTAL_PROXY_SECRET>";
-        proxy_set_header ssl-client-verify      $ssl_client_verify;
-        proxy_set_header ssl-client-subject-dn  $ssl_client_s_dn;
-        # Never forward auth material a client might try to smuggle.
-        proxy_set_header Authorization "";
-        proxy_set_header Cookie "";
-    }
+# ONLY these two prefixes reach HomePilot. Everything else 404s here.
+location ~ ^/(guest|invite)(/|$) {
+    proxy_pass http://<backend-host>:8000;
+    proxy_set_header X-Hp-Portal-Secret     "<value of HP_PORTAL_PROXY_SECRET>";
+    proxy_set_header ssl-client-verify      $ssl_client_verify;
+    proxy_set_header ssl-client-subject-dn  $ssl_client_s_dn;
+    # Never forward auth material a client might try to smuggle.
+    proxy_set_header Authorization "";
+    proxy_set_header Cookie "";
 }
 ```
 
@@ -54,6 +49,16 @@ Three factors, all required by the backend on every request: the request must
 come from the address in `HP_PORTAL_TRUSTED_PROXY`, carry the shared secret,
 and carry `ssl-client-verify: SUCCESS` with exactly one `CN=` in the subject.
 Anything less renders "no client certificate".
+
+The vhost is the FIRST wall, not the only one: the backend serves the operator
+API from the same process, and `tests/test_portal_management_boundary.py` proves
+that a request carrying perfect guest trust is refused by every management route
+even when it reaches the backend directly.
+
+**Not yet proven live.** No guest portal is deployed. A real deployment is
+verified by a live smoke at go-live (mTLS handshake, `/guest/` renders,
+`/inventory` through the public vhost 404s); that is owner-gated and has not
+been run.
 
 ## Per-guest budgets
 
