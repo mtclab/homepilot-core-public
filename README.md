@@ -8,7 +8,7 @@ Manage your homelab through structured artifacts — proposed by AI, reviewed by
 
 ```bash
 git clone https://github.com/mtclab/homepilot-core-public.git
-cd homepilot-v2
+cd homepilot-core-public
 cp .env.example .env
 docker compose up -d
 ```

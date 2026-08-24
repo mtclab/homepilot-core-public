@@ -1,9 +1,16 @@
 name: Auto-tag release on version bump
 
 # When main advances and pyproject's version has no matching tag yet, create and
-# push `v<version>`. On the public mirror that tag triggers release.yml → the
-# Docker image build. So: scrub+sync to public main (manual, security-reviewed) →
-# this auto-tags → the image builds. No manual tagging.
+# push `v<version>`, then DISPATCH release.yml on that tag.
+#
+# The dispatch is load-bearing, not a belt-and-braces extra: a tag pushed with
+# GITHUB_TOKEN does not fire another workflow's `on: push: tags` trigger (GitHub's
+# recursion guard), so release.yml would never run on its own. If the dispatch
+# fails, no image and no release get built - which is why the step below fails the
+# job instead of logging and moving on.
+#
+# So: scrub+sync to public main (manual, security-reviewed) -> this auto-tags ->
+# this dispatches release.yml -> the image builds. No manual tagging.
 on:
   push:
     branches: [main, master]
@@ -39,8 +46,14 @@ jobs:
           git tag -a "$TAG" -m "Release $TAG"
           git push origin "$TAG"
           # Tags pushed with GITHUB_TOKEN do not fire on:push triggers
-          # (GitHub recursion guard) — dispatch the release explicitly.
-          gh workflow run release.yml --ref "$TAG" || echo "no release.yml to dispatch"
+          # (GitHub recursion guard) - dispatch the release explicitly. A failed
+          # dispatch leaves a tag with no image and no release behind it, so it
+          # must fail the job: swallowing it reported green on a release that
+          # never happened.
+          if ! gh workflow run release.yml --ref "$TAG"; then
+            echo "::error::Tagged $TAG but could not dispatch release.yml - no image or release was built. Dispatch it manually, then investigate."
+            exit 1
+          fi
           echo "Created + pushed $TAG (release dispatched)."
         env:
           GH_TOKEN: ${{ github.token }}
