@@ -28,6 +28,11 @@
 #   --write-prefix P  Grant writes under P (repeatable). Replaces the default
 #                     prefix set; /etc/homepilot is always included.
 #   --no-start        Install the unit but do not start it.
+#   --allow-unverified
+#                     Install the GitHub-fallback binary even when the release
+#                     carries no SHA256SUMS manifest to verify it against. This
+#                     installs UNVERIFIED code that runs as root - the default is
+#                     to refuse.
 #
 # The agent is purely env-configured and runs as a systemd service. This script
 # writes /etc/homepilot/agent.env with the connection settings and installs the
@@ -59,6 +64,18 @@ PRIVILEGED="${PRIVILEGED:-false}"
 ALLOW_PACKAGE_INSTALL="${ALLOW_PACKAGE_INSTALL:-false}"
 WRITE_PREFIXES="${WRITE_PREFIXES:-}"
 START=1
+# Opt-out of the GitHub-fallback checksum requirement. Off by default: this
+# script installs a binary that runs as root, so "we could not verify it" has to
+# stop the install rather than print a warning nobody reads.
+ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
+# GitHub endpoints, overridable so the fallback path can be pointed at a local
+# server by tests (the control-plane path is already addressable via HP_API).
+# Production never sets these.
+GH_API_BASE="${GH_API_BASE:-https://api.github.com}"
+GH_DL_BASE="${GH_DL_BASE:-https://github.com}"
+# Name of the release asset carrying the per-file sha256 digests. Named in a
+# variable so the refusal message can state exactly what was looked for.
+SUMS_NAME="${SUMS_NAME:-SHA256SUMS}"
 
 # ─── Parse flags (the UI passes --hub / --token) ───
 while [ $# -gt 0 ]; do
@@ -74,6 +91,7 @@ while [ $# -gt 0 ]; do
                       PRIVILEGED="true"; ALLOW_PACKAGE_INSTALL="true"; shift ;;
         --write-prefix) WRITE_PREFIXES="$WRITE_PREFIXES $2"; shift 2 ;;
         --no-start)   START=0; shift ;;
+        --allow-unverified) ALLOW_UNVERIFIED="true"; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -199,55 +217,106 @@ esac
 
 echo "=== Installing hp-agent (linux-$GOARCH) ==="
 
+# >>> download block (executed verbatim by tests/test_install_agent_download.py)
 # ─── Download ───
 #
 # Prefer the control plane. It has the binary in its own image, it is reachable
 # from a guest that has no internet at all, and the version it serves is by
 # construction the one managing this host (#464). GitHub is the fallback for a
 # host installed without a reachable HomePilot.
+#
+# Two properties hold on BOTH paths, because what is being installed is a binary
+# that will run as root:
+#
+#   * The bytes never touch a predictable path. They are downloaded into a
+#     private `mktemp -d` (mode 0700), verified there, and installed from there.
+#     The old code wrote /tmp/hp-agent, which any local user could pre-create as
+#     a symlink for root to write through, and it left a TOCTOU window between
+#     the sha256sum check and the `mv` that published the file.
+#   * Nothing unverified is installed. The control-plane path checks the
+#     x-hp-sha256 header served with the bytes; the GitHub path checks the
+#     release's SHA256SUMS manifest. If no digest can be obtained the install
+#     REFUSES, unless the operator explicitly passed --allow-unverified.
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hp-agent-install.XXXXXX")
+trap 'rm -rf "$TMP_DIR"' EXIT
+BIN="$TMP_DIR/hp-agent"
+
 if [ -n "$HP_API" ]; then
     SRC="${HP_API%/}/agents/dist/hp-agent-linux-$GOARCH"
     echo "Downloading $SRC ..."
     # The digest travels in a header alongside the bytes, so it is verified below
     # without a second request that could be answered by something else.
-    EXPECTED=$(curl -fsSL -D /tmp/hp-agent.hdr -o /tmp/hp-agent \
+    EXPECTED=$(curl -fsSL -D "$TMP_DIR/hp-agent.hdr" -o "$BIN" \
         -H "x-hp-agent-token: $TOKEN" "$SRC" \
-        && tr -d '\r' < /tmp/hp-agent.hdr \
+        && tr -d '\r' < "$TMP_DIR/hp-agent.hdr" \
         | awk 'tolower($1) == "x-hp-sha256:" { print $2 }' | tail -1)
-    rm -f /tmp/hp-agent.hdr
+    rm -f "$TMP_DIR/hp-agent.hdr"
     if [ -z "$EXPECTED" ]; then
         echo "The control plane served no x-hp-sha256 for the agent binary." >&2
         echo "Refusing to install an unverified binary." >&2
         exit 1
     fi
-    ACTUAL=$(sha256sum /tmp/hp-agent | awk '{print $1}')
-    if [ "$ACTUAL" != "$EXPECTED" ]; then
-        echo "Checksum mismatch for hp-agent:" >&2
-        echo "  expected $EXPECTED" >&2
-        echo "  got      $ACTUAL" >&2
-        rm -f /tmp/hp-agent
-        exit 1
-    fi
-    echo "Verified sha256 $ACTUAL"
 else
     # ─── Resolve version (GitHub fallback) ───
     if [ "$VERSION" = "latest" ]; then
-        VERSION=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
+        VERSION=$(curl -sL "$GH_API_BASE/repos/$REPO/releases/latest" \
             | grep '"tag_name":' | head -1 | sed 's/.*"tag_name": "\([^"]*\)".*/\1/')
         [ -z "$VERSION" ] && { echo "Could not resolve latest release tag." >&2; exit 1; }
         echo "Latest release: $VERSION"
     fi
-    URL="https://github.com/$REPO/releases/download/$VERSION/hp-agent-linux-$GOARCH"
+    ASSET="hp-agent-linux-$GOARCH"
+    URL="$GH_DL_BASE/$REPO/releases/download/$VERSION/$ASSET"
+    SUMS_URL="$GH_DL_BASE/$REPO/releases/download/$VERSION/$SUMS_NAME"
     echo "Downloading $URL ..."
-    curl -fSL -o /tmp/hp-agent "$URL"
+    curl -fSL -o "$BIN" "$URL"
+    # The manifest is a SEPARATE release asset published alongside the binaries.
+    # No manifest (or no line for this asset) means the download is unverifiable.
+    EXPECTED=""
+    if curl -fsSL -o "$TMP_DIR/$SUMS_NAME" "$SUMS_URL"; then
+        echo "Fetched $SUMS_URL"
+        # sha256sum manifest format: "<digest>  <name>", or "*<name>" in binary
+        # mode; a leading directory is tolerated.
+        EXPECTED=$(awk -v want="$ASSET" \
+            '{ n = $2; sub(/^[*]/, "", n); sub(/^.*\//, "", n); if (n == want) print $1 }' \
+            "$TMP_DIR/$SUMS_NAME" | tail -1)
+    fi
+    if [ -z "$EXPECTED" ]; then
+        if [ "$ALLOW_UNVERIFIED" = "true" ]; then
+            echo "WARNING: no checksum found for $ASSET; installing it UNVERIFIED" >&2
+            echo "         because --allow-unverified was passed." >&2
+        else
+            echo "Cannot verify the downloaded hp-agent binary." >&2
+            echo "  wanted a sha256 for : $ASSET" >&2
+            echo "  looked in           : $SUMS_URL" >&2
+            echo "                        (release asset '$SUMS_NAME' of $REPO $VERSION)" >&2
+            echo "Refusing to install an unverified binary that runs as root." >&2
+            echo "Publish $SUMS_NAME with the release, install from the control plane" >&2
+            echo "(--hp-api URL), or re-run with --allow-unverified to accept the risk." >&2
+            exit 1
+        fi
+    fi
 fi
-if ! file /tmp/hp-agent | grep -q "ELF"; then
+
+# Verify and install THE SAME FILE, with no window in between: $BIN sits inside a
+# 0700 directory no other user can reach, and `install` publishes it in one step
+# with its final mode (no chmod-then-move dance on a shared path).
+if [ -n "$EXPECTED" ]; then
+    ACTUAL=$(sha256sum "$BIN" | awk '{print $1}')
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Checksum mismatch for hp-agent:" >&2
+        echo "  expected $EXPECTED" >&2
+        echo "  got      $ACTUAL" >&2
+        exit 1
+    fi
+    echo "Verified sha256 $ACTUAL"
+fi
+if command -v file >/dev/null 2>&1 && ! file "$BIN" | grep -q "ELF"; then
     echo "Downloaded file is not a valid binary. Check the release exists." >&2
     exit 1
 fi
-chmod +x /tmp/hp-agent
-$SUDO mv /tmp/hp-agent "$INSTALL_DIR/hp-agent"
+$SUDO install -m 0755 "$BIN" "$INSTALL_DIR/hp-agent"
 echo "Installed to $INSTALL_DIR/hp-agent"
+# <<< end download block
 
 # ─── Create the service user (no login, no home writes needed) ───
 if ! id hp-agent >/dev/null 2>&1; then

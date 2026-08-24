@@ -344,7 +344,6 @@ class TestNoSecretsInTheReport:
             events_webhook_secret=f"{s}-webhook",
             n8n_api_key=f"{s}-n8n",
             vault_passphrase=f"{s}-vault",
-            secret_key=f"{s}-key",
             admin_secret=f"{s}-admin",
             portal_proxy_secret=f"{s}-portal",
             artifacts_remote=f"https://oauth2:{s}-git@github.com/example/artifacts.git",
@@ -508,7 +507,6 @@ class TestAgainstRealAppState:
         from homepilot.config import Settings
 
         settings = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
             data_dir=hp_dir,
             artifacts_dir=os.path.join(hp_dir, "artifacts"),
             **overrides,

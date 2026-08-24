@@ -156,7 +156,7 @@ func TestDockerRunSingleSpace450(t *testing.T) {
 	allowed := []string{
 		"docker run nginx",
 		"docker run --name=web nginx",
-		"docker run --network host registry.example.com/img:tag",
+		"docker run --name web registry.example.com/img:tag",
 		"docker run  nginx", // the old accidental form keeps working
 	}
 	for _, c := range allowed {
@@ -174,6 +174,94 @@ func TestDockerRunSingleSpace450(t *testing.T) {
 	for _, c := range blocked {
 		if ok, _ := a.IsAllowed(c); ok {
 			t.Errorf("expected blocked: %q", c)
+		}
+	}
+}
+
+// A privileged agent may start containers, but never one that IS the host.
+//
+// The docker-run allow pattern matches a generic `--flag value` shape, so it
+// cannot enumerate what is safe. Once #450 widened it from `--flag=value` to
+// `--flag[= ]value`, `docker run --volume /:/mnt --user 0 img` matched: the
+// agent's own containment (a non-root user, ProtectSystem=strict, an argument
+// -checked command list) all became irrelevant the moment the container it
+// launched had / bind-mounted and ran as uid 0.
+//
+// Each dangerous flag is asserted in BOTH forms (`--flag=value` and
+// `--flag value`, plus the -v/-u short forms) and, for every one, the same
+// command WITHOUT the flag is asserted to still be allowed - so this gate fails
+// if the fix simply refused docker run outright.
+//
+// Teeth: delete the dockerRunDeniedFlag call from IsAllowed and every case in
+// `escapes` fails with "expected BLOCKED".
+func TestDockerRunDangerousFlagsAreDenied(t *testing.T) {
+	a := Allowlist{privileged: true}
+
+	escapes := []string{
+		// bind mounts: the whole filesystem, read-write, into the container
+		"docker run --volume=/:/mnt nginx",
+		"docker run --volume /:/mnt nginx",
+		"docker run -v /:/mnt nginx",
+		"docker run -v=/:/mnt nginx",
+		"docker run --mount=type=bind,src=/,dst=/mnt nginx",
+		"docker run --mount type=bind,src=/,dst=/mnt nginx",
+		// all capabilities, no confinement
+		"docker run --privileged nginx",
+		"docker run --privileged=true nginx",
+		// run as root inside, which matters as soon as anything is mounted
+		"docker run --user=0 nginx",
+		"docker run --user 0 nginx",
+		"docker run -u 0 nginx",
+		"docker run -u=0:0 nginx",
+		// host namespaces
+		"docker run --pid=host nginx",
+		"docker run --pid host nginx",
+		"docker run --ipc=host nginx",
+		"docker run --ipc host nginx",
+		"docker run --net=host nginx",
+		"docker run --net host nginx",
+		"docker run --network=host nginx",
+		"docker run --network host nginx",
+		"docker run --userns=host nginx",
+		"docker run --userns host nginx",
+		// capabilities / confinement profiles / raw devices
+		"docker run --cap-add=SYS_ADMIN nginx",
+		"docker run --cap-add SYS_ADMIN nginx",
+		"docker run --security-opt=seccomp=unconfined nginx",
+		"docker run --security-opt seccomp=unconfined nginx",
+		"docker run --device=/dev/sda nginx",
+		"docker run --device /dev/sda nginx",
+		// the exact #450-era vector, both orders
+		"docker run --volume /:/mnt --user 0 img",
+		"docker run --name web --volume /:/mnt img",
+	}
+	for _, c := range escapes {
+		if ok, reason := a.IsAllowed(c); ok {
+			t.Errorf("expected BLOCKED, agent would run it: %q (reason=%q)", c, reason)
+		}
+	}
+
+	// The same shapes minus the dangerous flag must still work: the fix is a
+	// deny-list on specific options, not a ban on `docker run`.
+	stillAllowed := []string{
+		"docker run nginx",
+		"docker run --name=web nginx",
+		"docker run --name web nginx",
+		"docker run --rm nginx",
+		"docker run --name web registry.example.com/img:tag",
+		"docker run nginx echo hello",
+	}
+	for _, c := range stillAllowed {
+		if ok, reason := a.IsAllowed(c); !ok {
+			t.Errorf("expected allowed: %q (%s)", c, reason)
+		}
+	}
+
+	// An unprivileged agent never reaches the docker-run entry at all.
+	un := Allowlist{}
+	for _, c := range escapes {
+		if ok, _ := un.IsAllowed(c); ok {
+			t.Errorf("expected BLOCKED unprivileged: %q", c)
 		}
 	}
 }

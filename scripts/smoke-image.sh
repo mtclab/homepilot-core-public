@@ -26,7 +26,7 @@ chmod 777 "$DATA"
 
 echo "smoke: starting container on :$PORT…"
 docker run -d --name "$NAME" -p "$PORT":8000 \
-    -e HP_MCP_TOKEN="$TOKEN" -e HP_SECRET_KEY=smoke-secret \
+    -e HP_MCP_TOKEN="$TOKEN" \
     -e HP_VAULT_PASSPHRASE=smoke-pass -e HP_ENV=dev \
     -v "$DATA":/home/homepilot/.hp "$TAG" >/dev/null
 

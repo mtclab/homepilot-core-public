@@ -9,11 +9,20 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..auth.deps import SCOPE_ENFORCER_ATTR, require_scope
-from .audit import set_audit_caller
+from .audit import ActionType, set_audit_caller
 from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
+from .enrolment_window import (
+    DEFAULT_WINDOW_MINUTES,
+    MAX_WINDOW_MINUTES,
+    close_window,
+    open_window,
+)
+from .enrolment_window import (
+    status as window_status,
+)
 from .registry import AgentRegistry
 
 if TYPE_CHECKING:
@@ -475,7 +484,12 @@ async def migrate_fleet_tls(request: Request, body: MigrateTLSRequest) -> dict[s
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.get("/bootstrap", dependencies=[_admin_only])
+# POST, not GET: this route MINTS a credential. The CSRF gate in auth/deps.py
+# deliberately skips safe methods, so a state-changing endpoint reachable by GET
+# is a state change a cookie-authenticated browser can be tricked into making
+# from any origin. Minting is a mutation; it gets a mutating method and the CSRF
+# gate that comes with it.
+@router.post("/bootstrap", dependencies=[_admin_only])
 async def create_bootstrap_token(request: Request) -> dict[str, Any]:
     registry = _get_registry()
     hub = registry.hub_server
@@ -489,6 +503,92 @@ async def create_bootstrap_token(request: Request) -> dict[str, Any]:
         "hub_port": port,
         **_hub_tls_fields(hub),
     }
+
+
+# ── Enrolment window (#537) ──────────────────────────────────────────────────
+# Declared BEFORE the `/{agent_id}` routes at the bottom of this module: FastAPI
+# matches in declaration order, so `/enrolment-window` registered after them
+# would be swallowed as an agent id.
+
+
+class EnrolmentWindowRequest(BaseModel):
+    minutes: int = Field(
+        default=DEFAULT_WINDOW_MINUTES,
+        ge=1,
+        le=MAX_WINDOW_MINUTES,
+        description="How long the window stays open, from now. Capped at 24h.",
+    )
+
+
+def _window_repo(request: Request) -> Any:
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="Enrolment window store not available")
+    return repo
+
+
+async def _window_payload(repo: Any) -> dict[str, Any]:
+    """The window's state plus the ONE thing that changes what it means: an
+    install with no agents enrols its first host with or without a window, so a
+    UI that showed only "closed" there would be lying about what will happen."""
+    state = await window_status(repo)
+    state["fleet_empty"] = await repo.count_agents() == 0
+    return state
+
+
+@router.get("/enrolment-window", dependencies=[_admin_only])
+async def get_enrolment_window(request: Request) -> dict[str, Any]:
+    """Whether the shared fleet token can currently enrol a NEW host."""
+    return await _window_payload(_window_repo(request))
+
+
+@router.post("/enrolment-window", dependencies=[_admin_only])
+async def open_enrolment_window(
+    request: Request,
+    body: EnrolmentWindowRequest | None = None,
+    token: dict[str, Any] = _admin_token,
+) -> dict[str, Any]:
+    """Open (or extend) the enrolment window.
+
+    While it is open the shared fleet token enrols hostnames this install has
+    never seen. That is the whole exposure a leaked shared token used to carry
+    permanently, so opening it is audited with the operator who did it.
+    """
+    repo = _window_repo(request)
+    minutes = (body or EnrolmentWindowRequest()).minutes
+    result = await open_window(repo, minutes)
+    _audit_window("enrolment_window_opened", token, f"minutes={result['minutes']}")
+    return await _window_payload(repo)
+
+
+@router.delete("/enrolment-window", dependencies=[_admin_only])
+async def close_enrolment_window(
+    request: Request, token: dict[str, Any] = _admin_token
+) -> dict[str, Any]:
+    """Close the enrolment window now. Idempotent."""
+    repo = _window_repo(request)
+    await close_window(repo)
+    _audit_window("enrolment_window_closed", token, "")
+    return await _window_payload(repo)
+
+
+def _audit_window(action: ActionType, token: dict[str, Any], detail: str) -> None:
+    """Record who widened (or narrowed) who may join the fleet.
+
+    Best-effort like every other audit write: a hub that is not running must not
+    stop an operator from closing the window."""
+    from homepilot.app_state import get_agent_registry
+
+    audit_log = getattr(get_agent_registry(), "audit_log", None)
+    if audit_log is None:
+        return
+    audit_log.log(
+        agent_id="",
+        action=action,
+        command_or_path=detail,
+        result="success",
+        caller=_caller_label(token),
+    )
 
 
 class InstallAgentRequest(BaseModel):

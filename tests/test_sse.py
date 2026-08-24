@@ -106,7 +106,6 @@ class TestEmitEventPublishesToBus:
             from homepilot.config import Settings
 
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url=None,
             )
             from homepilot.events import emit_event

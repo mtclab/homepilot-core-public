@@ -149,10 +149,14 @@ def test_the_native_replacement_is_wired_in_its_place():
     """The removal and the replacement ship together, so there is never a
     release where the UI advertises metrics that do not exist."""
     from homepilot.config import Settings
-    from homepilot.main import app
+    from homepilot.main import _walk_api_routes, app
 
     assert "metrics_retention_days" in Settings.model_fields
-    paths = {route.path for route in app.routes}  # type: ignore[attr-defined]
+    # FastAPI 0.137+ keeps routes behind include_router in an _IncludedRouter
+    # wrapper with no `.path`, and the routes inside carry UNPREFIXED paths, so
+    # walk the app through the scope guard's walker - it descends the wrappers
+    # and rebuilds the full paths (#472).
+    paths = {path for path, _route, _deps in _walk_api_routes(list(app.routes))}
     assert "/monitoring/hosts/{hostname}/series" in paths
     assert "/monitoring/hosts/{hostname}/latest" in paths
     assert "/monitoring/rules" in paths

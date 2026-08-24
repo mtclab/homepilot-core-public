@@ -265,7 +265,7 @@ The agent hub uses **length-prefixed JSON** over TCP:
 ### Authentication
 
 1. **Persistent token** (`HP_AGENT_AUTH_TOKEN`): Shared secret between hub and agent. Set once, works forever.
-2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `GET /agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
+2. **Bootstrap token** (`hpbat_*`): One-time-use, 24h expiry. Generated via `hp agent bootstrap` or `POST /agents/bootstrap`. Consumed on first connection. Stored as hash in SQLite (migration 9).
 
 ### Enrolment without touching the host (ADR-004 S4)
 

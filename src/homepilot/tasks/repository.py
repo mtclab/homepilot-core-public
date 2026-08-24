@@ -111,6 +111,32 @@ class TaskRepository:
         await self.db.conn.commit()
         return await self.get_task(task_id)
 
+    async def record_cancel_outcome(
+        self,
+        task_id: str,
+        result_json: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Write what actually happened on the infrastructure onto an ALREADY
+        cancelled task (#452).
+
+        A provision cancel answers the caller immediately (the row goes
+        'cancelled' the moment we ask), but the unwind - stopping the PVE task,
+        destroying the half-created guest - finishes afterwards, and its outcome
+        is the thing an operator needs. So this touches result_json/error ONLY,
+        never status or finished_at, and only `WHERE status = 'cancelled'`: the
+        no-clobber invariant of cancel_task above works precisely because a late
+        writer cannot move a finished row, and this must not become the
+        exception to it.
+        """
+        await self.db.execute(
+            """UPDATE tasks SET result_json = ?, error = ?
+               WHERE id = ? AND status = 'cancelled'""",
+            (result_json, error, task_id),
+        )
+        await self.db.conn.commit()
+        return await self.get_task(task_id)
+
     async def get_active_task(self, artifact_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone(
             """SELECT id, status, action FROM tasks

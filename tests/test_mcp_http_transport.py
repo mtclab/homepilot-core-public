@@ -82,7 +82,6 @@ async def _booted_app(token: str) -> AsyncIterator[tuple[object, httpx.AsyncClie
         "HP_DATA_DIR": data_dir,
         "HP_ARTIFACTS_DIR": os.path.join(data_dir, "artifacts"),
         "HP_MCP_TOKEN": token,
-        "HP_SECRET_KEY": "test-secret-key-for-pytest-only-not-for-production",
     }
     from homepilot.config import get_settings
 

@@ -1,5 +1,96 @@
 # Changelog
 
+## v3.3.0 (2026-08-24)
+
+The open-mechanics sweep: the #381 hub-hardening remainder, an operator-gated
+enrolment window for the shared fleet token, real provision cancel, mirror
+provenance, and the config/docs parity gate.
+
+### A provision cancel now cancels (#452)
+
+Cancelling a provision task used to mark the row and let the clone finish -
+which then overwrote the row with 'succeeded'. Cancel now reaches the running
+job, unwinds what it put on Proxmox (stop the in-flight PVE task, destroy the
+half-created guest, disks and all), and the record states what actually
+happened - including "cleanup failed, guest vmid N may remain on node X" and
+the post-restart "PVE state unknown" case.
+
+### The route scope guard sees the whole API again (#472)
+
+FastAPI 0.137+ stopped flattening `include_router`, which silently blinded the
+startup scope guard (5 routes inspected instead of 98). The guard now walks the
+include wrappers - accumulating prefixes and include-time dependencies - on
+both old and new FastAPI, and the pin is lifted (0.141.1 in the lock). A floor
+on the inspected-route count makes an empty finding mean "nothing unscoped",
+never "nothing checked".
+
+### The secret key that signed nothing is gone (#394)
+
+`HP_SECRET_KEY` guarded a value nothing read (tokens never used JWT), and its
+production fail-closed gate could refuse to boot over it. Deleted end-to-end -
+field, vault entry, generation chain, docs claims. A stale value in a live
+`.env` is ignored; production now starts in strictly more cases. A new parity
+gate reflects over the real Settings fields and fails when `.env.example`, the
+deployment env table, or the compose image tags drift from the code.
+
+### The shared fleet token needs an open window to add a NEW host
+
+The shared hub token never expires, so a copy of it could add machines to the
+fleet for ever - and a fleet member gets fleet-root exec and file access. A
+shared-token enrolment of a hostname this install has **never seen** is now
+accepted only while an operator has an **enrolment window** open (default 15
+min, capped at 24h) - or when the install has no agents at all, so the
+zero-touch first rollout still needs zero input.
+
+Unchanged: per-agent reconnects, one-time bootstrap tokens (including the UI's
+**Install agent**), and re-enrolling a hostname the fleet already contains. A
+refused agent is told why and logs it, the hub audits the refusal with the
+claimed hostname, and no agent row is created for the stranger.
+
+`GET/POST/DELETE /api/agents/enrolment-window` (admin), `hp agent
+enrolment-window open|close|status`, and an Open/Close control next to the hub
+token in **Inventory**.
+
+### Every mirror export names the private commit it came from (#363)
+
+`scrub-for-public.sh` now writes a `PROVENANCE` file at the export root
+(`source_commit`, `source_repo`, `scrub_version` - the sha1 of the scrub script
+itself) and prints the exact mirror commit invocation, including the
+`Source-Commit: <sha>` trailer. There is deliberately no timestamp in the file:
+a re-export of the same private commit with the same scrub rules stays
+byte-identical. `validate-scrub.sh` FAILS when `PROVENANCE` is missing, when
+`source_commit` is not a full 40-char sha, or when a timestamp was added - so a
+tree hand-copied into the mirror, bypassing the scrub, does not validate.
+
+### Breaking: the bootstrap token is minted by POST
+
+`GET /api/agents/bootstrap` is now `POST /api/agents/bootstrap`. It mints a
+fleet-enrolment credential, and the CSRF gate deliberately skips safe methods -
+so as a GET it was mintable cross-origin from any page a signed-in admin
+visited. `hp agent bootstrap` and the web UI move with it; a script calling the
+old GET must be updated.
+
+### The agent installer verifies what it installs
+
+The GitHub fallback used to `curl` the binary and run it as root with no digest
+check at all (the control-plane path has verified since #464). It now checks the
+release's `SHA256SUMS` asset and REFUSES when there is none, naming the manifest
+it looked for; `--allow-unverified` is the only override. Both paths now
+download into a private `mktemp -d` and `install` the file they verified -
+no more predictable `/tmp/hp-agent` for a local user to pre-create as a symlink,
+and no window between the checksum and the move.
+
+### Agent
+
+`docker run` can no longer be handed the host: `--volume/-v`, `--mount`,
+`--privileged`, `--user/-u`, `--pid`, `--ipc`, `--net`/`--network`, `--cap-add`,
+`--security-opt`, `--device` and `--userns` are refused in both the `--flag=x`
+and `--flag x` forms. The durable hub credential is written atomically
+(temp + fsync + rename) instead of truncate-in-place, which could leave a
+half-written token and lock a host out for good. A command result must now
+answer the action it was issued for, and the reconnect path no longer races on
+the live socket (`make gate-go-race`).
+
 ## v3.2.0 (2026-08-24)
 
 The archive gets real, and the assistant can manage guests.

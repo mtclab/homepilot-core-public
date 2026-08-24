@@ -10,7 +10,6 @@ HomePilot v2 uses a **zero-secrets deployment model**: the `.env` file contains 
 Secret resolution order:
   env var → vault → file → auto-generate
 
-  HP_SECRET_KEY=          → vault("secret-key") → auto-generate & persist
   HP_ADMIN_SECRET=         → vault("admin-secret") → ConfigError (production)
   PVE_API_TOKEN=           → vault("pve-token") → unavailable
   HP_EVENTS_WEBHOOK_SECRET=→ vault("webhook-secret") → unavailable
@@ -71,7 +70,6 @@ This accommodates different vault secret formats:
 
 | Vault Key | Common Value Keys | Example |
 |-----------|------------------|---------|
-| `secret-key` | `value`, `secret` | `{"value": "abc123..."}` |
 | `admin-secret` | `value`, `secret` | `{"secret": "xyz789..."}` |
 | `pve-token` | `token`, `key` | `{"token": "admin@pam!tokenid=uuid"}` |
 | `pve-write-token` | `token`, `key` | `{"token": "admin@pam!tokenid=uuid"}` (optional, falls back to pve-token) |
@@ -84,7 +82,7 @@ This accommodates different vault secret formats:
 If the env var is set, it's used directly. No vault lookup.
 
 ```bash
-HP_SECRET_KEY=abc123  # Used directly
+HP_ADMIN_SECRET=abc123  # Used directly
 ```
 
 ### 2. Vault (recommended for production)
@@ -101,10 +99,10 @@ docker compose exec -it backend hp vault set pve-token
 
 If neither env var nor vault has the secret, some keys are auto-generated:
 
-- `secret_key` → persisted to `{data_dir}/.secret_key` (0o600)
 - `vault_passphrase` → persisted to `{data_dir}/.vault_passphrase` (0o600)
+- `agent_hub_auth_token` → persisted to `{data_dir}/.agent_hub_token` (0o600)
 
-**Production safeguards**: If `HP_ENV=production` and `HP_SECRET_KEY` is not set (and not in vault), HomePilot refuses to start with a `ConfigError`.
+**Production safeguard**: under `HP_ENV=production` the vault passphrase is never auto-generated — supply `HP_VAULT_PASSPHRASE` or `HP_VAULT_PASSPHRASE_FILE`, or the vault stays disabled.
 
 ## Deployment: Zero-Secrets .env
 
@@ -125,14 +123,13 @@ HP_CORS_ORIGINS=*
 HP_EMBEDDING_SERVICE_URL=http://llm-embed:8081/v1/embeddings
 HP_EMBEDDING_MODEL=bge-m3
 
-# All secrets are in the vault — no HP_SECRET_KEY, HP_ADMIN_SECRET, etc.
+# All secrets are in the vault — no HP_ADMIN_SECRET, PVE_API_TOKEN, etc.
 ```
 
-The vault holds 5 secrets:
+The vault holds 4 secrets:
 
 | Vault Key | Purpose | Value Format |
 |-----------|---------|-------------|
-| `secret-key` | API token signing key | `{"value": "random_hex_64"}` |
 | `admin-secret` | Admin authentication | `{"secret": "random_hex_32"}` |
 | `webhook-secret` | Event webhook verification | `{"value": "random_hex_32"}` |
 | `pve-token` | Proxmox VE read API access | `{"token": "admin@pam!tokenid=uuid"}` |
@@ -145,7 +142,6 @@ The vault holds 5 secrets:
 docker compose up -d
 
 # 2. Set vault secrets
-docker compose exec -it backend hp vault set secret-key
 docker compose exec -it backend hp vault set admin-secret
 docker compose exec -it backend hp vault set webhook-secret
 docker compose exec -it backend hp vault set pve-token
@@ -163,4 +159,4 @@ docker compose restart backend
 - Passphrase file (`{data_dir}/.vault_passphrase`) is mode `0o600` — only the HomePilot process can read it
 - Vault data is encrypted with age (X25519 + ChaCha20-Poly1305)
 - Auto-generated secrets are ephemeral if the passphrase file cannot be persisted (read-only filesystem)
-- In production (`HP_ENV=production`), `HP_SECRET_KEY` must be explicitly set or stored in vault — auto-generation is forbidden
+- In production (`HP_ENV=production`), the vault passphrase must be supplied explicitly (`HP_VAULT_PASSPHRASE` / `HP_VAULT_PASSPHRASE_FILE`) — auto-generation is forbidden

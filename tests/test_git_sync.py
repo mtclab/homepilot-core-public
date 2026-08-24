@@ -174,7 +174,6 @@ class TestCLIPush:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -193,7 +192,6 @@ class TestCLIPush:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -215,7 +213,6 @@ class TestCLIPush:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -235,7 +232,6 @@ class TestCLIPull:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -258,7 +254,6 @@ class TestCLIPull:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -281,7 +276,6 @@ class TestCLISyncStatus:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -302,7 +296,6 @@ class TestCLISyncStatus:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (

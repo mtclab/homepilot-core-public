@@ -1,22 +1,21 @@
 [project]
 name = "homepilot"
-version = "3.2.0"
+version = "3.3.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 readme = "README.md"
 
 dependencies = [
-    # Bounded below 0.137: that release stopped flattening include_router into the
-    # parent's route list and keeps an _IncludedRouter wrapper instead. The
-    # startup route scope guard (#405) then walked 5 routes instead of 81 - the
-    # whole API behind include_router became invisible to it - and reported a
-    # clean bill of health. A security check that passes because it is looking at
-    # nothing is worse than no check at all. Adopting 0.137+ needs the guard
-    # taught to descend into the wrapper AND to read the dependencies attached at
-    # include time (which is where most of this API's scopes live), so it is a
-    # deliberate piece of work, not a dependabot bump.
-    "fastapi>=0.115,<0.137",
+    # 0.137 stopped flattening include_router into the parent's route list and
+    # keeps an _IncludedRouter wrapper instead, which briefly blinded the startup
+    # route scope guard (#405) - it walked 5 routes instead of 81 and reported a
+    # clean bill of health. #472 taught the guard to descend into the wrapper,
+    # rebuild full paths from the accumulated include prefixes, and read the
+    # dependencies attached at include time (where most of this API's scopes
+    # live). The guard handles BOTH shapes, so no upper bound is needed; the
+    # gates in tests/test_route_scope_guard.py hold the line.
+    "fastapi>=0.115",
     "starlette>=1.0.1",
     "uvicorn[standard]>=0.34",
     "pydantic[email]>=2.10",

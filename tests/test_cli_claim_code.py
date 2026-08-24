@@ -37,7 +37,7 @@ def clear_settings_cache():
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
-    return {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+    return {"HP_DATA_DIR": str(tmp_path)}
 
 
 def _run(tmp_path: Path):

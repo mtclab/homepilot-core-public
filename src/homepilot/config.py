@@ -59,8 +59,6 @@ class Settings(BaseSettings):
     # shortly after boot so a fresh restore is mirrored without waiting.
     artifacts_push_interval_seconds: int = 3600
     artifacts_ssh_key: str = ""
-    secret_key: str = ""
-    secret_key_file: str = ""
     admin_secret: str = ""
 
     env: str = ""
@@ -72,8 +70,6 @@ class Settings(BaseSettings):
     vault_dir: str = ""
     vault_passphrase: str = ""
     vault_passphrase_file: str = ""
-
-    ssh_key_dir: str = ""
 
     allowed_http_domains: str = ""
 
@@ -201,45 +197,12 @@ class Settings(BaseSettings):
             )
             return passphrase
 
-    def _auto_generate_secret_key(self) -> tuple[str, bool]:
-        import logging
-        import secrets as secrets_mod
-
-        logger = logging.getLogger(__name__)
-        persisted_key_path = Path(self.data_dir) / ".secret_key"
-        try:
-            if persisted_key_path.exists():
-                key = persisted_key_path.read_text().strip()
-                logger.warning(
-                    "HP_SECRET_KEY not set — loaded persisted key from %s",
-                    persisted_key_path,
-                )
-                return key, False
-            key = secrets_mod.token_urlsafe(32)
-            persisted_key_path.parent.mkdir(parents=True, exist_ok=True)
-            persisted_key_path.write_text(key)
-            persisted_key_path.chmod(0o600)
-            logger.warning(
-                "HP_SECRET_KEY not set — auto-generated and persisted to %s. "
-                "Set HP_SECRET_KEY or HP_SECRET_KEY_FILE in .env for stable key.",
-                persisted_key_path,
-            )
-            return key, True
-        except OSError:
-            key = secrets_mod.token_urlsafe(32)
-            logger.warning(
-                "HP_SECRET_KEY not set — auto-generated (could not persist to %s). "
-                "Key will change on restart.",
-                persisted_key_path,
-            )
-            return key, True
-
     def _auto_generate_hub_token(self) -> str:
         """The shared agent-hub token, persisted next to the other generated
         material so it survives restarts.
 
-        Same shape as ``_auto_generate_secret_key``: reuse the persisted value if
-        one exists, else mint and persist one. A token that changed on restart
+        Same shape as ``_auto_generate_passphrase``: reuse the persisted value
+        if one exists, else mint and persist one. A token that changed on restart
         would invalidate every pending enrolment one-liner."""
         import logging
         import secrets as secrets_mod
@@ -345,8 +308,6 @@ class Settings(BaseSettings):
 
         if not self.vault_dir:
             self.vault_dir = str(Path(self.data_dir) / "vault")
-        if not self.ssh_key_dir:
-            self.ssh_key_dir = str(Path(self.data_dir) / "ssh")
 
         # ── Resolve vault passphrase FIRST (vault reads depend on it) ──
         if not self.vault_passphrase and not self.vault_passphrase_file:
@@ -354,9 +315,9 @@ class Settings(BaseSettings):
             # Proxmox address and token and nothing else, and that token needs a
             # vault to live in. An install that silently has no vault cannot
             # store the one secret it was given. Production still refuses to
-            # invent key material, exactly as HP_SECRET_KEY does - there the
-            # passphrase must be supplied, because an auto-generated one that
-            # lives only on that host is not a credential anyone can restore.
+            # invent key material: there the passphrase must be supplied,
+            # because an auto-generated one that lives only on that host is not
+            # a credential anyone can restore.
             # An empty value means "unset", not "off": `HP_VAULT_AUTO_INIT=` is
             # how a .env spells a variable it does not care about, and reading
             # that as opt-out would silently disable the vault on a stock file.
@@ -383,30 +344,7 @@ class Settings(BaseSettings):
                         f"HP_VAULT_PASSPHRASE_FILE not found: {self.vault_passphrase_file}"
                     ) from exc
 
-        # ── Resolve secrets: vault → file → auto-generate ──
-        _secret_key_auto_generated = False
-
-        if not self.secret_key:
-            # The PARSED field, not the raw env var (#431). Reading os.environ
-            # directly ignored `secret_key_file` however it was set - the
-            # documented Docker-secrets pattern silently did nothing, a key was
-            # auto-generated instead, and every token was invalidated on a fresh
-            # volume. `_os.environ` stays as the fallback for the same name so
-            # nothing that worked before stops working.
-            secret_key_file = self.secret_key_file or _os.environ.get("HP_SECRET_KEY_FILE", "")
-            if secret_key_file:
-                try:
-                    self.secret_key = Path(secret_key_file).read_text().strip()
-                except FileNotFoundError:
-                    raise ConfigError(f"HP_SECRET_KEY_FILE not found: {secret_key_file}") from None
-            else:
-                _vault_key = self._try_vault_secret("secret-key")
-                if _vault_key:
-                    self.secret_key = _vault_key
-                    logger.info("HP_SECRET_KEY loaded from vault")
-                else:
-                    self.secret_key, _secret_key_auto_generated = self._auto_generate_secret_key()
-
+        # ── Resolve secrets: vault → env ──
         if not self.admin_secret:
             _admin = self._try_vault_secret("admin-secret")
             if _admin:
@@ -422,12 +360,6 @@ class Settings(BaseSettings):
                 logger.info("HP_AGENT_HUB_AUTH_TOKEN loaded from vault")
             else:
                 self.agent_hub_auth_token = self._auto_generate_hub_token()
-
-        if self.env == "production" and _secret_key_auto_generated:
-            raise ConfigError(
-                "HP_SECRET_KEY or HP_SECRET_KEY_FILE must be set when HP_ENV=production. "
-                "Auto-generated keys are not allowed in production."
-            )
 
 
 @lru_cache

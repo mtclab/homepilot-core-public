@@ -57,6 +57,58 @@ var privilegedCommands = map[string]*regexp.Regexp{
 	"bash": regexp.MustCompile(`^bash\s+/opt/homepilot/[a-zA-Z0-9_/-]+\.sh$`),
 }
 
+// dangerousDockerRunFlags are `docker run` options that hand the container the
+// host outright: a bind mount of any path (including /), the host's PID/IPC/
+// network namespaces, extra capabilities, a relaxed seccomp/apparmor profile, a
+// raw device, a chosen uid, or a userns opt-out. Each is a full escape from the
+// containment the allowlist exists to provide.
+//
+// This is a DENY pass, checked before the allow regex, and deliberately not
+// expressed as regex surgery. The docker-run allow pattern matches a GENERIC
+// "--flag value" shape, so it can never enumerate what is safe - widening it for
+// one legitimate flag admits all of these at once, which is exactly what
+// happened when #450 made the space-separated form reachable
+// (`docker run --volume /:/mnt --user 0 img` was accepted).
+//
+// Every token after `run` is scanned, in both `--flag=value` and `--flag value`
+// form and including the `-v` / `-u` short forms. Scanning the container's own
+// argv too is intentional: telling the image name from its arguments requires
+// knowing which docker flags take a value, and a parser that guesses wrong is a
+// bypass. Refusing a container argument that happens to be spelled `-v` is a
+// usability cost; letting `-v` through after a valueless flag is a root escape.
+var dangerousDockerRunFlags = map[string]bool{
+	"--volume":       true,
+	"-v":             true,
+	"--mount":        true,
+	"--privileged":   true,
+	"--user":         true,
+	"-u":             true,
+	"--pid":          true,
+	"--ipc":          true,
+	"--net":          true,
+	"--network":      true,
+	"--cap-add":      true,
+	"--security-opt": true,
+	"--device":       true,
+	"--userns":       true,
+}
+
+// dockerRunDeniedFlag returns the first dangerous flag found in a `docker run`
+// command's tokens, or "" when there is none. parts is the whitespace-split
+// command including the leading `docker run`.
+func dockerRunDeniedFlag(parts []string) string {
+	for _, tok := range parts[2:] {
+		name := tok
+		if i := strings.Index(tok, "="); i >= 0 {
+			name = tok[:i]
+		}
+		if dangerousDockerRunFlags[name] {
+			return name
+		}
+	}
+	return ""
+}
+
 var catAllowedPrefixes = []string{
 	"/var/log/", "/etc/homepilot/", "/etc/hostname", "/etc/os-release",
 	"/etc/resolv.conf", "/etc/hosts", "/etc/systemd/", "/opt/",
@@ -124,6 +176,12 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 				subKey = "docker-compose-up"
 			case sub == "stop" || sub == "rm" || sub == "restart":
 				subKey = "docker-stop"
+			}
+			if subKey == "docker-run" {
+				if flag := dockerRunDeniedFlag(parts); flag != "" {
+					return false, "docker run flag not allowed (it escapes the " +
+						"container): " + flag + " in " + actual
+				}
 			}
 			if subKey != "" {
 				if re, ok := privilegedCommands[subKey]; ok && re.MatchString(actual) {

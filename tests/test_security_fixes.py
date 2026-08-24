@@ -24,7 +24,6 @@ class TestVaultPassphraseFile:
         pf = tmp_path / "pass.txt"
         pf.write_text("testphrase\n")
         s = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
             vault_passphrase_file=str(pf),
             vault_passphrase="",
         )
@@ -33,7 +32,6 @@ class TestVaultPassphraseFile:
     async def test_logs_when_only_env_var_set(self, caplog):
         with caplog.at_level(logging.DEBUG, logger="homepilot.config"):
             Settings(
-                secret_key="test-secret-key-for-pytest-only-not-for-production",
                 vault_passphrase="testpassphrase",
                 vault_passphrase_file="",
             )

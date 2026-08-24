@@ -10,9 +10,6 @@ silent:
 * a webhook delivery task was held only by a local, and asyncio keeps a weak
   reference - so an in-flight delivery could be garbage-collected and its row sat
   `pending` forever, because nothing redrives pending;
-* `HP_SECRET_KEY_FILE` was read from `os.environ` rather than the parsed field,
-  so the documented Docker-secrets pattern silently did nothing and every token
-  was invalidated on a fresh volume;
 * a bare `except: return ""` made a wrong vault passphrase indistinguishable
   from "not configured";
 * `proxmox_host` was bound inside a `try` and read after it, so the ImportError
@@ -179,21 +176,6 @@ class _StubRepo:
 
 
 class TestConfigStopsHidingThings:
-    async def test_the_parsed_secret_key_file_is_used(self, tmp_path, monkeypatch):
-        """Reading `os.environ` directly ignored the field however it was set, so
-        the documented Docker-secrets pattern silently did nothing and every
-        token was invalidated on a fresh volume."""
-        from homepilot.config import Settings
-
-        key_file = tmp_path / "secret_key"
-        key_file.write_text("a-stable-secret-key-from-a-file\n")
-        monkeypatch.delenv("HP_SECRET_KEY_FILE", raising=False)
-        monkeypatch.delenv("HP_SECRET_KEY", raising=False)
-
-        settings = Settings(secret_key_file=str(key_file), data_dir=str(tmp_path), secret_key="")
-
-        assert settings.secret_key == "a-stable-secret-key-from-a-file"
-
     async def test_a_failing_vault_lookup_is_logged_not_swallowed(self, tmp_path, caplog):
         """A wrong passphrase was indistinguishable from "not configured": the
         admin secret came back empty and nothing said why."""

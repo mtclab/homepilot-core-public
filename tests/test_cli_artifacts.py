@@ -37,7 +37,6 @@ class TestArtifactsEdit:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
             "HP_ARTIFACTS_DIR": str(artifacts_dir),
         }
 
@@ -71,7 +70,6 @@ class TestArtifactsEdit:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
             "HP_ARTIFACTS_DIR": str(artifacts_dir),
             "EDITOR": "nano",
         }
@@ -94,7 +92,6 @@ class TestArtifactsEdit:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -114,7 +111,6 @@ class TestArtifactsEdit:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -144,7 +140,6 @@ class TestArtifactsEdit:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
             "HP_ARTIFACTS_DIR": str(artifacts_dir),
         }
 
@@ -177,7 +172,6 @@ class TestArtifactsShow:
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
-            "HP_SECRET_KEY": "x" * 64,
         }
 
         with (
@@ -211,7 +205,7 @@ class TestArtifactsShow:
             "# Deploy\n\nRun deployment script",
         )
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
 
         with (
             patch.dict("os.environ", env, clear=False),
@@ -228,7 +222,7 @@ class TestArtifactsShow:
         mock_store = MagicMock()
         mock_store.read.side_effect = FileNotFoundError("Artifact not found: nonexistent")
 
-        env = {"HP_DATA_DIR": str(tmp_path), "HP_SECRET_KEY": "x" * 64}
+        env = {"HP_DATA_DIR": str(tmp_path)}
 
         with (
             patch.dict("os.environ", env, clear=False),

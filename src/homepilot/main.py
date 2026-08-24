@@ -16,6 +16,7 @@ from typing import Any, cast
 import httpx
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.dependencies.models import Dependant
+from fastapi.dependencies.utils import get_dependant
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.routing import APIRoute
@@ -913,26 +914,110 @@ def _iter_sub_dependants(dependant: Dependant) -> list[Dependant]:
     return collected
 
 
-def _route_has_scope_dep(route: APIRoute) -> bool:
+def _include_wrapper_parts(route: Any) -> tuple[Any, str, tuple[Any, ...]] | None:
+    """Return (sub_router, prefix, include_dependencies) if `route` is a FastAPI
+    include wrapper, else None.
+
+    FastAPI < 0.137 flattened `include_router` straight into the parent's route
+    list, so there is no wrapper and this returns None for everything. 0.137+
+    keeps an `_IncludedRouter` placeholder instead, and the routes behind it are
+    NOT in the parent's list, carry UNPREFIXED paths, and do not have the
+    include-time dependencies merged into their dependant. All three live on the
+    wrapper.
+
+    Verified against the installed fastapi (0.141.1): the wrapper exposes
+    `original_router` plus an `include_context` carrying `prefix` (already
+    including the parent router's own prefix) and `dependencies` (the ones
+    passed to include_router, plus the parent router's). The context also names
+    the router as `included_router`, which is accepted as a fallback so a rename
+    of the wrapper attribute does not blind the guard. Duck-typed on purpose -
+    `_IncludedRouter` is private and must never be imported.
+    """
+    context = getattr(route, "include_context", None)
+    if context is None:
+        return None
+    sub_router = getattr(route, "original_router", None)
+    if sub_router is None:
+        sub_router = getattr(context, "included_router", None)
+    if sub_router is None or not hasattr(sub_router, "routes"):
+        return None
+    prefix = getattr(context, "prefix", "") or ""
+    dependencies = tuple(getattr(context, "dependencies", ()) or ())
+    return sub_router, prefix, dependencies
+
+
+def _walk_api_routes(
+    routes: list[Any],
+    prefix: str = "",
+    include_dependencies: tuple[Any, ...] = (),
+) -> list[tuple[str, APIRoute, tuple[Any, ...]]]:
+    """Every APIRoute reachable from `routes`, as (full path, route, deps).
+
+    Descends through include wrappers (nested ones too), accumulating BOTH the
+    path prefix and the include-time dependencies, exactly the way FastAPI
+    itself combines nested include contexts. On pre-0.137 FastAPI there are no
+    wrappers, the loop simply walks the already-flattened list, and both
+    accumulators stay empty - so the guard works on both shapes.
+    """
+    found: list[tuple[str, APIRoute, tuple[Any, ...]]] = []
+    for route in routes:
+        parts = _include_wrapper_parts(route)
+        if parts is not None:
+            sub_router, sub_prefix, sub_dependencies = parts
+            found.extend(
+                _walk_api_routes(
+                    list(sub_router.routes),
+                    prefix + sub_prefix,
+                    include_dependencies + sub_dependencies,
+                )
+            )
+            continue
+        if isinstance(route, APIRoute):
+            found.append((prefix + route.path, route, include_dependencies))
+        # anything else (Mounts like /mcp, static files, framework docs) is not
+        # scope-checkable
+    return found
+
+
+def _dependency_enforces_scope(depends: Any) -> bool:
+    """True if a `Depends(...)` handed to include_router enforces a scope.
+
+    Include-time dependencies are not merged into `route.dependant` on 0.137+,
+    so they have to be inspected on their own: the marker may sit on the
+    callable itself, or on something it depends on in turn.
+    """
+    call = getattr(depends, "dependency", None)
+    if call is None:
+        return False
+    if getattr(call, SCOPE_ENFORCER_ATTR, False):
+        return True
+    try:
+        dependant = get_dependant(path="/", call=call)
+    except Exception:  # pragma: no cover - a dependency FastAPI cannot analyse
+        return False
+    return any(
+        getattr(sub.call, SCOPE_ENFORCER_ATTR, False) for sub in _iter_sub_dependants(dependant)
+    )
+
+
+def _route_has_scope_dep(route: APIRoute, include_dependencies: tuple[Any, ...] = ()) -> bool:
     for sub in _iter_sub_dependants(route.dependant):
         if getattr(sub.call, SCOPE_ENFORCER_ATTR, False):
             return True
-    return False
+    return any(_dependency_enforces_scope(dep) for dep in include_dependencies)
 
 
 def find_unscoped_routes(target_app: FastAPI) -> list[tuple[str, str]]:
     """Return (method, path) for every non-public APIRoute lacking a scope dep."""
     missing: list[tuple[str, str]] = []
-    for route in target_app.routes:
-        if not isinstance(route, APIRoute):
-            continue  # Mounts (/mcp), static files, framework docs — not scope-checkable
+    for path, route, include_dependencies in _walk_api_routes(list(target_app.routes)):
         for method in route.methods or set():
             if method in ("HEAD", "OPTIONS"):
                 continue
-            if (method, route.path) in _PUBLIC_ROUTES:
+            if (method, path) in _PUBLIC_ROUTES:
                 continue
-            if not _route_has_scope_dep(route):
-                missing.append((method, route.path))
+            if not _route_has_scope_dep(route, include_dependencies):
+                missing.append((method, path))
     return sorted(missing)
 
 

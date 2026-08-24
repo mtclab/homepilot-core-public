@@ -53,17 +53,33 @@ class ProvisionService:
         self.ip_wait_s = ip_wait_s
         self.ip_interval = ip_interval
         self._running_tasks: set[asyncio.Task[Any]] = set()
+        # task_id → in-flight asyncio.Task, so cancel() can reach the coroutine
+        # that is actually talking to Proxmox (#452). Without it, a cancel only
+        # marked the row and the still-running job overwrote it seconds later.
+        self._task_by_id: dict[str, asyncio.Task[Any]] = {}
         # Names with a provision in flight IN THIS PROCESS. The DB cannot answer
         # this cheaply (a provision task carries no artifact_id, and the name only
         # appears in the result), and a duplicate would clone a second VM under
         # the same hostname.
         self._inflight_names: set[str] = set()
 
-    def _track_task(self, task: asyncio.Task[Any]) -> None:
+    def _track_task(self, task: asyncio.Task[Any], task_id: str | None = None) -> None:
         # Hold a strong reference until completion: asyncio keeps only a weak one,
         # so an untracked background task can be garbage-collected mid-flight.
         self._running_tasks.add(task)
-        task.add_done_callback(self._running_tasks.discard)
+        if task_id is None:
+            task.add_done_callback(self._running_tasks.discard)
+            return
+        self._task_by_id[task_id] = task
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            self._running_tasks.discard(t)
+            # Only drop the mapping if it still points at THIS task — a fresh
+            # task for a reused id (shouldn't happen: ids are uuid4) must win.
+            if self._task_by_id.get(task_id) is t:
+                del self._task_by_id[task_id]
+
+        task.add_done_callback(_done)
 
     async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
         """Let in-flight jobs finish before the database goes away (#496).
@@ -87,13 +103,65 @@ class ProvisionService:
         except Exception:
             self._inflight_names.discard(request.name)
             raise
-        self._track_task(asyncio.create_task(self._run(task_id, request, actor)))
+        self._track_task(asyncio.create_task(self._run(task_id, request, actor)), task_id)
         return task_id
+
+    async def cancel(self, task_id: str) -> dict[str, Any] | None:
+        """Stop an in-flight provision for real, and mark the record (#452).
+
+        Two halves, deliberately split. The ROW is marked here and now, so the
+        API answers immediately and the task stops counting as in flight; the
+        atomic status guard inside `TaskRepository.cancel_task` keeps a run that
+        finished a moment ago from being clobbered to 'cancelled'. The UNWIND
+        (stop the PVE task, destroy the half-created guest) happens in the
+        cancelled coroutine's own handler and lands on the row afterwards
+        through `record_cancel_outcome`, because it takes as long as Proxmox
+        takes and nobody should hold an HTTP request open for it.
+
+        Returns the task row, or None when the task id is unknown.
+        """
+        running_task = self._task_by_id.get(task_id)
+        before = await self.task_repo.get_task(task_id)
+        if before is None:
+            return None
+        row = await self.task_repo.cancel_task(task_id)
+        # The row is marked FIRST, and only then is the coroutine cancelled.
+        # Both orders stop the provision, but the other one loses the outcome:
+        # the cancelled coroutine's cleanup writes `WHERE status = 'cancelled'`,
+        # and it can reach that write while this one is still awaiting its own
+        # UPDATE - so the unwind's result would silently match no row.
+        if (
+            running_task is not None
+            and not running_task.done()
+            and row is not None
+            and row["status"] == "cancelled"
+        ):
+            running_task.cancel()
+        if (
+            running_task is None
+            and before["status"] == "running"
+            and row is not None
+            and row["status"] == "cancelled"
+        ):
+            # The row says a provision was mid-flight, but this process is not
+            # the one running it (a restart, most likely). Nothing will ever
+            # write the real outcome, so say so rather than leaving a blank row
+            # that reads like a clean cancel.
+            row = await self.task_repo.record_cancel_outcome(
+                task_id, error="process restarted; in-flight PVE state unknown"
+            )
+        return row
 
     async def _run(self, task_id: str, request: ProvisionRequest, actor: str) -> None:
         # `step` names the stage a failure happened at, so the task's error tells
         # an operator WHERE the provision died, not just that it did.
         step = "start"
+        # What this run has already put on Proxmox, kept where the cancel
+        # handler below can read it (#452). A CancelledError can arrive at any
+        # await, so the unwind is driven by these rather than by `step` alone.
+        vmid: int | None = None
+        clone_issued = False
+        inflight_upid: str | None = None
         try:
             await self.task_repo.update_task_status(task_id, "running")
             proxmox = self.proxmox
@@ -104,6 +172,11 @@ class ProvisionService:
             vmid = await proxmox.next_vmid(request.node)
 
             step = "clone"
+            # Set BEFORE the call, not after: if a cancel lands while the clone
+            # request is in flight we cannot know whether PVE took it, and an
+            # attempted destroy of a VM that was never created is a cheap,
+            # reported failure - a leaked guest is not.
+            clone_issued = True
             upid = await proxmox.clone_vm(
                 node=request.node,
                 template_vmid=request.template_vmid,
@@ -112,9 +185,11 @@ class ProvisionService:
                 full=request.full,
                 pool=request.pool,
             )
+            inflight_upid = upid
             await proxmox.wait_for_task(
                 request.node, upid, timeout_s=self.task_timeout_s, poll_interval=self.poll_interval
             )
+            inflight_upid = None
 
             step = "configure"
             config = self._build_config(request)
@@ -130,12 +205,14 @@ class ProvisionService:
 
             step = "start_vm"
             start_upid = await proxmox.start_vm(request.node, vmid)
+            inflight_upid = start_upid
             await proxmox.wait_for_task(
                 request.node,
                 start_upid,
                 timeout_s=self.task_timeout_s,
                 poll_interval=self.poll_interval,
             )
+            inflight_upid = None
 
             # Best-effort only: a template without qemu-guest-agent never answers,
             # and that must not fail the provision — the inventory reconciler
@@ -167,6 +244,30 @@ class ProvisionService:
                 task_id, "succeeded", result_json=json.dumps(result)
             )
             await self._audit(actor, request, "provision", result)
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so the `except Exception` below
+            # never sees it - which is exactly right: a cancel must NOT be
+            # recorded as a failure, and must not overwrite the 'cancelled' row
+            # `cancel()` has already written. What it must do is unwind whatever
+            # this run put on Proxmox, and say so on the record.
+            cleanup = asyncio.create_task(
+                self._cleanup_after_cancel(
+                    task_id, request, actor, vmid, clone_issued, inflight_upid
+                )
+            )
+            # Tracked (so a shutdown drains it instead of orphaning a half-run
+            # destroy) and shielded (so THIS coroutine's cancellation cannot
+            # take it down mid-unwind).
+            self._track_task(cleanup)
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # We are already being cancelled; the cleanup task survives on
+                # its own and drain() waits for it.
+                pass
+            except Exception:  # pragma: no cover - the cleanup swallows its own
+                logger.warning("Provision cancel cleanup raised", exc_info=True)
+            raise
         except Exception as exc:
             error = f"{step}: {exc}"
             logger.exception("Provision task %s failed at step %s", task_id, step)
@@ -177,6 +278,68 @@ class ProvisionService:
                 logger.error("Could not mark provision task %s failed", task_id, exc_info=True)
         finally:
             self._inflight_names.discard(request.name)
+
+    async def _cleanup_after_cancel(
+        self,
+        task_id: str,
+        request: ProvisionRequest,
+        actor: str,
+        vmid: int | None,
+        clone_issued: bool,
+        inflight_upid: str | None,
+    ) -> None:
+        """Unwind a cancelled provision and record what actually happened (#452).
+
+        Every Proxmox call here is best-effort with a DISTINCT outcome: the
+        point of a cancel is that the operator knows the state of their cluster
+        afterwards, so "we destroyed it", "there was nothing to destroy" and
+        "we tried and failed, guest N may still be on node X" must never look
+        alike on the record.
+        """
+        node = request.node
+        outcome: dict[str, Any] = {"cancelled": True}
+        error: str | None = None
+
+        if not clone_issued or self.proxmox is None:
+            outcome["cleanup"] = "nothing_created"
+        else:
+            proxmox = self.proxmox
+            outcome["vmid"] = vmid
+            if inflight_upid is not None:
+                try:
+                    await proxmox.stop_task(node, inflight_upid)
+                    outcome["stop_task"] = "stopped"
+                except Exception as exc:
+                    # A PVE task that cannot be stopped (or already finished)
+                    # does not stop us destroying what it made.
+                    logger.warning("Could not stop PVE task %s: %s", inflight_upid, exc)
+                    outcome["stop_task"] = "failed"
+            else:
+                outcome["stop_task"] = "not_needed"
+
+            if vmid is None:
+                outcome["cleanup"] = "nothing_created"
+            else:
+                try:
+                    await proxmox.delete_vm(node, vmid)
+                    outcome["cleanup"] = "deleted"
+                except Exception as exc:
+                    logger.warning("Could not destroy guest vmid %s on %s", vmid, node)
+                    outcome["cleanup"] = "failed"
+                    error = (
+                        f"cancelled but cleanup failed at delete_vm: {exc}; "
+                        f"guest vmid {vmid} may remain on {node}"
+                    )
+
+        try:
+            await self.task_repo.record_cancel_outcome(
+                task_id, result_json=json.dumps(outcome), error=error
+            )
+        except Exception:
+            logger.error(
+                "Could not record the cancel outcome for provision task %s", task_id, exc_info=True
+            )
+        await self._audit(actor, request, "provision_cancelled", outcome)
 
     def _build_config(self, request: ProvisionRequest) -> dict[str, Any]:
         config: dict[str, Any] = {

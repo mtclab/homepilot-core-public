@@ -32,7 +32,6 @@ def clear_settings_cache():
 def _env(tmp_path) -> dict[str, str]:
     return {
         "HP_DATA_DIR": str(tmp_path),
-        "HP_SECRET_KEY": "x" * 64,
         "HP_PORTAL_BASE_URL": "https://portal.example",
     }
 

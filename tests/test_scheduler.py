@@ -181,14 +181,14 @@ class TestApplyReconcilerAutoApply:
 
 class TestAutoApplyConfig:
     def test_auto_apply_interval_default(self):
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.auto_apply_interval_seconds == 300
 
     def test_auto_apply_interval_from_env(self, monkeypatch):
         monkeypatch.setenv("HP_AUTO_APPLY_INTERVAL_SECONDS", "60")
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.auto_apply_interval_seconds == 60
 
     def test_auto_apply_disabled_by_default(self):
-        settings = Settings(secret_key="test")
+        settings = Settings()
         assert settings.auto_apply_enabled is False

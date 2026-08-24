@@ -187,3 +187,54 @@ class TestAgentNetwork:
                 return_value=Response(500, text="QEMU guest agent is not running")
             )
             assert await client.get_vm_agent_network("pve1", 105) is None
+
+
+class TestCancelUnwind:
+    """stop_task / delete_vm — the two calls a cancelled provision unwinds with (#452)."""
+
+    async def test_stop_task_deletes_the_task_and_quotes_the_upid(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.delete(url__regex=rf"{API}/nodes/pve1/tasks/.*").mock(
+                return_value=Response(200, json={"data": None})
+            )
+            await client.stop_task("pve1", UPID)
+
+        assert len(route.calls) == 1
+        raw_path = route.calls[0].request.url.raw_path.decode()
+        # Same rule as wait_for_task: an unescaped UPID splits the path into
+        # extra segments and PVE 501s.
+        assert ":" not in raw_path.split("/tasks/")[1]
+        assert unquote(raw_path.split("/tasks/")[1]) == UPID
+
+    async def test_stop_task_propagates_a_pve_error(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.delete(url__regex=rf"{API}/nodes/pve1/tasks/.*").mock(
+                return_value=Response(500, text="no such task")
+            )
+            with pytest.raises(ProxmoxError):
+                await client.stop_task("pve1", UPID)
+
+    async def test_delete_vm_purges_and_takes_unreferenced_disks(self, client: ProxmoxClient):
+        destroy_upid = UPID.replace("qmclone", "qmdestroy")
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.delete(f"{API}/nodes/pve1/qemu/105").mock(
+                return_value=Response(200, json={"data": destroy_upid})
+            )
+            upid = await client.delete_vm("pve1", 105)
+
+        assert upid == destroy_upid
+        params = route.calls[0].request.url.params
+        # Without BOTH, unwinding a half-created guest leaves the debris the
+        # cancel was meant to remove: pool/job/HA references, and the disks.
+        assert params["purge"] == "1"
+        assert params["destroy-unreferenced-disks"] == "1"
+
+    async def test_delete_vm_propagates_a_pve_error(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.delete(f"{API}/nodes/pve1/qemu/105").mock(
+                return_value=Response(500, text="storage is busy")
+            )
+            with pytest.raises(ProxmoxError) as excinfo:
+                await client.delete_vm("pve1", 105)
+
+        assert "storage is busy" in str(excinfo.value)

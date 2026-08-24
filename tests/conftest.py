@@ -1,10 +1,7 @@
-import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
-os.environ["HP_SECRET_KEY"] = "test-secret-key-for-pytest-only-not-for-production"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -151,7 +148,6 @@ def test_settings():
     from homepilot.config import Settings
 
     return Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir="/tmp/hp-test",
         artifacts_dir="/tmp/hp-test/artifacts",
     )

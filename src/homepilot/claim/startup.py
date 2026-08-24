@@ -10,7 +10,7 @@ from .tokens import generate_claim_code, validate_token
 logger = logging.getLogger(__name__)
 
 # The operator-facing copy of the pending claim code, beside .vault_passphrase
-# and .secret_key in the data directory and written with the same 0600 mode.
+# in the data directory and written with the same 0600 mode.
 #
 # The DATABASE stores only the sha256 - a copy of the database can never redeem
 # a claim. This file exists so `hp claim-code` can print the code on demand: a

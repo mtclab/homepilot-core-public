@@ -70,7 +70,6 @@ async def _hub_on(hp_dir: str) -> tuple[Any, Any]:
         port = int(probe.getsockname()[1])
 
     settings = Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir=hp_dir,
         artifacts_dir=os.path.join(hp_dir, "artifacts"),
         agent_hub_port=port,

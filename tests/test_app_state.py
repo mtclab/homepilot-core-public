@@ -36,7 +36,6 @@ def hp_dir() -> Iterator[str]:
 
 def _settings(hp_dir: str, **overrides: object) -> Settings:
     return Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir=hp_dir,
         artifacts_dir=os.path.join(hp_dir, "artifacts"),
         **overrides,  # type: ignore[arg-type]

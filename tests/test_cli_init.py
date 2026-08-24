@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from homepilot.cli.main import app
-from homepilot.config import Settings, get_settings
+from homepilot.config import get_settings
 
 runner = CliRunner()
 
@@ -16,48 +16,6 @@ def clear_cache():
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
-
-
-class TestSecretKeyDefault:
-    def test_settings_auto_generates_secret_key_when_missing(self):
-        env = {"HP_DATA_DIR": "/tmp/hp-test-init-missing"}
-        with patch.dict("os.environ", env, clear=True):
-            s = Settings(secret_key="")
-        assert s.secret_key
-        assert len(s.secret_key) >= 32
-
-    def test_settings_auto_generates_different_keys(self, tmp_path):
-        import os
-
-        dir1 = str(tmp_path / "hp1")
-        dir2 = str(tmp_path / "hp2")
-        os.makedirs(dir1, exist_ok=True)
-        os.makedirs(dir2, exist_ok=True)
-        with patch.dict("os.environ", {"HP_DATA_DIR": dir1}, clear=False):
-            s1 = Settings(secret_key="")
-        with patch.dict("os.environ", {"HP_DATA_DIR": dir2}, clear=False):
-            s2 = Settings(secret_key="")
-        assert s1.secret_key != s2.secret_key
-
-    def test_settings_preserves_explicit_secret_key(self):
-        s = Settings(secret_key="my-explicit-key")
-        assert s.secret_key == "my-explicit-key"
-
-
-class TestSecretKeyWarning:
-    def test_warns_when_secret_key_auto_generated(self, caplog):
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger="homepilot.config"):
-            Settings(secret_key="")
-        assert any("HP_SECRET_KEY not set" in r.message for r in caplog.records)
-
-    def test_no_warning_when_secret_key_provided(self, caplog):
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger="homepilot.config"):
-            Settings(secret_key="explicit-key")
-        assert not any("HP_SECRET_KEY not set" in r.message for r in caplog.records)
 
 
 class TestHpInit:
@@ -70,7 +28,6 @@ class TestHpInit:
         assert env_file.exists()
         content = env_file.read_text()
         assert "HP_VAULT_PASSPHRASE=" in content
-        assert "HP_SECRET_KEY=" not in content
         assert "HP_ADMIN_SECRET=" not in content
 
     def test_init_stores_secrets_in_vault(self, tmp_path):
@@ -79,7 +36,6 @@ class TestHpInit:
             result = runner.invoke(app, ["init"], input="\n\n\n\n\n")
         assert result.exit_code == 0, result.output
         vault_dir = tmp_path / "vault" / "secrets"
-        assert (vault_dir / "secret-key.age").exists()
         assert (vault_dir / "admin-secret.age").exists()
 
     def test_init_creates_directories(self, tmp_path):

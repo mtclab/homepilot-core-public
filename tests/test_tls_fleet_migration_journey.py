@@ -88,7 +88,6 @@ async def _legacy_install(hp_dir: str):
         port = int(probe.getsockname()[1])
 
     settings = Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir=hp_dir,
         artifacts_dir=os.path.join(hp_dir, "artifacts"),
         agent_hub_host="127.0.0.1",
@@ -97,6 +96,14 @@ async def _legacy_install(hp_dir: str):
     state = await create_app_state(settings)
     assert state.agent_hub is not None
     assert state.agent_hub.tls_enabled is False, "a legacy install must start on plaintext"
+    # This fixture enrols a BRAND-NEW host with the shared token against an
+    # install that already has a fleet member ('legacy-host', the stranded one),
+    # which since #537 needs an operator-opened enrolment window. Open one for
+    # the run - the subject here is the transport migration, and weakening the
+    # enrolment rule to keep this green would be the wrong repair.
+    from homepilot.agent_hub.enrolment_window import open_window
+
+    await open_window(Repository(state.database), 60)
     await state.agent_hub.start()
     return state, settings
 
@@ -273,7 +280,6 @@ async def test_the_agent_comes_back_over_tls_after_the_hub_restarts(agent_binary
             probe.bind(("127.0.0.1", 0))
             del probe
         restarted_settings = Settings(
-            secret_key="test-secret-key-for-pytest-only-not-for-production",
             data_dir=hp_dir,
             artifacts_dir=os.path.join(hp_dir, "artifacts"),
             agent_hub_host="127.0.0.1",

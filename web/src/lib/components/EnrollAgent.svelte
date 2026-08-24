@@ -3,12 +3,55 @@
 	// machine under management starts from the fleet page now. Both flows:
 	// single-use bootstrap token for a one-off connect, shared hub token for a
 	// permanent install.
-	import { api } from '$lib/api';
+	import { onMount } from 'svelte';
+	import { api, type EnrolmentWindow } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { isValidHubHost } from '$lib/hostValidation';
 	import { base } from '$app/paths';
 
 	export let show: 'bootstrap' | 'hub' | null = null;
+
+	// The shared token no longer enrols an unknown host whenever it likes (#537):
+	// it needs an open window, unless this install has no agents at all. Showing
+	// that here is the difference between "run this one-liner" and "run this
+	// one-liner and watch the agent be refused for reasons nobody mentioned".
+	let window_: EnrolmentWindow | null = null;
+	let windowBusy = false;
+	let windowMinutes = 15;
+
+	async function loadWindow() {
+		try {
+			window_ = await api.getEnrolmentWindow();
+		} catch (e) {
+			notify('Failed to read the enrolment window: ' + String(e), 'err');
+		}
+	}
+
+	async function openWindow() {
+		windowBusy = true;
+		try {
+			window_ = await api.openEnrolmentWindow(windowMinutes);
+			notify(`Enrolment window open for ${windowMinutes} min`, 'ok');
+		} catch (e) {
+			notify('Failed to open the enrolment window: ' + String(e), 'err');
+		} finally {
+			windowBusy = false;
+		}
+	}
+
+	async function closeWindow() {
+		windowBusy = true;
+		try {
+			window_ = await api.closeEnrolmentWindow();
+			notify('Enrolment window closed', 'ok');
+		} catch (e) {
+			notify('Failed to close the enrolment window: ' + String(e), 'err');
+		} finally {
+			windowBusy = false;
+		}
+	}
+
+	onMount(loadWindow);
 
 	interface TokenAnswer {
 		hub_host: string;
@@ -62,8 +105,9 @@
 	<div class="card p-4 space-y-4">
 		<h2 class="section-title">Enroll New Agent</h2>
 		<p class="prose-note text-xs">
-			Bootstrap tokens are single-use and expire — fine for a one-off connect. For a
-			permanent install that survives agent reboots, use the shared Hub Auth Token.
+			Bootstrap tokens are single-use and expire — fine for a one-off connect, and they
+			enrol a new host whether or not the enrolment window is open. For a permanent
+			install that survives agent reboots, use the shared Hub Auth Token.
 		</p>
 		<p class="prose-note text-xs">
 			A running Proxmox guest that answers on qemu-guest-agent needs none of this: open its
@@ -111,6 +155,56 @@
 	<div class="card p-4 space-y-3">
 		<h2 class="section-title">Hub Auth Token</h2>
 		<p class="prose-note text-xs">The shared token agents use to connect to the hub.</p>
+
+		{#if window_}
+			<div
+				class="bg-canvas border rounded p-3 space-y-2 {window_.open
+					? 'border-ok-border'
+					: 'border-warn'}"
+				data-testid="enrolment-window"
+			>
+				{#if window_.open}
+					<p class="text-xs text-ok" data-testid="enrolment-window-state">
+						Enrolment window open until {window_.expires_at} — the shared token can enrol a
+						host this install has never seen.
+					</p>
+				{:else if window_.fleet_empty}
+					<p class="prose-note text-xs" data-testid="enrolment-window-state">
+						No agents enrolled yet, so the first host joins with the shared token whether or
+						not a window is open. After that, new hosts need an open window.
+					</p>
+				{:else}
+					<p class="text-xs text-warn" data-testid="enrolment-window-state">
+						Enrolment window closed — a host this install has never seen will be refused
+						with “not accepting new hosts right now”. Open a window, or enrol it with a
+						single-use bootstrap token.
+					</p>
+				{/if}
+				<div class="flex items-center gap-2">
+					<label class="field-label" for="enrolment-window-minutes">Minutes</label>
+					<input
+						id="enrolment-window-minutes"
+						class="input w-20 text-xs"
+						type="number"
+						min="1"
+						max="1440"
+						bind:value={windowMinutes}
+					/>
+					<button
+						class="btn btn-primary text-xs"
+						on:click={openWindow}
+						disabled={windowBusy}
+					>
+						{window_.open ? 'Extend window' : 'Open window'}
+					</button>
+					{#if window_.open}
+						<button class="btn btn-ghost text-xs" on:click={closeWindow} disabled={windowBusy}>
+							Close now
+						</button>
+					{/if}
+				</div>
+			</div>
+		{/if}
 
 		{#if !hubData}
 			<button class="btn btn-primary text-xs" on:click={getHubToken} disabled={loadingHubToken}>

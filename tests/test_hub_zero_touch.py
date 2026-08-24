@@ -65,7 +65,6 @@ def _settings(hp_dir: str, **overrides: object) -> Settings:
     token, and the stock non-loopback bind - the exact shape that used to
     refuse to start."""
     return Settings(
-        secret_key="test-secret-key-for-pytest-only-not-for-production",
         data_dir=hp_dir,
         artifacts_dir=os.path.join(hp_dir, "artifacts"),
         agent_hub_port=_free_port(),

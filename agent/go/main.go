@@ -169,6 +169,12 @@ func (a *Agent) register() error {
 		"auth_token":  a.cfg.AuthToken,
 		"request_id":  newUUID(),
 		"v":           protocolVersion,
+		// Declare that every command_result this agent sends echoes the issued
+		// action back as "for_action". The hub holds a declaring agent to it and
+		// drops a reply that answers a different request than the one it claims
+		// (#381 confused deputy); an agent that does not declare it is exempt, so
+		// a hub upgraded ahead of its fleet still works.
+		"result_action": 1,
 	}
 	// Negotiate replay protection when we hold a per-agent token (a durable
 	// shared secret usable as the MAC key). The register frame gains a fresh
@@ -213,7 +219,9 @@ func (a *Agent) register() error {
 		// of it may fall back to the env enrollment token again.
 		a.usingFileToken = true
 		if a.cfg.AuthTokenFile != "" {
-			if err := os.WriteFile(a.cfg.AuthTokenFile, []byte(dt), 0o600); err != nil {
+			// Atomic (temp + fsync + rename): a truncated token file is a
+			// permanent lockout, not a retryable error.
+			if err := writeAgentTokenFile(a.cfg.AuthTokenFile, dt); err != nil {
 				log.Printf("warning: could not persist durable token to %s: %v", a.cfg.AuthTokenFile, err)
 			} else {
 				log.Printf("adopted durable hub token (persisted to %s)", a.cfg.AuthTokenFile)
@@ -322,9 +330,21 @@ func (a *Agent) connectWithRetry() {
 	}
 }
 
+// closeConn drops the live socket.
+//
+// It reads a.conn under writeMu, like every other reader and writer of that
+// field. It used to read it bare, which is a data race against connect()
+// publishing the next socket: closeConn is called from the reconnect loop and
+// from handleSetTransport (the hub-pushed TLS migration), so "close the old one"
+// could observe a torn interface value and close - or dereference - the wrong
+// thing. The generation-scoped writes (sendOn) fixed the write path; this read
+// was missed.
 func (a *Agent) closeConn() {
-	if a.conn != nil {
-		_ = a.conn.Close()
+	a.writeMu.Lock()
+	conn := a.conn
+	a.writeMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
 	}
 }
 
@@ -404,7 +424,7 @@ func (a *Agent) handleExec(m msg, reqID string) {
 	}
 	code, stdout, stderr := a.exec.Exec(command, timeout)
 	_ = a.send(msg{
-		"action": "command_result", "exit_code": code,
+		"action": "command_result", "for_action": "exec", "exit_code": code,
 		"stdout": stdout, "stderr": stderr, "request_id": reqID,
 	})
 }
@@ -412,18 +432,22 @@ func (a *Agent) handleExec(m msg, reqID string) {
 func (a *Agent) handleReadFile(m msg, reqID string) {
 	content, err := readFile(str(m, "path"))
 	if err != nil {
-		_ = a.send(msg{"action": "command_result", "error": err.Error(), "request_id": reqID})
+		_ = a.send(msg{"action": "command_result", "for_action": "read_file",
+			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	_ = a.send(msg{"action": "command_result", "content": content, "request_id": reqID})
+	_ = a.send(msg{"action": "command_result", "for_action": "read_file",
+		"content": content, "request_id": reqID})
 }
 
 func (a *Agent) handleWriteFile(m msg, reqID string) {
 	if err := writeFile(str(m, "path"), str(m, "content")); err != nil {
-		_ = a.send(msg{"action": "command_result", "error": err.Error(), "request_id": reqID})
+		_ = a.send(msg{"action": "command_result", "for_action": "write_file",
+			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	_ = a.send(msg{"action": "command_result", "status": "ok", "request_id": reqID})
+	_ = a.send(msg{"action": "command_result", "for_action": "write_file",
+		"status": "ok", "request_id": reqID})
 }
 
 // handleInstallPackage / handleManageService / handleWriteConfig dispatch the
@@ -434,12 +458,12 @@ func (a *Agent) handleWriteFile(m msg, reqID string) {
 func (a *Agent) handleInstallPackage(m msg, reqID string) {
 	res, err := installPackage(a.exec.Exec, a.exec.allow.privileged,
 		a.exec.allow.allowPackageInstall, str(m, "name"))
-	a.sendProvisionResult(res, err, reqID)
+	a.sendProvisionResult("install_package", res, err, reqID)
 }
 
 func (a *Agent) handleManageService(m msg, reqID string) {
 	res, err := manageService(a.exec.Exec, a.exec.allow.privileged, str(m, "name"), str(m, "state"))
-	a.sendProvisionResult(res, err, reqID)
+	a.sendProvisionResult("manage_service", res, err, reqID)
 }
 
 func (a *Agent) handleWriteConfig(m msg, reqID string) {
@@ -448,18 +472,19 @@ func (a *Agent) handleWriteConfig(m msg, reqID string) {
 		mode = "0644"
 	}
 	res, err := writeConfig(a.exec.allow.privileged, str(m, "path"), str(m, "content"), mode)
-	a.sendProvisionResult(res, err, reqID)
+	a.sendProvisionResult("write_config", res, err, reqID)
 }
 
 // sendProvisionResult frames a provisioning outcome as a command_result: an
 // error frame on failure, else a structured {changed, detail} success.
-func (a *Agent) sendProvisionResult(res provisionResult, err error, reqID string) {
+func (a *Agent) sendProvisionResult(forAction string, res provisionResult, err error, reqID string) {
 	if err != nil {
-		_ = a.send(msg{"action": "command_result", "error": err.Error(), "request_id": reqID})
+		_ = a.send(msg{"action": "command_result", "for_action": forAction,
+			"error": err.Error(), "request_id": reqID})
 		return
 	}
 	_ = a.send(msg{
-		"action": "command_result", "status": "ok",
+		"action": "command_result", "for_action": forAction, "status": "ok",
 		"changed": res.Changed, "detail": res.Detail, "request_id": reqID,
 	})
 }
@@ -486,14 +511,14 @@ func (a *Agent) handleSetTransport(m msg, reqID string) {
 		// would let anyone who reached the channel talk a fleet back down onto
 		// plaintext, which is a downgrade attack with extra steps.
 		_ = a.send(msg{
-			"action": "command_result", "request_id": reqID,
+			"action": "command_result", "for_action": "set_transport", "request_id": reqID,
 			"error": "set_transport: only enabling TLS is supported",
 		})
 		return
 	}
 	if _, err := parsePin(pin); err != nil {
 		_ = a.send(msg{
-			"action": "command_result", "request_id": reqID,
+			"action": "command_result", "for_action": "set_transport", "request_id": reqID,
 			"error": fmt.Sprintf("set_transport: unusable pin, keeping current transport: %v", err),
 		})
 		return
@@ -501,7 +526,7 @@ func (a *Agent) handleSetTransport(m msg, reqID string) {
 
 	if err := writeTransportFile(a.cfg.TransportFile, persistedTransport{TLS: true, Pin: pin}); err != nil {
 		_ = a.send(msg{
-			"action": "command_result", "request_id": reqID,
+			"action": "command_result", "for_action": "set_transport", "request_id": reqID,
 			"error": fmt.Sprintf("set_transport: could not persist to %s: %v", a.cfg.TransportFile, err),
 		})
 		return
@@ -511,7 +536,7 @@ func (a *Agent) handleSetTransport(m msg, reqID string) {
 	// decide when the fleet is ready for the listener to flip, and an ack sent
 	// after the reconnect would arrive on a socket the hub is not waiting on.
 	_ = a.send(msg{
-		"action": "command_result", "status": "ok", "request_id": reqID,
+		"action": "command_result", "for_action": "set_transport", "status": "ok", "request_id": reqID,
 		"transport": "tls", "persisted_to": a.cfg.TransportFile,
 	})
 

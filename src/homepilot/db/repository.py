@@ -516,6 +516,33 @@ class Repository:
             (agent_id,),
         )
 
+    async def count_agents(self) -> int:
+        """How many agents this install has, ever enrolled or not.
+
+        The enrolment window (#537) exempts a genuinely FRESH install so the
+        zero-touch first rollout still needs zero operator input: zero rows here
+        is what "fresh" means. A refused stranger never creates a row, so this
+        cannot be inflated by the attempts the window exists to refuse.
+        """
+        row = await self.db.fetchone("SELECT COUNT(*) AS n FROM agents")
+        return int(row["n"]) if row else 0
+
+    async def agent_hostname_known(self, hostname: str) -> bool:
+        """Whether this install already has an agent row for ``hostname``.
+
+        Includes revoked and credential-less rows on purpose: the question is
+        "is this host already part of the fleet", not "can it authenticate".
+        Re-enrolling a host the operator already added is the documented
+        recovery path; enrolling a hostname nobody has ever seen is the thing
+        the enrolment window gates (#537).
+        """
+        if not hostname:
+            return False
+        row = await self.db.fetchone(
+            "SELECT 1 AS present FROM agents WHERE hostname = ? LIMIT 1", (hostname,)
+        )
+        return row is not None
+
     async def get_agent_credentials_by_hostname(self, hostname: str) -> list[dict[str, Any]]:
         """Return the live (non-revoked, credentialed) rows issued to ``hostname``,
         newest credential first.

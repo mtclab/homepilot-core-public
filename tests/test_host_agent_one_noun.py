@@ -78,6 +78,14 @@ async def _stack(tmp_path: Path):
     app.state.database = db
     app.state.agent_registry = registry
 
+    # Several tests here enrol a SECOND, different hostname with the shared
+    # token, which since #537 needs an operator-opened enrolment window. This
+    # stack is about hosts and agents being one noun, not about who may join, so
+    # it enrols with the window open rather than relaxing the rule.
+    from homepilot.agent_hub.enrolment_window import open_window
+
+    await open_window(repo, 60)
+
     async def register(agent_id: str, hostname: str):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(

@@ -69,7 +69,6 @@ class TestWebhookOnPropose:
             from homepilot.config import Settings
 
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()
@@ -96,7 +95,6 @@ class TestWebhookOnPropose:
             from homepilot.config import Settings
 
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url="https://hooks.example.com/artifacts",
             )
             mock_client = AsyncMock()
@@ -118,7 +116,6 @@ class TestWebhookOnPropose:
             from homepilot.config import Settings
 
             mock_settings.return_value = Settings(
-                secret_key="test",
                 events_webhook_url=None,
             )
 
@@ -135,7 +132,6 @@ class TestWebhookFailSoft:
         from homepilot.config import Settings
 
         mock_settings.return_value = Settings(
-            secret_key="test",
             events_webhook_url="https://hooks.example.com/artifacts",
         )
         mock_client = AsyncMock()
