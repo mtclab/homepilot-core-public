@@ -36,7 +36,7 @@ var privilegedCommands = map[string]*regexp.Regexp{
 	"apt": regexp.MustCompile(
 		`^apt\s+(install|update|upgrade)\s+-y\s+[a-zA-Z0-9_.+-]+(\s+[a-zA-Z0-9_.+-]+)*$`),
 	"docker-run": regexp.MustCompile(
-		`^docker\s+run\s+(\s+--[a-zA-Z]+[= ][a-zA-Z0-9_.:/-]+)*\s+[a-zA-Z0-9_.:/-]+(\s+[a-zA-Z0-9_./-]+)*$`),
+		`^docker\s+run(\s+--[a-zA-Z]+[= ][a-zA-Z0-9_.:/-]+)*\s+[a-zA-Z0-9_.:/-]+(\s+[a-zA-Z0-9_./-]+)*$`),
 	"docker-pull": regexp.MustCompile(`^docker\s+pull\s+[a-zA-Z0-9_.:/-]+$`),
 	"docker-compose-up": regexp.MustCompile(
 		`^docker\s+compose\s+(-f\s+[a-zA-Z0-9_./-]+\s+)?(up|down)\s+(-d\s+)?(--build\s+)?[a-zA-Z0-9_.-]*$`),

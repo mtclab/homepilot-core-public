@@ -17,6 +17,7 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from homepilot.app_state import create_app_state
 from homepilot.config import get_settings
 
+from ..portal.repository import InviteRepository
 from .tools.artifact_tools import (
     TOOL_DEFINITIONS as ARTIFACT_TOOL_DEFS,
 )
@@ -28,6 +29,14 @@ from .tools.artifact_tools import (
     handle_get_task_result,
     handle_propose_artifact,
     handle_query_artifacts,
+)
+from .tools.guest_tools import (
+    TOOL_DEFINITIONS as GUEST_TOOL_DEFS,
+)
+from .tools.guest_tools import (
+    handle_query_guests,
+    handle_revoke_guest_invite,
+    handle_set_guest_quota,
 )
 from .tools.inventory_tools import (
     TOOL_DEFINITIONS as INVENTORY_TOOL_DEFS,
@@ -66,7 +75,7 @@ _Handler = Callable[
 ]
 
 _TOOL_DEFINITIONS: list[dict[str, Any]] = (
-    INVENTORY_TOOL_DEFS + SYSTEM_TOOL_DEFS + KB_TOOL_DEFS + ARTIFACT_TOOL_DEFS
+    INVENTORY_TOOL_DEFS + SYSTEM_TOOL_DEFS + KB_TOOL_DEFS + ARTIFACT_TOOL_DEFS + GUEST_TOOL_DEFS
 )
 
 _MUTATING_TOOLS = frozenset(
@@ -74,6 +83,10 @@ _MUTATING_TOOLS = frozenset(
         "propose_artifact",
         "approve_artifact",
         "record_fact",
+        # Guest management (#442): budgets and invite revocation change what a
+        # guest may do; a read-only MCP token gets query_guests and nothing else.
+        "set_guest_quota",
+        "revoke_guest_invite",
     }
 )
 
@@ -186,6 +199,8 @@ async def _bootstrap() -> dict[str, Any]:
         # app, which is where the API's instance lives.
         "inventory_service": inventory_service,
         "drift_reconciler": drift_reconciler,
+        # Guest management (#442): the assistant can see and budget guests.
+        "invite_repo": InviteRepository(state.database) if state.database else None,
         # Task outcomes live here. Without it an agent can start an apply and
         # never learn whether it worked (#427).
         "task_repo": TaskRepository(state.database),
@@ -221,6 +236,9 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "check_artifact_drift": handle_check_artifact_drift,
     "approve_artifact": handle_approve_artifact,
     "get_artifact_status": handle_get_artifact_status,
+    "query_guests": handle_query_guests,
+    "set_guest_quota": handle_set_guest_quota,
+    "revoke_guest_invite": handle_revoke_guest_invite,
 }
 
 

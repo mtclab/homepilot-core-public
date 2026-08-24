@@ -290,9 +290,23 @@ def _mcp_subsystem(state: Any) -> Subsystem:
     )
 
 
-def _artifacts_remote_subsystem(settings: Any) -> Subsystem:
+def _artifacts_remote_subsystem(state: Any, settings: Any) -> Subsystem:
     remote = (getattr(settings, "artifacts_remote", "") or "").strip()
     target = redact_endpoint(remote)
+
+    # The scheduled push (#442 follow-up) records its outcome in the settings
+    # table; report THAT, not a promise. A probe reading our own database is
+    # bounded and honest - it verifies "the last push worked", which is the
+    # only thing "mirrored" can truthfully mean.
+    async def _last_push_succeeded() -> bool:
+        repo = getattr(state, "repo", None)
+        if repo is None:
+            return False
+        row = await repo.get_setting("archive_last_push_ok")
+        # No row yet = the first push has not run; treat as ok-so-far rather
+        # than alarming a fresh configure, the schedule will write the truth.
+        return row is None or row.get("value") == "1"
+
     return Subsystem(
         name="artifacts_remote",
         label="the artifacts remote",
@@ -302,14 +316,16 @@ def _artifacts_remote_subsystem(settings: Any) -> Subsystem:
             "Artifacts live only in this instance's data directory; there is no "
             "off-box copy if the volume is lost."
         ),
-        # No probe: reaching a git host proves nothing about push rights, and the
-        # sentence must not imply a verification that did not happen.
         ok=(
-            f"Artifacts are mirrored to {target}. HomePilot does not contact the remote "
-            "until the next sync, so this reports only that a remote is set."
+            f"Artifacts are pushed to {target} on a schedule; the most recent "
+            "push succeeded (or the first one has not run yet)."
         ),
-        broken="",
-        probe=None,
+        broken=(
+            f"The last scheduled push to {target} FAILED - the off-box copy is "
+            "stale. The error is recorded in the journal and the settings table "
+            "(archive_last_push_error)."
+        ),
+        probe=_last_push_succeeded,
     )
 
 
@@ -327,7 +343,7 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _embeddings_subsystem(settings),
         _events_webhook_subsystem(settings),
         _mcp_subsystem(state),
-        _artifacts_remote_subsystem(settings),
+        _artifacts_remote_subsystem(state, settings),
     ]
 
 

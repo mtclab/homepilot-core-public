@@ -244,7 +244,7 @@ var privilegedCommandNeeds = map[string]commandNeed{
 	// single-spaced form unusable), left alone here — #422 is about the runtime,
 	// not about widening or reshaping the allowlist.
 	"systemctl":         {sample: "systemctl restart nginx.service", needsRoot: true},
-	"docker-run":        {sample: "docker run  nginx", needsRoot: true},
+	"docker-run":        {sample: "docker run nginx", needsRoot: true},
 	"docker-pull":       {sample: "docker pull nginx:latest", needsRoot: true},
 	"docker-compose-up": {sample: "docker compose -f /opt/homepilot/docker-compose.yml up -d", needsRoot: true},
 	"docker-stop":       {sample: "docker stop web", needsRoot: true},
