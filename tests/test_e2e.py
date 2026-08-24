@@ -682,10 +682,12 @@ class TestThePhoneViewport:
         try:
             page.set_viewport_size({"width": 390, "height": 844})
             page.goto(f"{UI}/", wait_until="networkidle")
-            # The shell must offer a menu control at this width...
-            toggle = page.locator(
-                "button[aria-label*='menu' i], button[aria-label*='navigation' i]"
-            )
+            # The shell must offer a menu control at this width. Its accessible
+            # name comes from an sr-only span ("Open navigation"), so ask by
+            # ROLE + NAME - the way assistive tech does - not by aria-label.
+            import re as _re
+
+            toggle = page.get_by_role("button", name=_re.compile("open navigation", _re.I))
             assert toggle.count() > 0, "no menu control in the phone-width shell"
             toggle.first.click()
             # ...whose Hosts entry actually navigates.
