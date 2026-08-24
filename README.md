@@ -46,11 +46,11 @@ longer the way in.
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=3.0.1 docker compose pull
+HP_IMAGE_TAG=3.1.0 docker compose pull
 docker compose up -d
 ```
 
-Available tags: `latest`, `3.0.1`, `3.0`, `3` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
+Available tags: `latest`, `3.1.0`, `3.1`, `3` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
 
 ## Services
 
@@ -364,6 +364,8 @@ hp token list                 # list API tokens (prefix, label, scope, last-used
 hp token revoke               # revoke an API token by its prefix
 hp invite create              # mint a one-time, CN-bound self-service provisioning invite
 hp invite list                # list invites (prefix, CN, caps, expiry, state - never tokens)
+hp quota set                  # set a guest's resource budget (totals across ALL their machines)
+hp quota list                 # every guest budget next to what each guest actually uses
 hp invite revoke <prefix>     # revoke an unredeemed invite by its prefix
 hp vault set <name>           # store a JSON secret in the vault
 hp vault get <name>           # retrieve a secret from the vault

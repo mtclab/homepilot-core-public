@@ -465,6 +465,25 @@ export interface Service {
 	status?: string;
 }
 
+
+/** Operator view of the guest world (#442 G3). */
+export interface GuestOverview {
+	guests: Array<{
+		cn: string;
+		usage: { vms: number; cores: number; memory_mb: number; disk_gb: number };
+		limits: { vms: number | null; cores: number | null; memory_mb: number | null; disk_gb: number | null } | null;
+	}>;
+	invites: Array<{
+		id: string;
+		prefix: string;
+		cn: string;
+		state: string;
+		caps: { template_vmid: number; node: string; cores: number; memory_mb: number; disk_gb: number };
+		expires_at: string;
+		created_at: string;
+	}>;
+}
+
 export interface KBEntry {
 	id: number;
 	source: string;
@@ -855,6 +874,23 @@ export const api = {
 	},
 	listFiringAlerts() {
 		return req<{ items: FiringAlert[]; total: number }>('/monitoring/alerts');
+	},
+
+	// --- Guests (#442 G3) ---
+	getGuests() {
+		return req<GuestOverview>('/admin/guests');
+	},
+	mintGuestInvite(body: { cn: string; template_vmid: number; node: string; cores: number; memory_mb: number; disk_gb: number; ttl_days: number }) {
+		return req<{ id: string; token: string; cn: string }>('/admin/guests/invites', {
+			method: 'POST',
+			body: JSON.stringify(body),
+		});
+	},
+	revokeGuestInvite(prefix: string) {
+		return req<{ prefix: string; revoked: boolean }>(`/admin/guests/invites/${encodeURIComponent(prefix)}/revoke`, { method: 'POST' });
+	},
+	setGuestQuota(body: { cn: string; max_vms: number | null; max_cores: number | null; max_memory_mb: number | null; max_disk_gb: number | null }) {
+		return req<unknown>('/admin/guests/quota', { method: 'POST', body: JSON.stringify(body) });
 	},
 
 	getProxmoxSettings() {

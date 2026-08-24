@@ -202,6 +202,17 @@ class ProxmoxClient:
         result = await self.call("POST", f"/nodes/{node}/qemu/{vmid}/status/start")
         return str(result.get("data", ""))
 
+    async def stop_vm(self, node: str, vmid: int) -> str:
+        # Hard stop (power button). The guest API deliberately offers this and
+        # shutdown-by-reboot only - a wedged guest OS must not be able to make
+        # its own machine unstoppable.
+        result = await self.call("POST", f"/nodes/{node}/qemu/{vmid}/status/stop")
+        return str(result.get("data", ""))
+
+    async def reboot_vm(self, node: str, vmid: int) -> str:
+        result = await self.call("POST", f"/nodes/{node}/qemu/{vmid}/status/reboot")
+        return str(result.get("data", ""))
+
     async def get_vm_current(self, node: str, vmid: int) -> dict[str, Any]:
         return await self.read(f"/nodes/{node}/qemu/{vmid}/status/current")
 

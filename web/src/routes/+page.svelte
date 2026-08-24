@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { base } from '$app/paths';
-	import { api, type DashboardSummary } from '$lib/api';
+	import { api, type FiringAlert, type Host, type DashboardSummary } from '$lib/api';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import Donut from '$lib/components/Donut.svelte';
@@ -41,15 +41,30 @@
 			}));
 	}
 
+	// The fleet-health strip (#514 P3/S5): one chip per host - state, agent,
+	// firing alerts - so glancing is Overview and digging is the host page.
+	let fleet: Host[] = [];
+	let firing: FiringAlert[] = [];
+
 	async function load() {
 		loading = true;
 		try {
 			d = await api.getDashboard();
+			const [inv, alerts] = await Promise.allSettled([
+				api.listInventory({ limit: 100 }),
+				api.listFiringAlerts(),
+			]);
+			fleet = inv.status === 'fulfilled' ? inv.value.items : [];
+			firing = alerts.status === 'fulfilled' ? alerts.value.items : [];
 		} catch (e) {
 			error = String(e);
 		} finally {
 			loading = false;
 		}
+	}
+
+	function alertCount(hostname: string): number {
+		return firing.filter((f) => f.hostname === hostname).length;
 	}
 	onMount(() => {
 		try {
@@ -220,6 +235,39 @@
 				{/if}
 			</div>
 		</div>
+
+		{#if fleet.length}
+			<div class="card space-y-2">
+				<div class="flex items-center justify-between">
+					<div class="section-title">Fleet</div>
+					<a class="text-accent text-xs" href="{base}/hosts">All hosts →</a>
+				</div>
+				<div class="flex flex-wrap gap-1.5">
+					{#each fleet as h (h.id)}
+						<a
+							href="{base}/hosts/{h.id}"
+							class="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-line text-xs hover:border-accent"
+							title="{h.hostname}: {h.status ?? 'unknown'}{h.agent_id ? (h.agent_connected ? ', agent connected' : ', agent not connected') : ''}"
+						>
+							<span
+								class="w-1.5 h-1.5 rounded-full {h.status === 'online'
+									? 'bg-ok'
+									: h.status === 'offline'
+										? 'bg-danger'
+										: 'bg-border-strong'}"
+							></span>
+							<span class="text-ink font-mono">{h.hostname}</span>
+							{#if h.agent_id && !h.agent_connected}
+								<span class="text-muted" title="Agent enrolled but not connected">∅</span>
+							{/if}
+							{#if alertCount(h.hostname)}
+								<span class="badge badge-failed">{alertCount(h.hostname)}</span>
+							{/if}
+						</a>
+					{/each}
+				</div>
+			</div>
+		{/if}
 
 		<a
 			href="{base}/hosts"

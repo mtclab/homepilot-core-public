@@ -1,0 +1,293 @@
+<!doctype html>
+<!-- The guest portal client (#442 G2).
+
+     One file, no build step, no dependencies: the operator's front nginx
+     serves this page on the mTLS vhost and proxies /guest/* and /invite/* to
+     the HomePilot backend. The page talks to the SAME ORIGIN it was served
+     from - the client certificate the browser presented is what the backend
+     trusts, relayed by nginx (docs/guest-portal.md).
+
+     Deliberately single-theme: this page is a friend's small window into the
+     lab, not the operator console. It borrows the same register - dark
+     ground, serif voice, one ember accent - so it is recognisably the same
+     workshop, seen from the guest room. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your machines</title>
+<style>
+  :root {
+    --paper: #171310; --raised: #201b15; --line: #322b23;
+    --ink: #e9e2d6; --muted: #9a8f80; --accent: #d98a45;
+    --ok: #6fbc85; --warn: #d9a842; --crit: #e07b6d;
+    --serif: "Source Serif 4", Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
+    --sans: ui-sans-serif, system-ui, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: var(--sans); line-height: 1.5;
+    padding: 2rem 1rem 4rem;
+  }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-family: var(--serif); font-size: 1.7rem; margin: 0; }
+  .sub { color: var(--muted); font-size: .9rem; margin: .2rem 0 1.6rem; }
+  .card {
+    background: var(--raised); border: 1px solid var(--line);
+    border-radius: 8px; padding: 1rem 1.2rem; margin-bottom: 1rem;
+  }
+  .vm-head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .vm-name { font-family: var(--serif); font-size: 1.15rem; font-weight: 600; }
+  .dot { display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; }
+  .dot.online  { background: var(--ok); }
+  .dot.offline { background: var(--crit); }
+  .dot.unknown { background: var(--muted); }
+  .state { font-size: .8rem; color: var(--muted); }
+  .facts {
+    display: grid; grid-template-columns: max-content 1fr;
+    gap: .15rem 1.4rem; margin: .7rem 0; font-size: .88rem;
+  }
+  .facts dt { color: var(--muted); }
+  .facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .ip { font-family: var(--mono); cursor: pointer; border-bottom: 1px dotted var(--muted); }
+  .actions { display: flex; gap: .5rem; margin-top: .5rem; }
+  button {
+    font: inherit; font-size: .82rem; color: var(--ink);
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 6px; padding: .3rem .8rem; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1a130c; }
+  button.danger:hover { border-color: var(--crit); color: var(--crit); }
+  .budget { margin-top: 1.6rem; }
+  .budget h2 { font-family: var(--serif); font-size: 1.05rem; margin: 0 0 .6rem; }
+  .meter { margin-bottom: .55rem; font-size: .82rem; }
+  .meter .row { display: flex; justify-content: space-between; color: var(--muted); }
+  .meter .row b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: .25rem; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar i.hot { background: var(--warn); }
+  .banner {
+    border: 1px solid var(--crit); color: var(--crit);
+    border-radius: 6px; padding: .6rem .9rem; font-size: .85rem; margin-bottom: 1rem;
+    display: none;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 2.5rem 0; }
+  .empty .big { font-family: var(--serif); font-size: 1.1rem; color: var(--ink); }
+  dialog {
+    background: var(--raised); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 1.2rem 1.4rem; max-width: 22rem;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.5); }
+  dialog h3 { font-family: var(--serif); margin: 0 0 .4rem; font-size: 1.05rem; }
+  dialog p { color: var(--muted); font-size: .85rem; margin: 0 0 1rem; }
+  dialog .row { display: flex; justify-content: flex-end; gap: .5rem; }
+  footer {
+    max-width: 42rem; margin: 2.5rem auto 0; padding-top: .8rem;
+    border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .75rem; text-align: right;
+  }
+  footer a { color: var(--muted); }
+  .toast {
+    position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+    background: var(--raised); border: 1px solid var(--line); border-radius: 6px;
+    padding: .5rem 1rem; font-size: .85rem; opacity: 0; transition: opacity .2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Your machines</h1>
+  <p class="sub" id="who">&nbsp;</p>
+  <div class="banner" id="banner"></div>
+  <div id="vms"></div>
+  <section class="budget" id="budget" hidden>
+    <h2>Your budget</h2>
+    <div id="meters"></div>
+  </section>
+</main>
+
+<dialog id="confirm">
+  <h3 id="c-title"></h3>
+  <p id="c-body"></p>
+  <div class="row">
+    <button id="c-cancel">Cancel</button>
+    <button id="c-go" class="primary">Confirm</button>
+  </div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<footer>Built by <a href="https://mtclab.net">MTC Lab</a></footer>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  let pending = null; // {id, hostname, action}
+
+  const fmt = {
+    mem: (mb) => mb == null ? "—" : (mb / 1024).toFixed(mb % 1024 ? 1 : 0) + " GB",
+    disk: (gb) => gb == null ? "—" : gb + " GB",
+  };
+
+  async function api(path, opts) {
+    const res = await fetch(path, Object.assign({ headers: { "content-type": "application/json" } }, opts));
+    if (!res.ok) {
+      let detail = "something went wrong";
+      try { detail = (await res.json()).detail || detail; } catch (e) { /* keep default */ }
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  function banner(msg) {
+    const el = $("banner");
+    el.textContent = msg;
+    el.style.display = msg ? "block" : "none";
+  }
+
+  function toast(msg) {
+    const el = $("toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    setTimeout(() => el.classList.remove("show"), 2600);
+  }
+
+  function stateClass(status) {
+    if (status === "online") return "online";
+    if (status === "offline") return "offline";
+    return "unknown";
+  }
+
+  function vmCard(vm) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const online = vm.status === "online";
+    card.innerHTML = `
+      <div class="vm-head">
+        <span class="dot ${stateClass(vm.status)}"></span>
+        <span class="vm-name"></span>
+        <span class="state"></span>
+      </div>
+      <dl class="facts">
+        <dt>Address</dt><dd><span class="ip" title="Click to copy"></span></dd>
+        <dt>Cores</dt><dd class="f-cores"></dd>
+        <dt>Memory</dt><dd class="f-mem"></dd>
+        <dt>Disk</dt><dd class="f-disk"></dd>
+      </dl>
+      <div class="actions"></div>`;
+    card.querySelector(".vm-name").textContent = vm.hostname;
+    card.querySelector(".state").textContent = vm.status || "state unknown";
+    const ip = card.querySelector(".ip");
+    ip.textContent = vm.ip_address || "no address yet";
+    if (vm.ip_address) ip.addEventListener("click", () => {
+      navigator.clipboard?.writeText(vm.ip_address).then(() => toast("Address copied"));
+    });
+    card.querySelector(".f-cores").textContent = vm.cpu_cores ?? "—";
+    card.querySelector(".f-mem").textContent = fmt.mem(vm.memory_mb);
+    card.querySelector(".f-disk").textContent = fmt.disk(vm.disk_gb);
+
+    const actions = card.querySelector(".actions");
+    const acts = online ? [["reboot", "Reboot", ""], ["stop", "Stop", "danger"]]
+                        : [["start", "Start", "primary"]];
+    for (const [action, label, cls] of acts) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (cls) b.className = cls;
+      b.addEventListener("click", () => {
+        pending = { id: vm.id, hostname: vm.hostname, action };
+        $("c-title").textContent = `${label} ${vm.hostname}?`;
+        $("c-body").textContent = action === "stop"
+          ? "This is the power button, not a polite shutdown - save your work first."
+          : action === "reboot"
+            ? "The machine restarts now. Connections drop for a minute."
+            : "The machine powers on.";
+        $("confirm").showModal();
+      });
+      actions.appendChild(b);
+    }
+    return card;
+  }
+
+  function meter(label, used, limit, format) {
+    const wrap = document.createElement("div");
+    wrap.className = "meter";
+    const shown = limit == null ? `${format(used)} of unlimited` : `${format(used)} of ${format(limit)}`;
+    wrap.innerHTML = `<div class="row"><span></span><b></b></div>`;
+    wrap.querySelector("span").textContent = label;
+    wrap.querySelector("b").textContent = shown;
+    if (limit != null && limit > 0) {
+      const pct = Math.min(100, Math.round(100 * used / limit));
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.innerHTML = `<i style="width:${pct}%"${pct >= 90 ? ' class="hot"' : ""}></i>`;
+      wrap.appendChild(bar);
+    }
+    return wrap;
+  }
+
+  async function refresh() {
+    try {
+      const [vms, quota] = await Promise.all([api("/guest/vms"), api("/guest/quota")]);
+      banner("");
+      $("who").textContent = quota.cn ? `Signed in as ${quota.cn}` : "";
+
+      const list = $("vms");
+      list.replaceChildren();
+      if (!vms.items.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty card";
+        empty.innerHTML = `<p class="big">No machines yet</p>
+          <p>Open the invite link you were sent to set up your first one.</p>`;
+        list.appendChild(empty);
+      } else {
+        for (const vm of vms.items) list.appendChild(vmCard(vm));
+      }
+
+      const meters = $("meters");
+      meters.replaceChildren();
+      const u = quota.usage, l = quota.limits;
+      $("budget").hidden = !l;
+      if (l) {
+        meters.appendChild(meter("Machines", u.vms, l.vms, (v) => String(v)));
+        meters.appendChild(meter("CPU cores", u.cores, l.cores, (v) => String(v)));
+        meters.appendChild(meter("Memory", u.memory_mb, l.memory_mb, fmt.mem));
+        meters.appendChild(meter("Disk", u.disk_gb, l.disk_gb, fmt.disk));
+      }
+    } catch (e) {
+      banner(e.message === "no client certificate"
+        ? "Your browser did not present a valid certificate for this page."
+        : `Could not load your machines: ${e.message}`);
+    }
+  }
+
+  $("c-cancel").addEventListener("click", () => { pending = null; $("confirm").close(); });
+  $("c-go").addEventListener("click", async () => {
+    const p = pending;
+    pending = null;
+    $("confirm").close();
+    if (!p) return;
+    try {
+      await api(`/guest/vms/${encodeURIComponent(p.id)}/power`, {
+        method: "POST",
+        body: JSON.stringify({ action: p.action }),
+      });
+      toast(`${p.action === "start" ? "Starting" : p.action === "stop" ? "Stopping" : "Rebooting"} ${p.hostname}…`);
+      setTimeout(refresh, 2500);
+    } catch (e) {
+      banner(e.message);
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 15000);
+})();
+</script>
+</body>
+</html>

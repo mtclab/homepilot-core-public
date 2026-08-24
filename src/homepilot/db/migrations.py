@@ -780,6 +780,23 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             FROM agents a
             WHERE NOT EXISTS (SELECT 1 FROM hosts h WHERE h.hostname = a.hostname)""",
     ],
+    26: [
+        # Per-guest resource quotas (#442 G1.5). An invite caps ONE machine;
+        # the quota caps the GUEST - the total a friend's machines may consume
+        # across cores/memory/disk and how many they may hold at once.
+        # Enforced at provision time; visible to the guest in their portal.
+        # No row for a CN = no quota (invites alone gate), so quotas are
+        # opt-in per friend.
+        """CREATE TABLE IF NOT EXISTS guest_quotas (
+            cn             TEXT PRIMARY KEY,
+            max_vms        INTEGER,
+            max_cores      INTEGER,
+            max_memory_mb  INTEGER,
+            max_disk_gb    INTEGER,
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        )""",
+    ],
 }
 
 

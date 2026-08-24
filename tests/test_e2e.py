@@ -243,13 +243,18 @@ class TestAPIHealth:
 
 
 class TestUIPages:
+    # Every reachable console surface (#514 S5): the five S4 groups with their
+    # sub-views, the host list, and settings. The pre-S4 addresses are covered
+    # by their own redirect assertions, not repeated here.
     ROUTES: ClassVar[list[str]] = [
-        "artifacts",
-        "inventory",
-        "kb",
-        "drift",
-        "review",
-        "journal",
+        "",
+        "hosts",
+        "changes",
+        "changes/review",
+        "changes/drift",
+        "records/tasks",
+        "records/journal",
+        "records/kb",
         "settings",
     ]
 
@@ -636,3 +641,61 @@ class TestRateLimiting:
             if resp.status == 429:
                 break
         assert 429 in statuses, "Unauthenticated rapid requests should be rate-limited"
+
+
+class TestEveryOldAddressStillLands:
+    """The S4 redirect promise, proven on the SHIPPED artifact: a bookmark
+    from any pre-3.0 install lands on the page that replaced it."""
+
+    CASES: ClassVar[list[tuple[str, str]]] = [
+        ("inventory", "/ui/hosts"),
+        ("agents", "/ui/hosts"),
+        ("tokens", "/ui/settings"),
+        ("artifacts", "/ui/changes"),
+        ("review", "/ui/changes/review"),
+        ("drift", "/ui/changes/drift"),
+        ("tasks", "/ui/records/tasks"),
+        ("journal", "/ui/records/journal"),
+        ("kb", "/ui/records/kb"),
+    ]
+
+    def test_every_pre_move_url_redirects(self, auth_page):
+        misses: list[str] = []
+        for old_route, target in self.CASES:
+            auth_page.goto(f"{UI}/{old_route}", wait_until="networkidle")
+            if (
+                not auth_page.url.rstrip("/").endswith(target.lstrip("/").split("/", 1)[-1])
+                and target not in auth_page.url
+            ):
+                misses.append(f"/{old_route} -> {auth_page.url} (wanted {target})")
+        assert not misses, "stale addresses: " + "; ".join(misses)
+
+
+class TestThePhoneViewport:
+    """The console on a phone (#445 B3, re-proven on the shipped path): the
+    shell offers the menu, navigation works, and the fleet page renders -
+    not merely 'does not crash'."""
+
+    def test_hosts_reachable_and_rendered_at_phone_size(self, session_auth):
+        context = session_auth["context"]
+        page = context.new_page()
+        try:
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.goto(f"{UI}/", wait_until="networkidle")
+            # The shell must offer a menu control at this width...
+            toggle = page.locator(
+                "button[aria-label*='menu' i], button[aria-label*='navigation' i]"
+            )
+            assert toggle.count() > 0, "no menu control in the phone-width shell"
+            toggle.first.click()
+            # ...whose Hosts entry actually navigates.
+            page.get_by_role("link", name="Hosts").first.click()
+            page.wait_for_url("**/ui/hosts**")
+            assert page.locator("h1").first.inner_text().strip() == "Hosts"
+            # And nothing forces a horizontal scroll.
+            overflow = page.evaluate(
+                "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+            )
+            assert overflow <= 1, f"the page scrolls sideways by {overflow}px on a phone"
+        finally:
+            page.close()
