@@ -194,3 +194,17 @@ class TestTheTrustGateHoldsHere:
         async with client_for(app, peer="203.0.113.99") as client:
             res = await client.get("/guest/vms", headers=cert_headers(cn=ALICE))
         assert res.status_code == 403
+
+
+class TestThePortalPageShipsInTheBackend:
+    async def test_guest_root_serves_the_portal_shell(self, stack):
+        """The front nginx adds ONE proxy location and copies nothing: the
+        page itself comes from the backend. A data-free shell, so no
+        certificate is needed to receive it - the APIs behind it stay gated."""
+        app, _pve, _ids = stack
+        async with client_for(app) as client:
+            res = await client.get("/guest/")
+        assert res.status_code == 200
+        assert "Your machines" in res.text
+        # And it is the SHELL - no data baked in, everything fetched.
+        assert "alice-web" not in res.text

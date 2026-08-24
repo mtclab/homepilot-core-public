@@ -8,9 +8,10 @@ their budget - and nothing else HomePilot has.
 
 ### To turn it on
 
-1. Copy `web-guest/index.html` (one static file, no build) to your public
-   front server and add the vhost block from `docs/guest-portal.md` - it
-   publishes the page plus `/guest/*` and `/invite/*`, nothing else.
+1. Add the vhost block from `docs/guest-portal.md` to your public front
+   nginx - one proxy location for `/guest/*` and `/invite/*`, nothing else.
+   The portal page ships inside the backend and is served at `/guest/`;
+   nothing is copied anywhere.
 2. Set the four `HP_PORTAL_*` variables on the backend (unset = every guest
    route answers 503, fail-closed).
 3. Mint invites and set budgets from **Settings -> Guests** in the console,

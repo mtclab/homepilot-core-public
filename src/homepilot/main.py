@@ -873,6 +873,7 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # Guest API (#442 G1): same mTLS trust model as the invite portal -
         # every route re-derives the CN through portal.trust and scopes every
         # query to hosts the CN owns. No API token exists on the guest side.
+        ("GET", "/guest/"),
         ("GET", "/guest/vms"),
         ("GET", "/guest/quota"),
         ("GET", "/guest/vms/{host_id}"),

@@ -21,6 +21,7 @@ a wrong id and another guest's id both answer 404, indistinguishably.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -40,6 +41,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 POWER_ACTIONS = ("start", "stop", "reboot")
+
+# The client page ships INSIDE the backend (#442 G2, revised): the front
+# nginx adds one proxy location and nothing else - no files to copy, no
+# separate deploy to forget. The page is a data-free shell (the APIs behind
+# it stay trust-gated), so serving it takes no certificate.
+_PORTAL_HTML = Path(__file__).parent / "portal.html"
+
+
+@router.get("/", include_in_schema=False)
+async def portal_page() -> Any:
+    from fastapi.responses import FileResponse
+
+    return FileResponse(_PORTAL_HTML, media_type="text/html")
 
 
 class PowerRequest(BaseModel):

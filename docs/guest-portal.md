@@ -1,22 +1,18 @@
 # The guest portal (#442): a friend's window into the lab
 
-Same backend, different client. A cert-holding friend gets `web-guest/index.html`
-— one static file, no build step — and it talks to `/guest/*` (their machines,
+Same backend, different client. A cert-holding friend opens `/guest/`
+— the page ships inside the backend, nothing to copy — and it talks to `/guest/*` (their machines,
 their budget, power buttons) and `/invite/*` (redeeming a new machine). Nothing
 else of HomePilot faces them: not the admin UI, not the API, not MCP.
 
 ```
-friend's browser ──mTLS──> front nginx ──┬── /            serves web-guest/index.html
-                                          ├── /guest/*     proxied to backend :8000
-                                          └── /invite/*    proxied to backend :8000
+friend's browser ──mTLS──> front nginx ── /guest/* + /invite/* ──> backend :8000
 ```
 
 ## What goes where
 
-- **`web-guest/index.html`** → the front server, e.g. `/var/www/guest-portal/`.
-  Copy the one file; there is nothing to install or build.
-- **The nginx vhost** below → the front server's existing nginx (the one that
-  already terminates the friends' client certificates).
+- **Nothing is copied anywhere.** The portal page ships inside the backend and
+  is served at `/guest/`; the front nginx adds ONE location block.
 - **Backend env** (control-plane box): the four portal variables must be set —
   `HP_PORTAL_TRUSTED_PROXY` (the front server's address as the backend sees it),
   `HP_PORTAL_PROXY_SECRET`, `HP_PORTAL_VERIFY_HEADER=ssl-client-verify`,
@@ -39,12 +35,10 @@ server {
     ssl_client_certificate  /etc/nginx/certs/friends-ca.crt;
     ssl_verify_client       optional;
 
-    # The static client.
-    root /var/www/guest-portal;
-    location = / { try_files /index.html =404; }
+    location = / { return 302 /guest/; }
 
     # ONLY these two prefixes reach HomePilot. Everything else 404s here.
-    location ~ ^/(guest|invite)/ {
+    location ~ ^/(guest|invite)(/|$) {
         proxy_pass http://<backend-host>:8000;
         proxy_set_header X-Hp-Portal-Secret     "<value of HP_PORTAL_PROXY_SECRET>";
         proxy_set_header ssl-client-verify      $ssl_client_verify;
