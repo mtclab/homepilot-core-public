@@ -319,6 +319,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.alert_evaluator = alert_evaluator
 
+    # The artifact archive push (#442 follow-up): only when a remote is set -
+    # and when it IS set, "configured" finally means "actually synced".
+    if (settings.artifacts_remote or "").strip() and state.artifact_store is not None:
+        from .reconciler.archive_push import ArchivePushReconciler
+
+        archive_push = ArchivePushReconciler(state.artifact_store, state.repo)
+        reconciler_scheduler.register(
+            archive_push,
+            interval=float(settings.artifacts_push_interval_seconds),
+            startup_delay=90.0,
+        )
+        app.state.archive_push = archive_push
+
     apply_reconciler = None
     if app.state.artifact_executor is not None:
         apply_reconciler = ApplyReconciler(

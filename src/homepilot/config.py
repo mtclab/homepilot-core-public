@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     data_dir: str = str(Path.home() / ".hp")
     artifacts_dir: str = str(Path.home() / ".hp" / "artifacts")
     artifacts_remote: str = ""
+    # How often the artifact store is pushed to `artifacts_remote` (#442
+    # follow-up). Only meaningful when a remote is set; the push also runs
+    # shortly after boot so a fresh restore is mirrored without waiting.
+    artifacts_push_interval_seconds: int = 3600
     artifacts_ssh_key: str = ""
     secret_key: str = ""
     secret_key_file: str = ""

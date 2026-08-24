@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.2.0 (2026-08-24)
+
+The archive gets real, and the assistant can manage guests.
+
+### Artifact archive: configured now means synced
+
+`HP_ARTIFACTS_REMOTE` used to be a setting whose self-check promised "the
+next sync" while nothing synced. Now the artifact store is pushed to the
+remote every `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` (default 3600) and shortly
+after boot, and the Settings panel reports the LAST push's real outcome -
+green while pushes land, an honest fault naming the staleness when one fails.
+Point it at a private repo with a write deploy key:
+
+```env
+HP_ARTIFACTS_REMOTE=git@github.com:you/homepilot-archive.git
+HP_ARTIFACTS_SSH_KEY=/home/homepilot/.hp/archive_key
+```
+
+### Guest management over MCP
+
+`query_guests` (usage vs budget + invites), `set_guest_quota`,
+`revoke_guest_invite` - the mutators write-scoped. Deliberately absent:
+minting. An invite token is a machine-provisioning secret and an MCP
+transcript is not a safe channel; mint in Settings -> Guests or the CLI,
+where it is shown once to a human.
+
+### Agent
+
+`docker run nginx` no longer needs two spaces to pass the allowlist; the
+injection shapes the pattern blocks are still blocked, gated both directions.
+
 ## v3.1.0 (2026-08-24)
 
 The guest portal, as envisioned: same backend, a different client. A friend

@@ -211,6 +211,9 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `read_file_on_guest` | no | read | File read from a guest via the agent hub |
 | `exec_on_guest_readonly` | no | read | Read-only exec on guest via agent hub or SSH (cat, ls, ps…) |
 | `check_artifact_drift` | no | read | Check whether an applied artifact has drifted from desired state |
+| `query_guests` | no | read | Every portal guest's usage vs budget, plus invites (prefixes only - never tokens) |
+| `set_guest_quota` | quota table | write | Set a guest's resource budget (totals across all their machines) |
+| `revoke_guest_invite` | invite state | write | Revoke an open invite by prefix. Minting is deliberately NOT over MCP: the token is a machine-provisioning secret and a transcript is not a safe channel - mint in Settings -> Guests or `hp invite create` |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
 | `approve_artifact` | n/a | n/a | **Not exposed over MCP.** Delisted from `list_tools()` and hard-refused in dispatch (#385) - approval must come from an operator via CLI or web UI |

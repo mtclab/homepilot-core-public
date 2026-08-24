@@ -768,6 +768,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
+| `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` | `3600` | How often the artifact store is pushed to `HP_ARTIFACTS_REMOTE` (only when a remote is set) |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |
 | `HP_PORTAL_CN_HEADER` | `ssl-client-subject-dn` | Header the mTLS proxy sets with the client-certificate subject DN (see [portal.md](portal.md)) |
