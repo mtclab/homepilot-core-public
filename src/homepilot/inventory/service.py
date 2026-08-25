@@ -228,6 +228,52 @@ class InventoryService:
 
         return result
 
+    async def get_host_detail(self, host_id: str) -> dict[str, Any] | None:
+        """One host with its services and its agent, or None if there is no such host.
+
+        The single implementation behind GET /inventory/{host_id} and the
+        `get_host` MCP tool. The agent block is part of the host (#514 S2): the
+        answer to "is the channel live, which version, and why was it last
+        refused" must not require a second lookup - or a second, divergent copy
+        of this join.
+        """
+        import contextlib as _contextlib
+
+        host = await self.repo.get_host(host_id)
+        if host is None:
+            return None
+        host_dict = dict(host)
+        services = await self.repo.list_services(host_id=host_id)
+        host_dict["services"] = [dict(s) for s in services]
+        if host_dict.get("agent_id"):
+            agent = await self.repo.db.fetchone(
+                "SELECT agent_id, hostname, connected, first_seen, connected_at, "
+                "       last_heartbeat, disconnected_at, last_error, last_error_at, "
+                "       system_info, credential_set_at, revoked_at "
+                "FROM agents WHERE agent_id = ?",
+                (host_dict["agent_id"],),
+            )
+            if agent is not None:
+                info: dict[str, Any] = {}
+                with _contextlib.suppress(ValueError, TypeError):
+                    info = json.loads(agent["system_info"] or "{}")
+                host_dict["agent"] = {
+                    "agent_id": agent["agent_id"],
+                    "connected": bool(agent["connected"]),
+                    "version": info.get("agent_version"),
+                    "arch": info.get("arch"),
+                    "runtime": info.get("runtime"),
+                    "first_seen": agent["first_seen"],
+                    "connected_at": agent["connected_at"],
+                    "last_heartbeat": agent["last_heartbeat"],
+                    "disconnected_at": agent["disconnected_at"],
+                    "last_error": agent["last_error"],
+                    "last_error_at": agent["last_error_at"],
+                    "credential_set_at": agent["credential_set_at"],
+                    "revoked_at": agent["revoked_at"],
+                }
+        return host_dict
+
     async def _get_guest_description(
         self, node_name: str, guest_type: str, vmid: int
     ) -> str | None:

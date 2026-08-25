@@ -374,6 +374,7 @@ hp artifacts list             # list artifacts
 hp artifacts show <id>        # show artifact detail
 hp artifacts approve <id>     # approve a proposed artifact
 hp artifacts reject <id>      # reject a proposed artifact
+hp artifacts reset-approval <id>  # clear a brute-force approval-code lock
 hp artifacts apply <id>       # apply an approved artifact (via the backend's executor)
 hp artifacts edit <id>        # open artifact in editor
 hp artifacts revoke <id>      # revoke an applied artifact

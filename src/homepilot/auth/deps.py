@@ -16,6 +16,12 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # that ships without a scope dependency fails fast at app construction.
 SCOPE_ENFORCER_ATTR = "_hp_enforces_scope"
 
+# The scope string a require_scope() dependency enforces, recorded on the
+# callable so a route's required scope can be resolved exactly (not just "some
+# scope is enforced"). The MCP tier<->API scope anti-escalation gate reads it to
+# prove every MCP tool sits at exactly its route's scope tier.
+REQUIRED_SCOPE_ATTR = "_hp_required_scope"
+
 
 def get_db(request: Request) -> Repository:
     repo: Repository = request.app.state.repo
@@ -117,4 +123,5 @@ def require_scope(scope: str) -> Any:
         )
 
     setattr(_check, SCOPE_ENFORCER_ATTR, True)
+    setattr(_check, REQUIRED_SCOPE_ATTR, scope)
     return _check

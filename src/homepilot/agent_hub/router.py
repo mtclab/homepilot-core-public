@@ -21,7 +21,7 @@ from .enrolment_window import (
     open_window,
 )
 from .enrolment_window import (
-    status as window_status,
+    payload as window_payload,
 )
 from .registry import AgentRegistry
 
@@ -34,6 +34,10 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 
 _admin_only = Depends(require_scope("admin"))
 _admin_token = Depends(require_scope("admin"))
+# Plain fleet READS an operator should see without admin (owner decision, wave 3):
+# they expose no secret and relax nothing. The state-changing routes below
+# (enrol window open/close, revoke, forget, migrate, exec/write) stay admin.
+_read_only = Depends(require_scope("read"))
 
 
 def _caller_label(token: dict[str, Any]) -> str:
@@ -282,12 +286,13 @@ async def test_adapter() -> dict[str, Any]:
     return results
 
 
-@router.get("/", dependencies=[_admin_only])
-async def list_agents(request: Request) -> list[dict[str, Any]]:
+async def fleet_listing(registry: AgentRegistry, repo: Any) -> list[dict[str, Any]]:
     """Live connections overlaid on the persisted registry, so agents that are
     mid-reconnect after a backend restart show as known/disconnected rather than
-    vanishing (and inventory coverage doesn't flap to 'uncovered')."""
-    registry = _get_registry()
+    vanishing (and inventory coverage doesn't flap to 'uncovered').
+
+    Shared by GET /agents/ and the `list_agents` MCP tool: one fleet, one answer.
+    """
     # A live agent has no outstanding failure by definition - upsert_agent clears
     # the reason on a successful register - so the key is present and null rather
     # than absent, and the UI has one shape to render (#430).
@@ -296,7 +301,6 @@ async def list_agents(request: Request) -> list[dict[str, Any]]:
         for a in registry.list_connected()
     }
 
-    repo = getattr(request.app.state, "repo", None)
     if repo is not None:
         for row in await repo.list_agents():
             if row["agent_id"] in live:
@@ -315,6 +319,11 @@ async def list_agents(request: Request) -> list[dict[str, Any]]:
                 "last_error_at": row.get("last_error_at"),
             }
     return list(live.values())
+
+
+@router.get("/", dependencies=[_read_only])
+async def list_agents(request: Request) -> list[dict[str, Any]]:
+    return await fleet_listing(_get_registry(), getattr(request.app.state, "repo", None))
 
 
 @router.get("/token", dependencies=[_admin_only])
@@ -527,19 +536,10 @@ def _window_repo(request: Request) -> Any:
     return repo
 
 
-async def _window_payload(repo: Any) -> dict[str, Any]:
-    """The window's state plus the ONE thing that changes what it means: an
-    install with no agents enrols its first host with or without a window, so a
-    UI that showed only "closed" there would be lying about what will happen."""
-    state = await window_status(repo)
-    state["fleet_empty"] = await repo.count_agents() == 0
-    return state
-
-
-@router.get("/enrolment-window", dependencies=[_admin_only])
+@router.get("/enrolment-window", dependencies=[_read_only])
 async def get_enrolment_window(request: Request) -> dict[str, Any]:
     """Whether the shared fleet token can currently enrol a NEW host."""
-    return await _window_payload(_window_repo(request))
+    return await window_payload(_window_repo(request))
 
 
 @router.post("/enrolment-window", dependencies=[_admin_only])
@@ -558,7 +558,7 @@ async def open_enrolment_window(
     minutes = (body or EnrolmentWindowRequest()).minutes
     result = await open_window(repo, minutes)
     _audit_window("enrolment_window_opened", token, f"minutes={result['minutes']}")
-    return await _window_payload(repo)
+    return await window_payload(repo)
 
 
 @router.delete("/enrolment-window", dependencies=[_admin_only])
@@ -569,7 +569,7 @@ async def close_enrolment_window(
     repo = _window_repo(request)
     await close_window(repo)
     _audit_window("enrolment_window_closed", token, "")
-    return await _window_payload(repo)
+    return await window_payload(repo)
 
 
 def _audit_window(action: ActionType, token: dict[str, Any], detail: str) -> None:
@@ -682,7 +682,7 @@ async def install_agent_on_host(
     return {"task_id": task_id, "status": "pending", "host_id": body.host_id}
 
 
-@router.get("/audit", dependencies=[_admin_only])
+@router.get("/audit", dependencies=[_read_only])
 async def get_audit_log(
     limit: int = Query(default=100, ge=1, le=1000),
     agent_id: str | None = Query(default=None, description="Only this agent's trail"),
@@ -696,12 +696,9 @@ async def get_audit_log(
     return await registry.audit_log.query_persisted(limit=limit, agent_id=agent_id, action=action)
 
 
-@router.get("/hostname/{hostname}", dependencies=[_admin_only])
-async def get_agent_by_hostname(hostname: str) -> dict[str, Any]:
-    registry = _get_registry()
-    agent = registry.get_by_hostname(hostname)
-    if not agent:
-        raise HTTPException(status_code=404, detail=f"Agent for hostname {hostname} not connected")
+def agent_detail(agent: Any) -> dict[str, Any]:
+    """One connected agent, as GET /agents/{agent_id} and /agents/hostname/{name}
+    return it - and as the `get_agent` MCP tool returns it."""
     return {
         "agent_id": agent.agent_id,
         "hostname": agent.hostname,
@@ -712,7 +709,15 @@ async def get_agent_by_hostname(hostname: str) -> dict[str, Any]:
     }
 
 
-@router.get("/hostname/{hostname}/connected", dependencies=[_admin_only])
+@router.get("/hostname/{hostname}", dependencies=[_read_only])
+async def get_agent_by_hostname(hostname: str) -> dict[str, Any]:
+    agent = _get_registry().get_by_hostname(hostname)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent for hostname {hostname} not connected")
+    return agent_detail(agent)
+
+
+@router.get("/hostname/{hostname}/connected", dependencies=[_read_only])
 async def is_agent_connected(hostname: str) -> dict[str, Any]:
     registry = _get_registry()
     connected = registry.is_connected(hostname)
@@ -862,17 +867,9 @@ async def forget_agent(agent_id: str, request: Request) -> dict[str, Any]:
     return {"agent_id": agent_id, "forgotten": True}
 
 
-@router.get("/{agent_id}", dependencies=[_admin_only])
+@router.get("/{agent_id}", dependencies=[_read_only])
 async def get_agent(agent_id: str) -> dict[str, Any]:
-    registry = _get_registry()
-    agent = registry.get(agent_id)
+    agent = _get_registry().get(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-    return {
-        "agent_id": agent.agent_id,
-        "hostname": agent.hostname,
-        "system_info": agent.system_info,
-        "state": agent.state,
-        "connected_at": agent.connected_at.isoformat(),
-        "last_heartbeat": agent.last_heartbeat.isoformat(),
-    }
+    return agent_detail(agent)

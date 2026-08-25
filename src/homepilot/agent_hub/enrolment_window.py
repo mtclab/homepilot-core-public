@@ -105,6 +105,20 @@ async def status(repo: Any) -> dict[str, Any]:
     }
 
 
+async def payload(repo: Any) -> dict[str, Any]:
+    """The window's state plus the ONE thing that changes what it means: an
+    install with no agents enrols its first host with or without a window, so a
+    UI that showed only "closed" there would be lying about what will happen.
+
+    Shared by GET /agents/enrolment-window and the `get_enrolment_window` MCP
+    tool, so the console and the assistant cannot disagree about whether a new
+    host can enrol right now.
+    """
+    state = await status(repo)
+    state["fleet_empty"] = await repo.count_agents() == 0
+    return state
+
+
 async def is_open(repo: Any) -> bool:
     """True only while an unexpired window is stored."""
     return bool((await status(repo))["open"])

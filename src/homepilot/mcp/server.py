@@ -18,22 +18,46 @@ from homepilot.app_state import create_app_state
 from homepilot.config import get_settings
 
 from ..portal.repository import InviteRepository
+from .tools.agent_tools import (
+    TOOL_DEFINITIONS as AGENT_TOOL_DEFS,
+)
+from .tools.agent_tools import (
+    handle_close_enrolment_window,
+    handle_exec_on_host,
+    handle_forget_agent,
+    handle_get_agent,
+    handle_get_agent_audit,
+    handle_get_enrolment_window,
+    handle_list_agents,
+    handle_migrate_agents_tls,
+    handle_open_enrolment_window,
+    handle_revoke_agent,
+    handle_write_file_on_host,
+)
 from .tools.artifact_tools import (
     TOOL_DEFINITIONS as ARTIFACT_TOOL_DEFS,
 )
 from .tools.artifact_tools import (
+    handle_apply_artifact,
     handle_approve_artifact,
     handle_check_artifact_drift,
     handle_get_artifact,
     handle_get_artifact_status,
+    handle_get_fleet_drift,
     handle_get_task_result,
+    handle_plan_artifact,
+    handle_preview_artifact,
     handle_propose_artifact,
     handle_query_artifacts,
+    handle_reject_artifact,
+    handle_replay_artifact,
+    handle_revoke_artifact,
 )
 from .tools.guest_tools import (
     TOOL_DEFINITIONS as GUEST_TOOL_DEFS,
 )
 from .tools.guest_tools import (
+    handle_provision_guest,
     handle_query_guests,
     handle_revoke_guest_invite,
     handle_set_guest_quota,
@@ -42,16 +66,56 @@ from .tools.inventory_tools import (
     TOOL_DEFINITIONS as INVENTORY_TOOL_DEFS,
 )
 from .tools.inventory_tools import (
+    handle_add_host,
+    handle_adopt_host,
+    handle_bulk_host_action,
+    handle_delete_host,
+    handle_enrich_inventory,
     handle_get_environment_doc,
+    handle_get_host,
+    handle_ignore_host,
     handle_query_inventory,
     handle_refresh_inventory,
+    handle_update_host,
 )
 from .tools.kb_tools import (
     TOOL_DEFINITIONS as KB_TOOL_DEFS,
 )
 from .tools.kb_tools import (
+    handle_delete_kb_doc,
+    handle_get_kb_doc,
+    handle_get_kb_embedding_status,
+    handle_ingest_kb,
+    handle_list_kb,
     handle_record_fact,
+    handle_reindex_kb,
     handle_search_kb,
+    handle_update_kb_doc,
+)
+from .tools.monitoring_tools import (
+    TOOL_DEFINITIONS as MONITORING_TOOL_DEFS,
+)
+from .tools.monitoring_tools import (
+    handle_create_alert_rule,
+    handle_delete_alert_rule,
+    handle_get_host_metrics,
+    handle_get_host_metrics_series,
+    handle_get_monitoring_alerts,
+    handle_list_alert_rules,
+    handle_update_alert_rule,
+)
+from .tools.ops_tools import (
+    TOOL_DEFINITIONS as OPS_TOOL_DEFS,
+)
+from .tools.ops_tools import (
+    handle_cancel_task,
+    handle_delete_auth_token,
+    handle_get_audit_log,
+    handle_get_dashboard_summary,
+    handle_get_proxmox_settings,
+    handle_get_selfcheck,
+    handle_list_tasks,
+    handle_test_proxmox_connection,
 )
 from .tools.system_tools import (
     TOOL_DEFINITIONS as SYSTEM_TOOL_DEFS,
@@ -75,7 +139,14 @@ _Handler = Callable[
 ]
 
 _TOOL_DEFINITIONS: list[dict[str, Any]] = (
-    INVENTORY_TOOL_DEFS + SYSTEM_TOOL_DEFS + KB_TOOL_DEFS + ARTIFACT_TOOL_DEFS + GUEST_TOOL_DEFS
+    INVENTORY_TOOL_DEFS
+    + SYSTEM_TOOL_DEFS
+    + KB_TOOL_DEFS
+    + ARTIFACT_TOOL_DEFS
+    + GUEST_TOOL_DEFS
+    + AGENT_TOOL_DEFS
+    + MONITORING_TOOL_DEFS
+    + OPS_TOOL_DEFS
 )
 
 _MUTATING_TOOLS = frozenset(
@@ -83,22 +154,91 @@ _MUTATING_TOOLS = frozenset(
         "propose_artifact",
         "approve_artifact",
         "record_fact",
-        # Guest management (#442): budgets and invite revocation change what a
-        # guest may do; a read-only MCP token gets query_guests and nothing else.
-        "set_guest_quota",
-        "revoke_guest_invite",
+        # Standard mutators (MCP<->API parity, wave 2), at `full` scope. A
+        # read_only token is denied all of these by _handle_tool.
+        "cancel_task",
+        "add_host",
+        "adopt_host",
+        "ignore_host",
+        "update_host",
+        "delete_host",
+        "enrich_inventory",
+        "bulk_host_action",
+        # KB: PUT /kb/{doc_id} is API `write`, so update_kb_doc is `full`. The
+        # DELETE/ingest/reindex routes are API `admin` -> _ADMIN_TOOLS (wave 3).
+        "update_kb_doc",
+        # reject only marks a proposal rejected (no host impact), so unlike
+        # approve it does not collapse the review model - allowed at full scope.
+        "reject_artifact",
+        # apply/replay execute an ALREADY-APPROVED artifact. Human approval is
+        # the gate and cannot be given over MCP, so these are sanctioned
+        # execution, not an unreviewed change.
+        "apply_artifact",
+        "replay_artifact",
+        # revoke rolls an APPLIED artifact back through the task runner. API
+        # DELETE /artifacts/{id} is require_scope('write'), so this is `full`, not
+        # admin - it needs an approved/applied artifact (the runner enforces the
+        # transition) and cannot grant approval, exactly like apply/replay.
+        "revoke_artifact",
     }
 )
 
-# approve_artifact is deliberately unreachable over the MCP transport. The MCP
-# credential is a single shared token, so letting it approve would collapse the
-# propose -> human-approve model: the LLM would both propose AND approve its own
-# mutations (#385). Approval must come from an operator via the CLI or web UI,
-# never an MCP tool call. Enforced in two places below — the tool is delisted
-# from list_tools() (never advertised) and hard-refused in the call_tool()
-# transport dispatch (defense in depth).
-_MCP_FORBIDDEN_TOOLS = frozenset({"approve_artifact"})
+# Every tool an MCP token needs the `admin` scope to call. These mirror API
+# routes guarded by require_scope("admin"): a `full` MCP token is refused them by
+# _handle_tool, an `admin` token passes. The tier<->scope invariant
+# (tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope) holds each of these
+# at exactly its route's admin scope.
+_ADMIN_TOOLS = frozenset(
+    {
+        # Guest management (#442). GET /admin/guests and the guest quota/invite
+        # writes are all API admin, so the whole set sits at the admin tier (wave
+        # 3 - they were escalation debt at read_only/full before it existed).
+        "query_guests",
+        "set_guest_quota",
+        "revoke_guest_invite",
+        # Guest provisioning (owner decision 2026-08-25): POST /guests/provision is
+        # API admin; it clones a Proxmox template into a running guest.
+        "provision_guest",
+        # KB admin: delete a doc, ingest sources, reindex, and the embedding
+        # status read (an API-admin GET, so admin-tier even though it is a read).
+        "delete_kb_doc",
+        "ingest_kb",
+        "reindex_kb",
+        "get_kb_embedding_status",
+        # Monitoring: alert-rule create/update/delete are all API admin.
+        "create_alert_rule",
+        "update_alert_rule",
+        "delete_alert_rule",
+        # Agent fleet, security-relaxing / host-mutating admin ops.
+        "open_enrolment_window",
+        "close_enrolment_window",
+        "revoke_agent",
+        "forget_agent",
+        "migrate_agents_tls",
+        "exec_on_host",
+        "write_file_on_host",
+        # Admin settings / credentials.
+        "test_proxmox_connection",
+        "delete_auth_token",
+    }
+)
 
+# Tools no MCP token may ever reach, whatever its scope. Enforced in two places
+# below — delisted from list_tools() and hard-refused in call_tool().
+#
+# approve_artifact USED to live here (#385): a single shared MCP token approving
+# its own proposal collapses the propose->human-approve model. The human-relay
+# approval mechanism replaced that blanket ban — approve_artifact is now exposed
+# but gated by a per-artifact approval code the assistant cannot see (generated
+# at propose, returned by NO MCP read, relayed by a human), so a valid code is
+# proof a human decided and the assistant still cannot self-approve. The set is
+# kept (empty) as the backstop for any future truly-forbidden tool.
+_MCP_FORBIDDEN_TOOLS: frozenset[str] = frozenset()
+
+# Every tool an MCP token with `read_only` scope may call. Nothing here writes,
+# so nothing here appears in _MUTATING_TOOLS. The read surface is held at parity
+# with the management API's GET routes by tests/test_mcp_read_parity.py: a new
+# GET route must gain a tool here or an explicit, reasoned exclusion.
 _READ_ONLY_TOOLS = frozenset(
     {
         "query_inventory",
@@ -112,6 +252,35 @@ _READ_ONLY_TOOLS = frozenset(
         "read_file_on_guest",
         "exec_on_guest_readonly",
         "check_artifact_drift",
+        "get_artifact",
+        "get_task_result",
+        "check_host_reachable",
+        # query_guests moved to _ADMIN_TOOLS in wave 3 (GET /admin/guests is API
+        # admin); it is no longer a read_only tool.
+        # Read parity with the management API, wave 1.
+        "list_agents",
+        "get_agent",
+        "get_agent_audit",
+        "get_enrolment_window",
+        "list_alert_rules",
+        "get_monitoring_alerts",
+        "get_host_metrics",
+        "get_host_metrics_series",
+        "get_host",
+        "list_tasks",
+        "get_dashboard_summary",
+        "get_audit_log",
+        "list_kb",
+        "get_kb_doc",
+        # get_kb_embedding_status is NOT here: GET /kb/embedding-status is API
+        # `admin`, so wave 3 places it in _ADMIN_TOOLS (an admin-tier read).
+        "get_fleet_drift",
+        "get_selfcheck",
+        "get_proxmox_settings",
+        # Wave 2: plan/preview are POST routes but API `read`-scoped and change no
+        # host, so read_only is their exact tier (they compute a plan/diff only).
+        "plan_artifact",
+        "preview_artifact",
     }
 )
 
@@ -182,6 +351,37 @@ async def _bootstrap() -> dict[str, Any]:
         executor=executor_ref,
     )
 
+    # One TaskRepository, shared by the read tools, the task runner and the
+    # provision service, so a cancel/apply started over MCP sees the same rows
+    # the read tools report.
+    task_repo = TaskRepository(state.database)
+
+    # Wave 2 mutators (apply/replay/cancel) need the SAME machinery the HTTP app
+    # builds. The runner and provision service are constructed exactly as main.py
+    # does (apply_reconciler is built only when an executor exists), so an apply
+    # over MCP runs through the one engine, not a weaker second path.
+    from homepilot.provision.service import ProvisionService
+    from homepilot.reconciler.apply import ApplyReconciler
+    from homepilot.tasks.runner import TaskRunner
+
+    apply_reconciler = (
+        ApplyReconciler(store=state.artifact_store, repo=state.repo, executor=executor_ref)
+        if executor_ref is not None
+        else None
+    )
+    task_runner = TaskRunner(
+        repo=task_repo,
+        lifecycle=lifecycle,
+        executor=executor_ref,
+        apply_reconciler=apply_reconciler,
+        store=state.artifact_store,
+    )
+    provision_service = ProvisionService(
+        proxmox=proxmox,
+        task_repo=task_repo,
+        repo=state.repo,
+    )
+
     return {
         "settings": settings,
         "repo": state.repo,
@@ -203,11 +403,23 @@ async def _bootstrap() -> dict[str, Any]:
         "invite_repo": InviteRepository(state.database) if state.database else None,
         # Task outcomes live here. Without it an agent can start an apply and
         # never learn whether it worked (#427).
-        "task_repo": TaskRepository(state.database),
+        "task_repo": task_repo,
+        # Wave 2: the runner and provision service the apply/replay/cancel
+        # mutators dispatch to. Both contexts (this one and main.py's HTTP one)
+        # must carry them or those tools work over one transport and fail on the
+        # other (the same trap TestBothTransportsCarryTheSameToolContext guards).
+        "task_runner": task_runner,
+        "provision_service": provision_service,
         # The hub's live registry, for the reachability check. None when the hub
         # is not running in this process, which the handler reports as "unknown"
         # rather than as "reachable".
         "agent_registry": get_agent_registry(),
+        # Read parity with the management API, wave 1: the metric store behind
+        # /monitoring, and the state bundle the selfcheck and Proxmox-settings
+        # reports read. Both contexts (this one and main.py's HTTP one) must
+        # carry them or the same tool answers differently per transport.
+        "metrics_repo": state.metrics_repo,
+        "app_state": state,
     }
 
 
@@ -239,6 +451,63 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "query_guests": handle_query_guests,
     "set_guest_quota": handle_set_guest_quota,
     "revoke_guest_invite": handle_revoke_guest_invite,
+    "provision_guest": handle_provision_guest,
+    # Read parity with the management API, wave 1. Every one is read-only and
+    # calls the same repo/service its management route calls.
+    "list_agents": handle_list_agents,
+    "get_agent": handle_get_agent,
+    "get_agent_audit": handle_get_agent_audit,
+    "get_enrolment_window": handle_get_enrolment_window,
+    "list_alert_rules": handle_list_alert_rules,
+    "get_monitoring_alerts": handle_get_monitoring_alerts,
+    "get_host_metrics": handle_get_host_metrics,
+    "get_host_metrics_series": handle_get_host_metrics_series,
+    "get_host": handle_get_host,
+    "list_tasks": handle_list_tasks,
+    "get_dashboard_summary": handle_get_dashboard_summary,
+    "get_audit_log": handle_get_audit_log,
+    "list_kb": handle_list_kb,
+    "get_kb_doc": handle_get_kb_doc,
+    "get_fleet_drift": handle_get_fleet_drift,
+    "get_selfcheck": handle_get_selfcheck,
+    "get_proxmox_settings": handle_get_proxmox_settings,
+    # Standard mutators (MCP<->API parity, wave 2). Each calls the same
+    # repo/service/runner its management route calls, and each is in
+    # _MUTATING_TOOLS so a read_only token is denied.
+    "cancel_task": handle_cancel_task,
+    "add_host": handle_add_host,
+    "adopt_host": handle_adopt_host,
+    "ignore_host": handle_ignore_host,
+    "update_host": handle_update_host,
+    "delete_host": handle_delete_host,
+    "enrich_inventory": handle_enrich_inventory,
+    "bulk_host_action": handle_bulk_host_action,
+    "update_kb_doc": handle_update_kb_doc,
+    "plan_artifact": handle_plan_artifact,
+    "preview_artifact": handle_preview_artifact,
+    "reject_artifact": handle_reject_artifact,
+    "apply_artifact": handle_apply_artifact,
+    "replay_artifact": handle_replay_artifact,
+    "revoke_artifact": handle_revoke_artifact,
+    # Admin tier (MCP<->API parity, wave 3). Each mirrors an API route guarded by
+    # require_scope("admin") and calls the SAME repo/service/runner that route
+    # calls; _handle_tool refuses every one of them a non-admin MCP token.
+    "delete_kb_doc": handle_delete_kb_doc,
+    "ingest_kb": handle_ingest_kb,
+    "reindex_kb": handle_reindex_kb,
+    "get_kb_embedding_status": handle_get_kb_embedding_status,
+    "create_alert_rule": handle_create_alert_rule,
+    "update_alert_rule": handle_update_alert_rule,
+    "delete_alert_rule": handle_delete_alert_rule,
+    "open_enrolment_window": handle_open_enrolment_window,
+    "close_enrolment_window": handle_close_enrolment_window,
+    "revoke_agent": handle_revoke_agent,
+    "forget_agent": handle_forget_agent,
+    "migrate_agents_tls": handle_migrate_agents_tls,
+    "exec_on_host": handle_exec_on_host,
+    "write_file_on_host": handle_write_file_on_host,
+    "test_proxmox_connection": handle_test_proxmox_connection,
+    "delete_auth_token": handle_delete_auth_token,
 }
 
 
@@ -246,6 +515,12 @@ async def _handle_tool(
     name: str, arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> list[TextContent] | dict[str, Any]:
     mcp_scope: str | None = ctx.get("_mcp_token_scope") or _mcp_token_scope_var.get()
+    # The ladder is read_only < full < admin. An admin tool needs an admin token;
+    # a mutating (full) tool needs full OR admin; a read tool needs nothing more
+    # than read_only. Admin is checked first so a `full` token is refused an admin
+    # tool with the precise reason, not the generic write-scope one.
+    if name in _ADMIN_TOOLS and mcp_scope != "admin":
+        raise ValueError(f"Tool '{name}' requires admin scope — '{mcp_scope}' token denied")
     if name in _MUTATING_TOOLS and mcp_scope == "read_only":
         raise ValueError(f"Tool '{name}' requires write scope — read-only token denied")
 
@@ -284,10 +559,7 @@ async def _on_call_tool(_ctx: Any, params: Any) -> CallToolResult:
             content=[
                 TextContent(
                     type="text",
-                    text=(
-                        f"Tool '{name}' is not available over the MCP transport — approval "
-                        "requires an operator via the CLI or web UI (#385)"
-                    ),
+                    text=(f"Tool '{name}' is not available over the MCP transport."),
                 )
             ],
             is_error=True,
@@ -413,6 +685,12 @@ def create_http_app(srv: Server) -> Any:
     from starlette.types import ASGIApp
 
     mcp_token = os.environ.get("HP_MCP_TOKEN", "").strip()
+    # HP_MCP_TOKEN_SCOPE selects the tool tier this HTTP MCP transport grants,
+    # mirroring the API scope ladder read < write < admin:
+    #   "read_only" -> read tools only
+    #   "full"      -> reads + full mutators (the default), NOT admin tools
+    #   "admin"     -> everything except the _MCP_FORBIDDEN_TOOLS set
+    # Enforced per call in _handle_tool.
     mcp_scope = os.environ.get("HP_MCP_TOKEN_SCOPE", "").strip() or "full"
 
     session_manager = StreamableHTTPSessionManager(

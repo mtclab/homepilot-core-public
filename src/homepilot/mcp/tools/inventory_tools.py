@@ -80,7 +80,210 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["target"],
         },
     },
+    {
+        "name": "get_host",
+        "description": (
+            "One host in full: its inventory record, every service recorded on it, and "
+            "- when an agent is linked - that agent's block (connected, version, arch, "
+            "runtime, first seen, last heartbeat, and last_error saying why it is not "
+            "connected). Takes the host's inventory id. Reads the database; it does not "
+            "touch the host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "string", "description": "Inventory id of the host"},
+            },
+            "required": ["host_id"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "hostname": {"type": "string"},
+                "services": {"type": "array", "items": {"type": "object"}},
+                "agent": {"type": ["object", "null"]},
+            },
+            "required": ["hostname"],
+        },
+    },
+    # ── Mutators (MCP<->API parity, wave 2). Each calls the SAME shared callable
+    # its management route calls, so the inventory an operator edits and the one
+    # the assistant edits cannot diverge. ───────────────────────────────────────
+    {
+        "name": "add_host",
+        "description": (
+            "Add a host HomePilot cannot learn from Proxmox - the NAS, the router, the "
+            "Pi, an old tower - to the inventory. Recorded as source=manual and adopted "
+            "on the spot (a machine typed in by hand is not a discovery awaiting "
+            "triage), and never declared absent by a Proxmox sync. hostname must be a "
+            "DNS hostname or an IPv4 address; a duplicate hostname is refused."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hostname": {"type": "string", "description": "DNS hostname or IPv4 address"},
+                "ip_address": {"type": ["string", "null"]},
+                "role": {"type": "string", "description": "Default 'guest'"},
+                "host_type": {"type": "string", "description": "Default 'baremetal'"},
+                "description": {"type": ["string", "null"]},
+                "tags": {"type": ["string", "null"]},
+                "fqdn": {"type": ["string", "null"]},
+            },
+            "required": ["hostname"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "hostname": {"type": "string"}},
+        },
+    },
+    {
+        "name": "adopt_host",
+        "description": (
+            "Adopt a discovered host by its inventory id: mark it managed and imported, "
+            "then best-effort introspect it (an offline or agent-less host still "
+            "adopts, just without the introspection block). Returns the updated host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "string", "description": "Inventory id of the host"},
+            },
+            "required": ["host_id"],
+        },
+        "outputSchema": {"type": "object", "properties": {"hostname": {"type": "string"}}},
+    },
+    {
+        "name": "ignore_host",
+        "description": (
+            "Set a host's import state to 'ignored' by its inventory id, keeping it out "
+            "of the way without deleting it. Returns the updated host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "string", "description": "Inventory id of the host"},
+            },
+            "required": ["host_id"],
+        },
+        "outputSchema": {"type": "object", "properties": {"hostname": {"type": "string"}}},
+    },
+    {
+        "name": "update_host",
+        "description": (
+            "Edit one host's fields by its inventory id (managed, tags, role, "
+            "ip_address, description, import_state, status). Only the fields you pass "
+            "are changed, and every field you set is PINNED so the next Proxmox sync or "
+            "enrich pass leaves it alone. Passing no recognised field is an error. "
+            "Returns the updated host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "string", "description": "Inventory id of the host"},
+                "managed": {"type": ["boolean", "null"]},
+                "tags": {"type": ["string", "null"]},
+                "role": {"type": ["string", "null"]},
+                "ip_address": {"type": ["string", "null"]},
+                "description": {"type": ["string", "null"]},
+                "import_state": {
+                    "type": ["string", "null"],
+                    "description": "One of: pending, adopted, ignored",
+                },
+                "status": {"type": ["string", "null"]},
+            },
+            "required": ["host_id"],
+        },
+        "outputSchema": {"type": "object", "properties": {"hostname": {"type": "string"}}},
+    },
+    {
+        "name": "delete_host",
+        "description": (
+            "Remove a host from inventory by its id, with its services and observation "
+            "note. Refused (409) for a host the hypervisor still reports, because the "
+            "next sync would bring it straight back - destroy the guest in Proxmox or "
+            "ignore_host it instead. Manually added and already-absent hosts remove "
+            "cleanly."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_id": {"type": "string", "description": "Inventory id of the host"},
+            },
+            "required": ["host_id"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "forgotten": {"type": "boolean"}},
+        },
+    },
+    {
+        "name": "enrich_inventory",
+        "description": (
+            "Fill in inferred inventory fields (role, IP and the like) for hosts that "
+            "lack them, without overwriting anything an operator pinned. Pass host_ids "
+            "to enrich only those, or a scope; omit both to enrich what needs it. "
+            "Returns a summary of what was touched."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host_ids": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": "Only these hosts, or null for all that need it",
+                },
+                "scope": {"type": ["string", "null"]},
+            },
+        },
+        "outputSchema": {"type": "object"},
+    },
+    {
+        "name": "bulk_host_action",
+        "description": (
+            "Apply ONE action to many hosts by id: 'adopt' (mark managed+imported and "
+            "best-effort introspect), 'ignore' (set import state ignored), or 'enrich' "
+            "(fill inferred fields). This does not ADD hosts - use add_host for that. "
+            "Best-effort per host: an unknown id or a per-host failure counts as failed "
+            "and the rest still run. Returns {succeeded, failed}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "adopt, ignore, or enrich",
+                },
+                "host_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["action", "host_ids"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "succeeded": {"type": "integer"},
+                "failed": {"type": "integer"},
+            },
+            "required": ["succeeded", "failed"],
+        },
+    },
 ]
+
+
+async def handle_get_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """One host, exactly as GET /inventory/{host_id} returns it.
+
+    Same InventoryService method, so the host page an operator reads and the
+    host record the assistant reads cannot describe different machines.
+    """
+    service = ctx.get("inventory_service")
+    if service is None:
+        raise RuntimeError("Inventory service not configured")
+    host_id = str(arguments["host_id"])
+    host: dict[str, Any] | None = await service.get_host_detail(host_id)
+    if host is None:
+        raise ValueError(f"Host not found: {host_id}")
+    return host
 
 
 async def handle_query_inventory(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -175,3 +378,120 @@ async def handle_get_environment_doc(
         lines.append(f"No data found for target '{target}'")
 
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+# ── Mutators (wave 2). Each handler builds the SAME request model and calls the
+# SAME shared callable the management route uses; InventoryError.status is mapped
+# to a ValueError so the MCP client sees a clean message. ──────────────────────
+
+
+def _require_repo(ctx: dict[str, Any]) -> Repository:
+    repo: Repository | None = ctx.get("repo")
+    if repo is None:
+        raise RuntimeError("Repository not configured")
+    return repo
+
+
+def _require_service(ctx: dict[str, Any]) -> Any:
+    service = ctx.get("inventory_service")
+    if service is None:
+        raise RuntimeError("Inventory service not configured")
+    return service
+
+
+async def handle_add_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from pydantic import ValidationError
+
+    from homepilot.inventory.router import (
+        HostCreateRequest,
+        InventoryError,
+        create_manual_host_record,
+    )
+
+    try:
+        body = HostCreateRequest(**arguments)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid host: {exc}") from exc
+    try:
+        return await create_manual_host_record(_require_repo(ctx), body)
+    except InventoryError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+async def handle_adopt_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from homepilot.inventory.router import InventoryError, adopt_host_record
+
+    try:
+        return await adopt_host_record(
+            str(arguments["host_id"]),
+            repo=_require_repo(ctx),
+            svc=_require_service(ctx),
+            adapter=ctx.get("agent_adapter"),
+        )
+    except InventoryError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+async def handle_ignore_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from homepilot.inventory.router import InventoryError, ignore_host_record
+
+    try:
+        return await ignore_host_record(_require_repo(ctx), str(arguments["host_id"]))
+    except InventoryError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+async def handle_update_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from pydantic import ValidationError
+
+    from homepilot.inventory.router import (
+        HostPatchRequest,
+        InventoryError,
+        update_host_record,
+    )
+
+    host_id = str(arguments["host_id"])
+    fields = {k: v for k, v in arguments.items() if k != "host_id"}
+    try:
+        body = HostPatchRequest(**fields)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid update: {exc}") from exc
+    try:
+        return await update_host_record(_require_repo(ctx), host_id, body)
+    except InventoryError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+async def handle_delete_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from homepilot.inventory.router import InventoryError, forget_host_record
+
+    try:
+        return await forget_host_record(_require_repo(ctx), str(arguments["host_id"]))
+    except InventoryError as exc:
+        raise ValueError(exc.detail) from exc
+
+
+async def handle_enrich_inventory(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    service = _require_service(ctx)
+    result: dict[str, Any] = await service.enrich_inventory(
+        host_ids=arguments.get("host_ids"),
+        scope=arguments.get("scope"),
+    )
+    return result
+
+
+async def handle_bulk_host_action(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from pydantic import ValidationError
+
+    from homepilot.inventory.router import BulkRequest, bulk_host_action_record
+
+    try:
+        body = BulkRequest(action=str(arguments["action"]), host_ids=list(arguments["host_ids"]))
+    except (ValidationError, KeyError, TypeError) as exc:
+        raise ValueError(f"Invalid bulk request: {exc}") from exc
+    return await bulk_host_action_record(
+        body,
+        repo=_require_repo(ctx),
+        svc=_require_service(ctx),
+        adapter=ctx.get("agent_adapter"),
+    )

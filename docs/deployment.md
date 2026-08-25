@@ -781,7 +781,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.3.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.4.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -844,7 +844,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROXMOX_PORT` | `8006` | Proxmox API port |
 | `HP_AGENT_HUB_HOST` | `0.0.0.0` | Agent Hub bind address |
 | `HP_AGENT_HUB_ALLOW_INSECURE` | `false` | Accepted alias of `HP_HUB_ALLOW_INSECURE` (same setting) |
-| `HP_MCP_TOKEN_SCOPE` | — | Scope granted to the MCP bearer token |
+| `HP_MCP_TOKEN_SCOPE` | `full` | Tool tier granted to the MCP bearer token, mirroring the API scope ladder read < write < admin. `read_only` = read tools only; `full` = reads + mutators (the default), but NOT admin tools; `admin` = every tool except the permanently-forbidden approval one |
 | `HP_EVENTS_WEBHOOK_URL` | — (off) | Webhook posted when an artifact is proposed. Empty = events are recorded and shown in the UI but forwarded nowhere. n8n is behind the `agents` profile and mints the path per workflow, so there is no default that works |
 | `HP_EVENTS_WEBHOOK_SECRET` | — | Webhook signing secret (vault `webhook-secret` preferred) |
 | `HP_N8N_API_KEY` | — | Optional API key sent to the n8n instance |

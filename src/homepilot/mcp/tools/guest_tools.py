@@ -1,7 +1,9 @@
 """Guest management over MCP (#442, AI-first).
 
 The operator's assistant can do what the console's Guests card does: see every
-guest's usage against their budget, adjust a budget, and revoke an invite.
+guest's usage against their budget, adjust a budget, revoke an invite, and -
+since the owner's 2026-08-25 decision - provision a guest (provision_guest,
+admin tier, mirroring POST /guests/provision).
 
 What is deliberately NOT here: minting invites. A minted token is a secret
 that provisions a machine, and an MCP transcript is not a safe place for one -
@@ -72,6 +74,63 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {"prefix": {"type": "string"}, "revoked": {"type": "boolean"}},
             "required": ["prefix", "revoked"],
+        },
+    },
+    {
+        # Admin tier (owner decision 2026-08-25). POST /guests/provision is API
+        # require_scope("admin"); it clones a Proxmox template into a running guest.
+        "name": "provision_guest",
+        "description": (
+            "Provision a new guest by cloning a Proxmox template. STARTS AN ASYNC "
+            "task and returns its task_id with status 'pending' - the guest is "
+            "cloned, configured (cloud-init) and started in the background; poll "
+            "get_task_result for the outcome. Refuses (an error) when Proxmox is not "
+            "configured, when the request is invalid (name, disk, or authorized-key "
+            "shapes), or when a provision for the same name is already in flight. Admin "
+            "only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Guest name: 3-63 lowercase alphanumerics/hyphens",
+                },
+                "node": {"type": "string", "description": "Proxmox node to clone on"},
+                "template_vmid": {
+                    "type": "integer",
+                    "description": "VMID of the template to clone",
+                },
+                "cores": {"type": ["integer", "null"], "description": "vCPUs (1-32)"},
+                "memory_mb": {"type": ["integer", "null"], "description": "RAM in MB (256-65536)"},
+                "disk_gb": {
+                    "type": ["integer", "null"],
+                    "description": "Resize the disk to this many GB (1-2000)",
+                },
+                "disk": {"type": "string", "description": "PVE disk name, e.g. scsi0 (default)"},
+                "ciuser": {"type": "string", "description": "cloud-init username (default friend)"},
+                "ssh_authorized_key": {
+                    "type": ["string", "null"],
+                    "description": "One authorized_keys line for the guest",
+                },
+                "tailscale_auth_key": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Optional tskey-... auth key, used once in-memory and never "
+                        "persisted or logged"
+                    ),
+                },
+                "ipconfig0": {"type": "string", "description": "cloud-init net config (ip=dhcp)"},
+                "owner": {"type": ["string", "null"], "description": "Owner CN for the guest"},
+                "pool": {"type": ["string", "null"], "description": "PVE resource pool"},
+                "full": {"type": "boolean", "description": "Full clone (default true)"},
+            },
+            "required": ["name", "node", "template_vmid"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}, "status": {"type": "string"}},
+            "required": ["task_id", "status"],
         },
     },
 ]
@@ -195,3 +254,28 @@ async def handle_revoke_guest_invite(
             target_host=prefix,
         )
     return {"prefix": prefix, "revoked": bool(ok)}
+
+
+async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """Queue a clone-from-template provision through the SAME ProvisionService the
+    POST /guests/provision route uses. Validation and refusals come from the
+    ProvisionRequest model and the service, not re-implemented here."""
+    from pydantic import ValidationError
+
+    from ...provision.models import ProvisionRequest
+    from ...provision.service import ProvisionConflictError
+
+    service = ctx.get("provision_service")
+    if service is None or getattr(service, "proxmox", None) is None:
+        # The route returns 503 here; over MCP it is a clean error.
+        raise ValueError("Proxmox not configured")
+    try:
+        body = ProvisionRequest(**arguments)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid provision request: {exc}") from exc
+    actor = str(ctx.get("_mcp_caller_id") or "mcp")
+    try:
+        task_id = await service.start(body, actor=actor)
+    except ProvisionConflictError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"task_id": task_id, "status": "pending"}

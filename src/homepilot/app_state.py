@@ -55,6 +55,11 @@ class AppState:
     agent_hub: Any = None
     agent_registry: Any = None
     metrics_repo: Any = None
+    # The mounted MCP Starlette app, assigned by main.py once it exists. The
+    # selfcheck report reads it to say whether the MCP transport is RUNNING, so
+    # a state object without it reports MCP as broken - which is why it is a
+    # field here rather than an attribute only `app.state` carries (#514).
+    mcp_app: Any = None
     # Why the hub is not running despite being enabled, in the operator's words.
     # Empty when the hub is off by configuration or running normally.
     agent_hub_disabled_reason: str = ""

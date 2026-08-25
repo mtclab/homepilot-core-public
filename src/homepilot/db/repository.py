@@ -1406,6 +1406,39 @@ class Repository:
         await self.db.conn.commit()
         return cursor.lastrowid
 
+    async def list_doc_metadata(
+        self,
+        kind: str | None = None,
+        target: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One page of KB documents plus the TRUE total for the same filters.
+
+        The total counts every matching row, not the page: a `len(items)` count
+        against a LIMIT saturates the UI's entry count and makes later documents
+        unreachable. Shared by GET /kb and the `list_kb` MCP tool.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if target is not None:
+            clauses.append("target = ?")
+            params.append(target)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        count_row = await self.db.fetchone(
+            f"SELECT COUNT(*) AS cnt FROM doc_metadata{where}",  # nosec B608
+            list(params),
+        )
+        total = int(count_row["cnt"]) if count_row else 0
+        rows = await self.db.fetchall(
+            f"SELECT * FROM doc_metadata{where} ORDER BY embedded_at DESC LIMIT ? OFFSET ?",  # nosec B608
+            [*params, limit, offset],
+        )
+        return [dict(r) for r in rows], total
+
     async def get_doc_metadata(self, doc_id: int) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM doc_metadata WHERE id = ?", (doc_id,))
         return dict(row) if row is not None else None
@@ -1459,6 +1492,77 @@ class Repository:
             (composite_id,),
         )
         return [dict(r) for r in rows]
+
+    # ── Approval codes (human-relay MCP approval, #385 follow-up) ────────────
+    # These rows live in artifact_approval_codes, a table NO MCP read touches, so
+    # the code is reachable only from operator surfaces (web/CLI/webhook) and can
+    # never leak into an agent-facing response.
+
+    async def set_approval_code(self, artifact_id: str, code: str) -> None:
+        """Store (or replace) the approval code for an artifact, resetting the
+        failed-attempt counter and unlocking it."""
+        ts = now()
+        await self.db.execute(
+            """INSERT INTO artifact_approval_codes
+               (artifact_id, code, failed_attempts, locked, created_at, updated_at)
+               VALUES (?, ?, 0, 0, ?, ?)
+               ON CONFLICT(artifact_id) DO UPDATE SET
+                 code=excluded.code,
+                 failed_attempts=0,
+                 locked=0,
+                 updated_at=excluded.updated_at""",
+            (artifact_id, code, ts, ts),
+        )
+        await self.db.conn.commit()
+
+    async def get_approval_code_row(self, artifact_id: str) -> dict[str, Any] | None:
+        """The full approval-code row (code, failed_attempts, locked) or None."""
+        row = await self.db.fetchone(
+            "SELECT * FROM artifact_approval_codes WHERE artifact_id = ?",
+            (artifact_id,),
+        )
+        return dict(row) if row is not None else None
+
+    async def record_failed_approval(self, artifact_id: str, lock_threshold: int) -> dict[str, Any]:
+        """Count one wrong-code attempt; lock the artifact at the threshold.
+
+        Returns {failed_attempts, locked} after the increment. A missing row (no
+        code was ever issued) returns {failed_attempts: 0, locked: 0} - there is
+        nothing to brute-force."""
+        row = await self.get_approval_code_row(artifact_id)
+        if row is None:
+            return {"failed_attempts": 0, "locked": 0}
+        attempts = int(row["failed_attempts"]) + 1
+        locked = 1 if attempts >= lock_threshold else int(row["locked"])
+        await self.db.execute(
+            """UPDATE artifact_approval_codes
+               SET failed_attempts = ?, locked = ?, updated_at = ?
+               WHERE artifact_id = ?""",
+            (attempts, locked, now(), artifact_id),
+        )
+        await self.db.conn.commit()
+        return {"failed_attempts": attempts, "locked": locked}
+
+    async def reset_approval_lock(self, artifact_id: str) -> bool:
+        """Operator reset: clear the failed-attempt counter and unlock.
+
+        Returns True if a code row existed to reset."""
+        cursor = await self.db.execute(
+            """UPDATE artifact_approval_codes
+               SET failed_attempts = 0, locked = 0, updated_at = ?
+               WHERE artifact_id = ?""",
+            (now(), artifact_id),
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+
+    async def clear_approval_code(self, artifact_id: str) -> None:
+        """Delete the approval code once the artifact leaves PROPOSED."""
+        await self.db.execute(
+            "DELETE FROM artifact_approval_codes WHERE artifact_id = ?",
+            (artifact_id,),
+        )
+        await self.db.conn.commit()
 
     async def upsert_drift_check(
         self,

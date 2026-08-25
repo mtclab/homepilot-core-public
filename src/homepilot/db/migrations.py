@@ -797,6 +797,27 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             updated_at     TEXT NOT NULL
         )""",
     ],
+    27: [
+        # Per-artifact approval codes (human-relay MCP approval, #385 follow-up).
+        # The code is the EXTRA gate that lets a human approve THROUGH the
+        # assistant without opening the portal: they read it from an operator
+        # surface and relay it, and approve_artifact verifies it server-side.
+        #
+        # It lives in its OWN table, NOT in the artifacts row and NEVER in the
+        # artifact FILE, because get_artifact / query_artifacts over MCP read the
+        # file (and the API mirror), and the code must be unreachable from every
+        # MCP surface - otherwise the assistant could read the very secret that is
+        # meant to prove a human acted. failed_attempts + locked implement the
+        # brute-force lock; one row per artifact, cleared when it leaves PROPOSED.
+        """CREATE TABLE IF NOT EXISTS artifact_approval_codes (
+            artifact_id     TEXT PRIMARY KEY,
+            code            TEXT NOT NULL,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked          INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )""",
+    ],
 }
 
 

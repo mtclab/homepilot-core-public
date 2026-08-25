@@ -1,4 +1,6 @@
-"""Tests for new MCP artifact tools: approve_artifact, get_artifact_status, query_artifacts target filter, rate limiting."""
+"""Tests for MCP artifact tools: get_artifact_status and query_artifacts target
+filter. The approve_artifact tool (now human-relay coded approval) is covered end
+to end in test_mcp_approval_code.py."""
 
 from __future__ import annotations
 
@@ -89,52 +91,6 @@ async def call(name, arguments, ctx):
     from homepilot.mcp.server import _handle_tool
 
     return await _handle_tool(name, arguments, ctx)
-
-
-class TestApproveArtifact:
-    @pytest.mark.asyncio
-    async def test_approve_calls_lifecycle_approve(self, ctx):
-        await call("approve_artifact", {"artifact_id": "2026-05-14-approve-test"}, ctx)
-        ctx["lifecycle"].approve.assert_called_once_with(
-            "2026-05-14-approve-test", user="test-caller", reason="Approved via MCP"
-        )
-
-    @pytest.mark.asyncio
-    async def test_approve_returns_metadata(self, ctx):
-        result = await call("approve_artifact", {"artifact_id": "2026-05-14-approve-test"}, ctx)
-        assert isinstance(result, dict)
-        assert result["id"] == "2026-05-14-approve-test"
-        assert result["status"] == "approved"
-        assert result["kind"] == "shell-script"
-        assert result["intent"] == "test approve"
-        assert "approved_by" in result
-
-    @pytest.mark.asyncio
-    async def test_approve_read_only_denied(self, ctx):
-        ctx["_mcp_token_scope"] = "read_only"
-        with pytest.raises(ValueError, match="write scope"):
-            await call("approve_artifact", {"artifact_id": "2026-05-14-approve-test"}, ctx)
-
-    @pytest.mark.asyncio
-    async def test_approve_rate_limit(self, ctx):
-        from homepilot.mcp.tools.artifact_tools import _APPROVE_RATELIMIT_MAX, _approve_ratelimit
-
-        _approve_ratelimit.clear()
-        for i in range(_APPROVE_RATELIMIT_MAX):
-            await call("approve_artifact", {"artifact_id": f"art-{i}"}, ctx)
-        with pytest.raises(ValueError, match="Rate limit exceeded"):
-            await call("approve_artifact", {"artifact_id": "art-extra"}, ctx)
-
-    @pytest.mark.asyncio
-    async def test_approve_rate_limit_per_caller(self, ctx):
-        from homepilot.mcp.tools.artifact_tools import _APPROVE_RATELIMIT_MAX, _approve_ratelimit
-
-        _approve_ratelimit.clear()
-        ctx_a = {**ctx, "_mcp_caller_id": "caller-a"}
-        ctx_b = {**ctx, "_mcp_caller_id": "caller-b"}
-        for i in range(_APPROVE_RATELIMIT_MAX):
-            await call("approve_artifact", {"artifact_id": f"art-a-{i}"}, ctx_a)
-        await call("approve_artifact", {"artifact_id": "art-b-0"}, ctx_b)
 
 
 class TestGetArtifactStatus:
