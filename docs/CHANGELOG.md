@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.4.1 (2026-08-25)
+
+### The archive push can actually reach its remote (#550)
+
+The image shipped `git` but no `openssh-client`, so every push to the SSH
+artifacts remote has failed since the feature landed in 3.2.0 - with correct
+configuration. The runtime image now carries an ssh client, and the image smoke
+gate asserts it stays there.
+
+
 ## v3.4.0 (2026-08-25)
 
 MCP reaches parity with the management API. The MCP tool surface went from 20

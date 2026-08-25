@@ -47,7 +47,7 @@ RUN go build -ldflags="-s -w -X main.version=${HP_VERSION}" -o /dist/hp-agent-li
 # Stage 4: Final image
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system homepilot && \
     useradd --system --gid homepilot --create-home homepilot
