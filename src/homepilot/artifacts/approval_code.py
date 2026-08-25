@@ -25,7 +25,7 @@ import secrets
 from typing import Any
 
 # No 0/O, 1/I/L, U - the characters a human most often mis-relays.
-CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"  # pragma: allowlist secret
 CODE_LENGTH = 10
 # Wrong-code attempts before approval is locked for the artifact (operator reset
 # required). Small enough that even a weak code cannot be brute-forced over MCP.
