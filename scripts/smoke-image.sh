@@ -47,6 +47,12 @@ echo "smoke: checking /health…"
 health="$(curl -fsm5 "http://localhost:$PORT/health")" || { echo "smoke: FAIL — /health unreachable" >&2; exit 1; }
 echo "  $health"
 
+echo "smoke: checking the image ships an ssh client (archive push needs it, #550)…"
+if ! docker exec "$NAME" sh -c 'command -v ssh >/dev/null'; then
+    echo "smoke: FAIL — no ssh in the image; git push to an SSH artifacts remote cannot work" >&2
+    exit 1
+fi
+
 echo "smoke: checking POST /mcp/ initialize (regression guard for #382/#399)…"
 code="$(curl -sm8 -o /dev/null -w '%{http_code}' -X POST "http://localhost:$PORT/mcp/" \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
