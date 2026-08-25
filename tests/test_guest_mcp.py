@@ -98,10 +98,31 @@ class TestTheToolsWork:
 
 
 class TestScope:
-    async def test_mutating_guest_tools_are_write_scoped(self):
-        from homepilot.mcp.server import _MUTATING_TOOLS
+    async def test_guest_tools_are_admin_scoped(self):
+        """Wave 3: the guest routes are all API `admin` (GET /admin/guests and the
+        quota/invite writes), so the whole set moved to the admin MCP tier. A
+        `full` MCP token can no longer see or change guests - only an `admin` one."""
+        from homepilot.mcp.server import _ADMIN_TOOLS, _MUTATING_TOOLS, _READ_ONLY_TOOLS
 
-        assert {"set_guest_quota", "revoke_guest_invite"} <= _MUTATING_TOOLS, (
-            "a read-only MCP token could change guest budgets or kill invites"
+        guest_tools = {"query_guests", "set_guest_quota", "revoke_guest_invite"}
+        assert guest_tools <= _ADMIN_TOOLS, (
+            "the guest tools mirror API-admin routes and must sit at the admin tier"
         )
-        assert "query_guests" not in _MUTATING_TOOLS
+        assert not (guest_tools & _MUTATING_TOOLS)
+        assert not (guest_tools & _READ_ONLY_TOOLS)
+
+    async def test_a_full_token_is_denied_and_an_admin_token_passes(self, ctx):
+        """The real scope check in _handle_tool: a `full` MCP token is refused a
+        guest tool (admin required), an `admin` token is not."""
+        from homepilot.mcp.server import _handle_tool, _mcp_token_scope_var
+
+        context, _db = ctx
+        token = _mcp_token_scope_var.set("full")
+        try:
+            with pytest.raises(ValueError, match="requires admin scope"):
+                await _handle_tool("query_guests", {}, {**context, "_mcp_token_scope": "full"})
+            # Same harness, admin token: reaches the handler and returns a dict.
+            out = await _handle_tool("query_guests", {}, {**context, "_mcp_token_scope": "admin"})
+            assert isinstance(out, dict) and "guests" in out
+        finally:
+            _mcp_token_scope_var.reset(token)

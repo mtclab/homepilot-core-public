@@ -4,9 +4,9 @@ These exercise the SHIPPED path: the real ``homepilot.main:app`` mounts the MCP
 app and must drive its lifespan, otherwise the StreamableHTTPSessionManager never
 starts and every ``POST /mcp/`` 500s with "Task group is not initialized" while
 ``/health`` still lies "ok". They also lock down the authorization/wiring gaps:
-``approve_artifact`` must be unreachable over MCP, the HTTP tool context must carry
-every key the tools reference, and the HTTP bind must refuse to start without a
-token.
+``approve_artifact`` is reachable over MCP but refuses a call with no human-relayed
+approval_code, the HTTP tool context must carry every key the tools reference, and
+the HTTP bind must refuse to start without a token.
 
 Revert-verification for each gate is recorded in the builder report.
 """
@@ -221,29 +221,29 @@ class TestHealthMcpTruthful:
         assert _mcp_health_status(FastAPI()) == "error"
 
 
-class TestApproveForbiddenOverMcp:
-    """Fix 2a (#385): approve_artifact must be unreachable over the MCP transport."""
+class TestApproveCodedOverMcp:
+    """Human-relay approval (#385 follow-up): approve_artifact IS advertised and
+    reachable over MCP, but a call with no approval_code is refused - the code, a
+    human relays it, is the gate that keeps the assistant from self-approving."""
 
-    async def test_approve_not_advertised_and_call_refused(self):
+    async def test_approve_advertised_but_uncoded_call_refused(self):
         from mcp import types
 
         from homepilot.mcp.server import _on_call_tool, _on_list_tools
 
-        # mcp 2.x: tools are registered via the on_list_tools/on_call_tool
-        # constructor handlers (the 1.x request_handlers dict is gone). Drive the
-        # handlers directly.
         listed = await _on_list_tools(None, None)
         names = {t.name for t in listed.tools}
-        assert "approve_artifact" not in names, "approve_artifact must not be advertised over MCP"
-        # Sanity: the other mutating tools stay available (propose/record must work).
+        assert "approve_artifact" in names, "approve_artifact must be advertised over MCP now"
         assert "propose_artifact" in names
 
+        # No approval_code -> refused before any lifecycle work: the self-approve
+        # guard. The refusal must not leak an approval code.
         result = await _on_call_tool(
             None,
             types.CallToolRequestParams(name="approve_artifact", arguments={"artifact_id": "x"}),
         )
         assert result.is_error is True
-        assert "not available over the MCP transport" in result.content[0].text
+        assert "approval_code" in result.content[0].text
 
 
 class TestHttpBindStartupGuard:

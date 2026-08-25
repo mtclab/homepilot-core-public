@@ -436,17 +436,20 @@ class TestWindowApi:
         assert closed[0]["caller"] == opened[0]["caller"]
 
     async def test_a_read_token_cannot_open_the_window(self, api):
-        """Scope-enforced: opening the door to new fleet members is an admin
-        action, not something a read token can do."""
+        """Scope-enforced: opening or closing the door to new fleet members is an
+        admin action, not something a read token can do. Reading the window state,
+        however, was loosened to `read` in wave 3 (it exposes no secret)."""
         client, _admin, reader, repo = api
 
         for call in (
             client.post("/agents/enrolment-window", json={"minutes": 5}, headers=_auth(reader)),
             client.delete("/agents/enrolment-window", headers=_auth(reader)),
-            client.get("/agents/enrolment-window", headers=_auth(reader)),
         ):
             resp = await call
             assert resp.status_code == 403, resp.text
+        # The GET is a plain read now: a read token may see the window state.
+        read = await client.get("/agents/enrolment-window", headers=_auth(reader))
+        assert read.status_code == 200, read.text
         assert await enrolment_window.is_open(repo) is False
 
     async def test_unauthenticated_is_refused(self, api):

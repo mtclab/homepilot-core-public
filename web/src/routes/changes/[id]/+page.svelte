@@ -101,6 +101,19 @@
 		}
 	}
 
+	async function doResetApprovalCode() {
+		working = true;
+		try {
+			await api.resetApprovalCode(id);
+			notify('Approval lock cleared');
+			await load();
+		} catch (e) {
+			notify(String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
 	async function doReject() {
 		working = true;
 		try {
@@ -292,6 +305,27 @@
 					<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
 				</svg>
 				<span>Task {detail?.active_task?.action ?? activeTask?.action ?? ''} in progress ({detail?.active_task?.status ?? activeTask?.status ?? ''})…</span>
+			</div>
+		{/if}
+
+		{#if status === 'proposed' && detail.approval_code}
+			<div class="card space-y-2" data-testid="approval-code">
+				<h2 class="section-title">Approval code</h2>
+				<p class="text-muted text-xs">
+					Relay this code to the assistant to approve over MCP — it cannot read
+					the code itself, so a valid code is proof you approved. Approving here
+					needs no code.
+				</p>
+				<p class="font-mono text-lg text-ink tracking-wider select-all" data-testid="approval-code-value">{detail.approval_code}</p>
+				{#if detail.approval_locked}
+					<p class="text-danger text-xs" data-testid="approval-locked">
+						Locked after too many wrong codes relayed over MCP. Clear the lock to
+						allow coded approval again; the code above is unchanged.
+					</p>
+					{#if canWrite}
+						<button class="btn btn-ghost text-xs" disabled={working} on:click={doResetApprovalCode}>Clear approval lock</button>
+					{/if}
+				{/if}
 			</div>
 		{/if}
 

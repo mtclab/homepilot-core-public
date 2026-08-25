@@ -12,7 +12,13 @@ from pydantic import BaseModel, Field
 from ..common import SlidingWindowLimiter
 from ..config import get_settings
 from ..db.repository import Repository
-from .deps import SCOPE_ENFORCER_ATTR, get_db, require_scope, require_token
+from .deps import (
+    REQUIRED_SCOPE_ATTR,
+    SCOPE_ENFORCER_ATTR,
+    get_db,
+    require_scope,
+    require_token,
+)
 from .tokens import PREFIX_LENGTH, generate_api_token, normalize_scope, validate_token
 
 logger = logging.getLogger(__name__)
@@ -105,8 +111,13 @@ async def require_admin_or_secret(
 
 
 # This is an explicit admin/secret gate; mark it so the startup route-scope
-# guard (main.py) counts it as satisfying a route's scope requirement.
+# guard (main.py) counts it as satisfying a route's scope requirement. Record the
+# required scope as "admin" too (it accepts an admin-scope token OR the admin
+# secret, both admin-equivalent) so the MCP tier<->API scope gate can resolve the
+# real scope of the routes it guards - GET /auth/tokens and DELETE
+# /auth/tokens/{prefix} - instead of seeing them as unscoped.
 setattr(require_admin_or_secret, SCOPE_ENFORCER_ATTR, True)
+setattr(require_admin_or_secret, REQUIRED_SCOPE_ATTR, "admin")
 
 _require_admin_or_secret_dep = Depends(require_admin_or_secret)
 

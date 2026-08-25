@@ -20,6 +20,21 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+class InventoryError(Exception):
+    """A domain error raised by the shared inventory callables.
+
+    Carries the HTTP-ish ``status`` the route should surface (404 not found, 409
+    conflict, 400 bad request) so one shared function can serve both the HTTP
+    route (which maps it to an HTTPException of the same status) and the MCP tool
+    (which maps every one to a ValueError the client sees)."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        self.status = status
+        self.detail = detail
+        super().__init__(detail)
+
+
 # Cap on how long adoption-time introspection may block the adopt response. It is
 # awaited so the caller gets an immediate summary, but a slow/hung host must
 # never make adopt itself slow or fail — the whole run is best-effort.
@@ -39,13 +54,16 @@ def _resolve_agent_adapter(request: Request) -> AgentAdapter | None:
     return AgentAdapter(hub_server=hub, pve_nodes=pve_nodes)
 
 
-async def _introspect_on_adopt(
-    request: Request, svc: InventoryService, host: dict[str, Any]
+async def _introspect_with_adapter(
+    svc: InventoryService, host: dict[str, Any], adapter: AgentAdapter | None
 ) -> dict[str, Any] | None:
     """Best-effort adoption-time introspection. Never raises and never fails the
-    adopt: any error/timeout/absent-agent is caught and logged, returning None."""
+    adopt: any error/timeout/absent-agent is caught and logged, returning None.
+
+    Request-free so both the HTTP route and the MCP adopt tool share it — the
+    caller supplies the adapter (the route resolves one from app state, the MCP
+    tool passes the one its context already holds)."""
     try:
-        adapter = _resolve_agent_adapter(request)
         return await asyncio.wait_for(
             svc.introspect_and_record(host, adapter),
             timeout=_INTROSPECT_TIMEOUT,
@@ -57,6 +75,12 @@ async def _introspect_on_adopt(
             exc_info=True,
         )
         return None
+
+
+async def _introspect_on_adopt(
+    request: Request, svc: InventoryService, host: dict[str, Any]
+) -> dict[str, Any] | None:
+    return await _introspect_with_adapter(svc, host, _resolve_agent_adapter(request))
 
 
 # Canonical import_state values, matching the DB CHECK constraint on
@@ -208,8 +232,7 @@ async def list_inventory(
     return {"items": hosts, "total": total}
 
 
-@router.post("", status_code=201, dependencies=[Depends(require_scope("write"))])
-async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[str, Any]:
+async def create_manual_host_record(repo: Any, body: HostCreateRequest) -> dict[str, Any]:
     """Add a host HomePilot could not otherwise know about (#445 A5).
 
     Inventory could only ever be filled by a Proxmox sync, so a homelab that is
@@ -221,16 +244,16 @@ async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[
     typed in by hand is not a discovery awaiting triage. That source is also what
     keeps a Proxmox sync from ever declaring it absent - the hypervisor never
     looked for it.
+
+    Shared by the HTTP route and the MCP ``add_host`` tool. Raises
+    ``InventoryError(409)`` on a duplicate hostname.
     """
-    repo = request.app.state.repo
     existing = await repo.get_host_by_hostname(body.hostname)
     if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A host named {body.hostname} is already in inventory "
-                f"(id {existing['id']}, source {existing.get('source')})"
-            ),
+        raise InventoryError(
+            409,
+            f"A host named {body.hostname} is already in inventory "
+            f"(id {existing['id']}, source {existing.get('source')})",
         )
     host_id = await repo.create_host(
         hostname=body.hostname,
@@ -260,27 +283,27 @@ async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[
     return dict(host) if host else {"id": host_id}
 
 
-@router.delete("/{host_id}", dependencies=[Depends(require_scope("write"))])
-async def forget_host(request: Request, host_id: str) -> dict[str, Any]:
+async def forget_host_record(repo: Any, host_id: str) -> dict[str, Any]:
     """Remove a host from inventory, with its services and observation note.
 
     Refused for a host the hypervisor still reports: deleting it would be undone
     by the next sync, which is worse than refusing - the operator would believe
     it was gone. Destroy the guest in Proxmox, or Ignore it, instead.
+
+    Shared by the HTTP route and the MCP ``delete_host`` tool. Raises
+    ``InventoryError(404)`` when unknown and ``InventoryError(409)`` when the
+    hypervisor still reports it.
     """
-    repo = request.app.state.repo
     host = await repo.get_host(host_id)
     if host is None:
-        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+        raise InventoryError(404, f"Host not found: {host_id}")
     source = host.get("source")
     if source != "manual" and not host.get("absent_since"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{host.get('hostname')} is still reported by the hypervisor, so the next "
-                "sync would bring it straight back. Destroy the guest in Proxmox, or set "
-                "its import state to 'ignored' to keep it out of the way."
-            ),
+        raise InventoryError(
+            409,
+            f"{host.get('hostname')} is still reported by the hypervisor, so the next "
+            "sync would bring it straight back. Destroy the guest in Proxmox, or set "
+            "its import state to 'ignored' to keep it out of the way.",
         )
     await repo.delete_host(host_id)
     await repo.log_audit(
@@ -292,46 +315,28 @@ async def forget_host(request: Request, host_id: str) -> dict[str, Any]:
     return {"id": host_id, "forgotten": True}
 
 
+@router.post("", status_code=201, dependencies=[Depends(require_scope("write"))])
+async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[str, Any]:
+    try:
+        return await create_manual_host_record(request.app.state.repo, body)
+    except InventoryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
+@router.delete("/{host_id}", dependencies=[Depends(require_scope("write"))])
+async def forget_host(request: Request, host_id: str) -> dict[str, Any]:
+    try:
+        return await forget_host_record(request.app.state.repo, host_id)
+    except InventoryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
 @router.get("/{host_id}", dependencies=[Depends(require_scope("read"))])
 async def get_host(request: Request, host_id: str) -> dict[str, Any]:
-    repo = request.app.state.repo
-    host = await repo.get_host(host_id)
+    host = await _get_service(request).get_host_detail(host_id)
     if host is None:
         raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
-    host_dict = dict(host)
-    services = await repo.list_services(host_id=host_id)
-    host_dict["services"] = [dict(s) for s in services]
-    # The agent is a property of the host (#514 S2). The host page must answer
-    # "is the channel live, which version, and WHY was it last refused" without
-    # sending the operator to a second tab.
-    if host_dict.get("agent_id"):
-        agent = await repo.db.fetchone(
-            "SELECT agent_id, hostname, connected, first_seen, connected_at, "
-            "       last_heartbeat, disconnected_at, last_error, last_error_at, "
-            "       system_info, credential_set_at, revoked_at "
-            "FROM agents WHERE agent_id = ?",
-            (host_dict["agent_id"],),
-        )
-        if agent is not None:
-            info: dict[str, Any] = {}
-            with contextlib.suppress(ValueError, TypeError):
-                info = _json.loads(agent["system_info"] or "{}")
-            host_dict["agent"] = {
-                "agent_id": agent["agent_id"],
-                "connected": bool(agent["connected"]),
-                "version": info.get("agent_version"),
-                "arch": info.get("arch"),
-                "runtime": info.get("runtime"),
-                "first_seen": agent["first_seen"],
-                "connected_at": agent["connected_at"],
-                "last_heartbeat": agent["last_heartbeat"],
-                "disconnected_at": agent["disconnected_at"],
-                "last_error": agent["last_error"],
-                "last_error_at": agent["last_error_at"],
-                "credential_set_at": agent["credential_set_at"],
-                "revoked_at": agent["revoked_at"],
-            }
-    return host_dict
+    return host
 
 
 @router.post("/refresh", dependencies=[Depends(require_scope("write"))])
@@ -357,12 +362,16 @@ async def get_host_doc(request: Request, host_id: str) -> dict[str, Any]:
     return doc
 
 
-@router.patch("/{host_id}", dependencies=[Depends(require_scope("write"))])
-async def update_host(request: Request, host_id: str, body: HostPatchRequest) -> dict[str, Any]:
-    repo = request.app.state.repo
+async def update_host_record(repo: Any, host_id: str, body: HostPatchRequest) -> dict[str, Any]:
+    """Apply an operator's edits to one host and PIN the fields they set.
+
+    Shared by the HTTP route and the MCP ``update_host`` tool. Raises
+    ``InventoryError(404)`` when unknown and ``InventoryError(400)`` when the
+    patch carries no recognised field.
+    """
     host = await repo.get_host(host_id)
     if host is None:
-        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+        raise InventoryError(404, f"Host not found: {host_id}")
     updates: dict[str, Any] = {}
     if body.managed is not None:
         updates["managed"] = int(body.managed)
@@ -381,7 +390,7 @@ async def update_host(request: Request, host_id: str, body: HostPatchRequest) ->
     if body.status is not None:
         updates["status"] = body.status
     if not updates:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
+        raise InventoryError(400, "No valid fields to update")
     await repo.update_host(host_id, **updates)
     # A PATCH is an operator deciding, so the fields it wrote are PINNED: the
     # next sync or enrich pass leaves them alone (#424). Without this, editing a
@@ -389,6 +398,46 @@ async def update_host(request: Request, host_id: str, body: HostPatchRequest) ->
     await repo.pin_host_fields(host_id, set(updates))
     updated = await repo.get_host(host_id)
     return dict(updated)
+
+
+async def adopt_host_record(
+    host_id: str, *, repo: Any, svc: InventoryService, adapter: AgentAdapter | None
+) -> dict[str, Any]:
+    """Adopt a discovered host and best-effort introspect it on the spot.
+
+    Shared by the HTTP route and the MCP ``adopt_host`` tool. Raises
+    ``InventoryError(404)`` when unknown.
+    """
+    host = await repo.get_host(host_id)
+    if host is None:
+        raise InventoryError(404, f"Host not found: {host_id}")
+    await repo.update_host(host_id, managed=1, source="imported", import_state="adopted")
+    updated = await repo.get_host(host_id)
+    result = dict(updated)
+    summary = await _introspect_with_adapter(svc, result, adapter)
+    if summary is not None:
+        result["introspection"] = summary
+    return result
+
+
+async def ignore_host_record(repo: Any, host_id: str) -> dict[str, Any]:
+    """Mark a host ignored so it stays out of the way. Shared by the HTTP route
+    and the MCP ``ignore_host`` tool. Raises ``InventoryError(404)`` when unknown.
+    """
+    host = await repo.get_host(host_id)
+    if host is None:
+        raise InventoryError(404, f"Host not found: {host_id}")
+    await repo.update_host(host_id, import_state="ignored")
+    updated = await repo.get_host(host_id)
+    return dict(updated)
+
+
+@router.patch("/{host_id}", dependencies=[Depends(require_scope("write"))])
+async def update_host(request: Request, host_id: str, body: HostPatchRequest) -> dict[str, Any]:
+    try:
+        return await update_host_record(request.app.state.repo, host_id, body)
+    except InventoryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @router.post("/enrich", dependencies=[Depends(require_scope("write"))])
@@ -404,41 +453,15 @@ async def enrich_inventory(request: Request) -> dict[str, Any]:
     return result
 
 
-@router.post("/{host_id}/adopt", dependencies=[Depends(require_scope("write"))])
-async def adopt_host(request: Request, host_id: str) -> dict[str, Any]:
-    repo = request.app.state.repo
-    host = await repo.get_host(host_id)
-    if host is None:
-        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
-    updates: dict[str, Any] = {
-        "managed": 1,
-        "source": "imported",
-        "import_state": "adopted",
-    }
-    await repo.update_host(host_id, **updates)
-    updated = await repo.get_host(host_id)
-    result = dict(updated)
-    summary = await _introspect_on_adopt(request, _get_service(request), result)
-    if summary is not None:
-        result["introspection"] = summary
-    return result
+async def bulk_host_action_record(
+    body: BulkRequest, *, repo: Any, svc: InventoryService, adapter: AgentAdapter | None
+) -> dict[str, Any]:
+    """Apply one action (adopt / ignore / enrich) to many hosts by id.
 
-
-@router.post("/{host_id}/ignore", dependencies=[Depends(require_scope("write"))])
-async def ignore_host(request: Request, host_id: str) -> dict[str, Any]:
-    repo = request.app.state.repo
-    host = await repo.get_host(host_id)
-    if host is None:
-        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
-    await repo.update_host(host_id, import_state="ignored")
-    updated = await repo.get_host(host_id)
-    return dict(updated)
-
-
-@router.post("/bulk", dependencies=[Depends(require_scope("write"))])
-async def bulk_inventory(request: Request, body: BulkRequest) -> dict[str, Any]:
-    repo = request.app.state.repo
-    svc = _get_service(request)
+    Shared by the HTTP route and the MCP ``bulk_host_action`` tool. Best-effort
+    per host: an unknown id or a per-host failure counts as ``failed`` and the
+    rest still run.
+    """
     succeeded = 0
     failed = 0
     for host_id in body.host_ids:
@@ -455,7 +478,7 @@ async def bulk_inventory(request: Request, body: BulkRequest) -> dict[str, Any]:
                     import_state="adopted",
                 )
                 # Best-effort observed-state capture; never affects adopt success.
-                await _introspect_on_adopt(request, svc, dict(host))
+                await _introspect_with_adapter(svc, dict(host), adapter)
             elif body.action == "ignore":
                 await repo.update_host(host_id, import_state="ignored")
             elif body.action == "enrich":
@@ -467,3 +490,34 @@ async def bulk_inventory(request: Request, body: BulkRequest) -> dict[str, Any]:
         except (KeyError, ValueError, httpx.HTTPError, sqlite3.Error, OSError):
             failed += 1
     return {"succeeded": succeeded, "failed": failed}
+
+
+@router.post("/{host_id}/adopt", dependencies=[Depends(require_scope("write"))])
+async def adopt_host(request: Request, host_id: str) -> dict[str, Any]:
+    try:
+        return await adopt_host_record(
+            host_id,
+            repo=request.app.state.repo,
+            svc=_get_service(request),
+            adapter=_resolve_agent_adapter(request),
+        )
+    except InventoryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
+@router.post("/{host_id}/ignore", dependencies=[Depends(require_scope("write"))])
+async def ignore_host(request: Request, host_id: str) -> dict[str, Any]:
+    try:
+        return await ignore_host_record(request.app.state.repo, host_id)
+    except InventoryError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
+@router.post("/bulk", dependencies=[Depends(require_scope("write"))])
+async def bulk_inventory(request: Request, body: BulkRequest) -> dict[str, Any]:
+    return await bulk_host_action_record(
+        body,
+        repo=request.app.state.repo,
+        svc=_get_service(request),
+        adapter=_resolve_agent_adapter(request),
+    )

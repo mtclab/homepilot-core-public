@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.4.0 (2026-08-25)
+
+MCP reaches parity with the management API. The MCP tool surface went from 20
+tools to ~70 across a read_only < full < admin scope ladder, so the assistant
+can do over MCP what an operator can do through the portal - gated to the same
+scope the API enforces for each route.
+
+### Every MCP tool is tied to its API scope
+
+`TestMcpTierMatchesApiScope` asserts each tool's MCP tier equals its route's
+`require_scope` (read<->read_only, write<->full, admin<->admin), and two
+route-walk gates fail the build if any management route has neither an MCP tool
+nor a stated exclusion - so the surface cannot silently drift or a tool be more
+permissive over MCP than over the API. `HP_MCP_TOKEN_SCOPE` gains `admin`.
+
+### A human can approve through the assistant, but the assistant still cannot
+
+`approve_artifact` is reachable over MCP again, gated by a per-artifact approval
+code a human reads from an operator surface (the review screen, `hp artifacts
+show`, or the proposed-artifact webhook) and relays. The code lives in its own
+table, is never returned by any MCP read, and locks after five wrong tries - so
+a valid code is proof a human decided, and the assistant calling the tool alone
+cannot approve its own proposal.
+
+### Deliberate exclusions
+
+Secret-minting routes, the binary/installer endpoints, the SSE stream, the two
+Proxmox-credential/secret-reload settings writes, and self-approval-without-a-
+code stay off MCP by design.
+
+
 ## v3.3.0 (2026-08-24)
 
 The open-mechanics sweep: the #381 hub-hardening remainder, an operator-gated

@@ -23,6 +23,10 @@ _reload_lock = asyncio.Lock()
 _proxmox_version: int = 0
 
 _require_admin_dep = Depends(require_scope("admin"))
+# Reads an operator should see without admin (owner decision, wave 3): the
+# selfcheck report and the (token-redacted) Proxmox wiring expose no secret. The
+# PUT/test/reload routes below stay admin.
+_require_read_dep = Depends(require_scope("read"))
 
 
 class ProxmoxConfigIn(BaseModel):
@@ -44,12 +48,12 @@ class ProxmoxConfigOut(BaseModel):
     connection_status: str = "not_configured"
 
 
-async def _resolve_proxmox_config(request: Request) -> tuple[str, int, bool]:
-    settings = getattr(request.app.state, "settings", None)
+async def _resolve_proxmox_config(state: Any) -> tuple[str, int, bool]:
+    settings = getattr(state, "settings", None)
     host = getattr(settings, "proxmox_host", "") if settings else ""
     port = getattr(settings, "proxmox_port", 8006) if settings else 8006
     verify_ssl = getattr(settings, "proxmox_verify_ssl", True) if settings else True
-    vault = getattr(request.app.state, "vault", None)
+    vault = getattr(state, "vault", None)
     if vault is not None:
         try:
             config_secret = await vault.get_secret("proxmox-config")
@@ -64,10 +68,10 @@ async def _resolve_proxmox_config(request: Request) -> tuple[str, int, bool]:
     return host, port, verify_ssl
 
 
-async def _resolve_proxmox_token(request: Request) -> tuple[str, str]:
+async def _resolve_proxmox_token(state: Any) -> tuple[str, str]:
     token = ""
     source = ""
-    vault = getattr(request.app.state, "vault", None)
+    vault = getattr(state, "vault", None)
     if vault is not None:
         from ..vault import VaultError
 
@@ -86,10 +90,10 @@ async def _resolve_proxmox_token(request: Request) -> tuple[str, str]:
     return token, source
 
 
-async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:
+async def _resolve_proxmox_write_token(state: Any) -> tuple[str, str]:
     write_token = ""
     source = ""
-    vault = getattr(request.app.state, "vault", None)
+    vault = getattr(state, "vault", None)
     if vault is not None:
         from ..vault import VaultError
 
@@ -101,7 +105,7 @@ async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:
         except (VaultError, OSError):
             pass
     if not write_token:
-        read_token, _ = await _resolve_proxmox_token(request)
+        read_token, _ = await _resolve_proxmox_token(state)
         if read_token:
             write_token = read_token
             source = "read_token"
@@ -111,7 +115,7 @@ async def _resolve_proxmox_write_token(request: Request) -> tuple[str, str]:
 @router.get("/selfcheck")
 async def selfcheck(
     request: Request,
-    token: dict[str, Any] = _require_admin_dep,
+    token: dict[str, Any] = _require_read_dep,
 ) -> dict[str, Any]:
     """What each optional subsystem is doing, and what that costs (ADR-004 S6).
 
@@ -126,12 +130,22 @@ async def selfcheck(
     return await selfcheck_report(request.app.state, settings)
 
 
-@router.get("/settings/proxmox", dependencies=[Depends(require_scope("admin"))])
-async def get_proxmox_settings(request: Request) -> dict[str, Any]:
-    host, port, verify_ssl = await _resolve_proxmox_config(request)
-    token, source = await _resolve_proxmox_token(request)
-    write_token, write_source = await _resolve_proxmox_write_token(request)
-    proxmox = getattr(request.app.state, "proxmox", None)
+async def proxmox_settings_report(state: Any) -> dict[str, Any]:
+    """How this instance is wired to Proxmox, and whether that wiring works.
+
+    Takes the state object rather than a Request so the ONE implementation
+    serves both GET /admin/settings/proxmox and the `get_proxmox_settings` MCP
+    tool - two surfaces answering the same question cannot be allowed to drift.
+
+    NO TOKEN VALUE IS EVER RETURNED. The tokens are resolved only to answer
+    "configured?" and "from where?"; the secrets themselves stay in the vault,
+    and tests/test_mcp_read_parity.py asserts a configured token's value is
+    absent from the serialized result.
+    """
+    host, port, verify_ssl = await _resolve_proxmox_config(state)
+    token, source = await _resolve_proxmox_token(state)
+    write_token, write_source = await _resolve_proxmox_write_token(state)
+    proxmox = getattr(state, "proxmox", None)
     if proxmox is not None:
         try:
             connected = await proxmox.test_connection()
@@ -156,13 +170,18 @@ async def get_proxmox_settings(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/settings/proxmox", dependencies=[_require_read_dep])
+async def get_proxmox_settings(request: Request) -> dict[str, Any]:
+    return await proxmox_settings_report(request.app.state)
+
+
 @router.put("/settings/proxmox", dependencies=[Depends(require_scope("admin"))])
 async def save_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> dict[str, Any]:
     vault = getattr(request.app.state, "vault", None)
     if vault is None:
         return {"status": "error", "message": "Vault not configured — cannot save settings"}
 
-    host, port, verify_ssl = await _resolve_proxmox_config(request)
+    host, port, verify_ssl = await _resolve_proxmox_config(request.app.state)
     if config.host is not None:
         host = config.host
     if config.port is not None:
@@ -189,8 +208,8 @@ async def save_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> di
     reloaded = reload_result.get("reloaded", [])
 
     # Resolve actual token state from vault for response
-    resolved_token, _ = await _resolve_proxmox_token(request)
-    resolved_write_token, _ = await _resolve_proxmox_write_token(request)
+    resolved_token, _ = await _resolve_proxmox_token(request.app.state)
+    resolved_write_token, _ = await _resolve_proxmox_write_token(request.app.state)
 
     return {
         "status": "ok",
@@ -203,9 +222,15 @@ async def save_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> di
     }
 
 
-@router.post("/settings/proxmox/test", dependencies=[Depends(require_scope("admin"))])
-async def test_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> dict[str, Any]:
-    host, port, verify_ssl = await _resolve_proxmox_config(request)
+async def probe_proxmox_connection(state: Any, config: ProxmoxConfigIn) -> dict[str, Any]:
+    """Build a Proxmox client from the stored wiring (with any supplied
+    overrides) and probe /version, returning {status, message[, version]}.
+
+    Takes a state object rather than a Request so the ONE implementation serves
+    both POST /admin/settings/proxmox/test and the `test_proxmox_connection` MCP
+    tool - the two surfaces must give the same verdict. Probes only; stores
+    nothing and mutates no live client."""
+    host, port, verify_ssl = await _resolve_proxmox_config(state)
     if config.host is not None:
         host = config.host
     if config.port is not None:
@@ -218,13 +243,13 @@ async def test_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> di
 
     token = config.token or ""
     if not token:
-        token, _source = await _resolve_proxmox_token(request)
+        token, _source = await _resolve_proxmox_token(state)
     if not token:
         return {"status": "error", "message": "No API token provided or stored"}
 
     write_token = config.write_token or ""
     if not write_token:
-        write_token_raw, _ = await _resolve_proxmox_write_token(request)
+        write_token_raw, _ = await _resolve_proxmox_write_token(state)
         write_token = write_token_raw or token
 
     from ..adapters.proxmox import ProxmoxClient
@@ -243,10 +268,17 @@ async def test_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> di
         return {"status": "error", "message": f"Connection failed: {exc}"}
 
 
+@router.post("/settings/proxmox/test", dependencies=[Depends(require_scope("admin"))])
+async def test_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> dict[str, Any]:
+    return await probe_proxmox_connection(request.app.state, config)
+
+
 async def _do_reload(request: Request) -> dict[str, Any]:
     global _proxmox_version
     settings = request.app.state.settings if hasattr(request.app.state, "settings") else None
-    proxmox_host, proxmox_port, proxmox_verify_ssl = await _resolve_proxmox_config(request)
+    proxmox_host, proxmox_port, proxmox_verify_ssl = await _resolve_proxmox_config(
+        request.app.state
+    )
     if settings:
         settings.proxmox_host = proxmox_host
         settings.proxmox_port = proxmox_port

@@ -398,7 +398,7 @@ class TestSelfcheckEndpoint:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from homepilot.admin.router import _require_admin_dep
+        from homepilot.admin.router import _require_read_dep
         from homepilot.admin.router import router as admin_router
 
         monkeypatch.delenv("HP_MCP_TOKEN", raising=False)
@@ -411,7 +411,9 @@ class TestSelfcheckEndpoint:
         app.state.agent_hub = None
         app.state.mcp_app = None
         client = TestClient(app)
-        app.dependency_overrides[_require_admin_dep.dependency] = lambda: {
+        # GET /admin/selfcheck was loosened from admin to read in wave 3; override
+        # the read dep the route now uses.
+        app.dependency_overrides[_require_read_dep.dependency] = lambda: {
             "user_id": 1,
             "token_id": 1,
             "scope": "*",
@@ -429,7 +431,9 @@ class TestSelfcheckEndpoint:
         assert "embeddings" in names and "events_webhook" in names
         assert all(s["state"] == STATE_OFF for s in body["subsystems"])
 
-    def test_endpoint_requires_admin(self, monkeypatch):
+    def test_endpoint_requires_authentication(self, monkeypatch):
+        # Loosened from admin to read scope in wave 3, but still authenticated: a
+        # request carrying no credentials is refused.
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 

@@ -141,6 +141,47 @@ def _get_lifecycle() -> ArtifactLifecycle:
     return ArtifactLifecycle(store)
 
 
+def _db_path() -> Path:
+    return Path(_get_settings().data_dir) / "homepilot.db"
+
+
+async def _with_repo(fn: Any) -> Any:
+    """Open the main DB, run `fn(repo)`, and close. For the approval-code surface
+    the CLI reaches directly (its ArtifactLifecycle carries no repo)."""
+    from homepilot.db.connection import Database
+    from homepilot.db.repository import Repository
+
+    database = Database(str(_db_path()))
+    await database.connect()
+    try:
+        return await fn(Repository(database))
+    finally:
+        await database.close()
+
+
+def _artifact_approval_code(artifact_id: str, status: str) -> tuple[str | None, bool]:
+    """(display code, locked) for a PROPOSED artifact, or (None, False).
+
+    Reads the code from the DB, backfilling one lazily if the artifact was
+    proposed before this feature shipped. Any DB/table trouble degrades to
+    (None, False) so `show` still renders."""
+    if status != "proposed":
+        return None, False
+
+    async def _work(repo: Any) -> tuple[str | None, bool]:
+        from homepilot.artifacts.approval_code import ensure_approval_code, format_for_display
+
+        code = await ensure_approval_code(repo, artifact_id)
+        row = await repo.get_approval_code_row(artifact_id)
+        return format_for_display(code), bool(row and int(row["locked"]))
+
+    try:
+        result: tuple[str | None, bool] = asyncio.run(_with_repo(_work))
+        return result
+    except Exception:
+        return None, False
+
+
 @app.command()
 def init(
     non_interactive: bool = typer.Option(
@@ -520,6 +561,28 @@ def artifacts_show(
     if meta_lines:
         console.print("\n".join(meta_lines))
 
+    # Approval code (human-relay MCP approval): shown ONLY while proposed, so a
+    # present operator can read it and relay it to the assistant, which cannot
+    # see it over MCP. Approving here at the CLI needs no code (you are the human).
+    code, locked = _artifact_approval_code(id, str(fm.get("status", "")))
+    if code is not None:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]{code}[/bold]\n"
+                "[dim]Relay this to the assistant to approve over MCP, or run "
+                "`hp artifacts approve` here.[/dim]"
+                + (
+                    "\n[red]LOCKED — too many wrong codes. "
+                    "Run `hp artifacts reset-approval` to unlock.[/red]"
+                    if locked
+                    else ""
+                ),
+                title="Approval code",
+                style="bold green",
+            )
+        )
+
     artifact_path = store.resolve_path(id)
     rel_path = str(artifact_path.relative_to(store.root))
     artifacts_dir = str(store.root)
@@ -591,10 +654,37 @@ def artifacts_approve(
     reason_str = " ".join(reason) if reason else None
     try:
         asyncio.run(lifecycle.approve(id, user="cli", reason=reason_str))
+        # The CLI lifecycle carries no repo, so clear the spent code directly.
+        with contextlib.suppress(Exception):
+            asyncio.run(_with_repo(lambda repo: repo.clear_approval_code(id)))
         console.print(f"[green]Approved: {id}[/green]")
     except Exception as e:
         err_console.print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1) from e
+
+
+@artifacts_app.command("reset-approval")
+def artifacts_reset_approval(
+    id: str = typer.Argument(..., help="Artifact ID"),
+) -> None:
+    """Clear a brute-force approval LOCK on an artifact.
+
+    After too many wrong codes relayed over MCP, coded approval locks for the
+    artifact. This clears the lock; the code itself is unchanged, so you can
+    re-read it with `hp artifacts show` and relay it again."""
+
+    async def _reset(repo: Any) -> bool:
+        return bool(await repo.reset_approval_lock(id))
+
+    try:
+        existed = asyncio.run(_with_repo(_reset))
+    except Exception as e:
+        err_console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+    if not existed:
+        err_console.print(f"[yellow]No active approval code for {id}.[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"[green]Approval lock cleared: {id}[/green]")
 
 
 @artifacts_app.command("reject")
@@ -607,6 +697,8 @@ def artifacts_reject(
     reason_str = " ".join(reason) if reason else None
     try:
         asyncio.run(lifecycle.reject(id, user="cli", reason=reason_str))
+        with contextlib.suppress(Exception):
+            asyncio.run(_with_repo(lambda repo: repo.clear_approval_code(id)))
         console.print(f"[yellow]Rejected: {id}[/yellow]")
     except Exception as e:
         err_console.print(f"[red]Error: {e}[/red]")

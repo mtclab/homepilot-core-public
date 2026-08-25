@@ -21,12 +21,28 @@
 ║  │  hp mcp-serve --transport http --port 8000                   │   ║
 ║  │  MCP endpoint: /mcp  (StreamableHTTP, stateful sessions)     │   ║
 ║  │                                                              │   ║
-║  │  MCP tools:                                                  │   ║
-║  │   query_inventory      refresh_inventory   get_environment_doc│  ║
-║  │   query_artifacts      propose_artifact    approve_artifact  │  ║
-║  │   get_artifact_status  search_kb           proxmox_api_read  │  ║
-║  │   record_fact          http_call_read      read_file_on_guest│  ║
-║  │   exec_on_guest_readonly check_artifact_drift                │  ║
+║  │  MCP tools (38) - the READ surface is at parity with the     │   ║
+║  │  management API's GET routes, gated by                       │   ║
+║  │  tests/test_mcp_read_parity.py:                              │   ║
+║  │   inventory   query_inventory  get_host  get_environment_doc │   ║
+║  │               refresh_inventory                              │   ║
+║  │   artifacts   query_artifacts  get_artifact  propose_artifact│   ║
+║  │               get_artifact_status  check_artifact_drift      │   ║
+║  │               get_fleet_drift  get_task_result  list_tasks   │   ║
+║  │   agents      list_agents  get_agent  get_agent_audit        │   ║
+║  │               get_enrolment_window  check_host_reachable     │   ║
+║  │   monitoring  list_alert_rules  get_monitoring_alerts        │   ║
+║  │               get_host_metrics  get_host_metrics_series      │   ║
+║  │   kb          search_kb  list_kb  get_kb_doc  record_fact    │   ║
+║  │               get_kb_embedding_status                        │   ║
+║  │   ops         get_dashboard_summary  get_audit_log           │   ║
+║  │               get_selfcheck  get_proxmox_settings            │   ║
+║  │   guests      query_guests  set_guest_quota                  │   ║
+║  │               revoke_guest_invite                            │   ║
+║  │   raw access  proxmox_api_read  http_call_read               │   ║
+║  │               read_file_on_guest  exec_on_guest_readonly     │   ║
+║  │  Never over MCP: the hub/enrolment token, the installer      │   ║
+║  │  one-liner, agent binaries, and approve_artifact (#385).     │   ║
 ║  └───────────┬────────────────────────────┬──────────────────────┘  ║
 ║              │                            │                          ║
 ║   ┌───────────▼────────────┐  ┌────────────▼───────────────────────┐ ║
@@ -218,7 +234,15 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
 | `approve_artifact` | n/a | n/a | **Not exposed over MCP.** Delisted from `list_tools()` and hard-refused in dispatch (#385) - approval must come from an operator via CLI or web UI |
 
-`propose_artifact` initiates a change (requires write scope). Approval is deliberately NOT available over MCP: the MCP credential is a single shared token, so an LLM able to approve would both propose and approve its own mutations (#385). All other tools are read-only and require only read scope. Agents with read-only tokens cannot call write-scoped tools.
+`propose_artifact` initiates a change (requires write scope). Approval is deliberately NOT available over MCP: the MCP credential is a single shared token, so an LLM able to approve would both propose and approve its own mutations (#385).
+
+The MCP transport has a three-tier scope ladder set by `HP_MCP_TOKEN_SCOPE`, mirroring the API scope ladder read < write < admin:
+
+- `read_only` — read tools only.
+- `full` (default) — reads plus the standard mutators (`add_host`, `apply_artifact`, `revoke_artifact`, …), but NOT admin tools.
+- `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest`, `delete_auth_token`, …), except the permanently-forbidden `approve_artifact`.
+
+Each tool's tier equals the API scope of the route it mirrors; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces that equality so a lesser MCP token can never do what the API reserves for a greater one.
 
 ---
 

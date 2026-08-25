@@ -54,6 +54,7 @@ vi.mock('$lib/api', async () => {
 			getArtifactBody: vi.fn().mockResolvedValue(''),
 			getArtifact: vi.fn(),
 			approveArtifact: vi.fn(),
+			resetApprovalCode: vi.fn(),
 			rejectArtifact: vi.fn(),
 			applyArtifact: vi.fn(),
 			revokeArtifact: vi.fn(),

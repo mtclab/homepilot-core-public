@@ -325,6 +325,12 @@ export interface ArtifactDetail {
 	frontmatter: Artifact;
 	body: string;
 	active_task: ActiveTask | null;
+	// The per-artifact approval code, present only while PROPOSED. A human reads
+	// it here and relays it to the assistant to approve over MCP (the assistant
+	// cannot see it there). `approval_locked` is true once too many wrong codes
+	// were relayed; an operator clears it with resetApprovalCode.
+	approval_code?: string | null;
+	approval_locked?: boolean;
 }
 
 /** What a person fills in to propose an artifact; the server adds the rest. */
@@ -611,6 +617,11 @@ export const api = {
 		return req<{ id: string; status: string }>(`/artifacts/${id}/approve`, {
 			method: 'POST',
 			body: JSON.stringify({ user }),
+		});
+	},
+	resetApprovalCode(id: string) {
+		return req<{ id: string; locked: boolean }>(`/artifacts/${id}/approval-code/reset`, {
+			method: 'POST',
 		});
 	},
 	rejectArtifact(id: string, user = 'web', reason?: string) {

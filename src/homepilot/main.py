@@ -486,11 +486,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "drift_reconciler": drift_reconciler,
                 # The hub's live registry, for `check_host_reachable` (#427).
                 "agent_registry": get_agent_registry(),
+                # Read-parity wave 1: the MCP read tools answer from the SAME
+                # repos/services the management routes use. `app_state` is what
+                # the selfcheck and Proxmox-settings reports take, and
+                # `invite_repo`/`settings` were simply MISSING from this context
+                # while the stdio bootstrap had them - so `query_guests` over
+                # HTTP MCP reported an empty invite list.
+                "settings": settings,
+                "metrics_repo": state.metrics_repo,
+                "invite_repo": app.state.invite_repo,
+                "app_state": state,
+                # Wave 2 mutators (apply/replay/cancel) dispatch to these; the
+                # stdio bootstrap carries them too, so both transports behave the
+                # same (TestBothTransportsCarryTheSameToolContext).
+                "task_runner": task_runner,
+                "provision_service": app.state.provision_service,
             }
         )
 
         mcp_app = create_http_app(srv)
         app.state.mcp_app = mcp_app
+        # The selfcheck report reads mcp_app off whichever state object it is
+        # handed; keeping both in step is what lets GET /admin/selfcheck and the
+        # get_selfcheck MCP tool agree about the transport.
+        state.mcp_app = mcp_app
         app.mount("/mcp", mcp_app)
         logger.info("MCP server mounted at /mcp")
     else:

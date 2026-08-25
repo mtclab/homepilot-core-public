@@ -39,6 +39,19 @@ def _get_lifecycle(request: Request) -> ArtifactLifecycle:
     return lifecycle
 
 
+class ArtifactActionError(Exception):
+    """A domain error raised by the shared artifact callables (plan/preview).
+
+    Carries the HTTP-ish ``status`` so one shared function serves both the HTTP
+    route (which maps it to an HTTPException of the same status) and the MCP tool
+    (which maps every one to a ValueError the client sees)."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        self.status = status
+        self.detail = detail
+        super().__init__(detail)
+
+
 @router.get("", dependencies=[Depends(require_scope("read"))])
 async def list_artifacts(
     request: Request,
@@ -113,7 +126,51 @@ async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
     task_repo = request.app.state.task_repo
     active_task = await task_repo.get_active_task(artifact_id)
-    return {"frontmatter": fm, "body": body, "active_task": active_task}
+    # Approval code, for the operator review surface only. This management API is
+    # not the MCP transport, so returning it here to the web UI / CLI is exactly
+    # how a present human reads the code to relay it. Only while PROPOSED (that is
+    # the one state a coded approval applies to); backfilled lazily for artifacts
+    # proposed before the feature shipped. `locked` drives the reset control.
+    approval_code: str | None = None
+    approval_locked = False
+    if fm.get("status") == "proposed":
+        repo = getattr(request.app.state, "repo", None)
+        if repo is not None:
+            from .approval_code import ensure_approval_code, format_for_display
+
+            code = await ensure_approval_code(repo, artifact_id)
+            approval_code = format_for_display(code)
+            row = await repo.get_approval_code_row(artifact_id)
+            approval_locked = bool(row and int(row["locked"]))
+    return {
+        "frontmatter": fm,
+        "body": body,
+        "active_task": active_task,
+        "approval_code": approval_code,
+        "approval_locked": approval_locked,
+    }
+
+
+@router.post(
+    "/{artifact_id}/approval-code/reset",
+    dependencies=[Depends(require_scope("write"))],
+)
+async def reset_approval_code(request: Request, artifact_id: str) -> dict[str, Any]:
+    """Operator reset of a brute-force approval lock (present-human action).
+
+    After too many wrong codes relayed over MCP, approval for the artifact locks.
+    A human at the UI/CLI clears the lock here; the code itself is unchanged, so
+    the operator can re-read and re-relay it."""
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="approval-code store unavailable")
+    existed = await repo.reset_approval_lock(artifact_id)
+    if not existed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active approval code for artifact: {artifact_id}",
+        )
+    return {"id": artifact_id, "locked": False}
 
 
 def _slugify(text: str, limit: int = 40) -> str:
@@ -164,14 +221,13 @@ async def propose_artifact(request: Request, token: _TokenDep) -> dict[str, Any]
     return {"id": artifact_id}
 
 
-async def _policies_for(request: Request, host: str) -> list[dict[str, Any]]:
+async def _policies_for(kb_service: Any, host: str) -> list[dict[str, Any]]:
     """KB entries an approver should read before letting a change run on `host`.
 
     Kept to `kind == "policy"`: the plan already says what will change, so what
     an operator needs beside it is the rules they wrote about this machine - not
     every note that mentions its name.
     """
-    kb_service = getattr(request.app.state, "kb_service", None)
     if kb_service is None or not host:
         return []
     try:
@@ -190,8 +246,9 @@ async def _policies_for(request: Request, host: str) -> list[dict[str, Any]]:
     ]
 
 
-@router.post("/{artifact_id}/plan", dependencies=[Depends(require_scope("read"))])
-async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+async def build_artifact_plan(
+    artifact_id: str, *, store: ArtifactStore, agent: Any, kb_service: Any
+) -> dict[str, Any]:
     """What applying this artifact would actually change on the host (#445 A1).
 
     Approval was blind. `/preview` returns a git diff of the artifact FILE, which
@@ -204,23 +261,23 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     only `exec_readonly` and `read_file`. It mutates nothing, which is what makes
     it safe to run automatically when an approval screen opens - and #419 is the
     reminder of what a "preview" that quietly mutates costs.
+
+    Shared by the HTTP route and the MCP ``plan_artifact`` tool; raises
+    ``ArtifactActionError`` with the status the caller should surface.
     """
-    store = _get_store(request)
     try:
         fm, body = store.read(artifact_id)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
+        raise ArtifactActionError(404, f"Artifact not found: {artifact_id}") from None
 
     kind = str(fm.get("kind", ""))
     if kind != "host-provision":
         # Said plainly rather than returning an empty plan: an empty plan reads
         # as "nothing will change", which for an unsupported kind is a lie.
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"No plan engine for artifact kind {kind!r}. A real plan exists for "
-                "host-provision; other kinds would need their own read-only probe."
-            ),
+        raise ArtifactActionError(
+            422,
+            f"No plan engine for artifact kind {kind!r}. A real plan exists for "
+            "host-provision; other kinds would need their own read-only probe.",
         )
 
     from ..artifacts.models import parse_host_provision_spec
@@ -229,31 +286,25 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     try:
         spec = parse_host_provision_spec(body)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid host-provision spec: {exc}") from exc
+        raise ArtifactActionError(400, f"Invalid host-provision spec: {exc}") from exc
 
     target = fm.get("target", {}) or {}
     host = str(target.get("host") or target.get("node") or "")
     if not host:
-        raise HTTPException(
-            status_code=400, detail="This artifact declares no target host to plan against"
-        )
+        raise ArtifactActionError(400, "This artifact declares no target host to plan against")
 
-    agent = getattr(request.app.state, "artifact_executor", None)
-    agent = getattr(agent, "agent", None) if agent is not None else None
     if agent is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "No agent transport is available, so the host cannot be inspected. "
-                "A plan without a live probe would be a guess."
-            ),
+        raise ArtifactActionError(
+            503,
+            "No agent transport is available, so the host cannot be inspected. "
+            "A plan without a live probe would be a guess.",
         )
 
     try:
         items = await probe(agent, host, spec)
     except Exception as exc:
         # A failed probe must not read as "nothing to do".
-        raise HTTPException(status_code=502, detail=f"Could not inspect {host}: {exc}") from exc
+        raise ArtifactActionError(502, f"Could not inspect {host}: {exc}") from exc
 
     changes = [item for item in items if item["changes"]]
     return {
@@ -268,7 +319,7 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
         # rules for a machine are the half the plan cannot supply. Best-effort:
         # a KB that is down must not block an approval screen from showing what
         # will change.
-        "policies": await _policies_for(request, host),
+        "policies": await _policies_for(kb_service, host),
         "summary": (
             f"{len(changes)} of {len(items)} item(s) would change on {host}"
             if changes
@@ -277,28 +328,26 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     }
 
 
-@router.post("/{artifact_id}/preview", dependencies=[Depends(require_scope("read"))])
-async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
-    store = _get_store(request)
+def build_artifact_preview(artifact_id: str, *, store: ArtifactStore) -> dict[str, Any]:
+    """A git diff of the artifact FILE against its previous committed version.
+
+    Shared by the HTTP route and the MCP ``preview_artifact`` tool; raises
+    ``ArtifactActionError`` with the status the caller should surface.
+    """
     try:
         fm, body = store.read(artifact_id)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
+        raise ArtifactActionError(404, f"Artifact not found: {artifact_id}") from None
 
     if "/" in artifact_id or "\\" in artifact_id or ".." in artifact_id:
-        raise HTTPException(
-            status_code=400, detail="Invalid artifact_id: path separators not allowed"
-        )
+        raise ArtifactActionError(400, "Invalid artifact_id: path separators not allowed")
 
     diff = ""
     try:
         path = store.resolve_path(artifact_id)
         resolved = path.resolve()
         if not str(resolved).startswith(str(store.root.resolve())):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid artifact_id: path traversal detected",
-            )
+            raise ArtifactActionError(400, "Invalid artifact_id: path traversal detected")
         rel = path.relative_to(store.root)
         result = subprocess.run(
             ["git", "diff", "HEAD~1", "--", str(rel)],
@@ -313,7 +362,7 @@ async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]
     except subprocess.SubprocessError:
         logger.warning("git diff timed out for artifact %s", artifact_id)
         diff = ""
-    except HTTPException:
+    except ArtifactActionError:
         raise
     except Exception as exc:
         logger.exception("git diff error for artifact %s: %s", artifact_id, exc)
@@ -328,6 +377,32 @@ async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]
         "body": body,
         "frontmatter": fm,
     }
+
+
+def _plan_agent(request: Request) -> Any:
+    executor = getattr(request.app.state, "artifact_executor", None)
+    return getattr(executor, "agent", None) if executor is not None else None
+
+
+@router.post("/{artifact_id}/plan", dependencies=[Depends(require_scope("read"))])
+async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+    try:
+        return await build_artifact_plan(
+            artifact_id,
+            store=_get_store(request),
+            agent=_plan_agent(request),
+            kb_service=getattr(request.app.state, "kb_service", None),
+        )
+    except ArtifactActionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
+@router.post("/{artifact_id}/preview", dependencies=[Depends(require_scope("read"))])
+async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+    try:
+        return build_artifact_preview(artifact_id, store=_get_store(request))
+    except ArtifactActionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @router.post("/{artifact_id}/approve", dependencies=[Depends(require_scope("write"))])

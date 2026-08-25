@@ -55,28 +55,9 @@ async def list_kb(
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     repo = request.app.state.repo
-    clauses: list[str] = []
-    params: list[Any] = []
-    if kind is not None:
-        clauses.append("kind = ?")
-        params.append(kind)
-    if target is not None:
-        clauses.append("target = ?")
-        params.append(target)
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    # `total` counts every matching row, not the page: it was len(items) against
-    # a hardcoded LIMIT 100, so the UI's entry count saturated at 100 and every
-    # later document was unreachable.
-    count_row = await repo.db.fetchone(
-        f"SELECT COUNT(*) AS cnt FROM doc_metadata{where}",
-        list(params),
+    items, total = await repo.list_doc_metadata(
+        kind=kind, target=target, limit=limit, offset=offset
     )
-    total = int(count_row["cnt"]) if count_row else 0
-    rows = await repo.db.fetchall(
-        f"SELECT * FROM doc_metadata{where} ORDER BY embedded_at DESC LIMIT ? OFFSET ?",
-        [*params, limit, offset],
-    )
-    items = [dict(r) for r in rows]
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 

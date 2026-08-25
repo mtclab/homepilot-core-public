@@ -93,6 +93,10 @@ class ArtifactLifecycle:
         fm_yml: str = self._file_store.serialize_frontmatter(fm)
         self._file_store.write(spec["id"], fm_yml, body, event)
         id_str: str = spec["id"]
+        # Approval code: generated at PROPOSE and surfaced to operators only. Set
+        # below once the artifacts row exists; stays None when there is no repo
+        # (e.g. the CLI lifecycle) - the webhook simply omits it there.
+        approval_code: str | None = None
         if self.repo is not None:
             try:
                 import json as _json
@@ -123,6 +127,17 @@ class ArtifactLifecycle:
             except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
                 logger.exception("DB sync failed for artifact %s: %s", id_str, exc)
 
+            # Mint the approval code AFTER the artifacts row exists. Never logged
+            # (it is a human-relay secret); it reaches operators only via the
+            # webhook/SSE payload below, the web review screen, and `hp artifacts
+            # show`, and NO MCP read ever returns it.
+            try:
+                from .approval_code import ensure_approval_code
+
+                approval_code = await ensure_approval_code(self.repo, id_str)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+                logger.exception("Approval-code mint failed for %s: %s", id_str, exc)
+
         # Propose wrote an event and a git commit and NO audit row (#433), so the
         # one action that starts every change was the one action missing from the
         # durable trail an operator reads. Every other transition logs one.
@@ -148,6 +163,10 @@ class ArtifactLifecycle:
                     "target": fm.get("target"),
                     "idempotence": fm.get("idempotence"),
                     "source": fm.get("produced_by", {}),
+                    # Carried so a configured notification (webhook/SSE) delivers
+                    # the code to a human without them opening the portal. This
+                    # payload never reaches an MCP client.
+                    "approval_code": approval_code,
                 },
                 repo=self.repo,
             )
@@ -162,6 +181,13 @@ class ArtifactLifecycle:
 
     async def approve(self, id: str, user: str, reason: str | None = None) -> None:
         await self._ensure_transitions().approve(id, user, reason)
+        # The artifact has left PROPOSED, so its approval code is spent: clear it
+        # so a replay of the same code cannot re-approve anything (#385 gate 2).
+        if self.repo is not None:
+            try:
+                await self.repo.clear_approval_code(id)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                logger.exception("Clearing approval code failed for %s", id)
         try:
             fm, _ = self.store.read(id)
             await emit_event(
@@ -184,6 +210,12 @@ class ArtifactLifecycle:
 
     async def reject(self, id: str, user: str, reason: str | None = None) -> None:
         await self._ensure_transitions().reject(id, user, reason)
+        # Left PROPOSED (rejected): the approval code is dead, remove it.
+        if self.repo is not None:
+            try:
+                await self.repo.clear_approval_code(id)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                logger.exception("Clearing approval code failed for %s", id)
         try:
             fm, _ = self.store.read(id)
             await emit_event(
