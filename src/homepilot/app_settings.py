@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Every DB row this module writes carries this prefix, so an operator setting can
 # never collide with the settings table's other tenants (`hub_tls_mode`, the
 # archive-push outcome keys) and a stray key cannot be mistaken for one.
-DB_KEY_PREFIX = "setting:"
+DB_KEY_PREFIX = "setting:"  # pragma: allowlist secret - a key namespace, not a credential
 
 SOURCE_ENV = "env"
 SOURCE_DB = "db"
