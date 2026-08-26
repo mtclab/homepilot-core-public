@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -266,7 +265,10 @@ def _vault_subsystem(state: Any) -> Subsystem:
 
 
 def _mcp_subsystem(state: Any) -> Subsystem:
-    token_set = bool(os.environ.get("HP_MCP_TOKEN", "").strip())
+    # The transport is always mounted and always authenticated: an MCP client
+    # presents an API token minted in Settings -> Tokens (HP_MCP_TOKEN is only
+    # the legacy static fallback), so there is no env var left to make it
+    # "configured". What is worth reporting is whether it is actually running.
     mcp_app = getattr(state, "mcp_app", None)
 
     async def probe() -> bool:
@@ -275,18 +277,21 @@ def _mcp_subsystem(state: Any) -> Subsystem:
     return Subsystem(
         name="mcp",
         label="the MCP transport",
-        configured=token_set,
+        configured=mcp_app is not None,
         target="/mcp",
         off=(
             "The MCP tool surface is not mounted, so external agents cannot drive "
-            "HomePilot over MCP. Set HP_MCP_TOKEN to mount it."
+            "HomePilot over MCP."
         ),
-        ok="MCP is mounted at /mcp and its transport is running.",
+        ok=(
+            "MCP is mounted at /mcp and its transport is running. Clients "
+            "authenticate with an API token from Settings -> Tokens."
+        ),
         broken=(
-            "HP_MCP_TOKEN is set but the MCP transport is not running, so every /mcp "
-            "request fails. Restart the backend and check the startup log."
+            "The MCP transport is mounted but not running, so every /mcp request "
+            "fails. Restart the backend and check the startup log."
         ),
-        probe=probe if token_set else None,
+        probe=probe if mcp_app is not None else None,
     )
 
 

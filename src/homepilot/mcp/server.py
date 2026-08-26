@@ -53,6 +53,12 @@ from .tools.artifact_tools import (
     handle_replay_artifact,
     handle_revoke_artifact,
 )
+from .tools.guest_network_tools import (
+    TOOL_DEFINITIONS as GUEST_NETWORK_TOOL_DEFS,
+)
+from .tools.guest_network_tools import (
+    handle_query_guest_network,
+)
 from .tools.guest_tools import (
     TOOL_DEFINITIONS as GUEST_TOOL_DEFS,
 )
@@ -153,6 +159,7 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + KB_TOOL_DEFS
     + ARTIFACT_TOOL_DEFS
     + GUEST_TOOL_DEFS
+    + GUEST_NETWORK_TOOL_DEFS
     + AGENT_TOOL_DEFS
     + MONITORING_TOOL_DEFS
     + OPS_TOOL_DEFS
@@ -237,6 +244,11 @@ _ADMIN_TOOLS = frozenset(
         # check above is what a lesser token meets, and a second listing would
         # only give the same tool two tiers to disagree about.
         "query_settings_overrides",
+        # The guest network (#553). GET /admin/guest-network is API admin - it
+        # names the operator's own LAN in the isolate list - so the read sits at
+        # the admin tier. There is no mutating twin ON PURPOSE: the change ships
+        # as a `guest-network` artifact through propose/approve/apply.
+        "query_guest_network",
         "set_setting_override",
         "clear_setting_override",
         "probe_setting_override",
@@ -349,6 +361,11 @@ async def _bootstrap() -> dict[str, Any]:
             vault=vault,
             pve_nodes=lifecycle._pve_nodes_list or [],
             agent=agent_adapter,
+            # Operator settings, resolved at APPLY time (#553). The stdio MCP
+            # process has no FastAPI app, so the AppState answers - the same
+            # repository and the same precedence the HTTP transport resolves
+            # through, because an apply must not depend on how it was started.
+            settings_source=state,
         )
         lifecycle._executor_ref = executor
 
@@ -532,6 +549,7 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     # admin route calls - report / checked_set / clear / run_probe - so the two
     # surfaces accept and refuse identically.
     "query_settings_overrides": handle_query_settings_overrides,
+    "query_guest_network": handle_query_guest_network,
     "set_setting_override": handle_set_setting_override,
     "clear_setting_override": handle_clear_setting_override,
     "probe_setting_override": handle_probe_setting_override,
@@ -672,6 +690,26 @@ async def run_server() -> None:
     ctx = await _bootstrap()
     await _server_context.async_update(ctx)
 
+    # stdio has no wire to present a credential on: the client IS the parent
+    # process, and the credential it supplies is the env block of its MCP server
+    # entry ("env": {"HP_MCP_TOKEN": "hp_..."} - which is exactly what `hp init`
+    # prints). So the same rule runs here: an API token wins its own tier, an
+    # hp_-prefixed token that does not verify is refused outright, and any other
+    # value is the legacy static secret at HP_MCP_TOKEN_SCOPE. With no token set
+    # at all the transport keeps its historical local-trust default (full).
+    presented = os.environ.get("HP_MCP_TOKEN", "").strip()
+    if presented:
+        legacy_scope = os.environ.get("HP_MCP_TOKEN_SCOPE", "").strip() or "full"
+        resolved = await resolve_mcp_credential(presented, presented, legacy_scope)
+        if resolved is None:
+            raise RuntimeError(
+                "HP_MCP_TOKEN does not authenticate: it looks like a HomePilot API "
+                "token but no live token matches it. Mint one in Settings -> Tokens."
+            )
+        tier, caller_id = resolved
+        _mcp_token_scope_var.set(tier)
+        _mcp_caller_id_var.set(caller_id if caller_id != "mcp-http" else "mcp-stdio")
+
     srv = create_server()
     async with stdio_server() as (read_stream, write_stream):
         try:
@@ -695,9 +733,109 @@ def main() -> None:
     asyncio.run(run_server())
 
 
+# How a resolved tool tier travels from the token verifier to the per-request
+# context: as a scope string on the verified AccessToken. The transport has no
+# other place to put per-request state that both middlewares can see.
+_TIER_SCOPE = "hp:tier:"
+
+
+def _caller_of(user: Any) -> str:
+    """Who the audit trail should name for this request.
+
+    The verifier records it on the AccessToken - "mcp-api:<prefix>" for an API
+    token, so an audited action names the credential that took it. Starlette's
+    SimpleUser has no client_id of its own, which is why reading it off the user
+    directly (as this used to) always fell back to the generic name.
+    """
+    access_token = getattr(user, "access_token", None)
+    client_id = getattr(access_token, "client_id", None) or getattr(user, "client_id", None)
+    return str(client_id) if client_id else "mcp-http"
+
+
+def _tier_of(user: Any, default_tier: str) -> str:
+    """The MCP tier the authenticated user's credential resolved to."""
+    for scope in getattr(user, "scopes", None) or []:
+        if isinstance(scope, str) and scope.startswith(_TIER_SCOPE):
+            return scope[len(_TIER_SCOPE) :]
+    return default_tier
+
+
+async def resolve_api_token_tier(raw_token: str) -> tuple[str, str] | None:
+    """Verify an API token and return (mcp_tier, caller_id), or None.
+
+    The SAME machinery the HTTP API authenticates with - prefix lookup, hash
+    compare, expiry, and the last_used stamp - reading the live repository, so a
+    revoked token (the row is deleted) stops working on its next call rather
+    than at the next restart. The scope is mapped to a tool tier through
+    auth.scopes.API_SCOPE_TO_MCP_TIER, the one map the tier<->scope parity gate
+    also reads.
+
+    Returns None when the token is not an API token, does not verify, has
+    expired, or carries no usable scope. It never falls back to anything: see
+    resolve_mcp_credential.
+    """
+    from ..auth.tokens import PREFIX_LENGTH, mcp_tier_for_token, validate_token
+
+    repo = _server_context.get("repo")
+    if repo is None:
+        return None
+    try:
+        row = await repo.get_token_by_prefix(raw_token[:PREFIX_LENGTH])
+    except Exception:
+        logger.warning("MCP token lookup failed", exc_info=True)
+        return None
+    if row is None or not validate_token(raw_token, row["hash"]):
+        return None
+    if row.get("expires_at"):
+        from datetime import UTC, datetime
+
+        try:
+            expires = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if expires <= datetime.now(UTC):
+            return None
+    tier = mcp_tier_for_token(row.get("scope"), row.get("role"))
+    if tier is None:
+        return None
+    with contextlib.suppress(Exception):
+        await repo.touch_token_last_used(row["id"])
+    return tier, f"mcp-api:{row.get('prefix', '')}"
+
+
+async def resolve_mcp_credential(
+    raw_token: str, legacy_token: str, legacy_scope: str
+) -> tuple[str, str] | None:
+    """The one credential rule both MCP transports authenticate by.
+
+    Precedence, and the reasoning for it:
+      1. An API token that verifies wins its OWN scope's tier. This is the way
+         in an operator is meant to use - mint an assistant a token in
+         Settings -> Tokens, revoke it there when the assistant is done.
+      2. A token that PRESENTS as an API token (the hp_ prefix) and does not
+         verify is refused outright - never handed to the legacy compare. Were
+         it otherwise, a revoked assistant token could quietly keep working by
+         happening to equal the static secret.
+      3. Anything else is compared against HP_MCP_TOKEN and, on a match, gets
+         HP_MCP_TOKEN_SCOPE. That is the legacy fallback, unchanged.
+      4. Anything else is refused.
+    """
+    import hmac as _hmac
+
+    from ..auth.tokens import PREFIX as _API_PREFIX
+
+    token = raw_token.strip()
+    if not token:
+        return None
+    if token.startswith(_API_PREFIX):
+        return await resolve_api_token_tier(token)
+    if legacy_token and _hmac.compare_digest(token, legacy_token):
+        return legacy_scope, "mcp-http"
+    return None
+
+
 def create_http_app(srv: Server) -> Any:
     import contextlib
-    import hmac as _hmac
 
     from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
     from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
@@ -747,61 +885,66 @@ def create_http_app(srv: Server) -> Any:
     # health by inspecting whether the session manager task group is running.
     starlette_app.state.session_manager = session_manager
 
-    if mcp_token:
+    # Auth is attached UNCONDITIONALLY. It used to depend on HP_MCP_TOKEN being
+    # set, which is what forced the operator to manage a static secret before the
+    # transport could be exposed at all. Now an API token authenticates here, so
+    # there is nothing left that an unauthenticated mount would be waiting for:
+    # with no credential configured, every request is simply refused.
 
-        class _TokenVerifier:
-            async def verify_token(self, token: str) -> AccessToken | None:
-                # Security note: MCP token is a static HMAC-compared value from
-                # HP_MCP_TOKEN env var. No expiry, no rotation — rotate by
-                # changing the env var and restarting the process.
-                if not _hmac.compare_digest(token, mcp_token):
-                    return None
-                return AccessToken(token=token, client_id="mcp-http", scopes=[])
+    class _TokenVerifier:
+        async def verify_token(self, token: str) -> AccessToken | None:
+            # An API token wins its own scope's tier (live revocation, expiry and
+            # a last_used stamp); HP_MCP_TOKEN remains the legacy static value at
+            # HP_MCP_TOKEN_SCOPE. See resolve_mcp_credential for the full rule.
+            resolved = await resolve_mcp_credential(token, mcp_token, mcp_scope)
+            if resolved is None:
+                return None
+            tier, caller_id = resolved
+            return AccessToken(token=token, client_id=caller_id, scopes=[_TIER_SCOPE + tier])
 
-        class _RequireAuthenticated(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next: Any) -> Any:
-                if not request.user.is_authenticated:
-                    return Response("Unauthorized", status_code=401)
-                return await call_next(request)
+    class _RequireAuthenticated(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next: Any) -> Any:
+            if not request.user.is_authenticated:
+                return Response("Unauthorized", status_code=401)
+            return await call_next(request)
 
-        class _InjectContext:
-            """ASGI middleware: sets per-request contextvars for MCP scope/caller.
+    class _InjectContext:
+        """ASGI middleware: sets per-request contextvars for MCP scope/caller.
 
-            Uses raw ASGI (not BaseHTTPMiddleware) to ensure contextvars
-            propagate correctly to downstream handlers without task isolation.
+        Uses raw ASGI (not BaseHTTPMiddleware) to ensure contextvars
+        propagate correctly to downstream handlers without task isolation.
 
-            Uses the token pattern for contextvars so values are scoped
-            to the request lifecycle and never persist across requests.
-            """
+        Uses the token pattern for contextvars so values are scoped
+        to the request lifecycle and never persist across requests.
 
-            def __init__(self, app: ASGIApp) -> None:
-                self.app = app
+        The tier comes from the credential this REQUEST presented (carried on the
+        verified AccessToken), not from the process environment - two clients
+        holding tokens of different scope must not share one tier.
+        """
 
-            async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-                if scope["type"] in ("http", "websocket"):
-                    request = Request(scope, receive)
-                    if hasattr(request, "user") and request.user.is_authenticated:
-                        client_id = (
-                            request.user.client_id
-                            if hasattr(request.user, "client_id") and request.user.client_id
-                            else "mcp-http"
-                        )
-                        caller_token = _mcp_caller_id_var.set(client_id)
-                        scope_token = _mcp_token_scope_var.set(mcp_scope)
-                        try:
-                            await self.app(scope, receive, send)
-                        finally:
-                            _mcp_caller_id_var.reset(caller_token)
-                            _mcp_token_scope_var.reset(scope_token)
-                        return
-                await self.app(scope, receive, send)
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
 
-        starlette_app.add_middleware(_InjectContext)
-        starlette_app.add_middleware(AuthContextMiddleware)
-        starlette_app.add_middleware(_RequireAuthenticated)
-        starlette_app.add_middleware(
-            AuthenticationMiddleware, backend=BearerAuthBackend(_TokenVerifier())
-        )
+        async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+            if scope["type"] in ("http", "websocket"):
+                request = Request(scope, receive)
+                if hasattr(request, "user") and request.user.is_authenticated:
+                    caller_token = _mcp_caller_id_var.set(_caller_of(request.user))
+                    scope_token = _mcp_token_scope_var.set(_tier_of(request.user, mcp_scope))
+                    try:
+                        await self.app(scope, receive, send)
+                    finally:
+                        _mcp_caller_id_var.reset(caller_token)
+                        _mcp_token_scope_var.reset(scope_token)
+                    return
+            await self.app(scope, receive, send)
+
+    starlette_app.add_middleware(_InjectContext)
+    starlette_app.add_middleware(AuthContextMiddleware)
+    starlette_app.add_middleware(_RequireAuthenticated)
+    starlette_app.add_middleware(
+        AuthenticationMiddleware, backend=BearerAuthBackend(_TokenVerifier())
+    )
 
     return starlette_app
 
@@ -809,15 +952,13 @@ def create_http_app(srv: Server) -> Any:
 async def run_server_http(host: str = "0.0.0.0", port: int = 8000) -> None:
     import uvicorn
 
-    # Hard startup guard (#385): the HTTP transport binds a network port
-    # (0.0.0.0 by default). Auth is only attached when HP_MCP_TOKEN is set, so
-    # binding without it would expose the full MCP tool surface unauthenticated.
-    # Refuse to start rather than serve an open control plane.
-    if not os.environ.get("HP_MCP_TOKEN", "").strip():
-        raise RuntimeError(
-            "Refusing to start the HTTP MCP transport without HP_MCP_TOKEN: the "
-            "bind would be unauthenticated. Set HP_MCP_TOKEN and restart."
-        )
+    # The hard startup guard (#385) protected against a bind with no auth
+    # middleware attached, which is no longer reachable: create_http_app attaches
+    # it unconditionally now, and a process with no HP_MCP_TOKEN refuses every
+    # request that does not present a valid API token. Starting with no static
+    # secret is therefore a supported configuration - it is how an operator runs
+    # the transport on API tokens alone - and TestHttpTransportNeverUnauthenticated
+    # holds the invariant that replaced the guard.
 
     ctx = await _bootstrap()
     await _server_context.async_update(ctx)

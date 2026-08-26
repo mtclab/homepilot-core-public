@@ -110,8 +110,12 @@
 					<p class="text-xs text-muted">{envLockNote(s)}</p>
 				{:else if canWrite}
 					<div class="flex items-center gap-2 flex-wrap">
+						<!-- The description below is ATTACHED to the input, not merely
+						     printed near it (#549 F7): a screen reader reads it with the
+						     field, and the explains-walk gate resolves it the same way. -->
 						<input
 							id={`setting-${s.key}`}
+							aria-describedby={`setting-note-${s.key}`}
 							class="input w-64"
 							type={s.type === 'int' ? 'number' : 'text'}
 							value={draftFor(s)}
@@ -137,7 +141,9 @@
 				{:else}
 					<p class="text-xs font-mono text-ink">{s.value === '' ? '(empty)' : s.value}</p>
 				{/if}
-				<p class="prose-note prose-measure text-xs">{s.description}</p>
+				<p class="prose-note prose-measure text-xs" id={`setting-note-${s.key}`}>
+					{s.description}
+				</p>
 				{#if s.source === 'db'}
 					<p class="text-xs text-muted">Saved here, in this instance's database.</p>
 				{/if}

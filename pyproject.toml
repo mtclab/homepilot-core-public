@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "3.5.1"
+version = "3.6.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -38,7 +38,21 @@ dependencies = [
     "aiohttp>=3.14.0",
     "sse-starlette>=1.6",
     "prometheus-client>=0.21",
+    # The estate's own Proxmox library (repo mtclab/proxmox-mcp, mirrored public
+    # as proxmox-mcp-public). HomePilot does NOT re-implement PVE endpoints: SDN
+    # zones/vnets/subnets, the apply, and the per-VM firewall all live there, and
+    # a second copy of an endpoint path here is a second place to fix when PVE
+    # changes one. HomePilot's own ProxmoxClient keeps what it already does
+    # (clone, power, status) and gains no new endpoint knowledge.
+    #
+    # Sourced from the PUBLIC mirror below rather than the private repo, because
+    # the Docker image builds from `uv export` and must resolve without a
+    # credential. Pinned by rev in uv.lock, so a build is reproducible.
+    "homepilot-proxmox-mcp>=0.3",
 ]
+
+[tool.uv.sources]
+homepilot-proxmox-mcp = { git = "https://github.com/mtclab/proxmox-mcp-public.git", rev = "386cfb2a0237c8491260a93f8324a0e52168e4a9" }
 
 [project.optional-dependencies]
 dev = [
@@ -96,6 +110,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "aiohttp"
+ignore_missing_imports = true
+
+# The estate's own Proxmox library ships no py.typed marker yet. Scoped to the
+# one adapter that imports it (adapters/pve_sdn.py) by naming the package, so
+# nothing else in this codebase loses type checking - and it is a real upstream
+# TODO rather than a permanent exemption.
+[[tool.mypy.overrides]]
+module = "proxmox_mcp.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

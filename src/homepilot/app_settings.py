@@ -138,6 +138,44 @@ def _parse_ipconfig(raw: Any) -> str:
     return value
 
 
+def _zero_or_one(raw: Any) -> int:
+    """A switch stored as a number (#553 guest network).
+
+    The registry stores strings, and "on"/"off" has to survive the round trip as
+    something a consumer can act on without guessing. 0 and 1 are the whole
+    domain: anything else is refused rather than truthified, because "2" meaning
+    "on" is exactly the kind of quiet reinterpretation a firewall setting must
+    not do.
+    """
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    text = "" if raw is None else str(raw).strip().lower()
+    if text in ("", "0", "false", "no", "off"):
+        return 0
+    if text in ("1", "true", "yes", "on"):
+        return 1
+    raise SettingError("expected 0 or 1")
+
+
+def _parse_cidr_list(raw: Any) -> str:
+    """A comma-separated list of IPv4 CIDRs, normalised, or the empty string.
+
+    Parsed here rather than only at use time: this list IS the fence, and a
+    typo in it is a network a guest can still reach. Stored back in one
+    canonical spelling so the value an operator reads is the value the rules
+    are built from.
+    """
+    from .provision.guest_network import GuestNetworkError, split_cidrs, validate_network
+
+    parts = split_cidrs(raw)
+    if not parts:
+        return ""
+    try:
+        return ",".join(str(validate_network(part, "isolate cidr")) for part in parts)
+    except GuestNetworkError as exc:
+        raise SettingError(str(exc)) from exc
+
+
 def _cluster_probe(key: str) -> ProbeFn:
     """The live check for one setting, bound at CALL time (#553 C3).
 
@@ -312,6 +350,123 @@ REGISTRY: dict[str, SettingSpec] = {
             hot_reloadable=True,
             parse=_parse_ipconfig,
             probe=_cluster_probe("provision_default_ipconfig"),
+        ),
+        # ── The guest network (#553) ─────────────────────────────────────────
+        # What the guest subnet IS. Together these are the desired state a
+        # `guest-network` artifact carries when a propose leaves a field out,
+        # and the fence the provision service writes per VM. The probes are
+        # LOCAL shape checks and say so - there is no cluster question to ask
+        # about a subnet that does not exist yet, and the cluster is asked by
+        # the survey/plan on GET /admin/guest-network instead.
+        SettingSpec(
+            key="guest_network_zone",
+            type_="str",
+            description=(
+                "SDN zone the guest network lives in. Created as a 'simple' zone with "
+                "dnsmasq DHCP when the guest-network artifact is applied. 1-8 lower-case "
+                "letters and digits, because PVE stores it in an 8-character field."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_zone"),
+        ),
+        SettingSpec(
+            key="guest_network_vnet",
+            type_="str",
+            description=(
+                "Vnet guests attach to - the bridge name their NIC gets. Setting "
+                "provision_default_bridge to this name is what makes a provisioned guest "
+                "land on the guest network and get its per-VM fence."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_vnet"),
+        ),
+        SettingSpec(
+            key="guest_network_subnet",
+            type_="str",
+            description=(
+                "The guest subnet in CIDR form, e.g. 10.96.17.0/24. Empty means this "
+                "instance describes no guest network: nothing is surveyed, nothing is "
+                "planned, and provisioning writes no fence."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_subnet"),
+        ),
+        SettingSpec(
+            key="guest_network_gateway",
+            type_="str",
+            description=(
+                "The address the guest subnet routes through, which must be INSIDE the "
+                "subnet above. It is also the only host a fenced guest may talk to, and "
+                "then only for DHCP and DNS."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_gateway"),
+        ),
+        SettingSpec(
+            key="guest_network_snat",
+            type_="int",
+            description=(
+                "1 to source-NAT guest traffic out of the node, so guests reach the "
+                "internet without the rest of the network knowing about their subnet. "
+                "0 leaves routing to the operator."
+            ),
+            hot_reloadable=True,
+            parse=_zero_or_one,
+        ),
+        SettingSpec(
+            key="guest_network_dhcp",
+            type_="int",
+            description=(
+                "1 to have the zone run dnsmasq and hand out addresses from the range "
+                "below. Needs the dnsmasq package on the node - the apply repeats the "
+                "cluster's own words if it is missing. 0 means guests are addressed by "
+                "cloud-init alone."
+            ),
+            hot_reloadable=True,
+            parse=_zero_or_one,
+        ),
+        SettingSpec(
+            key="guest_network_dhcp_range",
+            type_="str",
+            description=(
+                "The addresses DHCP may hand out, as '<start>-<end>', e.g. "
+                "10.96.17.100-10.96.17.199. Both ends must be inside the subnet and "
+                "neither may be the gateway."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_dhcp_range"),
+        ),
+        SettingSpec(
+            key="guest_network_dhcp_dns_server",
+            type_="str",
+            description=(
+                "Resolver handed to guests by DHCP. Empty means the gateway resolves for "
+                "them, which is what the fence allows; naming an address here means also "
+                "allowing it, so leave it empty unless you know you need it."
+            ),
+            hot_reloadable=True,
+            parse=_parse_str,
+            probe=_cluster_probe("guest_network_dhcp_dns_server"),
+        ),
+        SettingSpec(
+            key="guest_network_isolate_cidrs",
+            type_="str",
+            description=(
+                "The networks a guest must never reach, comma separated - "
+                "typically the operator LAN. This is the fence: every provisioned "
+                "guest on the guest vnet gets a per-VM DROP towards each of these. "
+                "EMPTY refuses to provision onto the guest vnet at all: a shipped "
+                "default cannot know your LAN, so the fence must be named before "
+                "the first guest."
+            ),
+            hot_reloadable=True,
+            parse=_parse_cidr_list,
+            probe=_cluster_probe("guest_network_isolate_cidrs"),
         ),
     )
 }
@@ -606,13 +761,22 @@ async def probe_context(state: Any, resolver: SettingsResolver | None = None) ->
     resolver = resolver or resolver_from_state(state)
     node = ""
     bridge = ""
+    guest_subnet = ""
     if resolver is not None:
         try:
             node = str(await resolver.value("provision_default_node") or "")
             bridge = str(await resolver.value("provision_default_bridge") or "")
+            # A gateway and a DHCP range are only checkable against a subnet, so
+            # the one in force rides along exactly as the node does for bridges.
+            guest_subnet = str(await resolver.value("guest_network_subnet") or "")
         except Exception:  # pragma: no cover - a probe never fails on context
             logger.debug("Could not resolve the probe context", exc_info=True)
-    return ProbeContext(proxmox=_proxmox_from(state), node=node, bridge=bridge)
+    return ProbeContext(
+        proxmox=_proxmox_from(state),
+        node=node,
+        bridge=bridge,
+        guest_subnet=guest_subnet,
+    )
 
 
 async def run_probe(state: Any, key: str, raw: Any) -> ProbeResult | None:

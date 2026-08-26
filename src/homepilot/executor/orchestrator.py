@@ -22,6 +22,7 @@ from homepilot.vault.manager import VaultManager
 
 from .ansible import execute as ansible_execute
 from .composite import execute as composite_execute
+from .guest_network import execute as guest_network_execute
 from .host_provision import execute as host_provision_execute
 from .http_sequence import execute as http_sequence_execute
 from .kb_note import execute as kb_note_execute
@@ -64,6 +65,7 @@ class ArtifactExecutor:
         vault: VaultManager,
         pve_nodes: list[str] | None = None,
         agent: AgentAdapter | None = None,
+        settings_source: Any = None,
     ):
         self.store = store
         self.lifecycle = lifecycle
@@ -72,6 +74,16 @@ class ArtifactExecutor:
         self.vault = vault
         self.pve_nodes = pve_nodes or []
         self.agent = agent
+        # Where operator settings are resolved from at APPLY time (#553). None
+        # falls back to the process-wide resolver, which is what a CLI apply and
+        # the unit tests get - and which honestly answers "nothing configured"
+        # when there is no database.
+        self.settings_source = settings_source
+        # The PVE SDN/firewall gateway (the estate's proxmox_mcp library). Built
+        # lazily from the Proxmox client's own credentials so there is ONE
+        # configuration surface, and settable so a test can drive an apply
+        # against a fake cluster at that boundary.
+        self.sdn_gateway: Any = None
 
     @property
     def host_adapter(self) -> AgentAdapter:
@@ -284,6 +296,13 @@ class ArtifactExecutor:
             # would have nothing to invert to (#426). Persisted even on FAILURE:
             # a partial apply is exactly when putting the host back matters most.
             await self._store_pre_state(str(fm.get("id", "")), result.pop("pre_state", None))
+        elif kind == ArtifactKind.GUEST_NETWORK:
+            # The settings source is the app state when there is one: the desired
+            # guest network a body leaves unstated comes from THIS instance's
+            # settings, resolved at apply time like every other C2 consumer.
+            result = await guest_network_execute(
+                fm, body, target, self.proxmox, self.settings_source, self.sdn_gateway
+            )
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:

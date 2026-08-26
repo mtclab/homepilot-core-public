@@ -392,7 +392,7 @@ hp export                     # export DB + artifacts as tarball (NO secrets - c
 hp import <file>              # restore from tarball (stop the backend first)
 hp policy init                # global interactive onboarding to seed the policy KB
 hp kb reindex                 # rebuild KB search index from artifacts
-hp token create               # create an API token
+hp token create               # mint an API token (needs an admin credential - see below)
 hp token list                 # list API tokens (prefix, label, scope, last-used)
 hp token revoke               # revoke an API token by its prefix
 hp invite create              # mint a one-time, CN-bound self-service provisioning invite
@@ -416,7 +416,20 @@ hp agent revoke               # revoke an agent's per-agent credential
 hp agent remove <id>          # forget a decommissioned agent (revokes its credential, then deletes the row)
 ```
 
+## Tokens
+
+Tokens are minted by admins. The browser claim hands you the one token you keep - everything else is created through the API by someone already holding an admin credential:
+
+- **Settings -> Tokens** in the console: you are signed in with an admin token, and that is the whole authorisation. Nothing else is asked for.
+- **`hp token create`** on the box: authenticates to the running backend the same way `hp agent` does, using `HP_ADMIN_TOKEN`, the box's own autocreated `~/.hp/api-token` (written by `hp init` and by the claim), or the vault's admin secret.
+
+The old unauthenticated direct-DB mint survives for exactly one case: an instance with **zero live tokens**, which has no admin to mint through. With a live token present, `hp token create` refuses and names the rule.
+
 ## MCP Server
+
+An MCP client signs in with an API token like any other client - mint it in Settings -> Tokens, paste it into the client config, revoke it there when you are done. The token's scope picks its tool tier (`read` -> read_only, `write` -> full, `admin` -> admin), revocation takes effect on the next call, and the call is stamped on the token's last-used.
+
+`HP_MCP_TOKEN` still works as the legacy static fallback, at `HP_MCP_TOKEN_SCOPE`.
 
 **stdio** (local, Claude Code / opencode on the same machine):
 
@@ -427,7 +440,11 @@ hp mcp-serve
 ```json
 {
   "mcpServers": {
-    "homepilot": { "command": "hp", "args": ["mcp-serve"] }
+    "homepilot": {
+      "command": "hp",
+      "args": ["mcp-serve"],
+      "env": { "HP_MCP_TOKEN": "<api token>" }
+    }
   }
 }
 ```
@@ -435,7 +452,7 @@ hp mcp-serve
 **HTTP** (remote server — recommended when AI client runs elsewhere, e.g. Kasm workspace):
 
 ```bash
-HP_MCP_TOKEN=<secret> hp mcp-serve --transport http --host 0.0.0.0 --port 8000
+hp mcp-serve --transport http --host 0.0.0.0 --port 8000
 ```
 
 ```json
@@ -443,7 +460,7 @@ HP_MCP_TOKEN=<secret> hp mcp-serve --transport http --host 0.0.0.0 --port 8000
   "mcpServers": {
     "homepilot": {
       "url": "http://<homelab-ip>:8000/mcp",
-      "headers": { "Authorization": "Bearer <secret>" }
+      "headers": { "Authorization": "Bearer <api token>" }
     }
   }
 }

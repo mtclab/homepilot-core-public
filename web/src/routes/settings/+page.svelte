@@ -12,6 +12,7 @@
 	// operator can see which of the three is in force.
 	import AlertRules from '$lib/components/AlertRules.svelte';
 	import SettingFields from '$lib/components/SettingFields.svelte';
+	import GuestNetworkCard from '$lib/components/GuestNetworkCard.svelte';
 	import GuestsPanel from '$lib/components/GuestsPanel.svelte';
 	import TokensPanel from '$lib/components/TokensPanel.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
@@ -620,6 +621,15 @@
 						<!-- Configuration with no probe behind it: nothing to reach, so the
 						     self-check says nothing about it, and it would otherwise be the
 						     one thing an operator cannot find here. -->
+						<!-- The guest network: settings, survey and plan on ONE card,
+						     because a subnet setting means nothing without what the
+						     cluster currently has. -->
+						<GuestNetworkCard
+							overrides={overrides}
+							canWrite={isAdminUser}
+							onSaved={loadOverrides}
+						/>
+
 						{#each EXTRA_GROUPS as group (group.id)}
 							{#if settingsFor(overrides, group.keys).length}
 								<div class="card space-y-2">

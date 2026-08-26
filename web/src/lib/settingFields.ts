@@ -58,7 +58,29 @@ const FIELD_LABELS: Record<string, string> = {
 	provision_default_bridge: 'Bridge',
 	provision_default_vlan_tag: 'VLAN tag (0 = untagged)',
 	provision_default_ipconfig: 'ipconfig0',
+	guest_network_zone: 'SDN zone',
+	guest_network_vnet: 'Vnet (the bridge guests get)',
+	guest_network_subnet: 'Subnet (CIDR)',
+	guest_network_gateway: 'Gateway',
+	guest_network_snat: 'SNAT (1 = on)',
+	guest_network_dhcp: 'DHCP (1 = on)',
+	guest_network_dhcp_range: 'DHCP range (start-end)',
+	guest_network_dhcp_dns_server: 'DNS server handed to guests',
+	guest_network_isolate_cidrs: 'Never reachable from a guest',
 };
+
+/** The eight settings that describe the guest network, in the order they are set. */
+export const GUEST_NETWORK_KEYS: string[] = [
+	'guest_network_subnet',
+	'guest_network_gateway',
+	'guest_network_zone',
+	'guest_network_vnet',
+	'guest_network_snat',
+	'guest_network_dhcp',
+	'guest_network_dhcp_range',
+	'guest_network_dhcp_dns_server',
+	'guest_network_isolate_cidrs',
+];
 
 export function fieldLabel(key: string): string {
 	return FIELD_LABELS[key] || key.replace(/_/g, ' ');
@@ -78,6 +100,9 @@ export function unplacedSettings(all: SettingOverride[], subsystemNames: string[
 	for (const group of EXTRA_GROUPS) {
 		for (const key of group.keys) placed.add(key);
 	}
+	// The guest-network settings live on their own card, which renders them next
+	// to the survey and the plan they describe rather than in this list.
+	for (const key of GUEST_NETWORK_KEYS) placed.add(key);
 	return all.filter((s) => !placed.has(s.key));
 }
 

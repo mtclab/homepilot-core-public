@@ -12,7 +12,6 @@
 	let showCreate = false;
 	let newLabel = '';
 	let newScope = 'full';
-	let adminSecret = '';
 	let createdToken = '';
 	let creating = false;
 	let revoking: string | null = null;
@@ -47,19 +46,14 @@
 	}
 
 	async function createToken() {
-		if (!adminSecret.trim()) {
-			notify('Admin secret is required', 'err');
-			return;
-		}
 		creating = true;
 		createdToken = '';
 		try {
-			const res = await api.createToken(newLabel.trim() || 'admin', newScope, adminSecret.trim());
+			const res = await api.createToken(newLabel.trim() || 'admin', newScope);
 			createdToken = res.token;
 			notify('Token created — copy it now, it will not be shown again', 'ok');
 			newLabel = '';
 			newScope = 'full';
-			adminSecret = '';
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
@@ -142,7 +136,9 @@
 		<span class="font-mono">admin</span> can also manage tokens and secrets - so
 		give each token the smallest one that does its job. A new token is shown
 		once, here; only a prefix and a hash of it are stored, so a lost token is
-		revoked and replaced rather than looked up.
+		revoked and replaced rather than looked up. An MCP client is no exception:
+		mint it a token here, paste that into the client's config, and revoking it
+		here cuts the assistant off on its next call.
 	</p>
 
 	{#if showCreate}
@@ -180,23 +176,10 @@
 				</div>
 			</div>
 
-			<div>
-				<label class="field-label block mb-1">
-					<span class="block mb-1">Admin Secret (HP_VAULT_PASSPHRASE)</span>
-					<input
-						type="password"
-						class="input text-sm w-full font-mono"
-						placeholder="Required to create tokens"
-						bind:value={adminSecret}
-						required
-					/>
-				</label>
-				<p class="prose-note prose-measure text-xs mt-1">
-					The vault passphrase, from the server's <span class="font-mono">HP_VAULT_PASSPHRASE</span>
-					environment variable. Minting a credential asks for it on top of your
-					admin session, so a borrowed browser cannot mint one.
-				</p>
-			</div>
+			<p class="prose-note prose-measure text-xs">
+				Minting is authorised by this session: you are signed in with an admin
+				token, and only an admin can create one. Nothing else is asked for.
+			</p>
 
 			<div class="flex justify-end">
 				<button class="btn btn-primary text-xs" type="submit" disabled={creating}>

@@ -12,6 +12,12 @@ from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
 from .defaults import ProvisioningDefaults, provisioning_defaults
+from .guest_network import (
+    DesiredGuestNetwork,
+    desired_from_settings,
+    fence_rules,
+    gateway_for,
+)
 from .models import ProvisionRequest
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,11 @@ class ProvisionService:
         # snapshot - the settings are hot-reloadable and a cached copy would
         # make that claim false.
         self.defaults_source = defaults_source
+        # The PVE firewall gateway (the estate's proxmox_mcp library) the per-VM
+        # fence is written through. Built from the Proxmox client's own
+        # credentials when it is needed; settable so a fence journey can be
+        # driven against a fake cluster at that boundary.
+        self.sdn_gateway: Any = None
         self.task_repo = task_repo
         self.repo = repo
         self.poll_interval = poll_interval
@@ -169,6 +180,11 @@ class ProvisionService:
         vmid: int | None = None
         clone_issued = False
         inflight_upid: str | None = None
+        # The per-VM firewall this run actually wrote, for the provision record.
+        # None means no fence was applied - the result says so rather than
+        # leaving the question open.
+        fence: DesiredGuestNetwork | None = None
+        applied_rules: list[dict[str, Any]] | None = None
         try:
             await self.task_repo.update_task_status(task_id, "running")
             proxmox = self.proxmox
@@ -200,9 +216,31 @@ class ProvisionService:
 
             step = "configure"
             defaults = await provisioning_defaults(self.defaults_source)
-            config = self._build_config(request, defaults)
+            # Resolved BEFORE the NIC is written, because the fence decides
+            # whether net0 carries `firewall=1` at all - a NIC configured
+            # without it cannot be fenced afterwards without a second write.
+            fence = await self._resolve_fence(defaults)
+            config = self._build_config(request, defaults, fence is not None)
             if config:
                 await proxmox.set_vm_config(request.node, vmid, config)
+
+            # The fence goes on BEFORE the guest boots. A guest that comes up on
+            # the guest vnet with no rules is on the operator's LAN for as long
+            # as it takes to notice, and "we added the rules a second later" is
+            # not a property anybody can rely on.
+            if fence is not None:
+                step = "fence"
+                try:
+                    applied_rules = await self._fence_guest(request, vmid, fence)
+                except Exception as exc:
+                    # LOUD, and the guest goes away. Anything else ships a
+                    # machine onto the guest wire with the operator's LAN in
+                    # reach, which is the one outcome the guest network exists
+                    # to make impossible.
+                    outcome = await self._destroy_unfenced(request, vmid)
+                    raise RuntimeError(
+                        f"could not write the guest firewall rules ({exc}); {outcome}"
+                    ) from exc
 
             if request.disk_gb is not None:
                 # PVE resize is grow-only and refuses a shrink; we cannot know the
@@ -247,6 +285,14 @@ class ProvisionService:
                 # re-deriving (and possibly mis-stating) it.
                 "ciuser": request.ciuser,
                 "tailnet": tailnet,
+                # What fences this guest, in full. An operator asking "is my
+                # friend's box walled off" gets the ruleset that was applied,
+                # not a boolean they have to trust.
+                "guest_network_fence": (
+                    None
+                    if fence is None or applied_rules is None
+                    else {"vnet": fence.vnet, "rules": applied_rules}
+                ),
             }
             await self.task_repo.update_task_status(
                 task_id, "succeeded", result_json=json.dumps(result)
@@ -349,8 +395,97 @@ class ProvisionService:
             )
         await self._audit(actor, request, "provision_cancelled", outcome)
 
+    async def _resolve_fence(self, defaults: ProvisioningDefaults) -> DesiredGuestNetwork | None:
+        """The guest network this provision must fence against, or None.
+
+        None - do not fence - is the answer in two ordinary cases: this
+        instance describes no guest network, or the guest is not being put on
+        the guest vnet (an operator VM on vmbr0 must NOT get a fence that
+        would cut it off).
+
+        An EMPTY isolate list is NOT one of them. The code default is empty
+        (a shipped default cannot name any particular operator's LAN - the
+        public build's scrub proved that by silently rewriting one), so empty
+        is what an unconfigured instance looks like, and provisioning onto
+        the guest wire unfenced is the one outcome this exists to prevent.
+        So: guest vnet + nothing to isolate = REFUSE, and the message says
+        which setting to fill. Unusable settings raise for the same reason.
+        """
+        desired = await desired_from_settings(self.defaults_source)
+        if desired is None:
+            return None
+        if (defaults.bridge or "").strip() != desired.vnet:
+            return None
+        if not desired.isolate_cidrs:
+            raise ValueError(
+                "refusing to provision onto the guest vnet "
+                f"{desired.vnet!r} with no isolation CIDRs configured - set "
+                "guest_network_isolate_cidrs (typically the operator LAN) "
+                "before provisioning guests, or provision onto another bridge"
+            )
+        return desired
+
+    async def _fence_guest(
+        self,
+        request: ProvisionRequest,
+        vmid: int,
+        fence: DesiredGuestNetwork,
+    ) -> list[dict[str, Any]]:
+        """Write the per-VM firewall that actually holds, and fail loudly if it does not.
+
+        This is the enforced fence. Vnet firewall rules are the tidier place for
+        the same intent, but the legacy iptables stack this estate runs stores
+        them without applying them to vnet forward traffic; the per-VM (tap
+        level) rules are enforced by both stacks, so they are what stands
+        between a friend's machine and the operator's LAN.
+
+        `policy_out: ACCEPT` with explicit DROPs, rather than a default-DROP
+        policy, on purpose: the guest must reach the internet. What it must not
+        reach is enumerated, in order, and the ACCEPTs for DHCP and DNS to the
+        gateway come first because the DROPs below cover the gateway too.
+
+        Any failure raises. A half-fenced guest is the exact thing this exists
+        to prevent, and the caller destroys the guest rather than starting it.
+        """
+        gateway = self.sdn_gateway or gateway_for(self.proxmox)
+        if gateway is None:  # pragma: no cover - the caller checked
+            raise RuntimeError("Proxmox not configured")
+        await gateway.set_vm_firewall_options(
+            node=request.node, vmid=vmid, enable=1, policy_out="ACCEPT"
+        )
+        applied: list[dict[str, Any]] = []
+        for position, rule in enumerate(fence_rules(fence, "out")):
+            body = {**rule, "pos": position}
+            await gateway.create_vm_firewall_rule(node=request.node, vmid=vmid, **body)
+            applied.append(body)
+        return applied
+
+    async def _destroy_unfenced(self, request: ProvisionRequest, vmid: int) -> str:
+        """Take back a guest whose fence could not be written.
+
+        The guest is still stopped at this point (the fence runs before the
+        start), so this is a plain destroy. If it fails, the failure rides into
+        the task error by name: an unfenced guest left on the guest wire is
+        something an operator must be told about in words, not a log line.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return "no Proxmox client to destroy with"
+        try:
+            await proxmox.delete_vm(request.node, vmid)
+        except Exception as exc:
+            logger.error("Could not destroy the unfenced guest %s: %s", vmid, exc)
+            return (
+                f"and the guest could NOT be destroyed ({exc}); vmid {vmid} may still "
+                f"be on {request.node}, unfenced"
+            )
+        return "the half-made guest was destroyed"
+
     def _build_config(
-        self, request: ProvisionRequest, defaults: ProvisioningDefaults | None = None
+        self,
+        request: ProvisionRequest,
+        defaults: ProvisioningDefaults | None = None,
+        fenced: bool = False,
     ) -> dict[str, Any]:
         config: dict[str, Any] = {
             "name": request.name,
@@ -364,7 +499,11 @@ class ProvisionService:
         # nothing about its network must not start rewriting NICs.
         net0 = defaults.net0 if defaults is not None else None
         if net0 is not None:
-            config["net0"] = net0
+            # `firewall=1` on the NIC is what makes PVE attach the per-VM rules
+            # to the tap at all: without it the rules are stored and inert, and
+            # the guest is on the operator's LAN with a firewall page that looks
+            # right.
+            config["net0"] = f"{net0},firewall=1" if fenced else net0
         if request.ssh_authorized_key is not None:
             config["sshkeys"] = request.ssh_authorized_key
         if request.cores is not None:

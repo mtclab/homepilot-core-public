@@ -32,6 +32,7 @@ class ProxmoxClient:
         self._token = token
         self._write_token = write_token or token
         self._has_separate_write = write_token is not None and write_token != token
+        self._verify_ssl = verify_ssl
         verify = verify_ssl
         self._client = httpx.AsyncClient(
             base_url=f"{self._base_url}/api2/json",
@@ -48,6 +49,27 @@ class ProxmoxClient:
             )
         else:
             self._write_client = self._client
+
+    def credentials(self) -> Any:
+        """This client's own connection details, for building a sibling client.
+
+        The guest-network work talks to PVE through the estate's
+        ``proxmox_mcp`` library rather than through this class (which gains no
+        new endpoint knowledge, by owner mandate), and that library needs the
+        same host and the same tokens. Handing them over here is what keeps
+        ONE configuration surface instead of two.
+
+        Carries live secrets: never log it, never put it in a response, never
+        serialise it. It exists to be passed to a client constructor.
+        """
+        from .pve_sdn import PveCredentials
+
+        return PveCredentials(
+            base_url=self._base_url,
+            token=self._token,
+            write_token=self._write_token,
+            verify_ssl=self._verify_ssl,
+        )
 
     async def call(
         self,

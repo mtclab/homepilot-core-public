@@ -261,6 +261,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 proxmox=state.proxmox,
                 vault=state.vault,
                 agent=agent_adapter,
+                # Operator settings, resolved at APPLY time (#553): a
+                # guest-network artifact fills the fields its body leaves out
+                # from this instance's guest_network_* settings, through the
+                # same resolver the Settings UI writes to.
+                settings_source=app.state,
             )
     except (ImportError, OSError, ConnectionError):
         logger.warning("Could not initialize artifact executor", exc_info=True)
@@ -445,102 +450,106 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     mcp_app: Any = None
     app.state.mcp_app = None
     app.state.mcp_running = False
-    mcp_token = os.environ.get("HP_MCP_TOKEN", "").strip()
-    if mcp_token:
-        from .mcp.server import _server_context, create_http_app, create_server
+    # The MCP transport is always mounted. Its auth is no longer conditional on
+    # HP_MCP_TOKEN: a client authenticates with an API token minted in
+    # Settings -> Tokens (the env var is the legacy static fallback), so gating
+    # the mount on that env var only hid the transport from the operator who had
+    # already minted themselves a credential for it.
+    from .mcp.server import _server_context, create_http_app, create_server
 
-        srv = create_server()
+    srv = create_server()
 
-        # Best-effort PVE node list for host-targeted tools.
-        if state.proxmox is not None:
-            try:
-                pve_data = await state.proxmox.read("/nodes")
-                pve_nodes = [
-                    n.get("node") or n.get("name", "")
-                    for n in (
-                        pve_data.get("data", pve_data) if isinstance(pve_data, dict) else pve_data
-                    )
-                ]
-                state.artifact_lifecycle._pve_nodes_list = pve_nodes
-            except (httpx.HTTPError, OSError, ConnectionError):
-                state.artifact_lifecycle._pve_nodes_list = []
+    # Best-effort PVE node list for host-targeted tools.
+    if state.proxmox is not None:
+        try:
+            pve_data = await state.proxmox.read("/nodes")
+            pve_nodes = [
+                n.get("node") or n.get("name", "")
+                for n in (
+                    pve_data.get("data", pve_data) if isinstance(pve_data, dict) else pve_data
+                )
+            ]
+            state.artifact_lifecycle._pve_nodes_list = pve_nodes
+        except (httpx.HTTPError, OSError, ConnectionError):
+            state.artifact_lifecycle._pve_nodes_list = []
 
-        # Host ops (read_file_on_guest / exec_on_guest_readonly) route through the
-        # agent hub. Build the SAME adapter the stdio bootstrap uses so those tools
-        # resolve over the HTTP transport, not only over stdio (#385). The adapter
-        # depends only on the hub, independent of Proxmox/vault, so build it
-        # whenever a hub exists — not just inside the Proxmox+vault branch.
-        mcp_agent = None
-        if state.agent_hub is not None:
-            from .adapters.agent import AgentAdapter
+    # Host ops (read_file_on_guest / exec_on_guest_readonly) route through the
+    # agent hub. Build the SAME adapter the stdio bootstrap uses so those tools
+    # resolve over the HTTP transport, not only over stdio (#385). The adapter
+    # depends only on the hub, independent of Proxmox/vault, so build it
+    # whenever a hub exists — not just inside the Proxmox+vault branch.
+    mcp_agent = None
+    if state.agent_hub is not None:
+        from .adapters.agent import AgentAdapter
 
-            mcp_agent = AgentAdapter(
-                hub_server=state.agent_hub,
-                pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
-            )
-
-        if state.proxmox and state.vault:
-            from .executor import ArtifactExecutor
-
-            executor = ArtifactExecutor(
-                store=state.artifact_store,
-                lifecycle=state.artifact_lifecycle,
-                repo=state.repo,
-                proxmox=state.proxmox,
-                vault=state.vault,
-                pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
-                agent=mcp_agent,
-            )
-            state.artifact_lifecycle._executor_ref = executor
-
-        # The HTTP tool context MUST carry the same keys the stdio bootstrap builds,
-        # or agent_adapter/drift_reconciler-backed tools error in every HTTP
-        # deployment (#385: read_file_on_guest, exec_on_guest_readonly,
-        # check_artifact_drift). drift_reconciler is the same instance the
-        # reconciler scheduler uses (built above).
-        await _server_context.async_update(
-            {
-                "store": state.artifact_store,
-                "lifecycle": state.artifact_lifecycle,
-                "repo": state.repo,
-                "proxmox": state.proxmox,
-                "vault": state.vault,
-                "database": state.database,
-                "kb_service": state.kb_service,
-                "inventory_service": inventory_service,
-                "task_repo": task_repo,
-                "agent_adapter": mcp_agent,
-                "drift_reconciler": drift_reconciler,
-                # The hub's live registry, for `check_host_reachable` (#427).
-                "agent_registry": get_agent_registry(),
-                # Read-parity wave 1: the MCP read tools answer from the SAME
-                # repos/services the management routes use. `app_state` is what
-                # the selfcheck and Proxmox-settings reports take, and
-                # `invite_repo`/`settings` were simply MISSING from this context
-                # while the stdio bootstrap had them - so `query_guests` over
-                # HTTP MCP reported an empty invite list.
-                "settings": settings,
-                "metrics_repo": state.metrics_repo,
-                "invite_repo": app.state.invite_repo,
-                "app_state": state,
-                # Wave 2 mutators (apply/replay/cancel) dispatch to these; the
-                # stdio bootstrap carries them too, so both transports behave the
-                # same (TestBothTransportsCarryTheSameToolContext).
-                "task_runner": task_runner,
-                "provision_service": app.state.provision_service,
-            }
+        mcp_agent = AgentAdapter(
+            hub_server=state.agent_hub,
+            pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
         )
 
-        mcp_app = create_http_app(srv)
-        app.state.mcp_app = mcp_app
-        # The selfcheck report reads mcp_app off whichever state object it is
-        # handed; keeping both in step is what lets GET /admin/selfcheck and the
-        # get_selfcheck MCP tool agree about the transport.
-        state.mcp_app = mcp_app
-        app.mount("/mcp", mcp_app)
-        logger.info("MCP server mounted at /mcp")
-    else:
-        logger.info("MCP server not mounted — HP_MCP_TOKEN not set")
+    if state.proxmox and state.vault:
+        from .executor import ArtifactExecutor
+
+        executor = ArtifactExecutor(
+            store=state.artifact_store,
+            lifecycle=state.artifact_lifecycle,
+            repo=state.repo,
+            proxmox=state.proxmox,
+            vault=state.vault,
+            pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
+            agent=mcp_agent,
+            # Same settings source as the HTTP executor above: an apply must
+            # not resolve differently depending on which transport started it.
+            settings_source=app.state,
+        )
+        state.artifact_lifecycle._executor_ref = executor
+
+    # The HTTP tool context MUST carry the same keys the stdio bootstrap builds,
+    # or agent_adapter/drift_reconciler-backed tools error in every HTTP
+    # deployment (#385: read_file_on_guest, exec_on_guest_readonly,
+    # check_artifact_drift). drift_reconciler is the same instance the
+    # reconciler scheduler uses (built above).
+    await _server_context.async_update(
+        {
+            "store": state.artifact_store,
+            "lifecycle": state.artifact_lifecycle,
+            "repo": state.repo,
+            "proxmox": state.proxmox,
+            "vault": state.vault,
+            "database": state.database,
+            "kb_service": state.kb_service,
+            "inventory_service": inventory_service,
+            "task_repo": task_repo,
+            "agent_adapter": mcp_agent,
+            "drift_reconciler": drift_reconciler,
+            # The hub's live registry, for `check_host_reachable` (#427).
+            "agent_registry": get_agent_registry(),
+            # Read-parity wave 1: the MCP read tools answer from the SAME
+            # repos/services the management routes use. `app_state` is what
+            # the selfcheck and Proxmox-settings reports take, and
+            # `invite_repo`/`settings` were simply MISSING from this context
+            # while the stdio bootstrap had them - so `query_guests` over
+            # HTTP MCP reported an empty invite list.
+            "settings": settings,
+            "metrics_repo": state.metrics_repo,
+            "invite_repo": app.state.invite_repo,
+            "app_state": state,
+            # Wave 2 mutators (apply/replay/cancel) dispatch to these; the
+            # stdio bootstrap carries them too, so both transports behave the
+            # same (TestBothTransportsCarryTheSameToolContext).
+            "task_runner": task_runner,
+            "provision_service": app.state.provision_service,
+        }
+    )
+
+    mcp_app = create_http_app(srv)
+    app.state.mcp_app = mcp_app
+    # The selfcheck report reads mcp_app off whichever state object it is
+    # handed; keeping both in step is what lets GET /admin/selfcheck and the
+    # get_selfcheck MCP tool agree about the transport.
+    state.mcp_app = mcp_app
+    app.mount("/mcp", mcp_app)
+    logger.info("MCP server mounted at /mcp")
 
     # Register SIGTERM handler for graceful shutdown in Docker
     _shutdown_event = asyncio.Event()
@@ -926,7 +935,10 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/auth/me"),  # self-identity: must work for any valid token
         ("POST", "/auth/login"),
         ("POST", "/auth/logout"),
-        ("POST", "/auth/tokens"),  # gated by the admin secret in the request body
+        # Minting requires an admin - an admin-scope token (bearer or session
+        # cookie) or the admin secret - checked in-body by _authorize_mint after
+        # the per-endpoint rate limiter, so there is no scope dependency to find.
+        ("POST", "/auth/tokens"),
         # Invite portal: authenticated by the mTLS client certificate the proxy
         # verified, not by an API token. Each route re-derives the CN through
         # portal.trust (trusted source + shared secret + verify header) and
@@ -1148,14 +1160,18 @@ async def health(request: Request) -> JSONResponse:
         cors_status = "ok"
     checks["cors"] = cors_status
 
+    # Report "ok" only when the mounted MCP app's session manager is ACTUALLY
+    # running. A mounted route alone is not proof the transport works: #382 had
+    # the mount present while its session manager was never started, so every
+    # request 500'd yet /health still claimed "ok". Inspect the live session
+    # manager task group instead of merely checking a route exists.
+    #
+    # No mcp_app at all means the transport was never built in this process (the
+    # lifespan has not run, or this is not the full app) - "not_configured", the
+    # same distinction /admin/selfcheck draws. "error" is reserved for the fault
+    # that matters: built, mounted, and not running.
     mcp_status: str = "not_configured"
-    mcp_token = os.environ.get("HP_MCP_TOKEN", "").strip()
-    if mcp_token:
-        # Report "ok" only when the mounted MCP app's session manager is ACTUALLY
-        # running. A mounted route alone is not proof the transport works: #382 had
-        # the mount present while its session manager was never started, so every
-        # request 500'd yet /health still claimed "ok". Inspect the live session
-        # manager task group instead of merely checking a route exists.
+    if getattr(request.app.state, "mcp_app", None) is not None:
         try:
             mcp_status = _mcp_health_status(request.app)
         except Exception as exc:

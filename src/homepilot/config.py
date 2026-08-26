@@ -85,6 +85,23 @@ class Settings(BaseSettings):
     provision_default_vlan_tag: int = 0
     provision_default_ipconfig: str = "ip=dhcp"
 
+    # The guest network (#553). Empty subnet/gateway means this instance
+    # describes no guest network at all: nothing is surveyed and provisioning
+    # writes no per-VM fence. The zone/vnet names carry defaults because they
+    # are names, not decisions - they mean nothing until a subnet exists.
+    guest_network_zone: str = "guest"
+    guest_network_vnet: str = "innkeep"
+    guest_network_subnet: str = ""
+    guest_network_gateway: str = ""
+    guest_network_snat: int = 1
+    guest_network_dhcp: int = 1
+    guest_network_dhcp_range: str = ""
+    guest_network_dhcp_dns_server: str = ""
+    # The LAN a guest must never reach. Non-empty by default on purpose: a
+    # guest network with no isolate list is a guest network with no fence, and
+    # the default has to fail closed.
+    guest_network_isolate_cidrs: str = ""
+
     vault_dir: str = ""
     vault_passphrase: str = ""
     vault_passphrase_file: str = ""

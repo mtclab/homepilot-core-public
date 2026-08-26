@@ -599,6 +599,67 @@ note_kind: note | policy | decision
 
 ---
 
+### 5.7 `kind: guest-network`
+
+The guest subnet HomePilot builds and fences (#553): an SDN zone, a vnet, a
+subnet with a gateway / SNAT / DHCP, and the vnet firewall rules that keep a
+guest off the operator's networks.
+
+**Body structure:**
+
+````markdown
+# <intent>
+
+```yaml guest-network-spec
+zone: guest                 # 1-8 chars, PVE's own limit
+vnet: innkeep               # 1-8 chars; also the bridge name guests get
+subnet_cidr: 10.96.17.0/24
+gateway: 10.96.17.1         # must be INSIDE the subnet
+snat: 1
+dhcp: 1                     # needs dnsmasq on the node
+dhcp_range: 10.96.17.100-10.96.17.199
+dhcp_dns_server: ''         # empty: guests resolve at the gateway
+isolate_cidrs:
+  - 10.0.0.1/24           # THE FENCE
+```
+````
+
+Every field is optional in the body: whatever it omits comes from this
+instance's `guest_network_*` settings at APPLY time, so an artifact can say only
+what this change is about. An unknown field is refused rather than ignored.
+
+**Validated at propose:** the spec block exists, is a mapping, names only known
+fields, and describes a network that could work - a gateway inside its own
+subnet, a DHCP range inside it that does not contain the gateway, names PVE can
+store. PVE accepts all of those happily; the first anybody hears of them
+otherwise is a guest with no route.
+
+**Executor algorithm:** survey the cluster, `plan(desired, survey)`, run the plan
+step by step, report each step in the cluster's own words. The plan is EMPTY when
+the cluster already matches, which is what makes the apply idempotent. The last
+step is always the SDN apply. A zone of another type, or a vnet in another zone,
+is a BLOCKER: nothing runs, because resolving it would mean repurposing
+something an operator built.
+
+**No deletes, so no rollback.** `rollback: true` on this kind is refused at
+propose - the kind cannot reverse itself, and a revoke that quietly removed the
+network a guest is sitting on would be worse than one that says it relabelled
+the artifact.
+
+**Drift** is the same `plan()`: in spec exactly when re-applying would change
+nothing; `unknown` when the cluster could not be read.
+
+**Target:** `kind: network` (the vnet) or `kind: cluster`. SDN is cluster-wide;
+`target.node` only tells the survey which node's firewall stack to report.
+
+**The enforcement caveat:** vnet firewall rules are enforced only under the
+nftables `proxmox-firewall` stack. On the legacy iptables stack PVE stores them
+and does not apply them to vnet forward traffic - the fence that holds there is
+the per-VM rule set written at provision time. See
+[docs/guest-portal.md](guest-portal.md).
+
+---
+
 ## 6. Composite semantics
 
 Already covered in §5.4. Recapping for findability:
