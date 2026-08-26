@@ -364,6 +364,11 @@
 			<div class="section-stack max-w-lg">
 				<div class="card space-y-4">
 					<h2 class="section-title">API Connection</h2>
+					<p class="prose-note prose-measure text-xs">
+						Where THIS browser sends its API calls, and the token it signs in
+						with. Both are stored in this browser only - they change nothing on
+						the server and nothing for anyone else using it.
+					</p>
 
 					<div class="space-y-1">
 						<label class="field-label" for="api-base">API Base URL</label>
@@ -425,6 +430,11 @@
 
 				<div class="card space-y-3">
 					<h2 class="section-title">System Health</h2>
+					<p class="prose-note prose-measure text-xs">
+						What the server answered on <span class="font-mono">/health</span> when
+						this page loaded: the state of each part it depends on. The optional
+						subsystems have a deeper report of their own on the Subsystems tab.
+					</p>
 					{#if loadingHealth}
 						<p class="text-xs text-muted">Loading…</p>
 					{:else if healthData}
@@ -462,6 +472,13 @@
 			{#if isAdminUser}
 				<div class="card space-y-4 max-w-lg">
 					<h2 class="section-title">Proxmox Connection</h2>
+					<p class="prose-note prose-measure text-xs">
+						The cluster this instance manages, and the API tokens it reaches it
+						with. Tokens go into the vault and are never shown again - leave a
+						token field blank to keep the one already stored. Test asks the
+						cluster without saving; Save &amp; Reload rebinds the live client
+						immediately.
+					</p>
 
 					{#if pveLoading}
 						<p class="text-xs text-muted">Loading…</p>
@@ -639,12 +656,12 @@
 				</p>
 			{/if}
 		{:else if activeTab === 'guests'}
-			<div class="card space-y-3">
+			<div class="card space-y-3 max-w-3xl">
 				<h2 class="section-title">Guests</h2>
 				<GuestsPanel />
 			</div>
 		{:else if activeTab === 'monitoring'}
-			<div class="card space-y-3">
+			<div class="card space-y-3 max-w-3xl">
 				<h2 class="section-title">Monitoring</h2>
 				<AlertRules />
 			</div>

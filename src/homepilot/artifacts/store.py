@@ -24,6 +24,7 @@ _TIMEOUT_PUSH = 60
 class GitOperationErrorCategory(StrEnum):
     TIMEOUT = "timeout"
     LOCK_CONTENTION = "lock_contention"
+    AUTH = "auth"
     NETWORK = "network"
     CORRUPT = "corrupt"
     UNKNOWN = "unknown"
@@ -42,6 +43,18 @@ _LOCK_PATTERNS = [
     re.compile(r"lock file.*already exists", re.IGNORECASE),
     re.compile(r"Unable to create.*\.lock", re.IGNORECASE),
     re.compile(r"fatal: Unable to create.*\.lock", re.IGNORECASE),
+]
+
+# Checked BEFORE the network patterns: ssh prints "could not read from remote"
+# after an auth refusal too, so an unreadable key or a rejected deploy key used
+# to be reported as "network" - which sent the operator to check connectivity
+# while the actual fix was key permissions (found live on prod, 2026-08-26).
+_AUTH_PATTERNS = [
+    re.compile(r"permission denied \(publickey", re.IGNORECASE),
+    re.compile(r"load key .*: Permission denied", re.IGNORECASE),
+    re.compile(r"authentication failed", re.IGNORECASE),
+    re.compile(r"correct access rights", re.IGNORECASE),
+    re.compile(r"host key verification failed", re.IGNORECASE),
 ]
 
 _NETWORK_PATTERNS = [
@@ -65,6 +78,9 @@ def _classify_stderr(stderr: str) -> GitOperationErrorCategory:
     for pat in _LOCK_PATTERNS:
         if pat.search(stderr):
             return GitOperationErrorCategory.LOCK_CONTENTION
+    for pat in _AUTH_PATTERNS:
+        if pat.search(stderr):
+            return GitOperationErrorCategory.AUTH
     for pat in _NETWORK_PATTERNS:
         if pat.search(stderr):
             return GitOperationErrorCategory.NETWORK
@@ -314,6 +330,15 @@ class ArtifactStore:
         if not resolved.is_relative_to(self.root.resolve()):
             raise ValueError(f"Artifact ID escapes store root: {id}")
         return resolved
+
+    def relative_path(self, id: str) -> str:
+        """The artifact's path relative to the store root (`YYYY/MM/<id>.md`).
+
+        This is what the DB mirror records as `file_path`: stable across moves
+        of the store root, unique per artifact (#545 - the mirror used to write
+        "" for every artifact, so its UNIQUE constraint let only one row in).
+        """
+        return str(self.resolve_path(id).relative_to(self.root.resolve()))
 
     def _compose_file(self, id: str, frontmatter_yml: str, body: str) -> str:
         return f"---\n{frontmatter_yml}---\n\n{body}"

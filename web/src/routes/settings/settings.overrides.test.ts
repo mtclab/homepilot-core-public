@@ -159,7 +159,12 @@ describe('Subsystems tab: settings are edited where their status is reported', (
 		expect(remote.textContent).toContain('takes effect on the next cycle');
 
 		const envLocked = field('embedding_service_url');
-		expect(envLocked.textContent).toContain('set by HP_EMBEDDING_SERVICE_URL in the environment');
+		// #549 F7 lengthened this sentence with the way out; the C2 half of it -
+		// WHICH variable decides the value - is what this case is about, and the
+		// unlock half has its own case in settings.explains.test.ts.
+		expect(envLocked.textContent).toContain(
+			'Set by HP_EMBEDDING_SERVICE_URL in the environment, which wins over anything saved here',
+		);
 	});
 
 	it('renders an env-locked setting read-only, with no input to fill in', async () => {

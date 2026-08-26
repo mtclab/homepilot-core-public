@@ -84,10 +84,22 @@
 </script>
 
 <div class="space-y-4">
-	<p class="prose-note text-xs">
-		A rule fires only when its condition has held for the whole duration, so a
-		single spike never raises one. Firing and recovery both go out as events;
-		firing alerts show on the Overview and on the affected host.
+	<p class="prose-note prose-measure text-xs">
+		An alert rule watches one metric on one host - or on all of them - and fires
+		only when its condition has held for the whole duration, so a single spike
+		never raises one. Firing and recovery both go out as events; firing alerts
+		show on the Overview and on the affected host. There is no mail and no
+		pager: to get an alert off this box, point the events webhook at something
+		(Settings → Subsystems).
+	</p>
+	<!-- One line instead of six ragged notes under six narrow inputs: the row
+	     already reads left to right, so saying so explains every field at once
+	     without turning a compact form into a wall (#549 F7). -->
+	<p class="prose-note prose-measure text-xs" data-alert-form-note>
+		Read the row as a sentence: <em>name</em> fires when <em>metric</em> is
+		<em>above/below</em> <em>threshold</em> for <em>minutes</em> on
+		<em>host</em> - where <span class="font-mono">*</span> means every host, and
+		a name is what you will see when it fires.
 	</p>
 
 	<div class="flex flex-wrap items-end gap-2">

@@ -306,3 +306,38 @@ class TestCLISyncStatus:
 
         assert result.exit_code == 0, result.output
         assert "Uncommitted changes" in result.output
+
+
+class TestStderrClassification:
+    """An auth refusal must not read as a network fault (#550 follow-up).
+
+    Found live on prod 2026-08-26: an unreadable deploy key surfaced as
+    "git push failed (network)" and pointed the operator at connectivity.
+    ssh prints "could not read from remote" after auth failures too, so the
+    auth patterns must win over the network ones.
+    """
+
+    def test_publickey_refusal_is_auth_not_network(self) -> None:
+        from homepilot.artifacts.store import _classify_stderr
+
+        stderr = (
+            "git@github.com: Permission denied (publickey).\n"
+            "fatal: Could not read from remote repository.\n"
+            "Please make sure you have the correct access rights\n"
+            "and the repository exists."
+        )
+        assert _classify_stderr(stderr) == GitOperationErrorCategory.AUTH
+
+    def test_unreadable_key_is_auth(self) -> None:
+        from homepilot.artifacts.store import _classify_stderr
+
+        stderr = 'Load key "/home/homepilot/.hp/archive_key": Permission denied'
+        assert _classify_stderr(stderr) == GitOperationErrorCategory.AUTH
+
+    def test_plain_connectivity_stays_network(self) -> None:
+        from homepilot.artifacts.store import _classify_stderr
+
+        assert (
+            _classify_stderr("fatal: Could not resolve host: github.com")
+            == GitOperationErrorCategory.NETWORK
+        )

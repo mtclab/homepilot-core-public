@@ -941,8 +941,16 @@ export const api = {
 	getGuests() {
 		return req<GuestOverview>('/admin/guests');
 	},
-	mintGuestInvite(body: { cn: string; template_vmid: number; node: string; cores: number; memory_mb: number; disk_gb: number; ttl_days: number }) {
-		return req<{ id: string; token: string; cn: string }>('/admin/guests/invites', {
+	// `template_vmid` and `node` are nullable because they are OPTIONAL server-side
+	// since #553 C3: omitting them means "use this instance's provisioning
+	// defaults", and the response echoes back which ones the invite actually got.
+	mintGuestInvite(body: { cn: string; template_vmid: number | null; node: string | null; cores: number; memory_mb: number; disk_gb: number; ttl_days: number }) {
+		return req<{
+			id: string;
+			token: string;
+			cn: string;
+			caps?: { node: string; template_vmid: number; pool: string | null; ipconfig0: string | null };
+		}>('/admin/guests/invites', {
 			method: 'POST',
 			body: JSON.stringify(body),
 		});

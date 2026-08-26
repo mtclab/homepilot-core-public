@@ -188,11 +188,15 @@ def mock_store(tmp_artifacts_dir: Path) -> MagicMock:
     def _resolve_path(id_str: str) -> Path:
         return tmp_artifacts_dir / f"{id_str}.md"
 
+    def _relative_path(id_str: str) -> str:
+        return f"{id_str}.md"
+
     store.exists = _exists
     store.read = _read
     store.write = _write
     store.list = _list
     store.resolve_path = _resolve_path
+    store.relative_path = _relative_path
     store._storage = _storage
     return store
 

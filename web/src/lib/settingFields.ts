@@ -90,7 +90,19 @@ export function reloadLabel(setting: Pick<SettingOverride, 'hot_reloadable'>): s
 	return setting.hot_reloadable ? 'takes effect on the next cycle' : 'restart required';
 }
 
-/** Why a field is read-only, in the words the server would use. */
+/**
+ * Why a field is read-only - and how to stop it being read-only (#549 F7).
+ *
+ * Naming the variable explains the lock; it does not explain the way out, and
+ * an operator who wants to manage the value from the product has to be told
+ * that the environment is what stands in the way and that removing it hands
+ * control back here. Saying only half of that is how "read-only" reads as
+ * "not configurable".
+ */
 export function envLockNote(setting: Pick<SettingOverride, 'env_var'>): string {
-	return `set by ${setting.env_var} in the environment`;
+	return (
+		`Set by ${setting.env_var} in the environment, which wins over anything saved here - ` +
+		`to manage it on this card instead, remove ${setting.env_var} from the server's ` +
+		`environment (.env) and restart.`
+	);
 }

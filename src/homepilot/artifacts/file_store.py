@@ -62,6 +62,9 @@ class ArtifactFileStore:
     def resolve_path(self, id: str) -> Any:
         return self.store.resolve_path(id)
 
+    def relative_path(self, id: str) -> str:
+        return self.store.relative_path(id)
+
     @contextmanager
     def file_lock(self, id: str) -> Generator[None, None, None]:
         path = self.store.resolve_path(id)

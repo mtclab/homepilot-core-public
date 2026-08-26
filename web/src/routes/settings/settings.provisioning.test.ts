@@ -223,7 +223,9 @@ describe('Subsystems tab: provisioning defaults, checked against the cluster', (
 		render(SettingsPage);
 		const node = await waitFor(() => field('provision_default_node'));
 		expect(within(node).queryAllByRole('button')).toHaveLength(0);
-		expect(node.textContent).toContain('set by HP_PROVISION_DEFAULT_NODE in the environment');
+		expect(node.textContent).toContain(
+			'Set by HP_PROVISION_DEFAULT_NODE in the environment, which wins over anything saved here',
+		);
 		expect(node.textContent).toContain('pve9');
 	});
 });
