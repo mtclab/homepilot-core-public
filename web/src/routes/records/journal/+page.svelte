@@ -4,6 +4,7 @@
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import { debounce } from '$lib/debounce';
+	import { groupByDay } from '$lib/grouping';
 
 	let entries: AuditEntry[] = [];
 	let loading = true;
@@ -72,6 +73,9 @@
 			});
 			entries = res.items;
 			total = res.total;
+			// A new result set invalidates whichever row was expanded: that id may
+			// not even be on this page any more.
+			openId = null;
 		} catch (e) {
 			// A toast alone left the previous page's rows on screen (or an empty
 			// table that read as "no entries") with no way to retry.
@@ -87,6 +91,19 @@
 		if (!s) return '—';
 		try {
 			return new Date(s).toLocaleString();
+		} catch {
+			return s;
+		}
+	}
+
+	// Inside a day group the date is already in the header, so a row only needs
+	// the clock time.
+	function fmtTime(s: string): string {
+		if (!s) return '—';
+		const d = new Date(s);
+		if (Number.isNaN(d.getTime())) return s;
+		try {
+			return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 		} catch {
 			return s;
 		}
@@ -136,6 +153,40 @@
 		load();
 	}
 
+	// Progressive disclosure: an entry is one line until it is asked to be more.
+	// One open at a time - the detail is a definition list several lines tall,
+	// and fifty of those expanded is the wall this slice exists to remove.
+	let openId: number | null = null;
+	function toggle(id: number) {
+		openId = openId === id ? null : id;
+	}
+	/** The one-line gist of an entry: who/what it touched, without the detail. */
+	function summaryOf(e: AuditEntry): string {
+		return [e.user_id, e.target_host, e.target_service].filter(Boolean).join(' · ');
+	}
+
+	/** Rows of the expanded detail, skipping the fields this entry has nothing for. */
+	function detailRows(e: AuditEntry): [string, string][] {
+		const rows: [string, string][] = [
+			['Time', fmtTs(e.timestamp)],
+			['User', e.user_id || '—'],
+			['Source', e.source],
+		];
+		if (e.target_host) rows.push(['Host', e.target_host]);
+		if (e.target_service) rows.push(['Service', e.target_service]);
+		if (e.command) rows.push(['Command', e.command]);
+		if (e.exit_code !== null) rows.push(['Exit code', String(e.exit_code)]);
+		if (e.duration_ms !== null) rows.push(['Duration', `${e.duration_ms} ms`]);
+		if (e.snapshot_id) rows.push(['Snapshot', e.snapshot_id]);
+		const details = parseDetails(e.details_json);
+		if (details) rows.push(['Details', details]);
+		return rows;
+	}
+
+	// The journal arrives newest-first and paginated, so a page is grouped as it
+	// stands: no group is ever split across a page boundary in the wrong order.
+	$: dayGroups = groupByDay(entries, (e) => e.timestamp);
+
 	$: totalPages = Math.ceil(total / PAGE_SIZE);
 	$: hasNext = page + 1 < totalPages;
 	$: hasPrev = page > 0;
@@ -143,7 +194,7 @@
 	onMount(load);
 </script>
 
-<div class="space-y-4">
+<div class="page-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Journal</h1>
 		<button class="btn btn-ghost text-xs" on:click={load}>↻ Refresh</button>
@@ -201,49 +252,53 @@
 			<p class="prose-note text-xs">Actions across the system will be recorded here.</p>
 		</div>
 	{:else}
-		<div class="card overflow-x-auto">
-			<table class="data-table text-xs">
-				<thead>
-					<tr>
-						<th class="text-left">Time</th>
-						<th class="text-left">Action</th>
-						<th class="text-left">Source</th>
-						<th class="text-left">User</th>
-						<th class="text-left">Artifact</th>
-						<th class="text-left">Host</th>
-						<th class="text-left">Details</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each entries as e}
-						<tr class="border-b border-divider hover:bg-raised transition-colors">
-							<td class="py-1.5 text-muted whitespace-nowrap">{fmtTs(e.timestamp)}</td>
-							<td class="py-1.5"><span class="badge {actionClass(e.action)}">{e.action}</span></td>
-							<td class="py-1.5 {sourceClass(e.source)}">{e.source}</td>
-							<td class="py-1.5 text-ink">{e.user_id || '—'}</td>
-							<td class="py-1.5 font-mono whitespace-nowrap">
+		{#each dayGroups as group (group.key)}
+			<section class="section-stack" aria-labelledby="journal-group-{group.key || 'undated'}">
+				<h2 class="section-title" id="journal-group-{group.key || 'undated'}">
+					{group.label} <span class="text-muted font-normal num-inline">({group.items.length})</span>
+				</h2>
+				<ul class="card divide-y divide-divider">
+					{#each group.items as e (e.id)}
+						<li>
+							<div class="flex items-baseline gap-2 px-3 py-1.5 text-xs">
+								<button
+									class="flex items-baseline gap-2 flex-1 min-w-0 text-left hover:text-ink-strong"
+									aria-expanded={openId === e.id}
+									on:click={() => toggle(e.id)}
+								>
+									<span class="text-muted num-inline whitespace-nowrap">{fmtTime(e.timestamp)}</span>
+									<span class="badge {actionClass(e.action)}">{e.action}</span>
+									<span class={sourceClass(e.source)}>{e.source}</span>
+									<span class="text-muted truncate">{summaryOf(e)}</span>
+									<span class="text-muted ml-auto pl-2" aria-hidden="true"
+									>{openId === e.id ? '▾' : '▸'}</span>
+								</button>
 								{#if e.artifact_id}
 									<a
 										href="{base}/changes/{e.artifact_id}"
-										class="text-accent hover:text-accent-strong"
+										class="text-accent hover:text-accent-strong font-mono whitespace-nowrap"
 										title={e.artifact_id}
 									>{fmtShortId(e.artifact_id)}</a>
 									<button
-										class="text-muted hover:text-accent-strong ml-1"
+										class="text-muted hover:text-accent-strong"
 										title="Filter journal by this artifact"
 										on:click={() => filterByArtifact(e.artifact_id ?? '')}
 									>⊃</button>
-								{:else}
-									<span class="text-muted">—</span>
 								{/if}
-							</td>
-							<td class="py-1.5 text-muted font-mono">{e.target_host || '—'}</td>
-							<td class="py-1.5 text-muted truncate max-w-xs">{parseDetails(e.details_json)}</td>
-						</tr>
+							</div>
+							{#if openId === e.id}
+								<dl class="px-3 pb-3 pt-1 grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 text-xs">
+									{#each detailRows(e) as [label, value]}
+										<dt class="text-muted">{label}</dt>
+										<dd class="text-ink break-words font-mono">{value}</dd>
+									{/each}
+								</dl>
+							{/if}
+						</li>
 					{/each}
-				</tbody>
-			</table>
-		</div>
+				</ul>
+			</section>
+		{/each}
 
 		<div class="flex gap-3 items-center">
 			<button class="btn btn-ghost text-xs" disabled={!hasPrev} on:click={() => { page--; load(); }}>← Prev</button>

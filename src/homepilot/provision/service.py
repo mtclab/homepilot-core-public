@@ -11,6 +11,7 @@ from ..adapters.proxmox import ProxmoxClient
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
+from .defaults import ProvisioningDefaults, provisioning_defaults
 from .models import ProvisionRequest
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,14 @@ class ProvisionService:
         task_timeout_s: float = 600.0,
         ip_wait_s: float = 60.0,
         ip_interval: float = 3.0,
+        defaults_source: Any = None,
     ):
         self.proxmox = proxmox
+        # Where the provisioning defaults are read from at RUN time (#553 C3):
+        # an app state, a resolver, or None for the process-wide one. Never a
+        # snapshot - the settings are hot-reloadable and a cached copy would
+        # make that claim false.
+        self.defaults_source = defaults_source
         self.task_repo = task_repo
         self.repo = repo
         self.poll_interval = poll_interval
@@ -192,7 +199,8 @@ class ProvisionService:
             inflight_upid = None
 
             step = "configure"
-            config = self._build_config(request)
+            defaults = await provisioning_defaults(self.defaults_source)
+            config = self._build_config(request, defaults)
             if config:
                 await proxmox.set_vm_config(request.node, vmid, config)
 
@@ -341,12 +349,22 @@ class ProvisionService:
             )
         await self._audit(actor, request, "provision_cancelled", outcome)
 
-    def _build_config(self, request: ProvisionRequest) -> dict[str, Any]:
+    def _build_config(
+        self, request: ProvisionRequest, defaults: ProvisioningDefaults | None = None
+    ) -> dict[str, Any]:
         config: dict[str, Any] = {
             "name": request.name,
             "ciuser": request.ciuser,
             "ipconfig0": request.ipconfig0,
         }
+        # net0 is touched ONLY when this instance has a default bridge (#553 C3).
+        # Before C3 the template's NIC was cloned untouched, which is precisely
+        # why a guest VLAN could not be enforced; with no bridge configured that
+        # behaviour is preserved exactly, because an instance that has said
+        # nothing about its network must not start rewriting NICs.
+        net0 = defaults.net0 if defaults is not None else None
+        if net0 is not None:
+            config["net0"] = net0
         if request.ssh_authorized_key is not None:
             config["sshkeys"] = request.ssh_authorized_key
         if request.cores is not None:

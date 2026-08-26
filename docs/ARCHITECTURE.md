@@ -21,7 +21,7 @@
 ║  │  hp mcp-serve --transport http --port 8000                   │   ║
 ║  │  MCP endpoint: /mcp  (StreamableHTTP, stateful sessions)     │   ║
 ║  │                                                              │   ║
-║  │  MCP tools (38) - the READ surface is at parity with the     │   ║
+║  │  MCP tools (73) - the READ surface is at parity with the     │   ║
 ║  │  management API's GET routes, gated by                       │   ║
 ║  │  tests/test_mcp_read_parity.py:                              │   ║
 ║  │   inventory   query_inventory  get_host  get_environment_doc │   ║
@@ -39,10 +39,12 @@
 ║  │               get_selfcheck  get_proxmox_settings            │   ║
 ║  │   guests      query_guests  set_guest_quota                  │   ║
 ║  │               revoke_guest_invite                            │   ║
+║  │   settings    query_settings_overrides set_setting_override  │   ║
+║  │               clear_setting_override probe_setting_override  │   ║
 ║  │   raw access  proxmox_api_read  http_call_read               │   ║
 ║  │               read_file_on_guest  exec_on_guest_readonly     │   ║
 ║  │  Never over MCP: the hub/enrolment token, the installer      │   ║
-║  │  one-liner, agent binaries, and approve_artifact (#385).     │   ║
+║  │  one-liner, agent binaries, and any secret setting (#553).   │   ║
 ║  └───────────┬────────────────────────────┬──────────────────────┘  ║
 ║              │                            │                          ║
 ║   ┌───────────▼────────────┐  ┌────────────▼───────────────────────┐ ║
@@ -230,17 +232,21 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `query_guests` | no | read | Every portal guest's usage vs budget, plus invites (prefixes only - never tokens) |
 | `set_guest_quota` | quota table | write | Set a guest's resource budget (totals across all their machines) |
 | `revoke_guest_invite` | invite state | write | Revoke an open invite by prefix. Minting is deliberately NOT over MCP: the token is a machine-provisioning secret and a transcript is not a safe channel - mint in Settings -> Guests or `hp invite create` |
+| `query_settings_overrides` | no | admin | Every operator setting with its value, source (env/db/default), hot-reloadability, probeability and env var. Only NON-SECRET settings exist in the registry, so no token, passphrase or signing secret can be listed (#553 C4) |
+| `set_setting_override` | settings table | admin | Persist one operator setting through the same `checked_set` the admin route uses. Refused - storing nothing - for an unknown key (which is every secret), a key the environment already decides, a value of the wrong shape, or a value the live cluster refutes or cannot be asked about |
+| `clear_setting_override` | settings table | admin | Drop a stored setting so the install falls back to the environment or the code default. Same refusals |
+| `probe_setting_override` | no | admin | Ask the cluster about a candidate value WITHOUT saving it (is this node real, is this bridge on it, is this vmid a template). Admin-tier despite writing nothing: its route is |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
-| `approve_artifact` | n/a | n/a | **Not exposed over MCP.** Delisted from `list_tools()` and hard-refused in dispatch (#385) - approval must come from an operator via CLI or web UI |
+| `approve_artifact` | triggers flow | write | Exposed, but gated by a per-artifact approval code a human relays: the code is generated at propose time and returned by no MCP read, so the assistant cannot approve its own proposal (#385 follow-up) |
 
-`propose_artifact` initiates a change (requires write scope). Approval is deliberately NOT available over MCP: the MCP credential is a single shared token, so an LLM able to approve would both propose and approve its own mutations (#385).
+`propose_artifact` initiates a change (requires write scope). Approval used to be refused over MCP outright, because the MCP credential is a single shared token and an LLM able to approve would both propose and approve its own mutations (#385); the relayed approval code replaced the blanket ban with a gate the assistant cannot pass on its own.
 
 The MCP transport has a three-tier scope ladder set by `HP_MCP_TOKEN_SCOPE`, mirroring the API scope ladder read < write < admin:
 
 - `read_only` — read tools only.
 - `full` (default) — reads plus the standard mutators (`add_host`, `apply_artifact`, `revoke_artifact`, …), but NOT admin tools.
-- `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest`, `delete_auth_token`, …), except the permanently-forbidden `approve_artifact`.
+- `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest`, `delete_auth_token`, the operator-settings tools, …).
 
 Each tool's tier equals the API scope of the route it mirrors; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces that equality so a lesser MCP token can never do what the API reserves for a greater one.
 

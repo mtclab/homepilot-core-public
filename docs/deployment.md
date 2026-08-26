@@ -143,6 +143,62 @@ delays startup (it is scheduled, never awaited) and never holds the endpoint
 open. No token, passphrase or webhook path appears in it — addresses are reduced
 to scheme, host and port.
 
+### 2.1 Changing a subsystem's settings from the product
+
+The non-secret settings behind those subsystems are editable on the Settings →
+Subsystems tab, and persist in the instance's database. Precedence is binding:
+
+**an explicitly set environment variable wins and records nothing; otherwise the
+saved value; otherwise the code default.**
+
+So a variable you set in `.env` or the compose file stays authoritative - the UI
+renders that field read-only, naming the variable, and the API refuses the write
+with `409` rather than saving a value it would never read. Unset the variable
+and restart to manage the setting from the product instead.
+
+Editable today: `HP_ARTIFACTS_REMOTE`, `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS`,
+`HP_EMBEDDING_SERVICE_URL`, `HP_EMBEDDING_MODEL`, `HP_RETENTION_DAYS`,
+`HP_METRICS_RETENTION_DAYS`, `HP_EVENTS_WEBHOOK_URL` and the provisioning
+defaults of 2.2 below. Each is re-read at use time - the next push, the next
+prune, the next event, the next provision - so a change takes effect
+on the next cycle without a restart. **Secrets are not on this surface at all**:
+the webhook signing secret, tokens and passphrases stay in the environment or
+the vault, and cannot be read or written through it.
+
+| Endpoint | Scope | What it does |
+|---|---|---|
+| `GET /admin/settings/overrides` | admin | every setting with its value, its source (`env`/`db`/`default`) and whether it hot-reloads |
+| `PUT /admin/settings/overrides/{key}` | admin | saves a value; `409` when the environment decides that key, `400` when the type rejects it |
+| `DELETE /admin/settings/overrides/{key}` | admin | drops the saved value, back to the code default |
+| `POST /admin/settings/overrides/{key}/probe` | admin | asks the cluster about a value WITHOUT saving it - the "Test" button |
+
+### 2.2 Provisioning defaults, checked against the cluster
+
+`HP_PROVISION_DEFAULT_NODE`, `HP_PROVISION_DEFAULT_TEMPLATE_VMID`,
+`HP_PROVISION_DEFAULT_POOL`, `HP_PROVISION_DEFAULT_BRIDGE`,
+`HP_PROVISION_DEFAULT_VLAN_TAG` and `HP_PROVISION_DEFAULT_IPCONFIG` are the
+same kind of setting, on their own **Provisioning defaults** card, and they are
+what lets an invite stop carrying raw infra details: mint an invite without a
+node or a template and it takes both from here, frozen into the invite at mint
+time. `POST /guests/provision` and the `provision_guest` MCP tool fill the same
+gaps. Name neither a value nor a default and the call is refused, saying which
+setting would have filled it.
+
+Each one is **checked against the live cluster before it is stored**. A value
+the cluster refutes comes back `422` with the cluster's own answer - *"no bridge
+vmbr7 on node pve1; node has: vmbr0, vmbr1"* - and nothing is saved. A cluster
+that cannot be reached comes back `502`: nothing is saved then either, because
+an unchecked provisioning default is exactly what the check exists to refuse.
+A bridge is per-node, so setting one before the node is refused with *"set the
+node first"*; a VLAN tag needs a VLAN-aware bridge, and where the node does not
+report VLAN-awareness at all the value is saved with the uncertainty stated
+rather than guessed either way.
+
+Setting a bridge also **turns on a capability**: from then on provisioning
+writes `net0` (`virtio,bridge=<bridge>[,tag=<vlan>]`) on the fresh clone, which
+is what makes a guest VLAN enforceable. With no bridge configured, `net0` is
+never touched and the template's own NIC is cloned exactly as before.
+
 ---
 
 ## 3. Create the First API Token
@@ -781,7 +837,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.4.1` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.5.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -792,6 +848,12 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROXMOX_HOST` | — | Proxmox VE hostname or IP |
 | `PVE_API_TOKEN` | — | Proxmox read API token (use vault `pve-token` instead) |
 | `HP_PROXMOX_VERIFY_SSL` | `true` | Set `false` for self-signed Proxmox certs |
+| `HP_PROVISION_DEFAULT_NODE` | — | Node guests are cloned on when the request does not name one |
+| `HP_PROVISION_DEFAULT_TEMPLATE_VMID` | `0` | Template cloned when the request does not name one; `0` means no default |
+| `HP_PROVISION_DEFAULT_POOL` | — | PVE resource pool provisioned guests join |
+| `HP_PROVISION_DEFAULT_BRIDGE` | — | Bridge the guest NIC is put on. Setting it is what makes provisioning write `net0` at all; empty leaves the template's NIC untouched |
+| `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
+| `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
 | `HP_AGENT_HUB_ENABLED` | `true` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
 | `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |

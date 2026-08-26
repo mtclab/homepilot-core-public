@@ -416,7 +416,17 @@ async def run_selfcheck(
 async def selfcheck_report(
     state: Any, settings: Any, timeout: float = PROBE_TIMEOUT_SECONDS
 ) -> dict[str, Any]:
-    return await run_selfcheck(build_subsystems(state, settings), timeout=timeout)
+    """The report as of NOW, against the values actually in force.
+
+    Persisted operator settings (#553 C2) are resolved first: a report built from
+    the boot-time ``Settings`` would call a subsystem the operator configured
+    from the product "off by choice", which is the exact collapse this file
+    exists to prevent.
+    """
+    from .app_settings import effective_settings
+
+    in_force = await effective_settings(state, settings)
+    return await run_selfcheck(build_subsystems(state, in_force), timeout=timeout)
 
 
 async def log_selfcheck(state: Any, settings: Any) -> dict[str, Any]:

@@ -192,6 +192,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.vault = state.vault
     app.state.settings = settings
+
+    # Operator settings resolve env > db > default (#553 C2). Bound
+    # process-wide as well as hung on app.state, because the leaf consumers -
+    # the embedding call, the webhook senders - are reached from executors and
+    # background tasks that hold no request and no app.
+    from .app_settings import SettingsResolver, bind_resolver, resolve_interval
+
+    settings_resolver = SettingsResolver(state.repo, settings)
+    app.state.settings_resolver = settings_resolver
+    bind_resolver(settings_resolver)
     app.state.pve_token_source = state.pve_token_source
 
     if state.proxmox is not None:
@@ -290,7 +300,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from .metrics.alerts import AlertEvaluator
     from .metrics.retention import MetricsPruner
 
-    metrics_pruner = MetricsPruner(state.metrics_repo, settings.metrics_retention_days)
+    metrics_pruner = MetricsPruner(
+        state.metrics_repo, settings.metrics_retention_days, resolver=settings_resolver
+    )
     reconciler_scheduler.register(
         metrics_pruner,
         interval=float(settings.metrics_prune_interval_seconds),
@@ -305,7 +317,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # unbounded table happens.
     from .reconciler.retention import RetentionReconciler
 
-    retention_reconciler = RetentionReconciler(state.repo, settings.retention_days)
+    retention_reconciler = RetentionReconciler(
+        state.repo, settings.retention_days, resolver=settings_resolver
+    )
     reconciler_scheduler.register(
         retention_reconciler,
         interval=float(settings.retention_interval_seconds),
@@ -320,15 +334,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.alert_evaluator = alert_evaluator
 
-    # The artifact archive push (#442 follow-up): only when a remote is set -
-    # and when it IS set, "configured" finally means "actually synced".
-    if (settings.artifacts_remote or "").strip() and state.artifact_store is not None:
+    # The artifact archive push (#442 follow-up): "configured" means "actually
+    # synced". Registered whenever there is a store to push, not only when a
+    # remote is set at boot: the remote is an operator setting now (#553 C2), and
+    # a loop that only exists when it was configured at startup would make
+    # setting one from the product a restart-required change. The reconciler
+    # resolves the remote per cycle and does nothing while there is none.
+    if state.artifact_store is not None:
         from .reconciler.archive_push import ArchivePushReconciler
 
-        archive_push = ArchivePushReconciler(state.artifact_store, state.repo)
+        archive_push = ArchivePushReconciler(
+            state.artifact_store, state.repo, resolver=settings_resolver
+        )
         reconciler_scheduler.register(
             archive_push,
-            interval=float(settings.artifacts_push_interval_seconds),
+            interval=lambda: resolve_interval(
+                settings_resolver,
+                "artifacts_push_interval_seconds",
+                float(settings.artifacts_push_interval_seconds),
+            ),
             startup_delay=90.0,
         )
         app.state.archive_push = archive_push
@@ -372,6 +396,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         proxmox=state.proxmox,
         task_repo=task_repo,
         repo=state.repo,
+        # Read through the app state, so the provisioning defaults come from the
+        # same resolver the settings UI writes to and are re-read per provision.
+        defaults_source=app.state,
     )
 
     from .agent_hub.enroll import AgentEnrollService
@@ -550,6 +577,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
     finally:
         logger.info("HomePilot v2 shutting down — stopping reconciler, closing connections")
+
+        # The process-wide binding outlives the app object otherwise, and a
+        # resolver holding a closed database is worse than none at all.
+        bind_resolver(None)
 
         if not selfcheck_task.done():
             selfcheck_task.cancel()

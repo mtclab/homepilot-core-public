@@ -96,6 +96,22 @@
 	--space-5: 1.5rem;
 	--space-6: 2.5rem;
 
+	/* Rhythm — the density scale (#549 F1, principle 3: "white-space discipline
+	   is the fingerprint"). The raw --space-N steps above are the alphabet; these
+	   three are the WORDS the layout speaks, so "cards breathe more" is one edit
+	   here rather than a sweep through every route. Anything that stacks uses
+	   them, in this order of magnitude: inside a group < between groups.
+	     --space-stack   gap between siblings inside one section
+	     --space-card    a card's own padding
+	     --space-section gap between the sections of a page */
+	--space-stack: 0.75rem;
+	--space-card: 1.25rem;
+	--space-section: 2rem;
+
+	/* Reading measure. Prose past ~75 characters loses the line it is on; the
+	   console's descriptions, empty states and KB bodies are prose. */
+	--measure-prose: 65ch;
+
 	--radius-sm: 3px;
 	--radius-md: 6px;
 }
@@ -149,14 +165,36 @@
 	/* Descriptions, empty states, KB/journal content — anything meant to be READ. */
 	.prose-note {
 		font-family: var(--font-serif);
-		line-height: 1.65;
+		line-height: 1.6;
 		color: var(--color-muted);
 	}
 
 	.prose-body {
 		font-family: var(--font-serif);
-		line-height: 1.65;
+		line-height: 1.6;
 		color: var(--color-text);
+	}
+
+	/* Opt-in reading measure. Deliberately NOT folded into .prose-* : those two
+	   classes are also used for single-line labels inside flex rows, where a
+	   max-width would fight the layout. A paragraph adds this; a label does not. */
+	.prose-measure {
+		max-width: var(--measure-prose);
+	}
+
+	/* --- Rhythm ----------------------------------------------------------- */
+	/* The two stacks a page is built from. Using these instead of a hand-picked
+	   `space-y-N` per route is what makes the vertical rhythm one decision. */
+	.page-stack {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-section);
+	}
+
+	.section-stack {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-stack);
 	}
 
 	/* Chrome: form labels sit with the controls, so they stay sans. */
@@ -225,6 +263,31 @@
 	.data-table tbody td {
 		padding-top: var(--space-2);
 		padding-bottom: var(--space-2);
+	}
+
+	/* Primary vs secondary columns (#549 F1, principle 4). A table row has ONE
+	   thing it is about - the name, with its state chip - and everything else is
+	   supporting evidence. Painting all eight columns at the same weight is why
+	   the fleet table reads as an undifferentiated wall.
+	   The classes go on the <th> AND the <td> so the header keeps the emphasis
+	   the column has. */
+	.data-table .col-primary {
+		color: var(--color-text-strong);
+		font-weight: 500;
+	}
+	.data-table thead th.col-primary {
+		color: var(--color-muted);
+	}
+	.data-table .col-secondary {
+		color: var(--color-muted);
+		font-weight: 400;
+	}
+	/* Name + chip on one baseline, without the chip pushing the name's link
+	   underline around. */
+	.col-primary-inner {
+		display: inline-flex;
+		align-items: baseline;
+		gap: var(--space-2);
 	}
 
 	/* A number INSIDE a sentence or a definition list stays left-anchored -
@@ -304,6 +367,26 @@
 		color: var(--color-text);
 		border-color: var(--color-border);
 	}
+	/* Severity chips (#549 F1). The badges above name a lifecycle STATE
+	   (proposed → applied); these name URGENCY, which is a different question and
+	   belongs to attention lists rather than to the artifact lifecycle. Reusing
+	   `badge-rejected` for a firing alert would say the alert was rejected. */
+	.badge-critical {
+		background: var(--color-danger-tint);
+		color: var(--color-danger);
+		border-color: var(--color-danger-border);
+	}
+	.badge-warning {
+		background: var(--color-warn-tint);
+		color: var(--color-warn);
+		border-color: var(--color-warn-border);
+	}
+	.badge-notice {
+		background: var(--color-info-tint);
+		color: var(--color-info);
+		border-color: var(--color-info-border);
+	}
+
 	/* Superseded differs from revoked by more than a shade — a dashed edge, so
 	   the distinction survives greyscale and colour-blindness. */
 	.badge-superseded {
@@ -384,11 +467,13 @@
 	}
 
 	/* --- Surfaces --------------------------------------------------------- */
+	/* Card padding is --space-card, not a raw step: loosening every card in the
+	   console is one token, and no route can quietly disagree with the others. */
 	.card {
 		background: var(--color-surface);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-md);
-		padding: var(--space-4);
+		padding: var(--space-card);
 	}
 
 	.input {

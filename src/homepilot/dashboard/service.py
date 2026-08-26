@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..app_settings import effective
 from ..config import get_settings
 
 
@@ -161,6 +162,8 @@ async def build_summary(repo: Any) -> dict[str, Any]:
                     "SELECT COUNT(*) c FROM alert_state WHERE firing_since IS NOT NULL"
                 )
             )["c"],
-            "retention_days": get_settings().metrics_retention_days,
+            # Resolved, not read off boot Settings: the number the overview
+            # states is the horizon actually in force (#553 C2).
+            "retention_days": await effective("metrics_retention_days", get_settings()),
         },
     }

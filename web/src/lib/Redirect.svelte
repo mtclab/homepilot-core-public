@@ -8,9 +8,12 @@
 
 	export let to: string;
 	// Carry the query string: /inventory?q=web01 must land on /hosts?q=web01.
+	// A target that already carries a query (a `?tab=` sector) joins with `&`,
+	// or the carried query would be lost behind a second `?`.
 	onMount(() => {
 		const qs = typeof window !== 'undefined' ? window.location.search : '';
-		void goto(`${base}${to}${qs}`, { replaceState: true });
+		const carried = qs ? (to.includes('?') ? '&' + qs.slice(1) : qs) : '';
+		void goto(`${base}${to}${carried}`, { replaceState: true });
 	});
 </script>
 

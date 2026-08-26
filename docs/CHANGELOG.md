@@ -1,5 +1,55 @@
 # Changelog
 
+## v3.5.0 (2026-08-26)
+
+The facelift: every page reorganised around attention before enumeration, and
+the optional subsystems plus VPS provisioning become configurable from the
+product - in the UI and, for the non-secret subset, over admin-tier MCP.
+
+### The UI leads with what needs an operator (#549)
+
+One shared tab pattern (URL-addressable, keyboard-reachable) across the Host
+page, Changes, Records and Settings. Overview opens with a "Needs attention"
+zone and a calm line when there is nothing. Hosts groups the fleet by state
+with healthy groups collapsed on large fleets. Changes reviews proposals as a
+card queue with the approval-code panel, and drift shows disagreeing artifacts
+only - in-spec artifacts are one summary line, never enumerated. Records is a
+grouped chronology: tasks by day with running and failed pinned first, the
+journal as one-line entries with disclosure, the KB grouped by kind. Settings
+becomes seven tabs, and every legacy link and fragment lands on the right one.
+
+### Subsystems tell the truth, and can be configured in place (#553)
+
+The Settings Subsystems tab shows one card per optional subsystem, sourced from
+the server's own self-check: a failing subsystem names its reason and its
+target, "off" is stated as a choice, never a grey mystery. Non-secret settings
+(archive push remote and interval, KB embedding URL and model, both retention
+horizons, the events webhook URL) are editable on their card with one binding
+precedence: an explicitly set env var wins and records nothing; otherwise the
+stored value; otherwise the code default. Changes take effect without a restart
+- the consumers re-resolve at use time, and the scheduler re-asks its interval
+while it waits. Secrets are structurally absent from the registry: no route or
+tool built on it can list, echo or accept one.
+
+### Provisioning defaults the cluster has confirmed (#553)
+
+Default node, template VMID, pool, bridge, VLAN tag and ipconfig are
+first-class settings consumed by guest provisioning and invite minting - an
+invite can now carry a person and a size instead of raw infra details, and the
+values it was minted with are frozen into it. Every save is checked against the
+live cluster first and a refuted value is refused with the cluster's own answer
+("no bridge vmbr7 on node pve1; node has: vmbr0, vmbr1"); an unreachable
+cluster refuses the save too, rather than storing an unchecked value. A bridge
+default is also what makes provisioning write net0 at all - with a VLAN tag
+when set - so the guest network can finally be enforced per provision.
+
+### The settings reach MCP at the admin tier (#553)
+
+query/set/clear/probe tools over the same machinery the API uses, refusing in
+the same words, held to the API's admin scope by the tier gate - with no new
+exemptions.
+
+
 ## v3.4.1 (2026-08-25)
 
 ### The archive push can actually reach its remote (#550)

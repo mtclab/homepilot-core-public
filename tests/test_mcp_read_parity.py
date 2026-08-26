@@ -68,6 +68,9 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # Admin
     "/admin/guests": "query_guests",
     "/admin/selfcheck": "get_selfcheck",
+    # The persisted operator settings (#553 C2/C3), reachable over MCP since C4.
+    # The route is API `admin`, so the tool is an admin-tier READ.
+    "/admin/settings/overrides": "query_settings_overrides",
     "/admin/settings/proxmox": "get_proxmox_settings",
     # Agent fleet
     "/agents/": "list_agents",
@@ -266,6 +269,12 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     ("POST", "/agents/host/write-file"): "write_file_on_host",
     # Admin settings / credentials (wave 3).
     ("POST", "/admin/settings/proxmox/test"): "test_proxmox_connection",
+    # Operator settings (#553 C4). All three routes are API `admin`, and the
+    # tools call the same app_settings functions the routes call. The probe
+    # writes nothing but is still admin-tier: its route is.
+    ("PUT", "/admin/settings/overrides/{key}"): "set_setting_override",
+    ("DELETE", "/admin/settings/overrides/{key}"): "clear_setting_override",
+    ("POST", "/admin/settings/overrides/{key}/probe"): "probe_setting_override",
     ("DELETE", "/auth/tokens/{prefix}"): "delete_auth_token",
     # Artifacts
     ("POST", "/artifacts"): "propose_artifact",

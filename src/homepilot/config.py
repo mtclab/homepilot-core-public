@@ -67,6 +67,24 @@ class Settings(BaseSettings):
     proxmox_port: int = 8006
     proxmox_verify_ssl: bool = True
 
+    # Provisioning defaults (#553 C3). Every one of them is EMPTY by default,
+    # which means "this instance has no opinion" - the caller must say it
+    # itself, exactly as before C3. They exist so an invite stops carrying raw
+    # infra details: the operator states the cluster's shape once, here or in
+    # the UI, and the mint/redemption paths fill it in.
+    #
+    # The two numeric ones use 0 as "unset" rather than None: the settings
+    # registry stores strings and a blanked field has to read back as "no
+    # opinion", which an int field can only say with a sentinel.
+    provision_default_node: str = ""
+    provision_default_template_vmid: int = 0
+    provision_default_pool: str = ""
+    # Only when a bridge is set does provisioning touch net0 at all; unset
+    # leaves the template's own NIC exactly as it was cloned.
+    provision_default_bridge: str = ""
+    provision_default_vlan_tag: int = 0
+    provision_default_ipconfig: str = "ip=dhcp"
+
     vault_dir: str = ""
     vault_passphrase: str = ""
     vault_passphrase_file: str = ""

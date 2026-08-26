@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from .app_settings import effective
 from .config import get_settings
 from .sse import bus as sse_bus
 from .webhooks.send import sign_payload
@@ -91,7 +92,7 @@ async def emit_event(
     await sse_bus.publish(event_type, dict(payload))
 
     settings = get_settings()
-    url = settings.events_webhook_url
+    url = await effective("events_webhook_url", settings)
     if url:
         payload_data = {"event": event_type, **payload}
         payload_bytes = json.dumps(payload_data).encode()

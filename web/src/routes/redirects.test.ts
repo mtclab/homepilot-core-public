@@ -48,4 +48,16 @@ describe('Every pre-move URL redirects (#514 S4)', () => {
 			expect(opts).toMatchObject({ replaceState: true });
 		});
 	}
+
+	/**
+	 * Settings became tabbed (#549 F6), so "the successor page" is no longer
+	 * precise enough for /tokens: landing on the API-base form instead of the
+	 * token panel is a dead end wearing a 200.
+	 */
+	it('/tokens lands on the Tokens tab, not the top of Settings', async () => {
+		render(TokensRedirect as never);
+		await waitFor(() => expect(goto).toHaveBeenCalled());
+		const [target] = (goto as ReturnType<typeof vi.fn>).mock.calls[0];
+		expect(String(target)).toBe('/ui/settings?tab=tokens');
+	});
 });

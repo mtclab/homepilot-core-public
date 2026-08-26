@@ -86,8 +86,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "cloned, configured (cloud-init) and started in the background; poll "
             "get_task_result for the outcome. Refuses (an error) when Proxmox is not "
             "configured, when the request is invalid (name, disk, or authorized-key "
-            "shapes), or when a provision for the same name is already in flight. Admin "
-            "only."
+            "shapes), or when a provision for the same name is already in flight. "
+            "node, template_vmid, pool and ipconfig0 may be omitted when the instance "
+            "has provisioning defaults configured; without both a value and a default "
+            "the call is refused naming the missing setting. Admin only."
         ),
         "inputSchema": {
             "type": "object",
@@ -96,10 +98,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Guest name: 3-63 lowercase alphanumerics/hyphens",
                 },
-                "node": {"type": "string", "description": "Proxmox node to clone on"},
+                "node": {
+                    "type": "string",
+                    "description": (
+                        "Proxmox node to clone on; omit to use the instance's "
+                        "provision_default_node"
+                    ),
+                },
                 "template_vmid": {
                     "type": "integer",
-                    "description": "VMID of the template to clone",
+                    "description": (
+                        "VMID of the template to clone; omit to use the instance's "
+                        "provision_default_template_vmid"
+                    ),
                 },
                 "cores": {"type": ["integer", "null"], "description": "vCPUs (1-32)"},
                 "memory_mb": {"type": ["integer", "null"], "description": "RAM in MB (256-65536)"},
@@ -125,7 +136,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "pool": {"type": ["string", "null"], "description": "PVE resource pool"},
                 "full": {"type": "boolean", "description": "Full clone (default true)"},
             },
-            "required": ["name", "node", "template_vmid"],
+            "required": ["name"],
         },
         "outputSchema": {
             "type": "object",
@@ -262,7 +273,8 @@ async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any])
     ProvisionRequest model and the service, not re-implemented here."""
     from pydantic import ValidationError
 
-    from ...provision.models import ProvisionRequest
+    from ...provision.defaults import MissingProvisioningDefaultError, provisioning_defaults
+    from ...provision.models import ProvisionRequestIn
     from ...provision.service import ProvisionConflictError
 
     service = ctx.get("provision_service")
@@ -270,7 +282,12 @@ async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any])
         # The route returns 503 here; over MCP it is a clean error.
         raise ValueError("Proxmox not configured")
     try:
-        body = ProvisionRequest(**arguments)
+        # The same model the HTTP route takes, so the instance's provisioning
+        # defaults fill the same gaps for an assistant as for the console.
+        given = ProvisionRequestIn(**arguments)
+        body = given.resolve(await provisioning_defaults(getattr(service, "defaults_source", None)))
+    except MissingProvisioningDefaultError as exc:
+        raise ValueError(str(exc)) from exc
     except ValidationError as exc:
         raise ValueError(f"Invalid provision request: {exc}") from exc
     actor = str(ctx.get("_mcp_caller_id") or "mcp")

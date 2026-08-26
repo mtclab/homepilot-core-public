@@ -22,6 +22,14 @@ from pydantic import BaseModel, Field
 from ..auth.deps import require_scope
 from ..portal.models import InviteCaps
 from ..portal.repository import InviteRepository, invite_state
+from ..provision.defaults import (
+    MissingProvisioningDefaultError,
+    provisioning_defaults,
+    resolve_ipconfig,
+    resolve_node,
+    resolve_pool,
+    resolve_template_vmid,
+)
 from .quota import get_quota, set_quota, usage_for
 
 router = APIRouter(prefix="/admin/guests", tags=["guests"])
@@ -38,9 +46,17 @@ class QuotaIn(BaseModel):
 
 
 class InviteIn(BaseModel):
+    """What the operator says when minting. The infra half is OPTIONAL (#553 C3).
+
+    "An invite stops carrying raw infra details" (facelift-v2 C3): the node and
+    the template come from this instance's provisioning defaults unless this
+    request names them, so the operator picks a person and a size, not a
+    cluster topology. An explicit value still wins, unchanged.
+    """
+
     cn: str = Field(min_length=1, max_length=128)
-    template_vmid: int = Field(ge=100)
-    node: str = Field(min_length=1)
+    template_vmid: int | None = Field(default=None, ge=100)
+    node: str | None = Field(default=None, min_length=1)
     cores: int = Field(ge=1, le=64)
     memory_mb: int = Field(ge=256)
     disk_gb: int = Field(ge=1)
@@ -160,9 +176,20 @@ async def put_quota(request: Request, body: QuotaIn) -> dict[str, Any]:
 async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
     """Mint a one-time, CN-bound invite. The token in this response is shown
     exactly once and stored nowhere."""
+    # Resolved HERE, at mint time, and frozen into the invite row: the caps are
+    # the contract the redeemer is promised, and a default changed next week
+    # must not silently re-point an invite that is already in someone's inbox.
+    defaults = await provisioning_defaults(request.app.state)
+    try:
+        node = resolve_node(body.node, defaults)
+        template_vmid = resolve_template_vmid(body.template_vmid, defaults)
+    except MissingProvisioningDefaultError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     caps = InviteCaps(
-        template_vmid=body.template_vmid,
-        node=body.node,
+        template_vmid=template_vmid,
+        node=node,
+        pool=resolve_pool(None, defaults),
+        ipconfig0=resolve_ipconfig(None, defaults),
         cores=body.cores,
         memory_mb=body.memory_mb,
         disk_gb=body.disk_gb,
@@ -177,7 +204,19 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
     await repo.log_audit(
         user_id="ui", source="ui", action="guest_invite_minted", target_host=body.cn
     )
-    return {"id": invite_id, "token": full_token, "cn": body.cn}
+    # The caps are echoed back: when the operator named neither node nor
+    # template, this response is where they see which ones the invite got.
+    return {
+        "id": invite_id,
+        "token": full_token,
+        "cn": body.cn,
+        "caps": {
+            "node": caps.node,
+            "template_vmid": caps.template_vmid,
+            "pool": caps.pool,
+            "ipconfig0": caps.ipconfig0,
+        },
+    }
 
 
 @router.post("/invites/{prefix}/revoke", dependencies=[_admin])

@@ -62,10 +62,14 @@ async def send_webhook(
     fm: dict[str, Any],
     extra: dict[str, Any] | None = None,
 ) -> None:
+    from ..app_settings import effective
     from ..config import get_settings
 
     settings = get_settings()
-    url = settings.events_webhook_url
+    # Per send (#553 C2): an operator who points events at a new receiver is
+    # obeyed by the next event, not by the next restart. The SIGNING SECRET is
+    # deliberately not part of that - it stays env/vault only.
+    url = await effective("events_webhook_url", settings)
     if not url:
         return
 
