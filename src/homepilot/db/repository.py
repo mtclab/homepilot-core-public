@@ -1334,6 +1334,7 @@ class Repository:
                ON CONFLICT(id) DO UPDATE SET
                  status=excluded.status,
                  hash=excluded.hash,
+                 file_path=excluded.file_path,
                  approved_by_json=excluded.approved_by_json,
                  applied_at=excluded.applied_at,
                  failed_at=excluded.failed_at,

@@ -67,7 +67,7 @@ class ArtifactTransitionManager:
                 target_json=json.dumps(target) if target else None,
                 idempotence=fm.get("idempotence"),
                 produced_by_json=json.dumps(produced_by) if produced_by else None,
-                file_path="",
+                file_path=self.file_store.relative_path(fm["id"]),
                 supersedes_json=json.dumps(supersedes) if supersedes else None,
                 tags_json=json.dumps(tags) if tags else None,
                 rollback=fm.get("rollback", False),

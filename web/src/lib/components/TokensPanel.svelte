@@ -134,6 +134,17 @@
 		</div>
 	</div>
 
+	<p class="prose-note prose-measure text-xs">
+		An API token is how everything that is not a browser signs in to this
+		instance: the CLI, MCP clients, CI, scripts. Scopes are a ladder -
+		<span class="font-mono">read_only</span> can look,
+		<span class="font-mono">full</span> can change things, and
+		<span class="font-mono">admin</span> can also manage tokens and secrets - so
+		give each token the smallest one that does its job. A new token is shown
+		once, here; only a prefix and a hash of it are stored, so a lost token is
+		revoked and replaced rather than looked up.
+	</p>
+
 	{#if showCreate}
 		<form class="card p-4 space-y-3" on:submit|preventDefault={createToken}>
 			<h2 class="section-title">Create New Token</h2>
@@ -145,19 +156,27 @@
 						<input
 							class="input text-sm w-full"
 							placeholder="e.g. ci-bot, admin"
+							aria-describedby="token-label-note"
 							bind:value={newLabel}
 						/>
 					</label>
+					<p id="token-label-note" class="prose-note text-xs">
+						Name it after whatever will use it - the label and the prefix are all
+						you get to recognise it by when it is time to revoke.
+					</p>
 				</div>
 				<div>
 					<label class="field-label block mb-1">
 						<span class="block mb-1">Scope</span>
-						<select class="input text-sm" bind:value={newScope}>
+						<select class="input text-sm" aria-describedby="token-scope-note" bind:value={newScope}>
 							<option value="read_only">read_only</option>
 							<option value="full">full</option>
 							<option value="admin">admin</option>
 						</select>
 					</label>
+					<p id="token-scope-note" class="prose-note text-xs">
+						Chosen once, at creation - a token's scope cannot be raised later.
+					</p>
 				</div>
 			</div>
 
@@ -172,7 +191,11 @@
 						required
 					/>
 				</label>
-				<p class="prose-note text-xs mt-1">Find this in your server's HP_VAULT_PASSPHRASE env var.</p>
+				<p class="prose-note prose-measure text-xs mt-1">
+					The vault passphrase, from the server's <span class="font-mono">HP_VAULT_PASSPHRASE</span>
+					environment variable. Minting a credential asks for it on top of your
+					admin session, so a borrowed browser cannot mint one.
+				</p>
 			</div>
 
 			<div class="flex justify-end">

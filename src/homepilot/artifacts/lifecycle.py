@@ -115,7 +115,7 @@ class ArtifactLifecycle:
                     target_json=_json.dumps(target) if target else None,
                     idempotence=fm.get("idempotence"),
                     produced_by_json=_json.dumps(produced_by) if produced_by else None,
-                    file_path="",
+                    file_path=self._file_store.relative_path(id_str),
                     supersedes_json=_json.dumps(supersedes) if supersedes else None,
                     tags_json=_json.dumps(tags) if tags else None,
                     rollback=fm.get("rollback", False),

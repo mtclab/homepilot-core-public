@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.5.1 (2026-08-26)
+
+The feedback round on 3.5.0, same day.
+
+### Settings explains every field it asks for (#549 F7)
+
+Owner verdict on 3.5.0: the tab organization is right, the information is
+missing. Every Guests input now says what it is for and what happens with it;
+Monitoring, Tokens, Connection and Proxmox get lead-ins; an env-locked setting
+now states HOW to hand control to the UI (remove the variable and restart).
+Writing the explanations down surfaced two real gaps: the "empty = the
+Provisioning default" invite path was unreachable from the product (the form
+still required node and pre-filled the template), and the invite TTL was a
+hidden constant - both fixed, and the mint response now shows which defaults
+the invite actually resolved to. A standing gate walks every rendered Guests
+control and fails on any input without an explanation.
+
+### The artifact DB mirror records every artifact (#545)
+
+Every mirror row was written with file_path="" against a NOT NULL UNIQUE
+column, so the second-and-later artifact's row silently failed to insert.
+Both write sites now record the store-relative path, and the upsert repairs
+pre-fix rows on their next status sync.
+
+### An auth failure no longer reads as a network fault
+
+Found live: an unreadable deploy key surfaced as "git push failed (network)",
+pointing at connectivity while the fix was key ownership. Auth patterns now
+classify before network ones.
+
+
 ## v3.5.0 (2026-08-26)
 
 The facelift: every page reorganised around attention before enumeration, and
