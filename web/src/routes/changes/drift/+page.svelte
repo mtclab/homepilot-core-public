@@ -1,10 +1,22 @@
 <script lang="ts">
+	// Drift, attention-first (#549 F4).
+	//
+	// This page used to print every active artifact across two tables: the forty
+	// that agree with reality next to the two that do not, each with its own
+	// green tick. The page whose whole job is "these two need you" said it in a
+	// wall of ✓. Now only DISAGREEMENT is enumerated — drifted artifacts, and
+	// checks that established nothing (#425) — and everything healthy collapses
+	// into one line. The rollup itself lives in `$lib/drift` so the rule can be
+	// asserted without a DOM.
 	import { onMount, onDestroy } from 'svelte';
 	import { api, type Artifact, type Host, type DriftCheck } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
+	import { buildDriftRollup } from '$lib/drift';
+	import { timeAgo } from '$lib/relativeTime';
+	import DriftItemCard from '$lib/components/DriftItemCard.svelte';
 
 	let artifacts: Artifact[] = [];
 	let hosts: Host[] = [];
@@ -14,16 +26,7 @@
 	let rechecking = false;
 	let recheckingId = '';
 
-	interface DriftRow {
-		artifact: Artifact;
-		target: string;
-		matchedHost: Host | null;
-		driftStatus: 'drifted' | 'in-spec' | 'unknown' | 'unchecked';
-		driftCheck: DriftCheck | null;
-	}
-
-	let rows: DriftRow[] = [];
-	let unmanagedHosts: Host[] = [];
+	$: rollup = buildDriftRollup(artifacts, hosts, driftChecks);
 
 	async function load(initial = true) {
 		if (initial) loading = true;
@@ -34,15 +37,14 @@
 				api.listInventory(),
 				api.getDriftStatus({ limit: 500 }),
 			]);
-			artifacts = aRes.items.filter((a) => ['applied', 'approved'].includes(a.status));
+			artifacts = aRes.items;
 			hosts = hRes.items;
 			driftChecks = dRes.items;
-			compute();
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			// On a silent live refresh, keep the last-good tables rather than
-			// replacing them with the error card / a toast.
-			if (initial || rows.length === 0) {
+			// On a silent live refresh, keep the last-good page rather than
+			// replacing it with the error card / a toast.
+			if (initial || artifacts.length === 0) {
 				loadError = msg;
 				notify(msg, 'err');
 			}
@@ -51,60 +53,17 @@
 		}
 	}
 
-	function artifactTarget(a: Artifact): string {
-		const t = a.target ?? {};
-		return t.host ?? t.service ?? t.node ?? '';
-	}
-
-	function getDriftStatus(artifactId: string): DriftCheck | null {
-		return driftChecks.find((dc) => dc.artifact_id === artifactId) ?? null;
-	}
-
-	function compute() {
-		const hostByName = new Map<string, Host>();
-		for (const h of hosts) {
-			hostByName.set(h.hostname, h);
-			if (h.node) hostByName.set(h.node, h);
-		}
-
-		rows = artifacts.map((a) => {
-			const target = artifactTarget(a);
-			const matchedHost = target ? (hostByName.get(target) ?? null) : null;
-			const dc = getDriftStatus(a.id);
-			let driftStatus: 'drifted' | 'in-spec' | 'unknown' | 'unchecked' = 'unchecked';
-			if (dc) {
-				// A check that ran and could not establish anything is NOT ok
-				// (#425): "no spec", "no host", "the executor errored" and the
-				// whole ansible path all stored `drifted: false`, and this line
-				// used to paint every one of them green.
-				driftStatus =
-					dc.state === 'drifted'
-						? 'drifted'
-						: dc.state === 'in_spec'
-							? 'in-spec'
-							: 'unknown';
-			}
-			return { artifact: a, target, matchedHost, driftStatus, driftCheck: dc };
-		});
-
-		const coveredHosts = new Set(rows.map((r) => r.matchedHost?.id).filter(Boolean));
-		unmanagedHosts = hosts.filter((h) => !coveredHosts.has(h.id));
-	}
-
 	async function recheck(artifactId: string) {
 		rechecking = true;
 		recheckingId = artifactId;
 		try {
 			const res = await api.recheckDrift(artifactId);
 			if (res.items.length > 0) {
-				const existingIdx = driftChecks.findIndex((dc) => dc.artifact_id === artifactId);
-				if (existingIdx >= 0) {
-					driftChecks[existingIdx] = res.items[0];
-				} else {
-					driftChecks.push(res.items[0]);
-				}
+				driftChecks = [
+					...driftChecks.filter((dc) => dc.artifact_id !== artifactId),
+					res.items[0],
+				];
 			}
-			compute();
 			notify('Drift recheck complete', 'ok');
 		} catch (e) {
 			notify(String(e), 'err');
@@ -114,58 +73,11 @@
 		}
 	}
 
-	let showOrphans = true;
-	let showCovered = true;
-	let showUnmanaged = true;
-
-	$: orphanRows = rows.filter((r) => !r.matchedHost);
-	$: coveredRows = rows.filter((r) => r.matchedHost);
-
-	const STATUS_CLASSES: Record<string, string> = {
-		proposed: 'badge-proposed',
-		approved: 'badge-approved',
-		applied: 'badge-applied',
-		rejected: 'badge-rejected',
-		revoked: 'badge-revoked',
-		failed: 'badge-failed',
-		superseded: 'badge-superseded',
-	};
-	function statusClass(s: string): string { return STATUS_CLASSES[s] ?? 'badge-proposed'; }
-
-	const DRIFT_COLORS: Record<string, string> = {
-		drifted: 'text-danger bg-danger-tint border-danger-border',
-		'in-spec': 'text-ok bg-ok-tint border-ok-border',
-		// Amber, not green and not red: something is unresolved and an operator
-		// should go and look, which is exactly what a grey "unchecked" does not say.
-		unknown: 'text-warn bg-warn-tint border-warn-border',
-		unchecked: 'text-muted bg-raised border-border-strong',
-	};
-
-	const DRIFT_LABELS: Record<string, string> = {
-		drifted: '⚠ drifted',
-		'in-spec': '✓ in spec',
-		unknown: '? not established',
-		unchecked: '— unchecked',
-	};
-
-	/** Why a check could not establish anything - the operator's next step. */
-	function driftReason(dc: DriftCheck | null): string {
-		if (!dc || dc.state !== 'unknown') return '';
-		try {
-			const details = dc.details_json ? JSON.parse(dc.details_json) : {};
-			return typeof details.reason === 'string' ? details.reason.replace(/_/g, ' ') : '';
-		} catch {
-			return '';
-		}
-	}
-
-	function fmtDate(s: string): string {
-		return s ? new Date(s).toLocaleDateString() : '—';
-	}
+	let showUncovered = false;
 
 	onMount(load);
 	// Live-refresh on drift + lifecycle events (an apply/revoke changes what's
-	// covered; artifact_drifted changes a row's status). Debounced hard: EVERY
+	// covered; artifact_drifted changes an item's state). Debounced hard: EVERY
 	// event here fired three parallel calls (500 artifacts + full inventory +
 	// 500 drift rows), so a burst of events was a burst of full reloads.
 	const refresh = debounce(() => load(false), 400);
@@ -176,34 +88,10 @@
 	});
 </script>
 
-<div class="space-y-4">
+<div class="section-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Drift</h1>
 		<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Refresh</button>
-	</div>
-
-	<div class="flex gap-3 flex-wrap text-xs">
-		<button
-			class="px-3 py-1 rounded-full border transition-colors
-			       {showCovered ? 'bg-ok-tint border-ok-border text-ok' : 'border-border-strong text-muted'}"
-			on:click={() => (showCovered = !showCovered)}
-		>
-			✓ {coveredRows.length} covered
-		</button>
-		<button
-			class="px-3 py-1 rounded-full border transition-colors
-			       {showOrphans ? 'bg-warn-tint border-warn-border text-warn' : 'border-border-strong text-muted'}"
-			on:click={() => (showOrphans = !showOrphans)}
-		>
-			⚠ {orphanRows.length} orphaned artifacts
-		</button>
-		<button
-			class="px-3 py-1 rounded-full border transition-colors
-			       {showUnmanaged ? 'bg-raised border-border-strong text-ink' : 'border-border-strong text-muted'}"
-			on:click={() => (showUnmanaged = !showUnmanaged)}
-		>
-			○ {unmanagedHosts.length} uncovered hosts
-		</button>
 	</div>
 
 	{#if loading}
@@ -214,119 +102,115 @@
 			<p class="text-xs text-muted">{loadError}</p>
 			<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Retry</button>
 		</div>
+	{:else if rollup.total === 0}
+		<p class="prose-note text-sm">
+			No active artifacts — nothing has been applied yet, so there is nothing to drift.
+		</p>
 	{:else}
-		{#if showOrphans && orphanRows.length}
-			<div class="card space-y-2">
-				<h2 class="section-title text-warn">⚠ Orphaned Artifacts</h2>
-				<p class="prose-note text-xs">Active artifacts whose target is absent from inventory.</p>
-				<table class="data-table text-xs">
-					<thead>
-						<tr>
-							<th class="text-left pb-1">Intent</th>
-							<th class="text-left pb-1">Kind</th>
-							<th class="text-left pb-1">Status</th>
-							<th class="text-left pb-1">Target</th>
-							<th class="text-left pb-1">Drift</th>
-							<th class="text-left pb-1">Date</th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each orphanRows as r}
-							<tr class="border-b border-divider">
-								<td class="py-1.5 text-ink truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1.5 text-muted">{r.artifact.kind}</td>
-								<td class="py-1.5"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
-								<td class="py-1.5 text-warn font-mono">{r.target || '(global)'}</td>
-								<td class="py-1.5">
-									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
-										{DRIFT_LABELS[r.driftStatus]}{#if driftReason(r.driftCheck)}<span class="text-muted"> ({driftReason(r.driftCheck)})</span>{/if}
-									</span>
-									{#if rechecking && recheckingId === r.artifact.id}
-										<span class="text-muted ml-1 animate-pulse">checking…</span>
-									{:else}
-										<button
-											class="text-accent hover:text-accent-strong ml-1"
-											on:click={() => recheck(r.artifact.id)}
-										>↻</button>
-									{/if}
-								</td>
-								<td class="py-1.5 text-muted">{fmtDate(r.artifact.created_at)}</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
+		<!-- The honest header (#425). With nothing checked there is no percentage
+		     to quote: a coverage figure computed over zero checks is the exact
+		     "100% healthy" lie the issue is about. -->
+		{#if rollup.checkedCount === 0}
+			<p class="prose-note text-sm" data-testid="drift-coverage">
+				Nothing checked yet — {rollup.total} active artifact{rollup.total === 1 ? '' : 's'} have never
+				been drift-checked.
+			</p>
+		{:else}
+			<p class="prose-note text-sm" data-testid="drift-coverage">
+				{rollup.checkedCount} of {rollup.total} active artifacts checked ({rollup.coveragePct}%).
+			</p>
 		{/if}
 
-		{#if showCovered && coveredRows.length}
-			<div class="card space-y-2">
-				<h2 class="section-title text-ok">✓ Covered</h2>
-				<table class="data-table text-xs">
-					<thead>
-						<tr>
-							<th class="text-left pb-1">Intent</th>
-							<th class="text-left pb-1">Kind</th>
-							<th class="text-left pb-1">Status</th>
-							<th class="text-left pb-1">Drift</th>
-							<th class="text-left pb-1">Host</th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each coveredRows as r}
-							<tr class="border-b border-divider">
-								<td class="py-1 text-ink truncate max-w-xs">{r.artifact.intent}</td>
-								<td class="py-1 text-muted">{r.artifact.kind}</td>
-								<td class="py-1"><span class="badge {statusClass(r.artifact.status)}">{r.artifact.status}</span></td>
-								<td class="py-1">
-									<span class="px-1.5 py-0.5 rounded border text-[10px] {DRIFT_COLORS[r.driftStatus]}">
-										{DRIFT_LABELS[r.driftStatus]}{#if driftReason(r.driftCheck)}<span class="text-muted"> ({driftReason(r.driftCheck)})</span>{/if}
-									</span>
-									{#if rechecking && recheckingId === r.artifact.id}
-										<span class="text-muted ml-1 animate-pulse">checking…</span>
-									{:else}
-										<button
-											class="text-accent hover:text-accent-strong ml-1"
-											on:click={() => recheck(r.artifact.id)}
-										>↻</button>
-									{/if}
-								</td>
-								<td class="py-1">
-									{#if r.matchedHost}
-										<a href="{base}/inventory/{r.matchedHost.id}" class="text-accent hover:text-accent-strong font-mono">
-											{r.matchedHost.hostname}
-										</a>
-									{/if}
-								</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
+		{#if rollup.drifted.length > 0}
+			<section class="section-stack" data-testid="drift-attention">
+				<h2 class="section-title text-danger">
+					⚠ {rollup.drifted.length} artifact{rollup.drifted.length === 1 ? '' : 's'} disagree{rollup
+						.drifted.length === 1
+						? 's'
+						: ''} with reality
+				</h2>
+				{#each rollup.drifted as item (item.artifact.id)}
+					<DriftItemCard
+						{item}
+						rechecking={rechecking && recheckingId === item.artifact.id}
+						onRecheck={recheck}
+					/>
+				{/each}
+			</section>
 		{/if}
 
-		{#if showUnmanaged && unmanagedHosts.length}
-			<div class="card space-y-2">
-				<h2 class="section-title text-muted">○ Uncovered Hosts</h2>
-				<p class="prose-note text-xs">
-					In inventory but not targeted by any applied artifact — config drift can't be
-					tracked for them. Adopting a host in inventory does not cover it; an artifact must
-					target it. Not related to the inventory "managed" flag.
+		{#if rollup.unresolved.length > 0}
+			<!-- An errored check is NOT "in spec" (#425). It gets its own section
+			     and its own reason, because the operator's next step is different:
+			     nothing is known about these, and no one is going to find out by
+			     waiting. -->
+			<section class="section-stack" data-testid="drift-unresolved">
+				<h2 class="section-title text-warn">
+					? {rollup.unresolved.length} check{rollup.unresolved.length === 1 ? '' : 's'} established
+					nothing
+				</h2>
+				{#each rollup.unresolved as item (item.artifact.id)}
+					<DriftItemCard
+						{item}
+						summaryPrefix="Not established:"
+						rechecking={rechecking && recheckingId === item.artifact.id}
+						onRecheck={recheck}
+					/>
+				{/each}
+			</section>
+		{/if}
+
+		<!-- Everything healthy is ONE line, on purpose. Naming the forty that
+		     agree is what buried the two that do not. -->
+		<div class="card space-y-1">
+			{#if rollup.inSpec.count > 0}
+				<p class="text-sm text-ok" data-testid="drift-in-spec-summary">
+					✓ {rollup.inSpec.count} in spec, last checked {timeAgo(rollup.inSpec.lastCheckedAt)}
 				</p>
-				<div class="flex flex-wrap gap-2">
-					{#each unmanagedHosts as h}
-						<a
-							href="{base}/inventory/{h.id}"
-							class="px-2 py-1 bg-raised hover:bg-border rounded text-xs font-mono text-ink transition-colors"
-						>
-							{h.hostname}
-						</a>
-					{/each}
-				</div>
-			</div>
-		{/if}
+			{/if}
+			{#if rollup.uncheckedCount > 0}
+				<p class="text-sm text-muted" data-testid="drift-unchecked-summary">
+					— {rollup.uncheckedCount} not checked yet
+				</p>
+			{/if}
+			{#if rollup.orphanCount > 0}
+				<p class="text-xs text-warn" data-testid="drift-orphan-summary">
+					{rollup.orphanCount} active artifact{rollup.orphanCount === 1 ? '' : 's'} target a name inventory
+					does not know.
+				</p>
+			{/if}
+			{#if rollup.drifted.length === 0 && rollup.unresolved.length === 0 && rollup.checkedCount > 0}
+				<p class="prose-note text-xs">Nothing disagrees with reality.</p>
+			{/if}
+		</div>
 
-		{#if rows.length === 0 && unmanagedHosts.length === 0}
-			<p class="prose-note text-sm">No data — no artifacts or inventory yet.</p>
+		{#if rollup.uncoveredHosts.length > 0}
+			<div class="card space-y-2">
+				<button
+					class="section-title text-muted text-left"
+					aria-expanded={showUncovered}
+					on:click={() => (showUncovered = !showUncovered)}
+				>
+					{showUncovered ? '▾' : '▸'} ○ {rollup.uncoveredHosts.length} hosts covered by no artifact
+				</button>
+				{#if showUncovered}
+					<p class="prose-note text-xs">
+						In inventory but not targeted by any active artifact — config drift can't be tracked for
+						them. Adopting a host in inventory does not cover it; an artifact must target it. Not
+						related to the inventory "managed" flag.
+					</p>
+					<div class="flex flex-wrap gap-2">
+						{#each rollup.uncoveredHosts as h (h.id)}
+							<a
+								href="{base}/inventory/{h.id}"
+								class="px-2 py-1 bg-raised hover:bg-border rounded text-xs font-mono text-ink transition-colors"
+							>
+								{h.hostname}
+							</a>
+						{/each}
+					</div>
+				{/if}
+			</div>
 		{/if}
 	{/if}
 </div>

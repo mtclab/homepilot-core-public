@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from typing import Any
 
 from ..reconciler.base import Reconciler, ReconcilerResult
 from .repository import MetricsRepository
@@ -26,16 +27,31 @@ class MetricsPruner(Reconciler):
         metrics_repo: MetricsRepository,
         retention_days: int,
         now: Callable[[], float] = time.time,
+        resolver: Any = None,
     ) -> None:
         self._metrics = metrics_repo
         self._retention_days = max(1, int(retention_days))
         self._now = now
+        # The horizon is an operator setting (#553 C2): with a resolver it is
+        # read at the start of every run, so a shortened window takes effect on
+        # the next cycle rather than at the next restart.
+        self._resolver = resolver
 
     @property
     def cutoff_ts(self) -> int:
         return int(self._now() - self._retention_days * SECONDS_PER_DAY)
 
+    async def _resolve_days(self) -> int:
+        if self._resolver is None:
+            return self._retention_days
+        try:
+            return max(1, int(await self._resolver.value("metrics_retention_days")))
+        except Exception:
+            logger.warning("Could not resolve metrics_retention_days; keeping the boot value")
+            return self._retention_days
+
     async def run(self) -> ReconcilerResult:
+        self._retention_days = await self._resolve_days()
         cutoff = self.cutoff_ts
         deleted = await self._metrics.prune(cutoff)
         if deleted:

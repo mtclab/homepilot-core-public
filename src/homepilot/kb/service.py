@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from homepilot.app_settings import effective
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import LifecycleError
 from homepilot.artifacts.store import ArtifactStore
@@ -71,8 +72,10 @@ async def _call_embed_service(
 
 async def _get_embedding(text: str) -> list[float] | None:
     settings = get_settings()
-    primary_url = settings.embedding_service_url
-    primary_model = settings.embedding_model
+    # Resolved per CALL, not per process: the embedding service is an operator
+    # setting that can be pointed somewhere else while HomePilot runs (#553 C2).
+    primary_url = await effective("embedding_service_url", settings)
+    primary_model = await effective("embedding_model", settings)
     fallback_url = settings.embedding_fallback_url
     fallback_model = settings.embedding_fallback_model
 
@@ -449,17 +452,18 @@ class KBService:
 
     async def embedding_status(self) -> dict[str, Any]:
         settings = get_settings()
-        primary_url = settings.embedding_service_url
+        primary_url = await effective("embedding_service_url", settings)
+        primary_model = await effective("embedding_model", settings)
         fallback_url = settings.embedding_fallback_url
         # Only probe what is configured: an unconfigured service is off, and
         # "off" must never be reported through the same path as "reachable".
         primary_ok = False
         if primary_url:
-            test_vec = await _call_embed_service(primary_url, settings.embedding_model, "test")
+            test_vec = await _call_embed_service(primary_url, primary_model, "test")
             primary_ok = test_vec is not None
         fallback_ok = False
         if fallback_url and not primary_ok:
-            fb_vec = await _call_embed_service(fallback_url, settings.embedding_model, "test")
+            fb_vec = await _call_embed_service(fallback_url, primary_model, "test")
             fallback_ok = fb_vec is not None
         rows = await self.repo.db.fetchone("SELECT COUNT(*) AS c FROM vec_docs")
         indexed = rows["c"] if rows else 0

@@ -59,6 +59,14 @@ export default {
 				's-4': 'var(--space-4)',
 				's-5': 'var(--space-5)',
 				's-6': 'var(--space-6)',
+				// The density scale (#549 F1): markup says how much room a thing
+				// needs, never how many rems that is this month.
+				's-stack': 'var(--space-stack)',
+				's-card': 'var(--space-card)',
+				's-section': 'var(--space-section)',
+			},
+			maxWidth: {
+				prose: 'var(--measure-prose)',
 			},
 		},
 	},

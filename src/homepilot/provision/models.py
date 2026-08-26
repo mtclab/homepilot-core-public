@@ -3,8 +3,12 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle: defaults reads the registry
+    from .defaults import ProvisioningDefaults
 
 # A guest name that is simultaneously a valid PVE VM name and a valid DNS label:
 # lowercase alnum, inner hyphens allowed, 3-63 chars, never starting or ending
@@ -132,3 +136,34 @@ class ProvisionRequest(BaseModel):
         if v is None:
             return None
         return validate_tailscale_auth_key(v)
+
+
+class ProvisionRequestIn(ProvisionRequest):
+    """The same request, with the two infra fields allowed to be OMITTED (#553 C3).
+
+    A SUBCLASS rather than a parallel model on purpose: every other field, every
+    validator and every future addition come from ProvisionRequest itself, so
+    the API surface cannot drift from what provisioning actually accepts. Only
+    ``node`` and ``template_vmid`` are loosened, and only because this instance
+    may already know them - ``resolve`` turns this back into a strict
+    ProvisionRequest or refuses, naming the setting that would have filled the
+    gap.
+    """
+
+    node: str = ""
+    template_vmid: int = 0
+
+    def resolve(self, defaults: ProvisioningDefaults) -> ProvisionRequest:
+        from .defaults import (
+            resolve_ipconfig,
+            resolve_node,
+            resolve_pool,
+            resolve_template_vmid,
+        )
+
+        payload = self.model_dump()
+        payload["node"] = resolve_node(self.node, defaults)
+        payload["template_vmid"] = resolve_template_vmid(self.template_vmid, defaults)
+        payload["pool"] = resolve_pool(self.pool, defaults)
+        payload["ipconfig0"] = resolve_ipconfig(self.ipconfig0, defaults)
+        return ProvisionRequest(**payload)

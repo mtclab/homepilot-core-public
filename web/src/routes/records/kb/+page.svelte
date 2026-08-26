@@ -3,6 +3,7 @@
 	import { api, type KBEntry, sessionStore } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
+	import { groupByKind } from '$lib/grouping';
 
 	let query = '';
 	let filterKind = '';
@@ -50,6 +51,8 @@
 				items = res.items;
 				total = res.total;
 			}
+			// A new result set invalidates whichever entry was expanded.
+			openId = null;
 		} catch (e) {
 			// Kept on screen, NOT just toasted. Clearing items and toasting made a
 			// failed search render as "No knowledge base entries yet" - a failure
@@ -141,6 +144,30 @@
 		search();
 	}
 
+	// Progressive disclosure: an entry is one line until asked. The KB's bodies
+	// are paragraphs of prose - fifty of them stacked is the wall F5 removes.
+	let openId: number | null = null;
+	function toggle(id: number) {
+		openId = openId === id ? null : id;
+		// Collapsing the row an edit/delete was staged on must not leave the
+		// confirmation armed out of sight.
+		if (openId !== id) deleteConfirmId = null;
+	}
+
+	/** The one-line gist of an entry: its own title, else the first line of the body. */
+	function summaryOf(entry: KBEntry): string {
+		if (entry.title) return entry.title;
+		const first = (entry.content || '').split('\n').find((l) => l.trim() !== '') ?? '';
+		return first.length > 110 ? `${first.slice(0, 110)}…` : first;
+	}
+
+	// Kinds come off the DATA, never a hardcoded list: the KB's kind column is
+	// open (ingest can write kinds the UI has never heard of) and a hardcoded set
+	// would silently drop them. KNOWN_KINDS only decides the ORDER the groups
+	// appear in; anything else follows alphabetically.
+	const KNOWN_KINDS = ['note', 'policy', 'doc', 'fact'];
+	$: kindGroups = groupByKind(items, (e) => e.kind, KNOWN_KINDS);
+
 	function kindColor(kind: string): string {
 		if (kind === 'note') return 'text-accent';
 		if (kind === 'doc') return 'text-note';
@@ -152,7 +179,7 @@
 	onMount(search);
 </script>
 
-<div class="space-y-4">
+<div class="page-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Knowledge Base</h1>
 		<div class="flex gap-2 items-center">
@@ -163,6 +190,33 @@
 				</button>
 			{/if}
 		</div>
+	</div>
+
+	<!-- Search is the KB's primary action, so it sits directly under the title -
+	     above the create/edit forms. It used to be pushed below a five-field
+	     form, i.e. below the fold exactly when an operator had one open. -->
+	<div class="flex gap-2">
+		<label class="flex-1">
+			<span class="sr-only">Search the knowledge base</span>
+			<input
+				class="input w-full text-sm"
+				type="search"
+				placeholder="Search KB…"
+				bind:value={query}
+				on:keydown={(e) => e.key === 'Enter' && search()}
+			/>
+		</label>
+		<label>
+			<span class="sr-only">Filter by kind</span>
+			<select class="input text-xs" bind:value={filterKind} on:change={search}>
+				<option value="">All kinds</option>
+				<option value="note">note</option>
+				<option value="doc">doc</option>
+				<option value="fact">fact</option>
+				<option value="policy">policy</option>
+			</select>
+		</label>
+		<button class="btn btn-ghost text-xs" on:click={search}>Search</button>
 	</div>
 
 	{#if showForm}
@@ -262,23 +316,6 @@
 		</form>
 	{/if}
 
-	<div class="flex gap-2">
-		<input
-			class="input flex-1 text-sm"
-			placeholder="Search KB…"
-			bind:value={query}
-			on:keydown={(e) => e.key === 'Enter' && search()}
-		/>
-		<select class="input text-xs" bind:value={filterKind} on:change={search}>
-			<option value="">All kinds</option>
-			<option value="note">note</option>
-			<option value="doc">doc</option>
-			<option value="fact">fact</option>
-			<option value="policy">policy</option>
-		</select>
-		<button class="btn btn-ghost text-xs" on:click={search}>Search</button>
-	</div>
-
 	{#if loading}
 		<p class="text-muted text-sm">Loading…</p>
 	{:else if loadError}
@@ -300,35 +337,54 @@
 			{/if}
 		</div>
 	{:else}
-		<div class="space-y-2">
-			{#each items as entry}
-				<div class="card p-4 space-y-1">
-					<div class="flex items-center gap-3">
-						<span class="text-xs font-medium {kindColor(entry.kind)}">{entry.kind}</span>
-						{#if entry.target}
-							<span class="text-xs text-muted font-mono">{entry.target}</span>
-						{/if}
-						{#if entry.title}
-							<span class="text-sm text-ink font-medium">{entry.title}</span>
-						{/if}
-						<div class="ml-auto flex gap-1">
-							{#if canWrite}
-								<button class="btn btn-ghost text-xs" on:click={() => startEdit(entry)}>Edit</button>
-							{/if}
-							{#if isAdmin}
-								{#if deleteConfirmId === entry.id}
-									<button class="btn btn-danger text-xs" on:click={() => doDelete(entry.id)}>Confirm</button>
-									<button class="btn btn-ghost text-xs" on:click={() => (deleteConfirmId = null)}>Cancel</button>
-								{:else}
-									<button class="btn btn-danger text-xs" on:click={() => confirmDelete(entry.id)}>Delete</button>
+		{#each kindGroups as group (group.kind)}
+			<section class="section-stack" aria-labelledby="kb-group-{group.kind}">
+				<h2 class="section-title" id="kb-group-{group.kind}">
+					<span class={kindColor(group.kind)}>{group.kind}</span>
+					<span class="text-muted font-normal num-inline">({group.items.length})</span>
+				</h2>
+				<ul class="card divide-y divide-divider">
+					{#each group.items as entry (entry.id)}
+						<li>
+							<button
+								class="flex items-baseline gap-3 w-full text-left px-3 py-1.5 text-xs hover:text-ink-strong"
+								aria-expanded={openId === entry.id}
+								on:click={() => toggle(entry.id)}
+							>
+								{#if entry.target}
+									<span class="text-muted font-mono whitespace-nowrap">{entry.target}</span>
 								{/if}
+								<span class="text-ink truncate">{summaryOf(entry)}</span>
+								<span class="text-muted ml-auto pl-2" aria-hidden="true"
+								>{openId === entry.id ? '▾' : '▸'}</span>
+							</button>
+							{#if openId === entry.id}
+								<div class="px-3 pb-3 space-y-2">
+									<p class="prose-body prose-measure text-xs whitespace-pre-wrap">{entry.content}</p>
+									<div class="flex items-center gap-3 text-xs text-muted">
+										<span>#{entry.id}</span>
+										<span>{entry.source}</span>
+										{#if entry.embedded_at}<span>embedded {entry.embedded_at}</span>{/if}
+										<span class="ml-auto flex gap-1">
+											{#if canWrite}
+												<button class="btn btn-ghost text-xs" on:click={() => startEdit(entry)}>Edit</button>
+											{/if}
+											{#if isAdmin}
+												{#if deleteConfirmId === entry.id}
+													<button class="btn btn-danger text-xs" on:click={() => doDelete(entry.id)}>Confirm</button>
+													<button class="btn btn-ghost text-xs" on:click={() => (deleteConfirmId = null)}>Cancel</button>
+												{:else}
+													<button class="btn btn-danger text-xs" on:click={() => confirmDelete(entry.id)}>Delete</button>
+												{/if}
+											{/if}
+										</span>
+									</div>
+								</div>
 							{/if}
-						</div>
-					</div>
-					<p class="prose-body text-xs line-clamp-3 whitespace-pre-wrap">{entry.content}</p>
-					<div class="text-xs text-muted">{entry.source}</div>
-				</div>
-			{/each}
-		</div>
+						</li>
+					{/each}
+				</ul>
+			</section>
+		{/each}
 	{/if}
 </div>

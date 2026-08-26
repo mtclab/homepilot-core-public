@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from homepilot.db.repository import Repository
 
@@ -49,18 +50,32 @@ _FINISHED_TASK_STATES = ("succeeded", "failed", "cancelled")
 class RetentionReconciler(Reconciler):
     """Delete operational history older than the retention horizon."""
 
-    def __init__(self, repo: Repository, retention_days: int) -> None:
+    def __init__(self, repo: Repository, retention_days: int, resolver: Any = None) -> None:
         self._repo = repo
         # A horizon of zero would delete everything written this instant, which
         # is never what an operator means; one day is the floor.
         self._retention_days = max(1, int(retention_days))
+        # The horizon is an operator setting (#553 C2): with a resolver it is
+        # read at the start of every run, so a shortened window prunes on the
+        # next cycle rather than at the next restart.
+        self._resolver = resolver
 
     @property
     def cutoff(self) -> str:
         cutoff = datetime.now(UTC) - timedelta(days=self._retention_days)
         return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    async def _resolve_days(self) -> int:
+        if self._resolver is None:
+            return self._retention_days
+        try:
+            return max(1, int(await self._resolver.value("retention_days")))
+        except Exception:
+            logger.warning("Could not resolve retention_days; keeping the boot value")
+            return self._retention_days
+
     async def run(self) -> ReconcilerResult:
+        self._retention_days = await self._resolve_days()
         cutoff = self.cutoff
         deleted: dict[str, int] = {}
         total = 0

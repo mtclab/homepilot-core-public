@@ -8,9 +8,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from ..app_settings import (
+    EnvOverrideError,
+    ProbeRefusedError,
+    SettingError,
+    checked_set,
+    resolver_from_state,
+    run_probe,
+)
 from ..auth.deps import require_scope
 from ..config import get_settings
 from ..selfcheck import selfcheck_report
@@ -271,6 +279,101 @@ async def probe_proxmox_connection(state: Any, config: ProxmoxConfigIn) -> dict[
 @router.post("/settings/proxmox/test", dependencies=[Depends(require_scope("admin"))])
 async def test_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> dict[str, Any]:
     return await probe_proxmox_connection(request.app.state, config)
+
+
+# ── Operator settings (#553 C2) ──────────────────────────────────────────────
+# ADMIN, all three verbs, including the GET: the report names the addresses this
+# instance pushes artifacts and events to. No secret is in the registry, so none
+# can pass through here in either direction - see app_settings.FORBIDDEN_KEYS.
+
+
+class SettingValueIn(BaseModel):
+    value: Any
+
+
+def _resolver_or_503(request: Request) -> Any:
+    resolver = resolver_from_state(request.app.state)
+    if resolver is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Settings are not available: this instance has no database bound.",
+        )
+    return resolver
+
+
+@router.get("/settings/overrides", dependencies=[_require_admin_dep])
+async def list_setting_overrides(request: Request) -> dict[str, Any]:
+    resolver = _resolver_or_503(request)
+    return {"settings": await resolver.report()}
+
+
+@router.put("/settings/overrides/{key}", dependencies=[_require_admin_dep])
+async def set_setting_override(request: Request, key: str, body: SettingValueIn) -> dict[str, Any]:
+    resolver = _resolver_or_503(request)
+    try:
+        resolved, probe = await checked_set(request.app.state, resolver, key, body.value)
+    except ProbeRefusedError as exc:
+        # 422 when the cluster ANSWERED and its answer contradicts the value:
+        # the request is well-formed, the estate simply is not shaped that way,
+        # and the cluster's own sentence is what an operator can act on. 502
+        # when the probe could not run at all - saving an unchecked provisioning
+        # default and calling it validated is the lie C3 exists to refuse.
+        status = 422 if exc.result.reachable else 502
+        raise HTTPException(status_code=status, detail=exc.result.detail) from exc
+    except EnvOverrideError as exc:
+        # 409, not 400: the request is well-formed and the operator is not wrong
+        # - the environment simply already decides this one, and saving a value
+        # that would never be read is the lie C2 exists to refuse.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SettingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "status": "ok",
+        "key": resolved.key,
+        "value": resolved.value,
+        "source": resolved.source,
+        # What the cluster said while confirming the save, so the UI can show
+        # WHERE a template was found or that a VLAN could not be verified.
+        "probe": None if probe is None else {"ok": probe.ok, "detail": probe.detail},
+    }
+
+
+@router.post("/settings/overrides/{key}/probe", dependencies=[_require_admin_dep])
+async def probe_setting_override(
+    request: Request, key: str, body: SettingValueIn
+) -> dict[str, Any]:
+    """Ask the cluster about a value WITHOUT saving it (#553 C3).
+
+    Always 200 when the probe ran: a refusal is the answer the operator asked
+    for, not a failed request. `ok` false with `reachable` false means the
+    cluster could not be asked at all - the one case where "no" says nothing
+    about the value itself.
+    """
+    _resolver_or_503(request)
+    try:
+        result = await run_probe(request.app.state, key, body.value)
+    except SettingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result is None:
+        return {
+            "key": key,
+            "ok": True,
+            "reachable": True,
+            "detail": "This setting has no cluster probe: there is nothing to check it against.",
+        }
+    return {"key": key, "ok": result.ok, "reachable": result.reachable, "detail": result.detail}
+
+
+@router.delete("/settings/overrides/{key}", dependencies=[_require_admin_dep])
+async def clear_setting_override(request: Request, key: str) -> dict[str, Any]:
+    resolver = _resolver_or_503(request)
+    try:
+        resolved = await resolver.clear(key)
+    except EnvOverrideError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SettingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "key": resolved.key, "value": resolved.value, "source": resolved.source}
 
 
 async def _do_reload(request: Request) -> dict[str, Any]:

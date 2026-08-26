@@ -222,6 +222,25 @@ class ArtifactStore:
             return {**os.environ, "GIT_SSH_COMMAND": ssh_cmd}
         return None
 
+    def set_remote(self, url: str) -> None:
+        """Point `origin` at `url`, creating it if the repository has no origin.
+
+        The remote is an operator setting that can change while the process runs
+        (#553 C2), and the git config written at init_repo would otherwise keep
+        pushing to the address configured at boot.
+        """
+        self.remote = url
+        if not url:
+            return
+        result = self._run_git(["remote", "get-url", "origin"], "remote", check=False)
+        if result.returncode == 0:
+            current = result.stdout.decode("utf-8", errors="replace").strip()
+            if current == url:
+                return
+            self._run_git(["remote", "set-url", "origin", url], "remote")
+        else:
+            self._run_git(["remote", "add", "origin", url], "remote")
+
     def _check_remote_exists(self, name: str) -> bool:
         result = self._run_git(["remote"], "remote", check=False)
         if result.returncode != 0:

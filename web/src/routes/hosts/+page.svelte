@@ -4,9 +4,18 @@
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
+	import RowMenu from '$lib/components/RowMenu.svelte';
 	import { pruneSelection } from '$lib/selection';
 	import { debounce } from '$lib/debounce';
 	import { base } from '$app/paths';
+	import {
+		attentionReason,
+		groupHosts,
+		initialCollapsed,
+		isCollapsible,
+		writeCollapsePreference,
+		type HostGroupId,
+	} from '$lib/hostGroups';
 
 	let items: Host[] = [];
 	// The list is paged. It used to cap at 100 rows with `total` reporting the
@@ -47,6 +56,61 @@
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+
+	// ── Grouping (#549 F3): attention first, then managed, then discovered.
+	// The rows are the same rows and the same selection; what changes is that
+	// the page leads with the machines that want an operator instead of with
+	// whatever the server happened to return first.
+	$: groups = groupHosts(items);
+	// Collapse state is decided ONCE per fleet-size change, not on every render,
+	// or an operator's click to open the healthy group would be undone by the
+	// next reload. `collapseKey` is what makes that "once".
+	let collapsed: Record<string, boolean> = {};
+	let collapseKey = '';
+	$: if (!loading) {
+		const key = String(items.length);
+		if (key !== collapseKey) {
+			collapseKey = key;
+			collapsed = {
+				managed: initialCollapsed('managed', items.length),
+				attention: false,
+				discovered: false,
+			};
+		}
+	}
+
+	function toggleGroup(id: HostGroupId) {
+		const next = !collapsed[id];
+		collapsed = { ...collapsed, [id]: next };
+		writeCollapsePreference(id, next);
+	}
+
+	// ── Hosts by role (#549 F3): moved off Overview, where it was a donut in a
+	// three-card grid. Here it is one inline line, and each role is a filter -
+	// the breakdown answers "how many web servers" AND opens them.
+	//
+	// The counts come from the dashboard summary because they are FLEET-wide:
+	// counting `items` would silently describe page one of a paged list.
+	let roleCounts: Array<[string, number]> = [];
+
+	async function loadRoleCounts() {
+		try {
+			const d = await api.getDashboard();
+			const by = d?.inventory?.by_role ?? {};
+			roleCounts = Object.entries(by)
+				.filter(([, n]) => n > 0)
+				.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+		} catch {
+			// A breakdown is context, not the page. Losing it must not blank the fleet.
+			roleCounts = [];
+		}
+	}
+
+	function filterToRole(role: string) {
+		filterRole = filterRole === role ? '' : role;
+		page = 0;
+		void load();
+	}
 
 	// Forgetting is irreversible (services and the observation note go with the
 	// host), so it is a two-step confirm inline.
@@ -184,10 +248,13 @@
 		load();
 	}
 
-	function statusColor(s?: string): string {
-		if (s === 'online') return 'text-ok';
-		if (s === 'offline') return 'text-danger';
-		return 'text-muted';
+	// The state chip that rides with the hostname in the primary column. It used
+	// to be a bare coloured word in a Status column of its own; the state belongs
+	// WITH the thing it is a state of (#549 F1, principle 4).
+	function statusChip(s?: string): string {
+		if (s === 'online') return 'bg-ok-tint text-ok';
+		if (s === 'offline') return 'bg-danger-tint text-danger';
+		return 'bg-raised text-muted';
 	}
 
 	function sourceBadge(source?: string): string {
@@ -316,6 +383,7 @@
 
 	onMount(async () => {
 		await load();
+		await loadRoleCounts();
 	});
 </script>
 
@@ -342,6 +410,23 @@
 			{/if}
 		</div>
 	</div>
+
+	<!-- Hosts by role (#549 F3). It was a donut in Overview's three-card grid,
+	     where it answered a question nobody asks at a glance; on the fleet page
+	     it is one line, and every role is a live filter into the table below. -->
+	{#if roleCounts.length}
+		<p class="text-xs text-muted flex flex-wrap items-baseline gap-x-s-2 gap-y-1">
+			<span>Hosts by role</span>
+			{#each roleCounts as [role, n] (role)}
+				<button
+					type="button"
+					class="hover:text-ink {filterRole === role ? 'text-accent' : ''}"
+					aria-pressed={filterRole === role}
+					title={filterRole === role ? `Clear the ${role} filter` : `Show only ${role} hosts`}
+					on:click={() => filterToRole(role)}>{role} <span class="num-inline text-ink">{n}</span></button>
+			{/each}
+		</p>
+	{/if}
 
 	{#if showAdd}
 		<!-- Inventory could only be filled by a Proxmox sync, so the NAS, the
@@ -491,107 +576,169 @@
 		</div>
 	{:else}
 		<div class="card overflow-x-auto">
+			<!-- ONE table, grouped by tbody (#549 F3): the groups share a column
+			     system, so a host in "Needs attention" and one in "Managed" still
+			     line up down the page - which is the whole reason rows earn a
+			     table rather than a stack of cards. -->
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left pr-2"><input type="checkbox" on:change={toggleSelectAll} checked={selectedIds.size > 0 && selectedIds.size === items.length} /></th>
-						<th class="text-left">Hostname</th>
-						<th class="text-left">IP</th>
-						<th class="text-left">Role</th>
-						<th class="text-left">Status</th>
-						<th class="text-left">Source</th>
-						<th class="text-left">Actions</th>
-						<th class="text-left">Node</th>
+						<th class="text-left pr-2">
+							<input
+								type="checkbox"
+								aria-label="Select all hosts"
+								on:change={toggleSelectAll}
+								checked={selectedIds.size > 0 && selectedIds.size === items.length} />
+						</th>
+						<th class="text-left col-primary">Host</th>
+						<th class="text-left col-secondary">IP</th>
+						<th class="text-left col-secondary">Role</th>
+						<th class="text-left col-secondary">Source</th>
+						<th class="text-left col-secondary">Node</th>
+						<th class="text-left"><span class="sr-only">Actions</span></th>
 					</tr>
 				</thead>
-				<tbody>
-					{#each items as h}
-						<tr class="border-b border-divider hover:bg-raised transition-colors">
-							<td class="pr-2"><input type="checkbox" checked={selectedIds.has(h.id)} on:change={() => toggleSelect(h.id)} /></td>
-							<td>
-								<a
-									href="{base}/hosts/{h.id}"
-									class="text-accent hover:text-accent-strong font-mono"
-								>{h.hostname}</a>
-								{#if h.absent_since}
-									<!-- A destroyed guest used to look exactly like a powered-off
-									     one: the row simply stopped being updated (#445 A5). -->
-									<span
-										class="badge badge-failed ml-1"
-										title="Proxmox stopped reporting this host on {fmtDate(h.absent_since)}"
-									>gone</span>
-								{/if}
-							</td>
-							<td class="text-muted font-mono">{h.ip_address || '—'}</td>
-							<td class="text-ink">
-								{h.role ?? '—'}
-								{#if h.role_source === 'inferred'}<span class="text-warn" title="Inferred">?</span>{/if}
-							</td>
-							<td class="{statusColor(h.status)}">
-								{h.status ?? 'unknown'}
-								{#if h.agent_id}
-									<span
-										class="ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium {h.agent_connected
-											? 'bg-ok-tint text-ok'
-											: 'bg-raised text-muted'}"
-										title={h.agent_connected
-											? `Agent ${h.agent_version ?? ''} connected`
-											: 'Agent enrolled but not connected'}
-									>{h.agent_connected ? 'agent ·' : 'agent ∅'}{h.agent_connected && h.agent_version ? ` ${h.agent_version}` : ''}</span>
-								{/if}
-							</td>
-							<td>
-								{#if h.source}
-									<span class="px-1.5 py-0.5 rounded text-[10px] font-medium {sourceClass(h.source)}">{sourceBadge(h.source)}</span>
+				{#each groups as g (g.id)}
+					<tbody data-group={g.id}>
+						<tr class="bg-raised">
+							<th colspan="7" scope="colgroup" class="text-left py-s-1">
+								{#if isCollapsible(g.id)}
+									<button
+										type="button"
+										class="btn btn-ghost btn-xs"
+										aria-expanded={!collapsed[g.id]}
+										on:click={() => toggleGroup(g.id)}
+									><span aria-hidden="true" class="mr-1">{collapsed[g.id] ? '▸' : '▾'}</span
+										>{g.label} ({g.hosts.length})</button>
 								{:else}
-									<span class="text-muted">—</span>
+									<span class="section-title">{g.label} ({g.hosts.length})</span>
 								{/if}
-							</td>
-							<td>
-								{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored'}
-									<button class="btn btn-xs text-[10px]" on:click={() => adoptOne(h)}>Adopt</button>
-									<button class="btn btn-xs text-[10px]" on:click={() => ignoreOne(h)}>Ignore</button>
-								{:else if h.import_state === 'ignored'}
-									<span class="text-muted">Ignored</span>
-								{:else if h.agent_id}
-									<!-- An agent-carried host's actions live on its host page
-									     (revoke/forget/install); the row offers the door, not
-									     an adopt-era dash (#514 S5). -->
-									<a class="text-accent hover:text-accent-strong text-[10px]" href="{base}/hosts/{h.id}">Open</a>
-								{:else}
-									<span class="text-muted">—</span>
-								{/if}
-								{#if canWrite && (h.source === 'manual' || h.absent_since)}
-									{#if forgetConfirm === h.id}
-										<button
-											class="btn btn-danger btn-xs text-[10px]"
-											disabled={forgetting === h.id}
-											on:click={() => forgetOne(h)}
-										>{forgetting === h.id ? 'Removing…' : 'Confirm'}</button>
-										<button
-											class="btn btn-ghost btn-xs text-[10px]"
-											on:click={() => (forgetConfirm = null)}
-										>Cancel</button>
-									{:else}
-										<button
-											class="btn btn-xs text-[10px] text-danger"
-											title="Remove this host from inventory, with its services and observation note"
-											on:click={() => (forgetConfirm = h.id)}
-										>Forget</button>
-									{/if}
-								{/if}
-								{#if h.hostname}
-									<a
-										class="text-accent hover:text-accent-strong text-[10px] ml-1"
-										href={hostMetricsUrl(base, h.hostname, h.id)}
-										title="Open this host's recent metrics">Metrics</a
-									>
-								{/if}
-							</td>
-							<td class="text-muted">{h.node ?? '—'}</td>
+							</th>
 						</tr>
-					{/each}
-				</tbody>
+						{#if !collapsed[g.id]}
+							{#each g.hosts as h (h.id)}
+								<tr class="border-b border-divider hover:bg-raised transition-colors">
+									<td class="pr-2">
+										<input
+											type="checkbox"
+											aria-label="Select {h.hostname}"
+											checked={selectedIds.has(h.id)}
+											on:change={() => toggleSelect(h.id)} />
+									</td>
+									<!-- The primary column: the machine, and what state it is in.
+									     Everything else on the row is supporting evidence and is
+									     painted as such (#549 F1, principle 4). -->
+									<td class="col-primary" title={attentionReason(h) || undefined}>
+										<span class="col-primary-inner">
+											<a
+												href="{base}/hosts/{h.id}"
+												class="text-accent hover:text-accent-strong font-mono"
+											>{h.hostname}</a>
+											<span class="badge {statusChip(h.status)}">{h.status ?? 'unknown'}</span>
+											{#if h.agent_id}
+												<span
+													class="badge {h.agent_connected
+														? 'bg-ok-tint text-ok'
+														: 'bg-raised text-muted'}"
+													title={h.agent_connected
+														? `Agent ${h.agent_version ?? ''} connected`
+														: 'Agent enrolled but not connected'}
+												>{h.agent_connected ? 'agent ·' : 'agent ∅'}{h.agent_connected && h.agent_version ? ` ${h.agent_version}` : ''}</span>
+											{/if}
+											{#if h.absent_since}
+												<!-- A destroyed guest used to look exactly like a powered-off
+												     one: the row simply stopped being updated (#445 A5). -->
+												<span
+													class="badge badge-failed"
+													title="Proxmox stopped reporting this host on {fmtDate(h.absent_since)}"
+												>gone</span>
+											{/if}
+											{#if h.import_state === 'ignored'}
+												<span class="badge badge-superseded" title="Ignored: HomePilot leaves this host alone">ignored</span>
+											{/if}
+										</span>
+									</td>
+									<td class="col-secondary font-mono">{h.ip_address || '—'}</td>
+									<td class="col-secondary">
+										{h.role ?? '—'}
+										{#if h.role_source === 'inferred'}<span class="text-warn" title="Inferred">?</span>{/if}
+									</td>
+									<td class="col-secondary">
+										{#if h.source}
+											<span class="px-1.5 py-0.5 rounded text-[10px] font-medium {sourceClass(h.source)}">{sourceBadge(h.source)}</span>
+										{:else}
+											—
+										{/if}
+									</td>
+									<td class="col-secondary">{h.node ?? '—'}</td>
+									<!-- ONE actions affordance per row (#549 F1 / #514 P7). The
+									     GATING is unchanged - the same capability check, the same
+									     source/state branches, the same two-step Forget - only the
+									     four-to-six buttons that used to sit open on every row now
+									     live behind the row's own menu. -->
+									<td>
+										<RowMenu label="Actions for {h.hostname}" let:close>
+											<a
+												role="menuitem"
+												class="btn btn-ghost btn-xs text-left"
+												href="{base}/hosts/{h.id}"
+												on:click={close}>Open host</a>
+											{#if h.hostname}
+												<a
+													role="menuitem"
+													class="btn btn-ghost btn-xs text-left"
+													href={hostMetricsUrl(base, h.hostname, h.id)}
+													title="Open this host's recent metrics"
+													on:click={close}>Metrics</a>
+											{/if}
+											{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored'}
+												<button
+													type="button"
+													role="menuitem"
+													class="btn btn-ghost btn-xs text-left"
+													on:click={() => {
+														close();
+														void adoptOne(h);
+													}}>Adopt</button>
+												<button
+													type="button"
+													role="menuitem"
+													class="btn btn-ghost btn-xs text-left"
+													on:click={() => {
+														close();
+														void ignoreOne(h);
+													}}>Ignore</button>
+											{/if}
+											{#if canWrite && (h.source === 'manual' || h.absent_since)}
+												{#if forgetConfirm === h.id}
+													<button
+														type="button"
+														role="menuitem"
+														class="btn btn-danger btn-xs text-left"
+														disabled={forgetting === h.id}
+														on:click={() => forgetOne(h)}
+													>{forgetting === h.id ? 'Removing…' : 'Confirm forget'}</button>
+													<button
+														type="button"
+														role="menuitem"
+														class="btn btn-ghost btn-xs text-left"
+														on:click={() => (forgetConfirm = null)}>Cancel</button>
+												{:else}
+													<button
+														type="button"
+														role="menuitem"
+														class="btn btn-ghost btn-xs text-left text-danger"
+														title="Remove this host from inventory, with its services and observation note"
+														on:click={() => (forgetConfirm = h.id)}>Forget</button>
+												{/if}
+											{/if}
+										</RowMenu>
+									</td>
+								</tr>
+							{/each}
+						{/if}
+					</tbody>
+				{/each}
 			</table>
 		</div>
 		{#if total > PAGE_SIZE}

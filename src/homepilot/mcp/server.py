@@ -117,6 +117,15 @@ from .tools.ops_tools import (
     handle_list_tasks,
     handle_test_proxmox_connection,
 )
+from .tools.settings_tools import (
+    TOOL_DEFINITIONS as SETTINGS_TOOL_DEFS,
+)
+from .tools.settings_tools import (
+    handle_clear_setting_override,
+    handle_probe_setting_override,
+    handle_query_settings_overrides,
+    handle_set_setting_override,
+)
 from .tools.system_tools import (
     TOOL_DEFINITIONS as SYSTEM_TOOL_DEFS,
 )
@@ -147,6 +156,7 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + AGENT_TOOL_DEFS
     + MONITORING_TOOL_DEFS
     + OPS_TOOL_DEFS
+    + SETTINGS_TOOL_DEFS
 )
 
 _MUTATING_TOOLS = frozenset(
@@ -220,6 +230,16 @@ _ADMIN_TOOLS = frozenset(
         # Admin settings / credentials.
         "test_proxmox_connection",
         "delete_auth_token",
+        # Operator settings (#553 C4). Every /admin/settings/overrides route is
+        # require_scope("admin"), so the whole set - the report and the probe
+        # included, read-shaped as they are - sits at the admin tier. They are
+        # not listed in _MUTATING_TOOLS: like every other admin tool, the admin
+        # check above is what a lesser token meets, and a second listing would
+        # only give the same tool two tiers to disagree about.
+        "query_settings_overrides",
+        "set_setting_override",
+        "clear_setting_override",
+        "probe_setting_override",
     }
 )
 
@@ -508,6 +528,13 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "write_file_on_host": handle_write_file_on_host,
     "test_proxmox_connection": handle_test_proxmox_connection,
     "delete_auth_token": handle_delete_auth_token,
+    # Operator settings (#553 C4). Each calls the SAME app_settings function the
+    # admin route calls - report / checked_set / clear / run_probe - so the two
+    # surfaces accept and refuse identically.
+    "query_settings_overrides": handle_query_settings_overrides,
+    "set_setting_override": handle_set_setting_override,
+    "clear_setting_override": handle_clear_setting_override,
+    "probe_setting_override": handle_probe_setting_override,
 }
 
 

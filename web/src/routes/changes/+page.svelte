@@ -147,6 +147,14 @@
 	// typing, not one per keystroke.
 	const searchAgain = debounce(() => loadAll(false), 300);
 
+	// Client-side paging: the server has no offset for artifacts, so the page
+	// fetches its capped window once and turns pages within it. Honest because
+	// the count shown is the count fetched.
+	const PAGE_SIZE = 25;
+	let page = 0;
+	$: pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+	$: rows = items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
 	function applyFilter() {
 		const tab = STATUS_TABS.find((t) => t.key === activeTab);
 		if (!tab) { items = allItems; return; }
@@ -158,6 +166,9 @@
 		if (filterKind) {
 			items = items.filter((a) => a.kind === filterKind);
 		}
+		// A filter that leaves fewer pages than the one being viewed must not
+		// strand the operator on an empty page.
+		page = 0;
 	}
 
 	function setTab(key: string) {
@@ -187,7 +198,7 @@
 	});
 </script>
 
-<div class="space-y-4">
+<div class="section-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Artifacts</h1>
 		<div class="flex gap-2">
@@ -274,17 +285,22 @@
 		</form>
 	{/if}
 
-	<div class="flex gap-1 flex-wrap border-b border-border pb-px">
+	<!-- Status is a FILTER, not a second tab row. Stacking a hand-rolled tab
+	     strip directly under the real TabBar taught the eye that neither row
+	     meant anything - the clutter the owner named. Same states, same counts,
+	     read as chips. -->
+	<div class="flex gap-2 flex-wrap" role="group" aria-label="Filter by status">
 		{#each STATUS_TABS as tab}
 			<button
-				class="px-3 py-1.5 text-xs font-medium transition-colors rounded-t relative
-				       {activeTab === tab.key ? 'text-accent bg-surface border-t border-x border-border -mb-px' : 'text-muted hover:text-ink'}"
+				class="px-3 py-1 rounded-full border text-xs transition-colors
+				       {activeTab === tab.key
+					? 'bg-accent-tint border-accent text-accent-strong'
+					: 'border-border-strong text-muted hover:text-ink'}"
+				aria-pressed={activeTab === tab.key}
 				on:click={() => setTab(tab.key)}
 			>
 				{tab.label}
-				<span class="ml-1 px-1.5 py-0 rounded-full text-[10px] {activeTab === tab.key ? 'bg-accent-tint text-accent-strong' : 'bg-raised text-muted'}">
-					{counts.get(tab.key === 'all' ? 'all' : tab.key) ?? 0}
-				</span>
+				<span class="ml-1 num-inline">{counts.get(tab.key === 'all' ? 'all' : tab.key) ?? 0}</span>
 			</button>
 		{/each}
 	</div>
@@ -342,38 +358,56 @@
 			<table class="data-table text-xs">
 				<thead>
 					<tr>
-						<th class="text-left">ID</th>
-						<th class="text-left">Kind</th>
-						<th class="text-left">Intent</th>
-						<th class="text-left">Status</th>
-						<th class="text-left">Target</th>
-						<th class="text-left">Created</th>
+						<th class="col-primary">Intent</th>
+						<th class="col-secondary">Kind</th>
+						<th class="col-secondary">Target</th>
+						<th class="col-secondary">ID</th>
+						<th class="col-secondary">Created</th>
 					</tr>
 				</thead>
 				<tbody>
-					{#each items as a (a.id)}
+					{#each rows as a (a.id)}
 						<tr class="border-b border-divider hover:bg-raised transition-colors">
-							<!-- A real link, like Tasks/Journal: keyboard-reachable, opens in a
-							     new tab, and readable by a screen reader. The old row-level
-							     on:click was mouse-only. -->
-							<td class="font-mono">
-								<a
-									href="{base}/changes/{a.id}"
-									class="text-accent hover:text-accent-strong"
-									title={a.id}
-								>{a.id.slice(-8)}</a>
+							<!-- ONE primary column: what the row is about, with its state
+							     chip beside it. Painting all six columns at the same weight
+							     is what made this read as a wall (facelift-v2 principle 4).
+							     A real link, like Tasks/Journal: keyboard-reachable, opens in
+							     a new tab, readable by a screen reader. -->
+							<td class="col-primary">
+								<span class="col-primary-inner">
+									<a
+										href="{base}/changes/{a.id}"
+										class="text-accent hover:text-accent-strong"
+										title={a.id}>{a.intent}</a
+									>
+									<span class="badge {statusClass(a.status)}">{a.status}</span>
+								</span>
 							</td>
-							<td class="text-ink">{a.kind}</td>
-							<td class="text-ink max-w-xs truncate">{a.intent}</td>
-							<td>
-								<span class="badge {statusClass(a.status)}">{a.status}</span>
-							</td>
-							<td class="text-muted">{targetStr(a)}</td>
-							<td class="text-muted">{fmtDate(a.created_at)}</td>
+							<td class="col-secondary">{a.kind}</td>
+							<td class="col-secondary font-mono">{targetStr(a)}</td>
+							<td class="col-secondary font-mono">{a.id.slice(-8)}</td>
+							<td class="col-secondary">{fmtDate(a.created_at)}</td>
 						</tr>
 					{/each}
 				</tbody>
 			</table>
 		</div>
+
+		{#if pages > 1}
+			<!-- Paged, because a thousand rows in one scroll is the default this
+			     facelift exists to remove. The table itself stays: these rows ARE
+			     comparable, which is exactly when a table is the right tool. -->
+			<div class="flex items-center gap-2 text-xs">
+				<button class="btn btn-ghost text-xs" disabled={page === 0} on:click={() => (page -= 1)}
+					>&larr; Newer</button
+				>
+				<span class="text-muted">Page {page + 1} of {pages}</span>
+				<button
+					class="btn btn-ghost text-xs"
+					disabled={page >= pages - 1}
+					on:click={() => (page += 1)}>Older &rarr;</button
+				>
+			</div>
+		{/if}
 	{/if}
 </div>

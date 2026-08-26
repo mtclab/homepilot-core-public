@@ -5,6 +5,7 @@
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
+	import ApprovalCodePanel from '$lib/components/ApprovalCodePanel.svelte';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import { isTerminalStatus } from '$lib/taskStatus';
@@ -308,25 +309,14 @@
 			</div>
 		{/if}
 
-		{#if status === 'proposed' && detail.approval_code}
-			<div class="card space-y-2" data-testid="approval-code">
-				<h2 class="section-title">Approval code</h2>
-				<p class="text-muted text-xs">
-					Relay this code to the assistant to approve over MCP — it cannot read
-					the code itself, so a valid code is proof you approved. Approving here
-					needs no code.
-				</p>
-				<p class="font-mono text-lg text-ink tracking-wider select-all" data-testid="approval-code-value">{detail.approval_code}</p>
-				{#if detail.approval_locked}
-					<p class="text-danger text-xs" data-testid="approval-locked">
-						Locked after too many wrong codes relayed over MCP. Clear the lock to
-						allow coded approval again; the code above is unchanged.
-					</p>
-					{#if canWrite}
-						<button class="btn btn-ghost text-xs" disabled={working} on:click={doResetApprovalCode}>Clear approval lock</button>
-					{/if}
-				{/if}
-			</div>
+		{#if status === 'proposed'}
+			<ApprovalCodePanel
+				code={detail.approval_code}
+				locked={detail.approval_locked ?? false}
+				{canWrite}
+				busy={working}
+				onClear={doResetApprovalCode}
+			/>
 		{/if}
 
 		{#if canWrite && getActions().length > 0}

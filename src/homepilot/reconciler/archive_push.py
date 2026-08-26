@@ -33,11 +33,26 @@ LAST_PUSH_ERROR = "archive_last_push_error"
 
 
 class ArchivePushReconciler(Reconciler):
-    def __init__(self, store: Any, repo: Any) -> None:
+    def __init__(self, store: Any, repo: Any, resolver: Any = None) -> None:
         self._store = store
         self._repo = repo
+        # With a resolver the remote is read fresh every cycle, so an operator
+        # who sets it from the product is mirrored on the next push instead of
+        # after a restart (#553 C2). Without one - the pre-C2 callers and the
+        # CLI - the store keeps whatever address it was built with.
+        self._resolver = resolver
 
     async def run(self) -> ReconcilerResult:
+        if self._resolver is not None:
+            remote = str(await self._resolver.value("artifacts_remote") or "").strip()
+            if not remote:
+                return ReconcilerResult(
+                    name="archive_push",
+                    success=True,
+                    details={"pushed": False, "skipped": "no artifacts remote configured"},
+                )
+            if remote != getattr(self._store, "remote", ""):
+                await asyncio.to_thread(self._store.set_remote, remote)
         try:
             output = await asyncio.to_thread(self._store.push, "origin")
             await self._repo.set_setting(LAST_PUSH_AT, now())

@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // $lib/api and never sees the mock.
 import '../../lib/test-mocks';
 import Inventory from './+page.svelte';
-import { api } from '$lib/api';
+import { api, sessionStore } from '$lib/api';
 
 /**
  * Inventory lifecycle in the UI (#445 A5).
@@ -109,13 +109,86 @@ describe('Inventory lifecycle', () => {
 		);
 	});
 
+	/**
+	 * SELECTOR CHANGED (#549 F3), reason: the row's four-to-six open buttons
+	 * collapsed into one overflow menu, so Forget is no longer in the DOM until
+	 * its row's menu is open. The GATE is unchanged and is if anything stricter -
+	 * it now names WHICH hosts may forget instead of counting buttons, so
+	 * offering Forget on the wrong row can no longer be masked by withholding it
+	 * from another.
+	 */
+	async function menuFor(hostname: string): Promise<HTMLElement> {
+		const trigger = screen.getByRole('button', { name: `Actions for ${hostname}` });
+		await fireEvent.click(trigger);
+		return screen.getByRole('menu', { name: `Actions for ${hostname}` });
+	}
+
 	it('offers Forget only where it can succeed', async () => {
 		render(Inventory);
 		await screen.findByText('web01');
 
-		// The manual host and the destroyed guest: two. Never the live guest -
-		// the API refuses that, because the next sync would bring it back.
-		const forgetButtons = screen.getAllByRole('button', { name: /^forget$/i });
-		expect(forgetButtons).toHaveLength(2);
+		// The manual host and the destroyed guest can be forgotten...
+		expect((await menuFor('nas01')).textContent).toContain('Forget');
+		expect((await menuFor('old-vm')).textContent).toContain('Forget');
+		// ...never the live guest: the API refuses that, because the next sync
+		// would bring it straight back.
+		expect((await menuFor('web01')).textContent).not.toContain('Forget');
+	});
+
+	it('keeps the adopt/ignore gating the row had, inside the menu', async () => {
+		// The branch, unchanged from the open-buttons row: a DISCOVERED host that
+		// has not been ignored may be adopted or ignored. An ignored one may not
+		// (it is a decision already taken), and a hand-added host may not (it was
+		// adopted the moment it was created).
+		listInventory.mockResolvedValue({
+			items: [
+				{ ...LIVE_GUEST, id: 'h-new', hostname: 'new-vm', import_state: 'pending' },
+				{ ...LIVE_GUEST, id: 'h-ign', hostname: 'ignored-vm', import_state: 'ignored' },
+				MANUAL_HOST,
+			],
+			total: 3,
+		});
+		render(Inventory);
+		await screen.findByText('new-vm');
+
+		const pending = await menuFor('new-vm');
+		expect(pending.textContent).toContain('Adopt');
+		expect(pending.textContent).toContain('Ignore');
+
+		const ignored = await menuFor('ignored-vm');
+		expect(ignored.textContent).not.toContain('Adopt');
+
+		const manual = await menuFor('nas01');
+		expect(manual.textContent).not.toContain('Adopt');
+	});
+
+	it('gives a read-only session no write actions at all', async () => {
+		// Default-deny is the point: a read-only token used to be offered Adopt,
+		// Ignore and Forget, all of which the server answers with a 403.
+		sessionStore.set({
+			authenticated: true,
+			token_label: 'ro',
+			scope: 'read',
+			role: 'viewer',
+			capabilities: ['read'],
+		});
+		try {
+			render(Inventory);
+			await screen.findByText('nas01');
+			const menu = await menuFor('nas01');
+			expect(menu.textContent).not.toContain('Forget');
+			expect(menu.textContent).not.toContain('Adopt');
+			// The read-only doors stay open.
+			expect(menu.textContent).toContain('Open host');
+			expect(menu.textContent).toContain('Metrics');
+		} finally {
+			sessionStore.set({
+				authenticated: true,
+				token_label: 'test',
+				scope: 'admin',
+				role: 'admin',
+				capabilities: ['read', 'write', 'admin'],
+			});
+		}
 	});
 });

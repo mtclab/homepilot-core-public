@@ -309,6 +309,8 @@ export type SelfcheckState = 'off' | 'ok' | 'unreachable' | 'unknown';
 
 export interface SelfcheckSubsystem {
 	name: string;
+	/** Optional server-sent display name; the UI falls back to its own list. */
+	label?: string;
 	configured: boolean;
 	state: SelfcheckState;
 	target: string;
@@ -319,6 +321,31 @@ export interface SelfcheckReport {
 	timeout_seconds: number;
 	counts: Record<SelfcheckState, number>;
 	subsystems: SelfcheckSubsystem[];
+}
+
+// One operator-editable setting (#553 C2). `source` is binding: `env` means the
+// environment decides it and the server will REFUSE a write; `db` means a saved
+// value is in force; `default` means the code default is.
+export type SettingSource = 'env' | 'db' | 'default';
+
+export interface SettingOverride {
+	key: string;
+	value: string | number;
+	source: SettingSource;
+	type: 'str' | 'int';
+	hot_reloadable: boolean;
+	description: string;
+	env_var: string;
+	editable: boolean;
+	/** #553 C3: this value can be tried against the live cluster before saving. */
+	probeable?: boolean;
+}
+
+export interface SettingProbe {
+	key: string;
+	ok: boolean;
+	reachable: boolean;
+	detail: string;
 }
 
 export interface ArtifactDetail {
@@ -927,6 +954,29 @@ export const api = {
 		return req<unknown>('/admin/guests/quota', { method: 'POST', body: JSON.stringify(body) });
 	},
 
+	// --- Operator settings (#553 C2) ---
+	listSettingOverrides() {
+		return req<{ settings: SettingOverride[] }>('/admin/settings/overrides');
+	},
+	saveSettingOverride(key: string, value: string | number) {
+		return req<{ status: string; key: string; value: string | number; source: SettingSource }>(
+			`/admin/settings/overrides/${encodeURIComponent(key)}`,
+			{ method: 'PUT', body: JSON.stringify({ value }) },
+		);
+	},
+	probeSettingOverride(key: string, value: string | number) {
+		return req<SettingProbe>(`/admin/settings/overrides/${encodeURIComponent(key)}/probe`, {
+			method: 'POST',
+			body: JSON.stringify({ value }),
+		});
+	},
+	clearSettingOverride(key: string) {
+		return req<{ status: string; key: string; value: string | number; source: SettingSource }>(
+			`/admin/settings/overrides/${encodeURIComponent(key)}`,
+			{ method: 'DELETE' },
+		);
+	},
+
 	getProxmoxSettings() {
 		return req<ProxmoxSettings>('/admin/settings/proxmox');
 	},
@@ -970,7 +1020,10 @@ export async function refreshSession(): Promise<MeInfo | null> {
 // where a machine's stats live now. Takes the host ID when the caller has it;
 // hostname fallback resolves through the list for callers that don't.
 export function hostMetricsUrl(base: string, hostname: string, hostId?: string): string {
-	if (hostId) return `${base}/hosts/${encodeURIComponent(hostId)}`;
+	// `?tab=metrics` since #549 F3: the host page's sections became tabs, so a
+	// link that promises metrics has to name the metrics tab or it lands on
+	// Overview and the promise is broken.
+	if (hostId) return `${base}/hosts/${encodeURIComponent(hostId)}?tab=metrics`;
 	if (!hostname) return '';
 	// No id in hand: land on the filtered fleet list (S4 renames it to Hosts).
 	return `${base}/inventory?q=${encodeURIComponent(hostname)}`;

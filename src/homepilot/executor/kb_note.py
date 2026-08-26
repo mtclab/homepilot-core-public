@@ -92,11 +92,14 @@ async def execute(
 async def _compute_embedding(text: str) -> list[float]:
     import httpx
 
+    from homepilot.app_settings import effective
     from homepilot.config import get_settings
 
     settings = get_settings()
-    primary_url = settings.embedding_service_url
-    primary_model = settings.embedding_model
+    # Same call-time resolution as kb/service.py: one setting, one meaning, no
+    # surface where a saved embedding URL is quietly ignored (#553 C2).
+    primary_url = await effective("embedding_service_url", settings)
+    primary_model = await effective("embedding_model", settings)
     fallback_url = settings.embedding_fallback_url
     fallback_model = settings.embedding_fallback_model
 
