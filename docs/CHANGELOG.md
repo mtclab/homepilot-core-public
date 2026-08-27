@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.6.4 (2026-08-27)
+
+### The bridge probe sees SDN vnets, and drift stays honest after an apply
+
+The guest network went live and two edges surfaced immediately, both as
+honest refusals: the bridge probe listed /nodes/{node}/network without
+type=any_bridge and so rejected the newly-real guest vnet as "no bridge";
+and an applied subnet reports DHCP ranges as dicts where pending state uses
+strings, keeping the drift check DRIFTED after a clean apply. Both fixed,
+both gated.
+
+
 ## v3.6.3 (2026-08-27)
 
 ### Pending SDN objects are read for what they will be

@@ -551,3 +551,24 @@ class TestPendingObjectsAreReadForWhatTheyWillBe:
         step = next(s for s in result.steps if s.id == "update-subnet")
         assert step.params["subnet"] == "guest-198.51.100.0-24"
         assert "/" not in step.params["subnet"]
+
+
+class TestAnAppliedRangeIsTheSameRange:
+    def test_dict_form_and_string_form_are_equal(self) -> None:
+        """An APPLIED subnet returns dhcp ranges as dicts; pending state and
+        our params use strings. Same range, one truth - the drift check read
+        the two spellings as a difference and stayed DRIFTED after a clean
+        apply (live catch #3)."""
+        from homepilot.provision.guest_network import _normalised_ranges
+
+        assert _normalised_ranges(
+            [{"start-address": "198.51.100.100", "end-address": "198.51.100.199"}]
+        ) == _normalised_ranges(["start-address=198.51.100.100,end-address=198.51.100.199"])
+
+    async def test_an_applied_converged_cluster_plans_nothing(self) -> None:
+        cluster = converged_cluster()
+        cluster.subnets[0]["dhcp-range"] = [
+            {"start-address": "198.51.100.100", "end-address": "198.51.100.199"}
+        ]
+        result = plan(desired(), await survey(cluster, desired()))
+        assert result.steps == ()

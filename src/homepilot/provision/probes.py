@@ -291,7 +291,14 @@ async def probe_ipconfig(value: Any, ctx: ProbeContext) -> ProbeResult:
 
 async def _network_entries(ctx: ProbeContext) -> tuple[list[dict[str, Any]], ProbeResult | None]:
     try:
-        return _rows(await _read(ctx, f"/nodes/{ctx.node}/network")), None
+        # type=any_bridge, because a plain /network listing omits SDN vnet
+        # bridges - the guest vnet IS a bridge a guest NIC can sit on, and the
+        # probe refused it with "no bridge innkeep on node elizabeth" the
+        # moment the guest network went live (found on prod, 2026-08-27).
+        return (
+            _rows(await _read(ctx, f"/nodes/{ctx.node}/network", {"type": "any_bridge"})),
+            None,
+        )
     except _NotConfiguredError:
         return [], _NO_CLUSTER
     except Exception as exc:

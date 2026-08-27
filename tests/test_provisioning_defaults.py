@@ -850,3 +850,24 @@ class TestInvitesStillWorkTheOldWay:
         rows = await invites.list_invites()
         assert rows[0]["node"] == "pve1"
         assert app.state.provision_service is not None
+
+
+class TestTheBridgeProbeSeesSdnVnets:
+    async def test_the_listing_asks_for_any_bridge(self) -> None:
+        """A plain /network listing omits SDN vnet bridges - the guest vnet IS
+        a valid guest NIC bridge, and the probe refused it the moment the
+        guest network went live (live catch #4). type=any_bridge includes them."""
+        from homepilot.provision.probes import ProbeContext, _network_entries
+
+        seen: list[tuple[str, dict | None]] = []
+
+        class Px:
+            async def read(self, path, query=None):
+                seen.append((path, query))
+                return {"data": [{"iface": "innkeep", "type": "any_bridge"}]}
+
+        ctx = ProbeContext(proxmox=Px(), node="elizabeth")
+        entries, failure = await _network_entries(ctx)
+        assert failure is None
+        assert seen and seen[0][1] == {"type": "any_bridge"}
+        assert entries and entries[0]["iface"] == "innkeep"
