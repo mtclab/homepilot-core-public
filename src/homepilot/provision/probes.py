@@ -220,9 +220,30 @@ async def probe_bridge(value: Any, ctx: ProbeContext) -> ProbeResult:
     bridges = sorted(str(e.get("iface", "")) for e in entries if str(e.get("type")) == "bridge")
     if bridge in bridges:
         return ProbeResult(True, f"Bridge {bridge} is on node {ctx.node}.")
+    # An SDN vnet IS a bridge a guest NIC can sit on, but this PVE's node
+    # network listing does not include vnets even with type=any_bridge - the
+    # probe refused the guest vnet the moment the guest network was applied
+    # (found live, 2026-08-27). Vnets are cluster-scoped, so ask the SDN.
+    try:
+        vnet_rows = _rows(await _read(ctx, "/cluster/sdn/vnets"))
+    except _NotConfiguredError:
+        vnet_rows = []
+    except Exception as exc:  # pragma: no cover - same shape as _network_entries
+        return ProbeResult(
+            False,
+            f"the cluster could not be asked about SDN vnets: {exc}",
+            reachable=False,
+        )
+    vnets = {str(v.get("vnet", "")): str(v.get("zone", "")) for v in vnet_rows}
+    if bridge in vnets:
+        return ProbeResult(
+            True, f"{bridge} is an SDN vnet (zone {vnets[bridge]}) - a valid guest bridge."
+        )
     return ProbeResult(
         False,
-        f"no bridge {bridge} on node {ctx.node}; node has: {', '.join(bridges) or '(none)'}",
+        f"no bridge {bridge} on node {ctx.node}; node has: "
+        f"{', '.join(bridges) or '(none)'}"
+        + (f"; SDN vnets: {', '.join(sorted(vnets))}" if vnets else ""),
     )
 
 
