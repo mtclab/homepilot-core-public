@@ -220,13 +220,15 @@ class TestThePlan:
             "create-zone",
             "create-vnet",
             "create-subnet",
+            # apply sits between the SDN objects and the firewall: the vnet
+            # firewall API refuses a vnet the cluster has not applied yet.
+            "apply-sdn",
             "vnet-firewall-options",
             "vnet-firewall-rule-0",
             "vnet-firewall-rule-1",
             "vnet-firewall-rule-2",
             "vnet-firewall-rule-3",
             "vnet-firewall-rule-4",
-            "apply-sdn",
         ]
         by_id = {s.id: s for s in result.steps}
         assert by_id["create-zone"].op == "create_zone"
@@ -244,9 +246,13 @@ class TestThePlan:
             "snat": 1,
             "dhcp-range": ["start-address=198.51.100.100,end-address=198.51.100.199"],
         }
-        # The apply is LAST and present: without it PVE holds the whole thing
-        # pending and the guest network exists only in the cluster's intentions.
-        assert result.steps[-1].op == "apply_sdn"
+        # The apply is present and sits AFTER every SDN object step but BEFORE
+        # the firewall ones: without it PVE holds the objects pending, and the
+        # vnet firewall API refuses a vnet that is not applied yet.
+        ops = [s.op for s in result.steps]
+        assert "apply_sdn" in ops
+        assert ops.index("apply_sdn") > ops.index("create_subnet")
+        assert ops.index("apply_sdn") < ops.index("set_vnet_firewall_options")
 
     async def test_a_converged_cluster_plans_nothing(self) -> None:
         current = await survey(converged_cluster(), desired())
@@ -266,7 +272,8 @@ class TestThePlan:
         assert "create-zone" not in ids
         assert "create-vnet" not in ids
         assert ids[0] == "create-subnet"
-        assert ids[-1] == "apply-sdn"
+        # apply follows the subnet create; the firewall work comes after it.
+        assert ids.index("apply-sdn") == ids.index("create-subnet") + 1
 
     async def test_a_subnet_whose_gateway_drifted_is_updated_not_recreated(self) -> None:
         cluster = converged_cluster()
@@ -287,7 +294,9 @@ class TestThePlan:
         cluster = converged_cluster()
         cluster.fw_rules = cluster.fw_rules[:-1]  # the gateway DROP went missing
         result = plan(desired(), await survey(cluster, desired()))
-        assert [s.id for s in result.steps] == ["vnet-firewall-rule-4", "apply-sdn"]
+        # Firewall config is not SDN-pending state: repairing a rule needs no
+        # apply at all (the old order wastefully applied for it).
+        assert [s.id for s in result.steps] == ["vnet-firewall-rule-4"]
         assert result.steps[0].params["dest"] == "198.51.100.1/32"
 
     async def test_a_zone_somebody_else_built_is_a_blocker_not_a_step(self) -> None:
@@ -381,13 +390,16 @@ class TestTheExecution:
             "create_zone",
             "create_vnet",
             "create_subnet",
+            # apply BEFORE the firewall: PVE's vnet firewall API validates the
+            # vnet against the APPLIED config, so options written while the
+            # vnet is pending are refused with "invalid vnet" (first live apply).
+            "apply_sdn",
             "set_vnet_firewall_options",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
-            "apply_sdn",
         ]
         assert all(s["status"] == "done" for s in result["steps"])
 

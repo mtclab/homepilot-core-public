@@ -226,13 +226,16 @@ class TestTheJourney:
             "create_zone",
             "create_vnet",
             "create_subnet",
+            # apply BEFORE the firewall: PVE's vnet firewall API validates the
+            # vnet against the APPLIED config, so options written while the
+            # vnet is pending are refused with "invalid vnet" (first live apply).
+            "apply_sdn",
             "set_vnet_firewall_options",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
-            "apply_sdn",
         ]
         params = dict(cluster.calls)
         assert params["create_subnet"]["gateway"] == "198.51.100.1"
