@@ -123,17 +123,17 @@ class TestTheSettings:
 
     async def test_a_typo_in_the_fence_is_refused(self, state) -> None:
         with pytest.raises(SettingError):
-            await state.settings_resolver.set("guest_network_isolate_cidrs", "10.0.0.1/24, nope")
+            await state.settings_resolver.set("guest_network_isolate_cidrs", "192.0.2.0/24, nope")
 
     async def test_a_host_address_where_a_cidr_belongs_is_refused(self, state) -> None:
         with pytest.raises(SettingError):
-            await state.settings_resolver.set("guest_network_isolate_cidrs", "10.0.0.1/24")
+            await state.settings_resolver.set("guest_network_isolate_cidrs", "192.0.2.5/24")
 
     async def test_the_fence_list_is_stored_in_one_canonical_spelling(self, state) -> None:
         resolved = await state.settings_resolver.set(
-            "guest_network_isolate_cidrs", " 10.0.0.1/24 ,192.168.1.0/24 "
+            "guest_network_isolate_cidrs", " 192.0.2.0/24 ,192.168.1.0/24 "
         )
-        assert resolved.value == "10.0.0.1/24,192.168.1.0/24"
+        assert resolved.value == "192.0.2.0/24,192.168.1.0/24"
 
     async def test_the_switches_take_only_0_or_1(self, state) -> None:
         assert (await state.settings_resolver.set("guest_network_snat", "0")).value == 0
@@ -142,7 +142,7 @@ class TestTheSettings:
             await state.settings_resolver.set("guest_network_snat", "2")
 
     async def test_an_env_locked_key_refuses_the_write(self, repo, monkeypatch) -> None:
-        monkeypatch.setenv("HP_GUEST_NETWORK_SUBNET", "10.96.17.0/24")
+        monkeypatch.setenv("HP_GUEST_NETWORK_SUBNET", "198.51.100.0/24")
         settings = _settings()
         resolver = SettingsResolver(repo, settings)
         with pytest.raises(EnvOverrideError):
@@ -150,7 +150,7 @@ class TestTheSettings:
         assert (await resolver.resolve("guest_network_subnet")).source == "env"
 
     async def test_the_api_refuses_an_env_locked_key_with_409(self, repo, monkeypatch) -> None:
-        monkeypatch.setenv("HP_GUEST_NETWORK_GATEWAY", "10.96.17.1")
+        monkeypatch.setenv("HP_GUEST_NETWORK_GATEWAY", "198.51.100.1")
         app = FastAPI()
         app.include_router(admin_router, prefix="/admin")
         settings = _settings()
@@ -175,30 +175,32 @@ class TestTheProbes:
     async def test_a_gateway_outside_the_stored_subnet_is_refused_before_saving(
         self, state
     ) -> None:
-        await state.settings_resolver.set("guest_network_subnet", "10.96.17.0/24")
-        result = await run_probe(state, "guest_network_gateway", "10.0.0.1")
+        await state.settings_resolver.set("guest_network_subnet", "198.51.100.0/24")
+        result = await run_probe(state, "guest_network_gateway", "203.0.113.1")
         assert result is not None
         assert result.ok is False
         assert result.reachable is True, "a local shape check always 'reached' something"
         assert "not inside the guest subnet" in result.detail
 
     async def test_a_gateway_inside_the_subnet_is_confirmed(self, state) -> None:
-        await state.settings_resolver.set("guest_network_subnet", "10.96.17.0/24")
-        result = await run_probe(state, "guest_network_gateway", "10.96.17.1")
+        await state.settings_resolver.set("guest_network_subnet", "198.51.100.0/24")
+        result = await run_probe(state, "guest_network_gateway", "198.51.100.1")
         assert result is not None and result.ok is True
         assert "No cluster call" in result.detail
 
     async def test_a_dhcp_range_outside_the_subnet_is_refused(self, state) -> None:
-        await state.settings_resolver.set("guest_network_subnet", "10.96.17.0/24")
-        result = await run_probe(state, "guest_network_dhcp_range", "10.96.18.100-10.96.18.199")
+        await state.settings_resolver.set("guest_network_subnet", "198.51.100.0/24")
+        result = await run_probe(state, "guest_network_dhcp_range", "203.0.113.100-203.0.113.199")
         assert result is not None and result.ok is False
 
     async def test_a_bad_value_is_never_stored(self, state) -> None:
         from homepilot.app_settings import ProbeRefusedError
 
-        await state.settings_resolver.set("guest_network_subnet", "10.96.17.0/24")
+        await state.settings_resolver.set("guest_network_subnet", "198.51.100.0/24")
         with pytest.raises(ProbeRefusedError):
-            await checked_set(state, state.settings_resolver, "guest_network_gateway", "10.0.0.1")
+            await checked_set(
+                state, state.settings_resolver, "guest_network_gateway", "203.0.113.1"
+            )
         assert (await state.settings_resolver.resolve("guest_network_gateway")).source == "default"
 
     async def test_an_empty_isolate_list_says_what_that_costs(self, state) -> None:
@@ -220,15 +222,15 @@ class TestTheApiRead:
     async def test_no_proxmox_is_reported_not_raised(self, api, state) -> None:
         client, app = api
         resolver: SettingsResolver = app.state.settings_resolver
-        await resolver.set("guest_network_subnet", "10.96.17.0/24")
-        await resolver.set("guest_network_gateway", "10.96.17.1")
-        await resolver.set("guest_network_dhcp_range", "10.96.17.100-10.96.17.199")
+        await resolver.set("guest_network_subnet", "198.51.100.0/24")
+        await resolver.set("guest_network_gateway", "198.51.100.1")
+        await resolver.set("guest_network_dhcp_range", "198.51.100.100-198.51.100.199")
 
         response = await client.get("/admin/guest-network")
         assert response.status_code == 200
         body = response.json()
         assert body["configured"] is True
-        assert body["desired"]["subnet_cidr"] == "10.96.17.0/24"
+        assert body["desired"]["subnet_cidr"] == "198.51.100.0/24"
         assert body["survey"] is None
         assert "Proxmox is not configured" in body["detail"]
 
@@ -237,10 +239,10 @@ class TestTheApiRead:
         network' - the operator would go looking for a setting that is there."""
         client, app = api
         resolver: SettingsResolver = app.state.settings_resolver
-        await resolver.set("guest_network_subnet", "10.96.17.0/24")
+        await resolver.set("guest_network_subnet", "198.51.100.0/24")
         # Stored directly, bypassing checked_set, the way a hand-edited row or an
         # older build's value arrives.
-        await resolver.set("guest_network_gateway", "10.96.17.1")
+        await resolver.set("guest_network_gateway", "198.51.100.1")
         await resolver.set("guest_network_dhcp_range", "")
         response = await client.get("/admin/guest-network")
         body = response.json()
@@ -282,9 +284,9 @@ class TestTheMcpTool:
     async def test_the_tool_and_the_route_answer_the_same(self, api, state) -> None:
         client, app = api
         resolver: SettingsResolver = app.state.settings_resolver
-        await resolver.set("guest_network_subnet", "10.96.17.0/24")
-        await resolver.set("guest_network_gateway", "10.96.17.1")
-        await resolver.set("guest_network_dhcp_range", "10.96.17.100-10.96.17.199")
+        await resolver.set("guest_network_subnet", "198.51.100.0/24")
+        await resolver.set("guest_network_gateway", "198.51.100.1")
+        await resolver.set("guest_network_dhcp_range", "198.51.100.100-198.51.100.199")
 
         over_http = (await client.get("/admin/guest-network")).json()
         over_mcp = await _handle_tool("query_guest_network", {}, self._ctx(state))

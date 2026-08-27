@@ -613,14 +613,14 @@ guest off the operator's networks.
 ```yaml guest-network-spec
 zone: guest                 # 1-8 chars, PVE's own limit
 vnet: innkeep               # 1-8 chars; also the bridge name guests get
-subnet_cidr: 10.96.17.0/24
-gateway: 10.96.17.1         # must be INSIDE the subnet
+subnet_cidr: 198.51.100.0/24
+gateway: 198.51.100.1         # must be INSIDE the subnet
 snat: 1
 dhcp: 1                     # needs dnsmasq on the node
-dhcp_range: 10.96.17.100-10.96.17.199
+dhcp_range: 198.51.100.100-198.51.100.199
 dhcp_dns_server: ''         # empty: guests resolve at the gateway
 isolate_cidrs:
-  - 10.0.0.1/24           # THE FENCE
+  - 192.0.2.0/24           # THE FENCE
 ```
 ````
 

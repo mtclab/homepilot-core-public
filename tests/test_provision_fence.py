@@ -53,7 +53,7 @@ AGENT_OK = {
     "data": {
         "result": [
             {"name": "lo", "ip-addresses": [{"ip-address": "127.0.0.1"}]},
-            {"name": "eth0", "ip-addresses": [{"ip-address": "10.96.17.104"}]},
+            {"name": "eth0", "ip-addresses": [{"ip-address": "198.51.100.104"}]},
         ]
     }
 }
@@ -61,12 +61,12 @@ AGENT_OK = {
 GUEST_NETWORK = DesiredGuestNetwork(
     zone="guest",
     vnet="innkeep",
-    subnet_cidr="10.96.17.0/24",
-    gateway="10.96.17.1",
+    subnet_cidr="198.51.100.0/24",
+    gateway="198.51.100.1",
     snat=True,
     dhcp=True,
-    dhcp_range="10.96.17.100-10.96.17.199",
-    isolate_cidrs=("10.0.0.1/24",),
+    dhcp_range="198.51.100.100-198.51.100.199",
+    isolate_cidrs=("192.0.2.0/24",),
 )
 
 
@@ -210,11 +210,11 @@ class TestAGuestOnTheGuestVnetIsFenced:
         assert [
             (r["action"], r.get("proto"), r.get("dport"), r["dest"]) for r in firewall.rules
         ] == [
-            ("ACCEPT", "udp", "67:68", "10.96.17.1"),
-            ("ACCEPT", "udp", "53", "10.96.17.1"),
-            ("ACCEPT", "tcp", "53", "10.96.17.1"),
-            ("DROP", None, None, "10.0.0.1/24"),
-            ("DROP", None, None, "10.96.17.1/32"),
+            ("ACCEPT", "udp", "67:68", "198.51.100.1"),
+            ("ACCEPT", "udp", "53", "198.51.100.1"),
+            ("ACCEPT", "tcp", "53", "198.51.100.1"),
+            ("DROP", None, None, "192.0.2.0/24"),
+            ("DROP", None, None, "198.51.100.1/32"),
         ]
         assert [r["pos"] for r in firewall.rules] == [0, 1, 2, 3, 4]
         assert all(r["type"] == "out" for r in firewall.rules)
@@ -251,7 +251,7 @@ class TestAGuestOnTheGuestVnetIsFenced:
         fence = result["guest_network_fence"]
         assert fence["vnet"] == "innkeep"
         assert len(fence["rules"]) == 5
-        assert fence["rules"][-1]["dest"] == "10.96.17.1/32"
+        assert fence["rules"][-1]["dest"] == "198.51.100.1/32"
 
 
 class TestAGuestElsewhereIsNotFenced:
@@ -281,9 +281,9 @@ class TestAGuestElsewhereIsNotFenced:
         open_network = DesiredGuestNetwork(
             zone="guest",
             vnet="innkeep",
-            subnet_cidr="10.96.17.0/24",
-            gateway="10.96.17.1",
-            dhcp_range="10.96.17.100-10.96.17.199",
+            subnet_cidr="198.51.100.0/24",
+            gateway="198.51.100.1",
+            dhcp_range="198.51.100.100-198.51.100.199",
             isolate_cidrs=(),
         )
         service = _service(db, proxmox, firewall, "innkeep", open_network)

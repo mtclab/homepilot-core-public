@@ -57,12 +57,12 @@ def desired(**overrides: Any) -> DesiredGuestNetwork:
     payload: dict[str, Any] = {
         "zone": "guest",
         "vnet": "innkeep",
-        "subnet_cidr": "10.96.17.0/24",
-        "gateway": "10.96.17.1",
+        "subnet_cidr": "198.51.100.0/24",
+        "gateway": "198.51.100.1",
         "snat": True,
         "dhcp": True,
-        "dhcp_range": "10.96.17.100-10.96.17.199",
-        "isolate_cidrs": ("10.0.0.1/24",),
+        "dhcp_range": "198.51.100.100-198.51.100.199",
+        "isolate_cidrs": ("192.0.2.0/24",),
     }
     payload.update(overrides)
     return DesiredGuestNetwork(**payload)
@@ -159,10 +159,10 @@ def converged_cluster() -> FakeCluster:
         vnets=[{"vnet": "innkeep", "zone": "guest"}],
         subnets=[
             {
-                "cidr": "10.96.17.0/24",
-                "gateway": "10.96.17.1",
+                "cidr": "198.51.100.0/24",
+                "gateway": "198.51.100.1",
                 "snat": 1,
-                "dhcp-range": ["start-address=10.96.17.100,end-address=10.96.17.199"],
+                "dhcp-range": ["start-address=198.51.100.100,end-address=198.51.100.199"],
             }
         ],
         fw_options={"enable": 1, "policy_forward": "ACCEPT"},
@@ -173,23 +173,23 @@ def converged_cluster() -> FakeCluster:
 class TestTheRefusals:
     async def test_a_gateway_outside_its_subnet_is_refused(self) -> None:
         with pytest.raises(GuestNetworkError) as exc:
-            desired(gateway="10.0.0.1")
-        assert "not inside subnet 10.96.17.0/24" in str(exc.value)
+            desired(gateway="203.0.113.1")
+        assert "not inside subnet 198.51.100.0/24" in str(exc.value)
         assert "no route off its own wire" in str(exc.value)
 
     async def test_a_dhcp_range_outside_the_subnet_is_refused(self) -> None:
         with pytest.raises(GuestNetworkError) as exc:
-            desired(dhcp_range="10.96.18.100-10.96.18.199")
+            desired(dhcp_range="203.0.113.100-203.0.113.199")
         assert "not inside subnet" in str(exc.value)
 
     async def test_a_dhcp_range_that_would_hand_out_the_gateway_is_refused(self) -> None:
         with pytest.raises(GuestNetworkError) as exc:
-            desired(dhcp_range="10.96.17.1-10.96.17.199")
+            desired(dhcp_range="198.51.100.1-198.51.100.199")
         assert "contains the gateway" in str(exc.value)
 
     async def test_a_backwards_dhcp_range_is_refused(self) -> None:
         with pytest.raises(GuestNetworkError) as exc:
-            desired(dhcp_range="10.96.17.199-10.96.17.100")
+            desired(dhcp_range="198.51.100.199-198.51.100.100")
         assert "ends before it starts" in str(exc.value)
 
     async def test_a_vnet_name_pve_cannot_store_is_refused(self) -> None:
@@ -209,7 +209,7 @@ class TestTheRefusals:
 
     async def test_a_bad_isolate_cidr_is_refused(self) -> None:
         with pytest.raises(GuestNetworkError):
-            desired(isolate_cidrs=("10.0.0.1/24",))
+            desired(isolate_cidrs=("203.0.113.1/24",))
 
 
 class TestThePlan:
@@ -238,11 +238,11 @@ class TestThePlan:
         }
         assert by_id["create-subnet"].params == {
             "vnet": "innkeep",
-            "subnet": "10.96.17.0/24",
+            "subnet": "198.51.100.0/24",
             "type": "subnet",
-            "gateway": "10.96.17.1",
+            "gateway": "198.51.100.1",
             "snat": 1,
-            "dhcp-range": ["start-address=10.96.17.100,end-address=10.96.17.199"],
+            "dhcp-range": ["start-address=198.51.100.100,end-address=198.51.100.199"],
         }
         # The apply is LAST and present: without it PVE holds the whole thing
         # pending and the guest network exists only in the cluster's intentions.
@@ -272,23 +272,23 @@ class TestThePlan:
         cluster = converged_cluster()
         cluster.subnets = [
             {
-                "cidr": "10.96.17.0/24",
-                "gateway": "10.96.17.254",
+                "cidr": "198.51.100.0/24",
+                "gateway": "198.51.100.254",
                 "snat": 1,
-                "dhcp-range": ["start-address=10.96.17.100,end-address=10.96.17.199"],
+                "dhcp-range": ["start-address=198.51.100.100,end-address=198.51.100.199"],
             }
         ]
         result = plan(desired(), await survey(cluster, desired()))
         assert [s.id for s in result.steps] == ["update-subnet", "apply-sdn"]
         assert result.steps[0].op == "update_subnet"
-        assert result.steps[0].params["gateway"] == "10.96.17.1"
+        assert result.steps[0].params["gateway"] == "198.51.100.1"
 
     async def test_a_missing_firewall_rule_is_the_only_thing_planned(self) -> None:
         cluster = converged_cluster()
         cluster.fw_rules = cluster.fw_rules[:-1]  # the gateway DROP went missing
         result = plan(desired(), await survey(cluster, desired()))
         assert [s.id for s in result.steps] == ["vnet-firewall-rule-4", "apply-sdn"]
-        assert result.steps[0].params["dest"] == "10.96.17.1/32"
+        assert result.steps[0].params["dest"] == "198.51.100.1/32"
 
     async def test_a_zone_somebody_else_built_is_a_blocker_not_a_step(self) -> None:
         cluster = FakeCluster(zones=[{"zone": "guest", "type": "vxlan"}])
@@ -347,12 +347,12 @@ class TestTheFence:
         assert rules[0]["proto"] == "udp" and rules[0]["dport"] == "67:68"
         assert {rules[1]["proto"], rules[2]["proto"]} == {"udp", "tcp"}
         assert all(r["dport"] == "53" for r in rules[1:3])
-        assert all(r["dest"] == "10.96.17.1" for r in rules[:3])
+        assert all(r["dest"] == "198.51.100.1" for r in rules[:3])
 
     async def test_every_isolated_network_gets_its_own_drop(self) -> None:
-        want = desired(isolate_cidrs=("10.0.0.1/24", "192.168.1.0/24"))
+        want = desired(isolate_cidrs=("192.0.2.0/24", "192.168.1.0/24"))
         drops = [r["dest"] for r in fence_rules(want, "out") if r["action"] == "DROP"]
-        assert drops == ["10.0.0.1/24", "192.168.1.0/24", "10.96.17.1/32"]
+        assert drops == ["192.0.2.0/24", "192.168.1.0/24", "198.51.100.1/32"]
 
     async def test_the_gateway_itself_is_dropped_last(self) -> None:
         """The guest talks to the gateway for DHCP and DNS and nothing else."""
@@ -360,7 +360,7 @@ class TestTheFence:
         assert rules[-1] == {
             "type": "out",
             "action": "DROP",
-            "dest": "10.96.17.1/32",
+            "dest": "198.51.100.1/32",
             "enable": 1,
             "comment": "the gateway is a router for guests, not a host they talk to",
         }
@@ -403,7 +403,7 @@ class TestTheExecution:
         rules = [params for op, params in cluster.calls if op == "create_vnet_firewall_rule"]
         assert [r["pos"] for r in rules] == [0, 1, 2, 3, 4]
         assert rules[0]["type"] == "forward"
-        assert rules[-1]["action"] == "DROP" and rules[-1]["dest"] == "10.96.17.1/32"
+        assert rules[-1]["action"] == "DROP" and rules[-1]["dest"] == "198.51.100.1/32"
 
     async def test_a_failed_step_repeats_the_clusters_own_words(self) -> None:
         cluster = FakeCluster(fail_on="apply_sdn")

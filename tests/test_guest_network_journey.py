@@ -57,13 +57,13 @@ The subnet a friend's machine lives on.
 ```yaml guest-network-spec
 zone: guest
 vnet: innkeep
-subnet_cidr: 10.96.17.0/24
-gateway: 10.96.17.1
+subnet_cidr: 198.51.100.0/24
+gateway: 198.51.100.1
 snat: 1
 dhcp: 1
-dhcp_range: 10.96.17.100-10.96.17.199
+dhcp_range: 198.51.100.100-198.51.100.199
 isolate_cidrs:
-  - 10.0.0.1/24
+  - 192.0.2.0/24
 ```
 """
 
@@ -72,7 +72,7 @@ def _spec(artifact_id: str = "2026-08-26-guest-network-a1b2c3", body: str = BODY
     return {
         "id": artifact_id,
         "kind": ArtifactKind.GUEST_NETWORK.value,
-        "intent": "Build the guest subnet 10.96.17.0/24, fenced off the operator LAN",
+        "intent": "Build the guest subnet 198.51.100.0/24, fenced off the operator LAN",
         "body": body,
         "target": {"kind": "network", "network": "innkeep"},
         "idempotence": "via-precheck",
@@ -106,7 +106,7 @@ class TestTheProposeGate:
     async def test_a_body_that_cannot_work_is_refused_at_propose(self, world) -> None:
         """The last moment before it is committed and put in front of a human."""
         lifecycle, *_ = world
-        bad = BODY.replace("gateway: 10.96.17.1", "gateway: 10.0.0.1")
+        bad = BODY.replace("gateway: 198.51.100.1", "gateway: 203.0.113.1")
         with pytest.raises(LifecycleError) as exc:
             await lifecycle.propose(_spec("2026-08-26-guest-network-bad001", bad))
         assert "not inside subnet" in str(exc.value)
@@ -167,7 +167,7 @@ class TestTheJourney:
         import json
 
         lifecycle, store, repo, _executor, _cluster = world
-        bad = BODY.replace("subnet_cidr: 10.96.17.0/24", "subnet_cidr: not-a-subnet")
+        bad = BODY.replace("subnet_cidr: 198.51.100.0/24", "subnet_cidr: not-a-subnet")
         with pytest.raises(LifecycleError):
             await _handle_tool(
                 "propose_artifact",
@@ -235,7 +235,7 @@ class TestTheJourney:
             "apply_sdn",
         ]
         params = dict(cluster.calls)
-        assert params["create_subnet"]["gateway"] == "10.96.17.1"
+        assert params["create_subnet"]["gateway"] == "198.51.100.1"
         assert params["create_subnet"]["snat"] == 1
 
         fm, _ = store.read(aid)
@@ -297,7 +297,7 @@ class TestDriftIsThePlan:
         await executor.apply(aid, approved_by="olli")
         _promote_fake_cluster(cluster)
         # Somebody deleted the DROP towards the operator LAN.
-        cluster.fw_rules = [r for r in cluster.fw_rules if r.get("dest") != "10.0.0.1/24"]
+        cluster.fw_rules = [r for r in cluster.fw_rules if r.get("dest") != "192.0.2.0/24"]
 
         result = await verify_artifact(aid, repo, store, executor)
         assert result.state is DriftState.DRIFTED

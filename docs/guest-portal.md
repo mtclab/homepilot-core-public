@@ -87,8 +87,8 @@ is a network and a fence, and HomePilot builds both.
 
 One SDN zone (`simple`, dnsmasq DHCP, PVE IPAM), one vnet, one subnet with a
 gateway, SNAT and a DHCP range. The estate's shape: vnet `innkeep` in zone
-`guest`, subnet `10.96.17.0/24`, gateway `10.96.17.1`, DHCP `.100-.199`,
-isolated from `10.0.0.1/24` - which is the operator LAN, on the same node,
+`guest`, subnet `198.51.100.0/24`, gateway `198.51.100.1`, DHCP `.100-.199`,
+isolated from `192.0.2.0/24` - which is the operator LAN, on the same node,
 because `elizabeth` is both hypervisor and gateway.
 
 The desired state lives in the `guest_network_*` settings (Settings ->

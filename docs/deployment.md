@@ -877,7 +877,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
 | `HP_GUEST_NETWORK_ZONE` | `guest` | SDN zone the guest network lives in (1-8 characters, PVE's own limit) |
 | `HP_GUEST_NETWORK_VNET` | `innkeep` | Vnet guests attach to. Point `HP_PROVISION_DEFAULT_BRIDGE` at this name to put provisioned guests on it |
-| `HP_GUEST_NETWORK_SUBNET` | — | The guest subnet in CIDR form, e.g. `10.96.17.0/24`. Empty means this instance describes no guest network |
+| `HP_GUEST_NETWORK_SUBNET` | — | The guest subnet in CIDR form, e.g. `198.51.100.0/24`. Empty means this instance describes no guest network |
 | `HP_GUEST_NETWORK_GATEWAY` | — | The guest subnet's gateway; must be inside the subnet |
 | `HP_GUEST_NETWORK_SNAT` | `1` | `1` source-NATs guest traffic out of the node |
 | `HP_GUEST_NETWORK_DHCP` | `1` | `1` runs dnsmasq on the zone; needs the `dnsmasq` package on the node |

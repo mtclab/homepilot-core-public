@@ -12,7 +12,8 @@ the UI - approve it with the human-relayed code, and apply runs an idempotent
 plan against the live cluster; drift checking runs the same plan, so "in spec"
 means the cluster still agrees. Provisioning onto the guest vnet fences every
 guest at the tap device before first boot (DHCP/DNS to the gateway allowed,
-the operator LAN dropped, fail-closed default 10.0.0.1/24); a fence that
+the operator LAN dropped; an empty isolate list refuses to provision onto
+the guest vnet at all - fail closed by refusal); a fence that
 cannot be written destroys the half-made guest loudly. VNet-level forward
 rules are written too - dormant on the legacy firewall stack, live the day the
 node switches to nftables, and the report says which.

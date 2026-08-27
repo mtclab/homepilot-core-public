@@ -386,7 +386,7 @@ REGISTRY: dict[str, SettingSpec] = {
             key="guest_network_subnet",
             type_="str",
             description=(
-                "The guest subnet in CIDR form, e.g. 10.96.17.0/24. Empty means this "
+                "The guest subnet in CIDR form, e.g. 198.51.100.0/24. Empty means this "
                 "instance describes no guest network: nothing is surveyed, nothing is "
                 "planned, and provisioning writes no fence."
             ),
@@ -434,7 +434,7 @@ REGISTRY: dict[str, SettingSpec] = {
             type_="str",
             description=(
                 "The addresses DHCP may hand out, as '<start>-<end>', e.g. "
-                "10.96.17.100-10.96.17.199. Both ends must be inside the subnet and "
+                "198.51.100.100-198.51.100.199. Both ends must be inside the subnet and "
                 "neither may be the gateway."
             ),
             hot_reloadable=True,

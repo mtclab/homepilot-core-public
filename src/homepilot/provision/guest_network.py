@@ -80,7 +80,7 @@ def validate_network(value: str, field_name: str) -> ipaddress.IPv4Network:
         net = ipaddress.ip_network(text, strict=True)
     except ValueError as exc:
         raise GuestNetworkError(
-            f"{field_name} must be an IPv4 CIDR like 10.96.17.0/24: {exc}"
+            f"{field_name} must be an IPv4 CIDR like 198.51.100.0/24: {exc}"
         ) from exc
     if not isinstance(net, ipaddress.IPv4Network):
         raise GuestNetworkError(f"{field_name} must be IPv4; got {text!r}")
@@ -208,7 +208,7 @@ def parse_range(raw: str) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]
     parts = [p.strip() for p in raw.split("-")]
     if len(parts) != 2 or not all(parts):
         raise GuestNetworkError(
-            f"dhcp_range must be '<start>-<end>', e.g. 10.96.17.100-10.96.17.199; got {raw!r}"
+            f"dhcp_range must be '<start>-<end>', e.g. 198.51.100.100-198.51.100.199; got {raw!r}"
         )
     return validate_address(parts[0], "dhcp_range start"), validate_address(
         parts[1], "dhcp_range end"

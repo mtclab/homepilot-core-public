@@ -31,7 +31,7 @@
 		// from the instance's guest_network_* settings at apply time, so a body
 		// that restates them all is a body that silently stops following them.
 		'guest-network':
-			'```yaml guest-network-spec\nsubnet_cidr: 10.96.17.0/24\ngateway: 10.96.17.1\ndhcp_range: 10.96.17.100-10.96.17.199\nisolate_cidrs:\n  - 10.0.0.1/24\n```',
+			'```yaml guest-network-spec\nsubnet_cidr: 198.51.100.0/24\ngateway: 198.51.100.1\ndhcp_range: 198.51.100.100-198.51.100.199\nisolate_cidrs:\n  - 192.0.2.0/24\n```',
 		'http-sequence': '```yaml http-sequence\nsteps:\n  - method: GET\n    path: /health\n```',
 		'shell-script': '```bash\nsystemctl status nginx\n```',
 		'kb-note': 'What this documents, in prose.',

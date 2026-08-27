@@ -46,13 +46,13 @@ function card(): HTMLElement {
 const DESIRED = {
 	zone: 'guest',
 	vnet: 'innkeep',
-	subnet_cidr: '10.96.17.0/24',
-	gateway: '10.96.17.1',
+	subnet_cidr: '198.51.100.0/24',
+	gateway: '198.51.100.1',
 	snat: true,
 	dhcp: true,
-	dhcp_range: '10.96.17.100-10.96.17.199',
+	dhcp_range: '198.51.100.100-198.51.100.199',
 	dhcp_dns_server: '',
-	isolate_cidrs: ['10.0.0.1/24'],
+	isolate_cidrs: ['192.0.2.0/24'],
 };
 
 const SURVEY = {
@@ -73,18 +73,18 @@ const LEGACY_NOTE =
 const SETTINGS = [
 	{
 		key: 'guest_network_subnet',
-		value: '10.96.17.0/24',
+		value: '198.51.100.0/24',
 		source: 'db',
 		type: 'str',
 		hot_reloadable: true,
-		description: 'The guest subnet in CIDR form, e.g. 10.96.17.0/24. Empty means no guest network.',
+		description: 'The guest subnet in CIDR form, e.g. 198.51.100.0/24. Empty means no guest network.',
 		env_var: 'HP_GUEST_NETWORK_SUBNET',
 		editable: true,
 		probeable: true,
 	},
 	{
 		key: 'guest_network_isolate_cidrs',
-		value: '10.0.0.1/24',
+		value: '192.0.2.0/24',
 		source: 'default',
 		type: 'str',
 		hot_reloadable: true,
