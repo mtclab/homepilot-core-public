@@ -1572,7 +1572,7 @@ def kb_reindex(
     )
 
 
-_TOKEN_RULE = (
+_TOKEN_RULE = (  # nosec B105 - a refusal message about tokens, not a credential
     "Tokens are minted by admins: create through the API with an admin token, "
     "or from Settings -> Tokens."
 )
