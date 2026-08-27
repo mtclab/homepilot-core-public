@@ -528,7 +528,15 @@ def _subnet_needs_update(row: dict[str, Any], desired: DesiredGuestNetwork) -> d
 def _normalised_ranges(values: Any) -> list[str]:
     out: list[str] = []
     for value in values or []:
-        parts = sorted(p.strip() for p in str(value).split(",") if p.strip())
+        if isinstance(value, dict):
+            # An APPLIED subnet returns each range as a dict
+            # ({"start-address": ..., "end-address": ...}); pending state and
+            # our own params use "start-address=..,end-address=.." strings.
+            # Both spell the same range, and treating them as different kept
+            # the drift check DRIFTED forever after a clean apply.
+            parts = sorted(f"{k}={v}" for k, v in value.items())
+        else:
+            parts = sorted(p.strip() for p in str(value).split(",") if p.strip())
         out.append(",".join(parts))
     return sorted(out)
 
