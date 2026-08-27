@@ -239,8 +239,24 @@ class TaskRunner:
                 result = await self.executor.apply(artifact_id, approved_by)
                 await self._record_outcome(task_id, result)
             else:
-                await self.lifecycle.mark_applied(artifact_id, "Applied without executor")
-                await self.repo.update_task_status(task_id, "succeeded")
+                # No executor means NOTHING can run - and an apply that runs
+                # nothing must not say "applied". This branch used to
+                # mark_applied("Applied without executor") and succeed, which is
+                # the product recording a change it never made (caught live on a
+                # proxmox-less instance: a guest-network apply "succeeded" with
+                # an empty log and no cluster). Handled here rather than raised:
+                # the artifact must STAY approved - it is the instance that is
+                # missing a limb, not the change that is wrong - and the except
+                # below would mark it failed.
+                await self.repo.update_task_status(
+                    task_id,
+                    "failed",
+                    error=(
+                        "no executor configured - this instance cannot apply "
+                        "artifacts (Proxmox and vault are not wired up); the "
+                        "artifact stays approved"
+                    ),
+                )
         except Exception as exc:
             logger.exception("Apply task %s failed for artifact %s", task_id, artifact_id)
             error_msg = str(exc)

@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.6.1 (2026-08-27)
+
+### A garbage write token no longer takes the guest network down
+
+Found live driving 3.6.0 over MCP: the vault's write-token slot held an
+error message a past failed settings save had stored, and the shared PVE
+client refused to build around it - every guest-network read failed. The
+client factory now falls back to the read token (warning names the repair),
+and the Proxmox settings save refuses to store a value that is not shaped
+like a PVE token.
+
+
 ## v3.6.0 (2026-08-26)
 
 The estate's network becomes a recorded change, and credentials grow up.
