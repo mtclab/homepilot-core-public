@@ -440,3 +440,32 @@ class TestPlanIsPureAndTestableWithoutACluster:
         function a test can call with two plain values."""
         empty = GuestNetworkSurvey()
         assert len(plan(desired(), empty).steps) == 10
+
+
+class TestAGarbageWriteTokenDoesNotTakeReadsDown:
+    """Found live: the vault's write-token slot held a stored ERROR MESSAGE
+    from a past failed settings save, and the library refused to build any
+    client around it - guest-network reads included. The factory now falls
+    back to the read token when the write slot is not a token at all."""
+
+    def test_garbage_falls_back_to_the_read_token(self) -> None:
+        from homepilot.adapters.pve_sdn import PveCredentials, _usable_write_token
+
+        creds = PveCredentials(
+            base_url="https://pve.example:8006",
+            token="root@pam!hp=11111111-2222-3333-4444-555555555555",
+            write_token="Failed to save Proxmox settings: Error: 500: Internal Server Error",
+            verify_ssl=True,
+        )
+        assert _usable_write_token(creds) == creds.token
+
+    def test_a_real_write_token_is_used(self) -> None:
+        from homepilot.adapters.pve_sdn import PveCredentials, _usable_write_token
+
+        creds = PveCredentials(
+            base_url="https://pve.example:8006",
+            token="root@pam!ro=11111111-2222-3333-4444-555555555555",
+            write_token="root@pam!rw=66666666-7777-8888-9999-000000000000",
+            verify_ssl=True,
+        )
+        assert _usable_write_token(creds) == creds.write_token

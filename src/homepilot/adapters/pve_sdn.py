@@ -35,6 +35,7 @@ Nothing in this module knows what a guest network SHOULD look like; that is
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,10 +73,36 @@ class PveCredentials:
     verify_ssl: bool
 
 
+_PVE_TOKEN_SHAPE = re.compile(r"^[^@\s]+@[^!\s]+![^=\s]+=\S+$")
+
+
 def _split_token(token: str) -> tuple[str, str]:
     """`user@realm!name=secret` -> (`user@realm!name`, `secret`)."""
     token_id, _, secret = token.partition("=")
     return token_id.strip(), secret.strip()
+
+
+def _usable_write_token(credentials: PveCredentials) -> str:
+    """The write token, unless it is not a PVE token at all.
+
+    Found live: a past settings save had stored an ERROR MESSAGE into the
+    vault's write-token slot, and the library (rightly) refused to build a
+    client around it - taking every guest-network read down with it. A
+    malformed write token falls back to the read token with a warning, the
+    same answer ProxmoxClient gives when there is no write token at all;
+    the read token is at least KNOWN to be real, because reads work.
+    """
+    write = (credentials.write_token or "").strip()
+    if not write:
+        return credentials.token
+    if _PVE_TOKEN_SHAPE.match(write):
+        return write
+    logger.warning(
+        "The stored PVE write token is not a token (got %r...) - falling back "
+        "to the read token; re-save Proxmox settings to repair it",
+        write[:24],
+    )
+    return credentials.token
 
 
 def multi_client_from(credentials: PveCredentials) -> Any:
@@ -94,7 +121,7 @@ def multi_client_from(credentials: PveCredentials) -> Any:
     from proxmox_mcp.multi_client import MultiClient
 
     monitor_id, monitor_secret = _split_token(credentials.token)
-    admin_id, admin_secret = _split_token(credentials.write_token or credentials.token)
+    admin_id, admin_secret = _split_token(_usable_write_token(credentials))
     endpoint = EndpointConfig(
         name="homepilot",
         url=credentials.base_url,

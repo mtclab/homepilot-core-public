@@ -206,6 +206,21 @@ async def save_proxmox_settings(request: Request, config: ProxmoxConfigIn) -> di
         },
     )
 
+    # A value that is not a PVE token must not enter the vault: a past save
+    # stored an error message into the write-token slot and every consumer of
+    # that slot then failed on garbage. Empty still means "clear/keep" as
+    # before; a NON-empty value has to look like user@realm!tokenid=secret.
+    from ..app_state import _validate_pve_token
+
+    for field_name, value in (("token", config.token), ("write_token", config.write_token)):
+        if value and not _validate_pve_token(value):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{field_name} is not a PVE API token - expected 'user@realm!tokenid=secret'"
+                ),
+            )
+
     if config.token is not None:
         await vault.store_secret("pve-token", {"token": config.token})
 

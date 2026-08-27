@@ -100,3 +100,39 @@ class TestEveryArtifactGetsAMirrorRow:
         assert row is not None and row["file_path"] == store.relative_path(a), (
             "the conflict-update must repair file_path, or pre-fix rows stay empty forever"
         )
+
+
+class TestApplyWithoutAnExecutorTellsTheTruth:
+    """Caught live on a proxmox-less rig: apply reported "succeeded" with an
+    empty log while nothing ran - the runner's no-executor branch marked the
+    artifact applied. Now the TASK fails naming the missing wiring and the
+    artifact STAYS approved, so a properly wired instance can still apply it."""
+
+    async def test_no_executor_apply_fails_and_leaves_the_artifact_approved(self, mirror) -> None:
+        import asyncio
+
+        from homepilot.tasks.repository import TaskRepository
+        from homepilot.tasks.runner import TaskRunner
+
+        _repo, store, lifecycle, db = mirror
+        a = "2026-08-27-mirror-truthful-apply-f0e1d2"
+        await lifecycle.propose(_spec(a, "truthful apply"))
+        await lifecycle.approve(a, user="admin")
+
+        runner = TaskRunner(
+            repo=TaskRepository(db),
+            lifecycle=lifecycle,
+            store=store,
+            executor=None,
+            apply_reconciler=None,
+        )
+        out = await runner.start_apply(a, approved_by="admin")
+        for _ in range(50):
+            task = await TaskRepository(db).get_task(out["task_id"])
+            if task and task["status"] in ("failed", "succeeded"):
+                break
+            await asyncio.sleep(0.1)
+        assert task is not None and task["status"] == "failed"
+        assert "no executor configured" in (task["error"] or "")
+        fm, _ = store.read(a)
+        assert fm["status"] == "approved", "the artifact must survive for a wired instance"
