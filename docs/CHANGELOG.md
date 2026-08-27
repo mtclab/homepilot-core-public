@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.6.5 (2026-08-27)
+
+### A vnet is a valid guest bridge
+
+The bridge probe now accepts an SDN vnet by name (this PVE's node network
+listing omits vnets even with type=any_bridge), so the provisioning default
+can finally point at the guest vnet the guest-network artifact built.
+
+
 ## v3.6.4 (2026-08-27)
 
 ### The bridge probe sees SDN vnets, and drift stays honest after an apply

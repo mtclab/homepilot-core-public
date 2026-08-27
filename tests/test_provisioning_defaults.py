@@ -112,6 +112,10 @@ class FakeCluster:
             return {"data": POOLS}
         if path.endswith("/network"):
             return {"data": self.network}
+        if path == "/cluster/sdn/vnets":
+            # The bridge probe asks the SDN too (an SDN vnet is a valid guest
+            # bridge); this cluster has none unless a test seeds them.
+            return {"data": getattr(self, "sdn_vnets", [])}
         raise AssertionError(f"unexpected probe read: {path}")
 
 
@@ -871,3 +875,35 @@ class TestTheBridgeProbeSeesSdnVnets:
         assert failure is None
         assert seen and seen[0][1] == {"type": "any_bridge"}
         assert entries and entries[0]["iface"] == "innkeep"
+
+
+class TestTheBridgeProbeAcceptsSdnVnets:
+    async def test_a_vnet_is_a_valid_guest_bridge(self) -> None:
+        """The node network listing does not include SDN vnets (even with
+        type=any_bridge on this PVE) - and a vnet IS what the guest bridge
+        default points at. The probe asks the SDN too (live catch #5)."""
+        from homepilot.provision.probes import ProbeContext, probe_bridge
+
+        class Px:
+            async def read(self, path, query=None):
+                if path.startswith("/nodes/"):
+                    return {"data": [{"iface": "vmbr0", "type": "bridge"}]}
+                assert path == "/cluster/sdn/vnets"
+                return {"data": [{"vnet": "innkeep", "zone": "guest"}]}
+
+        result = await probe_bridge("innkeep", ProbeContext(proxmox=Px(), node="elizabeth"))
+        assert result.ok, result.detail
+        assert "SDN vnet" in result.detail
+
+    async def test_a_missing_bridge_names_the_vnets_too(self) -> None:
+        from homepilot.provision.probes import ProbeContext, probe_bridge
+
+        class Px:
+            async def read(self, path, query=None):
+                if path.startswith("/nodes/"):
+                    return {"data": [{"iface": "vmbr0", "type": "bridge"}]}
+                return {"data": [{"vnet": "innkeep", "zone": "guest"}]}
+
+        result = await probe_bridge("vmbr9", ProbeContext(proxmox=Px(), node="elizabeth"))
+        assert result.ok is False
+        assert "SDN vnets: innkeep" in result.detail
