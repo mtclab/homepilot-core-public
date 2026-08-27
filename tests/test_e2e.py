@@ -290,13 +290,25 @@ class TestUIPages:
 
 
 class TestAdminTokenCreate:
-    def test_token_create_without_admin_secret_returns_403(self, page):
+    def test_an_admin_bearer_mints_without_the_secret(self, page):
+        """The owner's rule since the tokens-are-minted-by-admins slice: a
+        logged-in admin creates tokens, no shared secret needed. The e2e token
+        IS an admin credential, so this must succeed."""
         resp = page.request.post(
             f"{BASE_URL}/auth/tokens",
-            data='{"label": "ci", "scope": "read"}',
+            data='{"label": "ci-e2e-rule", "scope": "read"}',
             headers=_bearer_json(),
         )
-        assert resp.status == 403, f"Expected 403, got {resp.status}"
+        assert resp.status in (200, 201), f"Expected created, got {resp.status}"
+
+    def test_anonymous_token_create_is_refused(self, page):
+        """No bearer, no session, no secret - the refusal names the rule."""
+        resp = page.request.post(
+            f"{BASE_URL}/auth/tokens",
+            data='{"label": "ci-anon", "scope": "read"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status in (401, 403), f"Expected refusal, got {resp.status}"
 
 
 # ---------------------------------------------------------------------------

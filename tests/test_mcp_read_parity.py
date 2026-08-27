@@ -43,6 +43,12 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from homepilot.auth.deps import require_token
+
+# API scope -> the MCP tier that maps to it exactly. Imported, never re-declared:
+# the transport authenticates API tokens through this same map, and a private
+# copy here would let this gate agree with itself while disagreeing with what the
+# transport actually grants.
+from homepilot.auth.scopes import API_SCOPE_TO_MCP_TIER as _API_SCOPE_TO_MCP_TIER
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -72,6 +78,10 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # The route is API `admin`, so the tool is an admin-tier READ.
     "/admin/settings/overrides": "query_settings_overrides",
     "/admin/settings/proxmox": "get_proxmox_settings",
+    # The guest network (#553): survey + desired + plan. An API-admin read, so
+    # an admin-tier tool. There is no mutating twin: the change ships as a
+    # `guest-network` artifact through propose/approve/apply.
+    "/admin/guest-network": "query_guest_network",
     # Agent fleet
     "/agents/": "list_agents",
     "/agents/audit": "get_agent_audit",
@@ -465,8 +475,6 @@ class TestMutationParityGate:
 # require_scope from the app's dependency tree and demands an exact match for
 # every (tool, route) pair in BOTH parity maps.
 
-# API scope -> the MCP tier that maps to it exactly.
-_API_SCOPE_TO_MCP_TIER = {"read": "read_only", "write": "full", "admin": "admin"}
 _SCOPE_RANK = {"read": 0, "write": 1, "admin": 2}
 
 

@@ -246,14 +246,35 @@ class TestApproveCodedOverMcp:
         assert "approval_code" in result.content[0].text
 
 
-class TestHttpBindStartupGuard:
-    """Fix 2c (#385): the HTTP bind must hard-fail without HP_MCP_TOKEN."""
+class TestHttpTransportNeverUnauthenticated:
+    """The invariant that replaced the #385 startup guard.
 
-    async def test_run_server_http_refuses_without_token(self):
-        from homepilot.mcp.server import run_server_http
+    That guard refused to bind without HP_MCP_TOKEN because auth was attached
+    only when the env var was set - so binding without it served the whole tool
+    surface to anyone. The transport authenticates API tokens now (2026-08-26)
+    and attaches auth unconditionally, which makes running without a static
+    secret a SUPPORTED configuration. What must never change is the thing the
+    guard was protecting: no configuration of this transport is open.
 
-        with (
-            patch.dict(os.environ, {"HP_MCP_TOKEN": ""}, clear=False),
-            pytest.raises(RuntimeError, match="without HP_MCP_TOKEN"),
+    Teeth: make the auth middleware conditional on mcp_token again and this
+    fails - the no-token app answers the anonymous request with a non-401.
+    """
+
+    async def test_no_configuration_of_the_transport_admits_an_anonymous_caller(self):
+        from starlette.testclient import TestClient
+
+        from homepilot.mcp import server as mcp_mod
+
+        for env in (
+            {"HP_MCP_TOKEN": ""},
+            {"HP_MCP_TOKEN": "   "},
+            {"HP_MCP_TOKEN": "static-secret"},
         ):
-            await run_server_http(host="127.0.0.1", port=0)
+            with patch.dict(os.environ, env, clear=False):
+                mcp_mod._server_context.clear()
+                mock_srv = MagicMock()
+                mock_srv.create_initialization_options = MagicMock(return_value={})
+                app = mcp_mod.create_http_app(mock_srv)
+            client = TestClient(app, raise_server_exceptions=False)
+            assert client.get("/").status_code == 401, env
+            assert client.get("/", headers={"Authorization": "Bearer junk"}).status_code == 401, env

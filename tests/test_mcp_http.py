@@ -46,9 +46,11 @@ class TestCreateHttpApp:
         resp = client.get("/")
         assert resp.status_code != 404
 
-    def test_non_mcp_route_is_404(self, app_no_auth):
-        client = TestClient(app_no_auth, raise_server_exceptions=False)
-        resp = client.get("/health")
+    def test_non_mcp_route_is_404(self, app_with_auth):
+        client = TestClient(app_with_auth, raise_server_exceptions=False)
+        # Authenticated on purpose: this asks a ROUTING question, and auth now
+        # answers first for anyone who is not.
+        resp = client.get("/health", headers={"Authorization": "Bearer test-secret-token"})
         assert resp.status_code in (404, 500)
 
 
@@ -69,10 +71,13 @@ class TestBearerAuthMiddleware:
         # auth passed — may fail for other reasons, but not 401
         assert resp.status_code != 401
 
-    def test_no_middleware_when_no_token(self, app_no_auth):
+    def test_auth_is_attached_even_with_no_token_configured(self, app_no_auth):
+        """The transport authenticates API tokens now, so the middleware is never
+        conditional: a process with no static secret refuses callers instead of
+        admitting them."""
         client = TestClient(app_no_auth, raise_server_exceptions=False)
-        resp = client.get("/")
-        assert resp.status_code != 401
+        assert client.get("/").status_code == 401
+        assert client.get("/", headers={"Authorization": "Bearer anything"}).status_code == 401
 
 
 class TestHttpAuthMiddleware:
@@ -85,7 +90,7 @@ class TestHttpAuthMiddleware:
         # App should have middleware stack when token is configured
         assert app is not None
 
-    def test_create_http_app_no_auth_when_no_token(self):
+    def test_create_http_app_builds_without_a_static_token(self):
         from homepilot.mcp import server as mcp_mod
 
         mock_srv = MagicMock()

@@ -4,7 +4,13 @@ import hashlib
 import hmac
 import secrets
 
-from .scopes import ROLE_SCOPES, SCOPE_ADMIN
+from .scopes import (
+    API_SCOPE_TO_MCP_TIER,
+    ROLE_SCOPES,
+    SCOPE_ADMIN,
+    SCOPE_READ,
+    SCOPE_WRITE,
+)
 
 PREFIX = "hp_"
 TOKEN_BYTES = 32
@@ -41,6 +47,25 @@ def scope_allows(scope: str | None, action: str, role: str | None = None) -> boo
     if "*" in normalized:
         return True
     return action in normalized
+
+
+def mcp_tier_for_token(scope: str | None, role: str | None = None) -> str | None:
+    """The MCP tool tier an API token's scope grants, or None for no access.
+
+    The strongest capability the token holds wins, resolved through
+    API_SCOPE_TO_MCP_TIER - the same map the MCP tier<->API scope parity gate
+    reads - so an admin token gets the admin tier, a write token the full tier,
+    a read token read_only, and a token with no usable capability nothing at all.
+    """
+    normalized = normalize_scope(scope, role)
+    if not normalized:
+        return None
+    if "*" in normalized:
+        return API_SCOPE_TO_MCP_TIER[SCOPE_ADMIN]
+    for api_scope in (SCOPE_ADMIN, SCOPE_WRITE, SCOPE_READ):
+        if api_scope in normalized:
+            return API_SCOPE_TO_MCP_TIER[api_scope]
+    return None
 
 
 def hash_token(token: str) -> str:

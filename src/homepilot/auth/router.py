@@ -122,6 +122,62 @@ setattr(require_admin_or_secret, REQUIRED_SCOPE_ATTR, "admin")
 _require_admin_or_secret_dep = Depends(require_admin_or_secret)
 
 
+async def _authorize_mint(
+    request: Request,
+    authorization: str | None,
+    hp_token: str | None,
+    hp_csrf: str | None,
+    db: Repository,
+) -> dict[str, Any]:
+    """Authorize POST /tokens: an admin-scope token OR the admin secret.
+
+    Two credentials, one rule - the caller must already be an admin:
+      * the admin secret (header), which the CLI resolves from the vault;
+      * an admin-scope API token (bearer or session cookie), which is the
+        credential a human actually holds.
+    A caller presenting neither is refused with the rule spelled out, rather
+    than with a message about an environment variable they cannot see.
+    """
+    header_secret = request.headers.get("x-hp-admin-secret") or request.headers.get(
+        "x-admin-secret", ""
+    )
+    has_token_credential = bool(authorization or hp_token)
+    if header_secret:
+        admin_secret = await resolve_admin_secret(request)
+        # A secret that does not check out is only fatal when it is the ONLY
+        # credential offered: the CLI sends both headers when it holds both, and
+        # a stale secret must not shadow a perfectly good admin token.
+        if not admin_secret:
+            if not has_token_credential:
+                logger.warning("Token creation attempted but no admin secret is configured")
+                raise HTTPException(
+                    status_code=403,
+                    detail="HP_ADMIN_SECRET must be configured to use admin token creation",
+                )
+        elif secrets.compare_digest(header_secret.encode(), admin_secret.encode()):
+            return {"auth": "admin-secret", "user_id": None}
+        elif not has_token_credential:
+            raise HTTPException(status_code=403, detail="Invalid admin secret")
+
+    if not has_token_credential:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Token creation requires an admin: send an admin-scope token "
+                "(Authorization: Bearer, or the console session) or the admin secret."
+            ),
+        )
+
+    token = await require_token(request, authorization, hp_token, hp_csrf, db)
+    normalized = normalize_scope(token.get("scope"), token.get("role"))
+    if "*" in normalized or "admin" in normalized:
+        return token
+    raise HTTPException(
+        status_code=403,
+        detail=f"Insufficient scope: requires 'admin', has '{token.get('scope')}'",
+    )
+
+
 class LoginRequest(BaseModel):
     token: str = Field(..., max_length=256)
 
@@ -274,26 +330,28 @@ async def logout(request: Request, response: Response) -> dict[str, str]:
 async def admin_create_token(
     body: TokenCreateRequest,
     request: Request,
+    authorization: str | None = Header(None),
+    hp_token: str | None = Cookie(None),
+    hp_csrf: str | None = Cookie(None),
     db: Repository = _get_db_dep,
 ) -> dict[str, str]:
-    """Create an API token via admin secret. Checks vault at runtime if not in settings."""
+    """Mint an API token. Requires an authenticated ADMIN.
+
+    Owner rule (2026-08-26): "it should be ok to create tokens if one is logged
+    in with admin token". An admin-scope token - the one credential a human
+    holds, from the browser claim or Settings -> Tokens - is now a first-class
+    way in, alongside the admin secret the CLI resolves from the vault. A
+    claim-installed instance never had an admin secret at all, which is why
+    minting used to fall back to an unauthenticated direct-DB write; that
+    fallback is now bootstrap-only (see `hp token create`).
+    """
     client_ip = request.client.host if request.client else "unknown"
     if not _token_create_attempts.allow(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded for token creation")
 
-    admin_secret = await resolve_admin_secret(request)
-    if not admin_secret:
-        logger.warning("Admin token creation attempted but HP_ADMIN_SECRET is not configured")
-        raise HTTPException(
-            status_code=403,
-            detail="HP_ADMIN_SECRET must be configured to use admin token creation",
-        )
-    # Accept both X-Hp-Admin-Secret (canonical) and X-Admin-Secret (common convention)
-    header_secret = request.headers.get("x-hp-admin-secret") or request.headers.get(
-        "x-admin-secret", ""
-    )
-    if not secrets.compare_digest(header_secret.encode(), admin_secret.encode()):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    # Rate limiting stays AHEAD of authorization so a brute-force attempt on
+    # either credential is counted, not just a well-formed one.
+    await _authorize_mint(request, authorization, hp_token, hp_csrf, db)
 
     full_token, prefix, token_hash = generate_api_token()
     existing_users = await db.db.fetchall("SELECT id FROM users LIMIT 1")

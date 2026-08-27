@@ -12,6 +12,7 @@ from .models import (
     Target,
     compute_body_hash,
     extract_composite_steps,
+    parse_guest_network_spec,
     parse_host_provision_spec,
     utcnow_iso,
     validate_artifact_id,
@@ -44,6 +45,33 @@ def validate_host_provision_spec(body: str) -> None:
         parse_host_provision_spec(body)
     except ValueError as exc:
         raise LifecycleError(str(exc)) from exc
+
+
+def validate_guest_network_spec(body: str) -> None:
+    """Refuse an unbuildable guest network at PROPOSE.
+
+    The propose is the last moment before the description is committed to the
+    artifact store and put in front of a human for approval, so a body that
+    could never converge - a gateway outside its subnet, a vnet name PVE cannot
+    store - is refused here rather than approved and then failed at apply.
+
+    Fields the body leaves out are NOT filled in from the settings at this
+    point: propose validation runs in processes that may have no database (the
+    CLI), and a body that validates differently depending on where it was
+    proposed is worse than one that must state itself. What is checked is that
+    the spec is present, well-formed, and internally consistent as far as it
+    goes.
+    """
+    try:
+        parse_guest_network_spec(body)
+    except ValueError as exc:
+        message = str(exc)
+        if "is missing" in message:
+            # A body that names only some fields is legal: the executor fills
+            # the rest from this instance's settings. Everything else - a
+            # malformed value, an unknown key, a missing block - is refused.
+            return
+        raise LifecycleError(message) from exc
 
 
 def validate_transition(current: ArtifactStatus, target: ArtifactStatus) -> None:
@@ -105,6 +133,9 @@ def validate_propose_spec(spec: dict[str, Any], store: ArtifactStore) -> tuple[d
 
     if kind == ArtifactKind.HOST_PROVISION:
         validate_host_provision_spec(body)
+
+    if kind == ArtifactKind.GUEST_NETWORK:
+        validate_guest_network_spec(body)
 
     body_hash = compute_body_hash(body)
 

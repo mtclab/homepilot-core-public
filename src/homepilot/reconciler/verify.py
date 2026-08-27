@@ -142,6 +142,8 @@ async def verify_artifact(
         )
     elif kind == ArtifactKind.HOST_PROVISION:
         return await _verify_host_provision(artifact_id, fm, body, executor)
+    elif kind == ArtifactKind.GUEST_NETWORK:
+        return await _verify_guest_network(artifact_id, fm, body, executor)
     else:
         return VerifyResult(
             artifact_id=artifact_id,
@@ -541,6 +543,96 @@ async def _verify_host_provision(
         state=DriftState.DRIFTED if result["drifted"] else DriftState.IN_SPEC,
         verification_log=(result["log"] or "all items in desired state")[:2000],
         details={"drifted_items": drifted_items},
+    )
+
+
+async def _verify_guest_network(
+    artifact_id: str,
+    fm: dict[str, Any],
+    body: str,
+    executor: Any,
+) -> VerifyResult:
+    """Drift for a guest network is its plan (#553).
+
+    The apply runs ``plan()`` and does what it says; drift runs the SAME
+    function and asks whether it would still do anything. So "in spec" here
+    means precisely "re-applying this artifact would change nothing", which is
+    the only definition that cannot disagree with the apply.
+
+    A cluster that could not be read is UNKNOWN, never green: an unreachable
+    Proxmox tells you nothing about whether a zone still exists.
+    """
+    from homepilot.artifacts.models import parse_guest_network_spec
+    from homepilot.provision.guest_network import (
+        desired_from_settings,
+        gateway_for,
+        plan,
+        survey,
+    )
+
+    gateway = getattr(executor, "sdn_gateway", None) or gateway_for(
+        getattr(executor, "proxmox", None)
+    )
+    if gateway is None:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log="no Proxmox client: the guest network could not be checked",
+            details={"reason": "no_proxmox"},
+        )
+
+    defaults = None
+    try:
+        defaults = await desired_from_settings(getattr(executor, "settings_source", None))
+    except ValueError:
+        defaults = None
+
+    try:
+        desired = parse_guest_network_spec(body, defaults)
+    except ValueError as exc:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=f"no usable guest-network-spec: {exc}",
+            details={"reason": "no_spec"},
+        )
+
+    target: dict[str, Any] = fm.get("target", {}) or {}
+    try:
+        current = await survey(gateway, desired, str(target.get("node") or ""))
+    except Exception as exc:  # a survey raising at all means nothing was read
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=f"the cluster could not be surveyed: {exc}",
+            details={"reason": "survey_failed"},
+        )
+
+    if current.errors and not current.zones and not current.vnets:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log="; ".join(current.errors)[:2000],
+            details={"reason": "nothing_read", "errors": current.errors},
+        )
+
+    the_plan = plan(desired, current)
+    if the_plan.converged:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.IN_SPEC,
+            verification_log="the cluster matches the desired guest network",
+            details={"steps": [], "blockers": []},
+        )
+    summary = "; ".join([*(s.description for s in the_plan.steps), *the_plan.blockers])
+    return VerifyResult(
+        artifact_id=artifact_id,
+        state=DriftState.DRIFTED,
+        verification_log=summary[:2000],
+        details={
+            "steps": [s.id for s in the_plan.steps],
+            "blockers": list(the_plan.blockers),
+        },
     )
 
 

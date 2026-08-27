@@ -77,3 +77,102 @@ them, watch their budget, redeem invites. Cannot: see anyone else's machines
 (another guest's id answers exactly like a typo), see nodes / templates /
 tasks / topology, read hypervisor error text, destroy or resize anything, or
 reach any other HomePilot surface.
+
+## The guest network (#553)
+
+A friend's machine must reach the internet and nothing of the operator's. That
+is a network and a fence, and HomePilot builds both.
+
+### The network
+
+One SDN zone (`simple`, dnsmasq DHCP, PVE IPAM), one vnet, one subnet with a
+gateway, SNAT and a DHCP range. The estate's shape: vnet `innkeep` in zone
+`guest`, subnet `198.51.100.0/24`, gateway `198.51.100.1`, DHCP `.100-.199`,
+isolated from `192.0.2.0/24` - which is the operator LAN, on the same node,
+because `elizabeth` is both hypervisor and gateway.
+
+The desired state lives in the `guest_network_*` settings (Settings ->
+Subsystems -> **Guest network**, or `HP_GUEST_NETWORK_*`). Each field is checked
+locally before it is stored: a gateway outside its own subnet, a DHCP range that
+would hand out the router's address, a vnet name longer than PVE's 8-character
+field. PVE accepts all three happily, and the first anybody hears of them is a
+guest with no network.
+
+### The change ships as an artifact
+
+Describing the network does not build it. `GET /admin/guest-network` (and the
+`query_guest_network` MCP tool) reports the **survey** (what the cluster has),
+the **desired** state and the **plan** between them - empty when they already
+match. To build or repair it, propose a **`guest-network` artifact** carrying a
+```yaml guest-network-spec``` block, have a human approve it with the relayed
+approval code, and apply it. The apply runs exactly the plan that was reported.
+
+There is deliberately no "ensure" endpoint and no Apply button on the Settings
+card. The owner's rule: *we do things through HomePilot, so the artifacts and
+the KB stay up to date.* A bare admin mutation would change the estate and leave
+no record of who decided to.
+
+Nothing in this slice deletes. Every planned step creates or updates, so a
+mistaken desired state cannot take an operator's existing zone away - and
+because nothing deletes, the kind cannot roll itself back, which is why a
+`rollback: true` claim on a guest-network body is refused at propose rather than
+discovered at revoke. A zone somebody else built with a different type, or a
+vnet already living in another zone, is reported as a **blocker**: HomePilot
+will not repurpose it.
+
+Drift for this kind is the same `plan()` function: an applied guest-network
+artifact is "in spec" exactly when re-applying it would change nothing. An
+unreachable cluster reads as `unknown`, never as green.
+
+### Why the per-VM rules are the fence that actually holds
+
+PVE 9 can carry firewall rules on a vnet
+(`/cluster/sdn/vnets/{vnet}/firewall/*`), and that is the right place for
+"guests may not reach the operator LAN". **Those rules are enforced only under
+the nftables `proxmox-firewall` stack.** A node on the LEGACY iptables firewall
+- which is what `elizabeth` runs - accepts them, stores them, shows them, and
+does not apply them to vnet forward traffic.
+
+So HomePilot writes both:
+
+* the **vnet rules**, as part of the guest-network artifact, because they are
+  the correct place for the intent and they become live the moment the node is
+  switched to the nftables stack. The survey reports which stack the node runs,
+  and the Settings card says so in as many words rather than implying a fence
+  that is not there;
+* the **per-VM rules**, at provision time, on the guest's own tap device. These
+  are enforced by BOTH stacks, and they are what stands between a friend's
+  machine and the operator's LAN today.
+
+The per-VM fence is applied when the resolved bridge equals the configured guest
+vnet and the isolate list is non-empty. The NIC gets `firewall=1` (without it
+PVE stores the rules and applies none of them), the VM firewall is enabled with
+`policy_out: ACCEPT` - the guest must still reach the internet - and the rules
+go on in this order:
+
+1. `ACCEPT udp dport 67:68` to the gateway (DHCP)
+2. `ACCEPT udp dport 53` to the gateway (DNS)
+3. `ACCEPT tcp dport 53` to the gateway (DNS)
+4. `DROP` to each isolated CIDR
+5. `DROP` to `<gateway>/32`
+
+The ACCEPTs come first because the DROPs below them cover the gateway too;
+reverse them and a fenced guest cannot get an address or resolve a name. The
+applied ruleset is recorded on the provision result, so "is my friend's box
+walled off" is answered with the rules rather than with a boolean.
+
+A fence that cannot be written **fails the provision loudly and destroys the
+half-made guest**, before it ever boots. A guest on the guest wire with the
+operator's LAN in reach is the one outcome this exists to prevent, and "we
+added the rules a second later" is not a property anybody can rely on.
+
+### Where the PVE calls live
+
+HomePilot does not re-implement Proxmox endpoints. The SDN and firewall calls go
+through the estate's own library, `homepilot-proxmox-mcp` (repo
+`mtclab/proxmox-mcp`, public mirror `mtclab/proxmox-mcp-public`), via the single
+adapter `src/homepilot/adapters/pve_sdn.py`. That adapter is the only place in
+this codebase that names a PVE SDN or firewall endpoint, and it records the two
+kinds of gap it has to work around: reads whose library function returns a
+formatted string that has dropped the fields a plan needs, and endpoints the
+library does not cover yet (the vnet firewall, and subnet update).

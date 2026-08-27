@@ -26,6 +26,7 @@ class ArtifactKind(StrEnum):
     COMPOSITE = "composite"
     SHELL_SCRIPT = "shell-script"
     HOST_PROVISION = "host-provision"
+    GUEST_NETWORK = "guest-network"
     KB_NOTE = "kb-note"
 
 
@@ -281,6 +282,82 @@ def parse_host_provision_spec(body: str) -> HostProvisionSpec:
         return HostProvisionSpec.model_validate(parsed)
     except ValidationError as exc:
         raise ValueError(f"invalid host-provision spec: {exc}") from exc
+
+
+_GUEST_NETWORK_FENCE = "guest-network-spec"
+
+
+def parse_guest_network_spec(body: str, defaults: Any = None) -> Any:
+    """Parse the ```yaml guest-network-spec``` block into a DesiredGuestNetwork.
+
+    ``defaults`` is a ``DesiredGuestNetwork`` (this instance's settings) whose
+    fields fill in whatever the body leaves out - so a propose can say "the
+    guest network, as this instance describes it" without restating eight
+    values, and a propose that states them wins over the settings. The RECORD of
+    what was applied is the body either way, because the merged desired state is
+    written into the execution log.
+
+    Raises ``ValueError`` with a readable message when the block is missing, is
+    not a mapping, carries an unknown key, or describes a network that cannot
+    work (a gateway outside its subnet, a DHCP range that would hand out the
+    router's own address).
+    """
+    import yaml as _yaml
+
+    from homepilot.provision.guest_network import DesiredGuestNetwork, GuestNetworkError
+
+    pattern = re.compile(rf"```yaml\s+{_GUEST_NETWORK_FENCE}\s*\n(.*?)```", re.DOTALL)
+    m = pattern.search(body)
+    if not m:
+        raise ValueError(f"missing ```yaml {_GUEST_NETWORK_FENCE}``` block")
+    try:
+        parsed = _yaml.safe_load(m.group(1).strip())
+    except _yaml.YAMLError as exc:
+        raise ValueError(f"guest-network spec is not valid YAML: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("guest-network spec must be a YAML mapping")
+
+    allowed = {
+        "zone",
+        "vnet",
+        "subnet_cidr",
+        "gateway",
+        "snat",
+        "dhcp",
+        "dhcp_range",
+        "dhcp_dns_server",
+        "isolate_cidrs",
+    }
+    unknown = sorted(set(parsed) - allowed)
+    if unknown:
+        raise ValueError(
+            f"unknown guest-network field(s): {', '.join(unknown)}. "
+            f"Known fields: {', '.join(sorted(allowed))}"
+        )
+
+    merged: dict[str, Any] = {}
+    if defaults is not None:
+        merged.update(defaults.to_dict())
+        merged["isolate_cidrs"] = tuple(merged.get("isolate_cidrs") or ())
+    merged.update({k: v for k, v in parsed.items() if v is not None})
+    if "isolate_cidrs" in merged and not isinstance(merged["isolate_cidrs"], list | tuple):
+        from homepilot.provision.guest_network import split_cidrs
+
+        merged["isolate_cidrs"] = tuple(split_cidrs(merged["isolate_cidrs"]))
+    else:
+        merged["isolate_cidrs"] = tuple(merged.get("isolate_cidrs") or ())
+
+    missing = [f for f in ("zone", "vnet", "subnet_cidr", "gateway") if not merged.get(f)]
+    if missing:
+        raise ValueError(
+            "guest-network spec is missing "
+            + ", ".join(missing)
+            + " and this instance has no setting to fill it in"
+        )
+    try:
+        return DesiredGuestNetwork(**merged)
+    except GuestNetworkError as exc:
+        raise ValueError(f"invalid guest-network spec: {exc}") from exc
 
 
 VALID_TRANSITIONS: dict[ArtifactStatus, set[ArtifactStatus]] = {

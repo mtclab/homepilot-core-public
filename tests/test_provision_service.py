@@ -122,6 +122,10 @@ class TestHappyPath:
             "ciuser": "friend",
             # No tailscale key was requested, so no tailnet join was attempted.
             "tailnet": None,
+            # The guest network fence (#553), stated even when there is none:
+            # "this guest is not fenced" is a fact about the machine an operator
+            # must be able to read, and an absent key would leave it ambiguous.
+            "guest_network_fence": None,
         }
 
         proxmox.clone_vm.assert_awaited_once()

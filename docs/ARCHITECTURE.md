@@ -9,7 +9,7 @@
 ║   ┌─────────────┐   ┌─────────────┐                                  ║
 ║   │ Claude Code │   │  OpenCode   │                                  ║
 ║   └──────┬──────┘   └──────┬──────┘                                  ║
-║          │  HTTP MCP  Authorization: Bearer <HP_MCP_TOKEN>           ║
+║          │  HTTP MCP  Authorization: Bearer <API token>              ║
 ╚══════════╪══════════════════╪═══════════════════════════════════════╝
            └────────┬─────────┘
                     │ HP_MCP_URL = http://<homelab>:8000/mcp
@@ -100,8 +100,10 @@ Claude Code config (`~/.claude/settings.json`):
 For remote / HTTP use (recommended for shared homelab):
 
 ```bash
-HP_MCP_TOKEN=<secret> hp mcp-serve --transport http --port 8000
+hp mcp-serve --transport http --port 8000
 ```
+
+The client authenticates with an API token from Settings -> Tokens; `HP_MCP_TOKEN=<secret>` still works as the legacy static fallback (see MCP authentication below).
 
 Claude Code config:
 
@@ -110,7 +112,7 @@ Claude Code config:
   "mcpServers": {
     "homepilot": {
       "url": "http://<homelab-ip>:8000/mcp",
-      "headers": { "Authorization": "Bearer <secret>" }
+      "headers": { "Authorization": "Bearer <api token>" }
     }
   }
 }
@@ -242,7 +244,23 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 
 `propose_artifact` initiates a change (requires write scope). Approval used to be refused over MCP outright, because the MCP credential is a single shared token and an LLM able to approve would both propose and approve its own mutations (#385); the relayed approval code replaced the blanket ban with a gate the assistant cannot pass on its own.
 
-The MCP transport has a three-tier scope ladder set by `HP_MCP_TOKEN_SCOPE`, mirroring the API scope ladder read < write < admin:
+### MCP authentication
+
+An MCP client authenticates with an ordinary **API token** - the same credential the CLI, the console and any script use. Mint one in Settings -> Tokens (or `hp token create`), give it to the client, and revoke it there when the assistant is done: revocation is live, expiry is honoured, and `last_used_at` is stamped on every call, because the transport verifies the token through the same machinery the HTTP API does.
+
+The token's API scope selects its tool tier through one shared map (`homepilot.auth.scopes.API_SCOPE_TO_MCP_TIER`, also read by the tier<->scope parity gate, so the two cannot drift):
+
+| API scope | MCP tier |
+| --- | --- |
+| `read` | `read_only` |
+| `write` | `full` |
+| `admin` | `admin` |
+
+`HP_MCP_TOKEN` remains as a **legacy static fallback**: a value equal to it authenticates at `HP_MCP_TOKEN_SCOPE`. Precedence is exact - a token that verifies as an API token wins its own scope's tier; a token carrying the `hp_` API prefix that does NOT verify is refused outright and never falls through to the static compare (a revoked assistant token must not be able to resurrect itself); anything else is refused. Both transports follow this one rule: the HTTP `/mcp` mount, and the stdio server through the `HP_MCP_TOKEN` entry in its client's `env` block.
+
+The `/mcp` mount is unconditional and always authenticated. A backend with no credential configured at all refuses every MCP request rather than serving an open control plane.
+
+The tier ladder mirrors the API scope ladder read < write < admin:
 
 - `read_only` — read tools only.
 - `full` (default) — reads plus the standard mutators (`add_host`, `apply_artifact`, `revoke_artifact`, …), but NOT admin tools.

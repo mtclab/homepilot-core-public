@@ -14,13 +14,24 @@
 	// Kinds a person can sensibly author by hand here. `composite` is omitted on
 	// purpose: it references other artifacts by id, which is a picker, not a
 	// textarea, and offering it as free text invites a proposal that cannot apply.
-	const CREATABLE_KINDS = ['kb-note', 'host-provision', 'http-sequence', 'shell-script'];
+	const CREATABLE_KINDS = [
+		'kb-note',
+		'host-provision',
+		'guest-network',
+		'http-sequence',
+		'shell-script',
+	];
 	const IDEMPOTENCE = ['via-precheck', 'declared-natural', 'replay-only'];
 	const TARGET_KINDS = ['vm', 'lxc', 'node', 'cluster', 'service', 'network', 'global'];
 
 	const BODY_HINTS: Record<string, string> = {
 		'host-provision':
 			'```yaml host-provision-spec\npackages:\n  - nginx\nservices:\n  - name: nginx\n    state: started\n```',
+		// Only the fields this change actually states: everything omitted comes
+		// from the instance's guest_network_* settings at apply time, so a body
+		// that restates them all is a body that silently stops following them.
+		'guest-network':
+			'```yaml guest-network-spec\nsubnet_cidr: 198.51.100.0/24\ngateway: 198.51.100.1\ndhcp_range: 198.51.100.100-198.51.100.199\nisolate_cidrs:\n  - 192.0.2.0/24\n```',
 		'http-sequence': '```yaml http-sequence\nsteps:\n  - method: GET\n    path: /health\n```',
 		'shell-script': '```bash\nsystemctl status nginx\n```',
 		'kb-note': 'What this documents, in prose.',

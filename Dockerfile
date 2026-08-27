@@ -9,6 +9,14 @@ RUN npm run build
 # Stage 2: Install Python dependencies
 FROM python:3.12-slim AS py-builder
 WORKDIR /build
+# git, because one locked dependency (homepilot-proxmox-mcp, the estate's own
+# Proxmox library) is sourced from its PUBLIC mirror by revision rather than
+# from an index. `uv export` writes it as a `git+https://...@<sha>` requirement,
+# and pip cannot fetch that without git. The pin is a full SHA in uv.lock, so
+# the build stays reproducible; no credential is involved, which is exactly why
+# the mirror rather than the private repo is the source.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv
 # Install the EXACT locked dependency set (reproducible), then the project itself
 # without re-resolving. `pip install .` alone resolves from pyproject and would

@@ -262,6 +262,40 @@ class TestClaimJourney:
             assert settings.json()["connection_status"] == "not_configured"
             assert (await client.get("/claim/status")).json() == {"state": "claimed"}
 
+    async def test_the_box_gets_its_own_autocreated_admin_credential(self, instance: Any):
+        """Owner rule (2026-08-26): "I know only the login token - the rest
+        should be autocreated and live somewhere safe so they won't be deleted".
+
+        Minting now requires an authenticated admin, so the CLI on the box needs a
+        credential of its own. The claim writes one; the operator is never asked
+        to manage it, and their own login token is never put on disk.
+        """
+        await boot(instance)
+
+        async with client_for(instance.app) as client:
+            claimed = await client.post("/claim", json={"label": "olli"})
+            assert claimed.status_code == 200, claimed.text
+            operator_token = claimed.json()["token"]
+
+            stored_path = instance.data_dir / "api-token"
+            assert stored_path.exists(), "the box was left with no credential of its own"
+            stored = stored_path.read_text(encoding="utf-8").strip()
+            assert stored.startswith("hp_")
+            # The operator's own credential is NOT what got written to disk.
+            assert stored != operator_token
+            assert stored_path.stat().st_mode & 0o777 == 0o600
+
+            # THE GOAL: the stored credential is an admin - it opens an
+            # admin-scoped route, which is what `hp token create` needs.
+            resp = await client.get(
+                "/admin/settings/proxmox", headers={"Authorization": f"Bearer {stored}"}
+            )
+            assert resp.status_code == 200, resp.text
+
+        # It is a real token, listed and revocable like any other.
+        rows = await instance.db.fetchall("SELECT label FROM api_tokens")
+        assert "local-cli" in {r["label"] for r in rows}
+
     async def test_half_a_proxmox_pair_is_refused_and_does_not_claim(self, instance: Any):
         await boot(instance)
 
@@ -281,8 +315,11 @@ class TestClaimIsSingleUse:
         async with client_for(instance.app) as client:
             first = await client.post("/claim", json={"code": code})
             assert first.status_code == 200, first.text
+            # Two: the operator's own token, and the box's autocreated CLI
+            # credential (owner rule 2026-08-26 - the human keeps one token,
+            # anything internal is autocreated and persisted).
             minted_once = await token_count(instance.db)
-            assert minted_once == 1
+            assert minted_once == 2
 
             second = await client.post("/claim", json={"code": code})
             assert second.status_code == 410, second.text
@@ -298,7 +335,8 @@ class TestClaimIsSingleUse:
             second = await client.post("/claim", json={})
 
         assert second.status_code == 410, second.text
-        assert await token_count(instance.db) == 1
+        # The operator's token plus the box's autocreated CLI credential.
+        assert await token_count(instance.db) == 2
 
     async def test_a_claimed_instance_keeps_refusing_after_a_restart(self, instance: Any):
         code = await boot(instance)

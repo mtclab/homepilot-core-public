@@ -140,11 +140,18 @@ describe('Subsystems tab: one truthful status card per subsystem', () => {
 		// into: the page must never invent a control for a setting the server
 		// does not know about. (The controls themselves are gated in
 		// settings.overrides.test.ts, which seeds them.)
+		//
+		// The guest-network card's own re-survey button joined the budget in
+		// #553; it READS the cluster and changes nothing, and it is named for
+		// what it re-checks so it cannot be confused with the report's Re-check.
+		// The point of the assertion is unchanged: no control appears for a
+		// setting the server did not send.
 		render(SettingsPage);
 		await waitFor(() => card('Events webhook'));
 		const panel = document.getElementById('settings-panel') as HTMLElement;
 		expect(within(panel).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual([
 			'↻ Re-check',
+			'↻ Re-survey the cluster',
 		]);
 		expect(within(panel).queryAllByRole('textbox')).toHaveLength(0);
 	});

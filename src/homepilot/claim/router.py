@@ -38,6 +38,11 @@ _claim_attempts = SlidingWindowLimiter(
 # hand out, so the claimed instance behaves exactly like a bootstrapped one.
 _ADMIN_SCOPE = "full"
 
+# The label of the box's own autocreated CLI credential (see
+# _store_local_cli_token). Visible and revocable in Settings -> Tokens like any
+# other token - it is a real token, not a hidden back door.
+_LOCAL_CLI_LABEL = "local-cli"
+
 # One text for every rejected code. An unclaimed instance ALWAYS has a code, so
 # there is nothing to disclose about whether one exists; keeping the wording
 # uniform keeps it that way if that ever changes.
@@ -84,6 +89,41 @@ def _claims(request: Request) -> ClaimRepository:
 def _data_dir(request: Request) -> Path:
     settings = getattr(request.app.state, "settings", None) or get_settings()
     return Path(settings.data_dir)
+
+
+async def _store_local_cli_token(request: Request, db: Repository, user_id: str) -> None:
+    """Mint the box's OWN admin credential and persist it in the data dir.
+
+    Owner rule (2026-08-26): "I know only the login token - the rest should be
+    autocreated and live somewhere safe so they won't be deleted". The CLI on the
+    box has to authenticate to mint or revoke tokens now, and the human must not
+    be handed a second credential to look after - so the claim autocreates one,
+    exactly as `hp init` does, and writes it 0600 into the data dir where the
+    vault passphrase and the agent-hub token already live. The operator's own
+    login token is never written to disk.
+
+    Best effort: a claim that cannot write this file is still a good claim (the
+    operator can always export HP_ADMIN_TOKEN), so failures are logged, not
+    raised.
+    """
+    try:
+        full_token, prefix, token_hash = generate_api_token()
+        await db.create_api_token(
+            user_id=user_id,
+            token_type="personal",
+            prefix=prefix,
+            hash=token_hash,
+            scope=_ADMIN_SCOPE,
+            label=_LOCAL_CLI_LABEL,
+            expires_at=None,
+        )
+        path = _data_dir(request) / "api-token"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(full_token + "\n", encoding="utf-8")
+        path.chmod(0o600)
+        logger.info("Local CLI admin token autocreated (prefix=%s) at %s", prefix, path)
+    except Exception as exc:  # never fail the claim over this
+        logger.warning("Could not autocreate the local CLI admin token: %s", exc)
 
 
 def _source(request: Request) -> tuple[bool, str]:
@@ -201,6 +241,9 @@ async def claim_instance(request: Request, body: ClaimRequest) -> dict[str, Any]
             expires_at=None,
         )
         await claims.record_minted_token(prefix)
+        # The box's own credential, so the CLI on it can mint and revoke without
+        # the operator managing a second secret (owner rule, 2026-08-26).
+        await _store_local_cli_token(request, db, str(user_id))
     except Exception:
         # Releasing the latch leaves the instance claimable, which is the point.
         # Proxmox settings stored just above are deliberately NOT rolled back:

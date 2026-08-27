@@ -1,5 +1,43 @@
 # Changelog
 
+## v3.6.0 (2026-08-26)
+
+The estate's network becomes a recorded change, and credentials grow up.
+
+### The guest network ships as an artifact (#553)
+
+A new `guest-network` artifact kind carries the desired guest subnet (zone,
+vnet, subnet, gateway, SNAT, DHCP, isolation CIDRs). Propose it - over MCP or
+the UI - approve it with the human-relayed code, and apply runs an idempotent
+plan against the live cluster; drift checking runs the same plan, so "in spec"
+means the cluster still agrees. Provisioning onto the guest vnet fences every
+guest at the tap device before first boot (DHCP/DNS to the gateway allowed,
+the operator LAN dropped; an empty isolate list refuses to provision onto
+the guest vnet at all - fail closed by refusal); a fence that
+cannot be written destroys the half-made guest loudly. VNet-level forward
+rules are written too - dormant on the legacy firewall stack, live the day the
+node switches to nftables, and the report says which.
+
+All PVE endpoint knowledge comes from the estate's own
+`homepilot-proxmox-mcp` package (pinned to the public mirror by commit) - the
+one shared Proxmox client. HomePilot adds no endpoint paths of its own; the
+gaps found in the library (structured reads, vnet firewall, subnet update)
+are written down in code as upstream debt, not re-implemented.
+
+### Tokens are minted by admins, and MCP speaks API tokens
+
+`hp token create` now authenticates through the API like every other client;
+the unauthenticated direct-DB mint survives only on a fresh install with zero
+live tokens, and says so. The MCP transports authenticate API tokens against
+the same machinery as the HTTP API (expiry, live revocation, last-used),
+mapped read->read_only, write->full, admin->admin by the same constants the
+tier gate enforces - so an operator mints an assistant token in Settings ->
+Tokens, revocable like any other. HP_MCP_TOKEN remains as a legacy fallback,
+and /mcp now mounts unconditionally behind that always-on auth. A
+claim-installed instance autocreates its own local-cli admin credential, so
+the CLI works there at last; the human still holds exactly one login token.
+
+
 ## v3.5.1 (2026-08-26)
 
 The feedback round on 3.5.0, same day.

@@ -348,6 +348,40 @@ export interface SettingProbe {
 	detail: string;
 }
 
+/** What the guest network is, what it should be, and the difference (#553). */
+export interface GuestNetworkReport {
+	/** False when this instance describes no guest network at all. */
+	configured: boolean;
+	desired: {
+		zone: string;
+		vnet: string;
+		subnet_cidr: string;
+		gateway: string;
+		snat: boolean;
+		dhcp: boolean;
+		dhcp_range: string;
+		dhcp_dns_server: string;
+		isolate_cidrs: string[];
+	} | null;
+	survey: {
+		zones: Array<Record<string, unknown>>;
+		vnets: Array<Record<string, unknown>>;
+		subnets: Array<Record<string, unknown>>;
+		node: string;
+		/** 'nftables' | 'legacy' | 'unknown' — decides whether vnet rules are enforced. */
+		firewall_stack: string;
+		pending: string[];
+		errors: string[];
+	} | null;
+	plan: {
+		steps: Array<{ id: string; description: string; op: string; params: Record<string, unknown> }>;
+		blockers: string[];
+		converged: boolean;
+	} | null;
+	detail: string;
+	enforcement: string;
+}
+
 export interface ArtifactDetail {
 	frontmatter: Artifact;
 	body: string;
@@ -805,11 +839,14 @@ export const api = {
 	listTokens() {
 		return req<{ items: TokenInfo[]; total: number }>('/auth/tokens');
 	},
-	createToken(label: string, scope: string, adminSecret: string) {
+	// Minting is authenticated by the admin session itself (owner rule,
+	// 2026-08-26): an admin-scope token - which is what a session carries - is a
+	// first-class way in, so the console no longer asks the operator to paste a
+	// server-side secret it could not have on a claim-installed instance.
+	createToken(label: string, scope: string) {
 		return req<{ token: string; scope: string }>('/auth/tokens', {
 			method: 'POST',
-			body: JSON.stringify({ label, scope }),
-			headers: { 'x-hp-admin-secret': adminSecret },
+			body: JSON.stringify({ label, scope })
 		});
 	},
 	revokeToken(prefix: string) {
@@ -983,6 +1020,14 @@ export const api = {
 			`/admin/settings/overrides/${encodeURIComponent(key)}`,
 			{ method: 'DELETE' },
 		);
+	},
+
+	// --- The guest network (#553) ---
+	// Read-shaped, and the ONLY guest-network endpoint: the change ships as a
+	// `guest-network` artifact through Changes, so there is deliberately no
+	// "apply" call here to wire a button to.
+	getGuestNetwork() {
+		return req<GuestNetworkReport>('/admin/guest-network');
 	},
 
 	getProxmoxSettings() {

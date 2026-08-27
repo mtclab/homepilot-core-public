@@ -57,12 +57,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "JSON artifact spec. Must include: id, kind (host-provision, "
-                        "ansible-playbook, proxmox-api-sequence, http-sequence, composite, "
-                        "shell-script, kb-note), intent, body, produced_by. If kind != kb-note: "
+                        "guest-network, ansible-playbook, proxmox-api-sequence, "
+                        "http-sequence, composite, shell-script, kb-note), intent, body, "
+                        "produced_by. If kind != kb-note: "
                         "target and idempotence. host-provision is the native, working way to "
                         "install packages, manage services and write config on a managed host "
                         "(it runs over the agent and is the only kind with a real pre-apply plan "
-                        "and a captured rollback); prefer it for host configuration."
+                        "and a captured rollback); prefer it for host configuration. "
+                        "guest-network builds and fences the guest subnet (SDN zone, vnet, "
+                        "subnet, vnet firewall) from a ```yaml guest-network-spec``` block "
+                        "whose omitted fields come from this instance's guest_network_* "
+                        "settings; it is the ONLY way to change the guest network, and "
+                        "query_guest_network shows the plan it would run."
                     ),
                 },
             },

@@ -154,6 +154,17 @@ vi.mock('$lib/api', async () => {
 			probeSettingOverride: vi
 				.fn()
 				.mockResolvedValue({ key: '', ok: true, reachable: true, detail: 'ok' }),
+			// #553 guest network: the Subsystems tab asks for the survey/plan on
+			// mount. The default is "nothing configured", which is what a fresh
+			// install answers - a test about a plan seeds the plan it is about.
+			getGuestNetwork: vi.fn().mockResolvedValue({
+				configured: false,
+				desired: null,
+				survey: null,
+				plan: null,
+				detail: 'No guest network is configured on this instance.',
+				enforcement: '',
+			}),
 			getProxmoxSettings: vi.fn().mockResolvedValue({
 				host: '',
 				port: 8006,

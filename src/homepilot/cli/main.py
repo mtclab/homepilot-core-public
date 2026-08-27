@@ -331,7 +331,13 @@ def init(
             token_type="personal",
             prefix=token_prefix,
             hash=token_hash,
-            scope="read,write",
+            # "full" normalizes to "*" - the admin scope the browser claim hands
+            # its first credential. It used to be "read,write", which could not
+            # open Settings -> Tokens (admin) and, now that minting requires an
+            # admin, could not mint either: the box's only token was locked out
+            # of managing tokens.
+            scope="full",
+            label="admin",
             expires_at=None,
         )
         await database.conn.commit()
@@ -1566,28 +1572,74 @@ def kb_reindex(
     )
 
 
-async def _mint_token_via_api(
-    settings: Any, label: str, scope: str
-) -> tuple[str | None, str | None]:
-    """Create an API token through the running backend's admin endpoint.
+_TOKEN_RULE = (  # nosec B105 - a refusal message about tokens, not a credential
+    "Tokens are minted by admins: create through the API with an admin token, "
+    "or from Settings -> Tokens."
+)
 
-    Avoids sqlite write-lock contention with a live backend (the backend owns
-    the DB). Returns ``(token, error)``:
-      * ``(token, None)`` — created via the API.
-      * ``(None, None)``  — backend not reachable; caller should fall back to
-        the direct-DB path.
-      * ``(None, msg)``   — backend reached but refused (e.g. admin-secret not
-        configured / mismatched); caller should surface ``msg`` and NOT touch
-        the DB (it is locked).
 
-    The admin secret is resolved exactly like the backend's
-    ``resolve_admin_secret`` (settings/env, then vault) — no passphrase
-    fallback, which previously produced confusing 403s."""
-    import httpx
+def _stored_admin_token(settings: Any) -> str:
+    """The admin token this box keeps for its own CLI, if there is one.
 
+    Autocreated and persisted, never something a human has to manage: `hp init`
+    writes it, and the browser claim writes one too (the operator's own login
+    token is never put on disk). File permissions are the gate, exactly as for
+    the vault passphrase in .env.
+    """
+    try:
+        path = Path(settings.data_dir) / "api-token"
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return ""
+
+
+def _admin_credentials(settings: Any) -> tuple[str, str]:
+    """(admin_token, admin_secret) - whatever admin credential this box holds.
+
+    Precedence for the token: HP_ADMIN_TOKEN (the operator pasting the token they
+    hold), then the stored one in the data dir. The admin secret is resolved
+    exactly like the backend's ``resolve_admin_secret`` (settings/env, then
+    vault) - no passphrase fallback, which previously produced confusing 403s.
+    An instance installed through the browser claim has NO admin secret at all,
+    which is why the token is the first-class credential now.
+    """
+    admin_token = os.environ.get("HP_ADMIN_TOKEN", "").strip() or _stored_admin_token(settings)
     admin_secret = getattr(settings, "admin_secret", "") or ""
     if not admin_secret and hasattr(settings, "_try_vault_secret"):
         admin_secret = settings._try_vault_secret("admin-secret") or ""
+    return admin_token, admin_secret
+
+
+def _admin_headers(settings: Any) -> dict[str, str]:
+    admin_token, admin_secret = _admin_credentials(settings)
+    headers: dict[str, str] = {}
+    if admin_token:
+        headers["Authorization"] = f"Bearer {admin_token}"
+    if admin_secret:
+        headers["x-hp-admin-secret"] = admin_secret
+    return headers
+
+
+async def _mint_token_via_api(
+    settings: Any, label: str, scope: str
+) -> tuple[str | None, str | None]:
+    """Create an API token through the running backend, as an admin.
+
+    The backend owns the DB, so this is also what avoids sqlite write-lock
+    contention. Returns ``(token, error)``:
+      * ``(token, None)`` — created via the API.
+      * ``(None, None)``  - backend not reachable, or this box holds no admin
+        credential at all; the caller decides what that means.
+      * ``(None, msg)``   - backend reached and refused; caller should surface
+        ``msg`` and NOT touch the DB (it is locked).
+    """
+    import httpx
+
+    headers = _admin_headers(settings)
+    if not headers:
+        return None, None  # nothing to authenticate with - caller decides
     port = getattr(settings, "daemon_port", 8000)
 
     try:
@@ -1595,7 +1647,7 @@ async def _mint_token_via_api(
             resp = await client.post(
                 f"http://127.0.0.1:{port}/auth/tokens",
                 json={"label": label, "scope": scope},
-                headers={"x-hp-admin-secret": admin_secret},
+                headers=headers,
             )
     except httpx.ConnectError:
         return None, None  # backend down → caller falls back to direct DB
@@ -1611,9 +1663,9 @@ async def _mint_token_via_api(
     except Exception:
         detail = resp.text
     hint = (
-        " Bootstrap the admin secret with `hp init --non-interactive` "
-        "(stores it in the vault), or stop the backend to create a token via "
-        "the local DB."
+        " Pass an admin token in HP_ADMIN_TOKEN (the one the claim or "
+        "Settings -> Tokens gave you), or bootstrap the admin secret with "
+        "`hp init --non-interactive` (stores it in the vault)."
     )
     return None, f"Backend refused token creation ({resp.status_code}): {detail}.{hint}"
 
@@ -1626,9 +1678,20 @@ def token_create(
     ),
     output: str = typer.Option("plain", "--output", "-o", help="Output format: plain or json"),
 ) -> None:
-    """Create an API token non-interactively (safe for Docker / CI environments)."""
+    """Create an API token as an admin (the direct-DB mint is bootstrap only).
+
+    Owner rule (2026-08-26): "it should be ok to create tokens if one is logged
+    in with admin token". Minting used to be an unauthenticated direct write to
+    the local DB - anyone who could run `hp` on the box could mint a fleet-root
+    credential, and nothing was recorded about who did. Now the token is minted
+    through POST /auth/tokens with this box's admin credential, exactly as
+    `hp agent` does its work. The old path survives for the one case that cannot
+    be authenticated - an instance with no live token to authenticate WITH.
+    """
+    bootstrapped = False
 
     async def _create() -> str:
+        nonlocal bootstrapped
         from aiosqlite import OperationalError
 
         from homepilot.db.connection import Database
@@ -1639,11 +1702,6 @@ def token_create(
         token, err = await _mint_token_via_api(settings, label, scope)
         if token:
             return token
-        if err:
-            # Backend is up but refused — do not fall back to the DB path
-            # (it would only hit the write lock). Surface the real reason.
-            err_console.print(f"[red]{err}[/red]")
-            raise typer.Exit(1)
 
         data_dir = Path(settings.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1654,6 +1712,20 @@ def token_create(
             await database.connect()
             await _migrate_or_refuse(database, "hp token create")
             repo = Repository(database)
+
+            # THE RULE. An unauthenticated mint is allowed only while there is no
+            # admin to mint through: zero live tokens on the instance. The moment
+            # one exists, this path refuses and names the way in - otherwise the
+            # authenticated path above is decoration anyone can walk around.
+            live = await repo.count_live_api_tokens()
+            if live > 0:
+                await database.close()
+                err_console.print(
+                    f"[red]Refusing to mint: {live} live token(s) exist - {_TOKEN_RULE}[/red]"
+                )
+                if err:
+                    err_console.print(f"[yellow]{err}[/yellow]")
+                raise typer.Exit(1)
 
             full_token, prefix, token_hash = generate_api_token()
 
@@ -1669,16 +1741,18 @@ def token_create(
                 prefix=prefix,
                 hash=token_hash,
                 scope=scope,
+                label=label,
                 expires_at=None,
             )
             await database.conn.commit()
             await database.close()
+            bootstrapped = True
         except OperationalError as exc:
             if "database is locked" in str(exc).lower():
                 err_console.print(
-                    "[red]Database is locked — the backend may be running. "
-                    "Try: hp token create (uses API when backend is live), "
-                    "or stop the backend first.[/red]"
+                    "[red]Database is locked - the backend owns it. Mint through "
+                    "the running backend instead: set HP_ADMIN_TOKEN to an admin "
+                    "token, or use Settings -> Tokens.[/red]"
                 )
                 raise typer.Exit(1) from exc
             raise
@@ -1686,28 +1760,38 @@ def token_create(
 
     token = asyncio.run(_create())
 
+    # typer.echo, not the rich console: a token (and a JSON line) is machine
+    # output and must never be line-wrapped to the terminal width.
     if output == "json":
-        console.print(json.dumps({"token": token, "scope": scope}))
+        typer.echo(json.dumps({"token": token, "scope": scope, "bootstrap": bootstrapped}))
     else:
-        console.print(token)
+        typer.echo(token)
+    if bootstrapped:
+        err_console.print(
+            f"[yellow]Bootstrap mint: this instance had no live token. {_TOKEN_RULE}[/yellow]"
+        )
 
 
 async def _admin_request(settings: Any, method: str, path: str) -> tuple[Any | None, str | None]:
-    """Call a backend admin endpoint with the resolved admin secret. Returns
+    """Call a backend admin endpoint with whichever admin credential this box
+    holds - an admin token first, the vault's admin secret otherwise. Returns
     (json_or_None, error_or_None) — backend-down and refusals both report a
     message so the CLI never fails silently."""
     import httpx
 
-    admin_secret = getattr(settings, "admin_secret", "") or ""
-    if not admin_secret and hasattr(settings, "_try_vault_secret"):
-        admin_secret = settings._try_vault_secret("admin-secret") or ""
+    headers = _admin_headers(settings)
+    if not headers:
+        return None, (
+            "No admin credential on this box: set HP_ADMIN_TOKEN to an admin "
+            "token, or run `hp init` to store an admin secret in the vault."
+        )
     port = getattr(settings, "daemon_port", 8000)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.request(
                 method,
                 f"http://127.0.0.1:{port}{path}",
-                headers={"x-hp-admin-secret": admin_secret},
+                headers=headers,
             )
     except httpx.ConnectError:
         return None, "Backend not reachable — start it first (token list/revoke need the live API)."

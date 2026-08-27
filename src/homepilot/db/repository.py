@@ -236,6 +236,20 @@ class Repository:
         rows = await self.db.fetchall(sql)
         return [dict(r) for r in rows]
 
+    async def count_live_api_tokens(self) -> int:
+        """How many API tokens can still authenticate right now.
+
+        "Live" is the whole rule behind the bootstrap exception in `hp token
+        create`: revocation DELETES the row, so a live token is any row that has
+        not expired. An instance with zero of them has no admin to mint through
+        and is the only case where an unauthenticated mint is allowed.
+        """
+        rows = await self.db.fetchall(
+            "SELECT COUNT(*) AS n FROM api_tokens WHERE expires_at IS NULL OR expires_at > ?",
+            (now(),),
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     async def get_token_by_prefix(self, prefix: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM api_tokens WHERE prefix = ?", (prefix,))
         return dict(row) if row is not None else None

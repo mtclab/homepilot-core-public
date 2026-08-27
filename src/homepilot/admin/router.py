@@ -301,6 +301,24 @@ def _resolver_or_503(request: Request) -> Any:
     return resolver
 
 
+@router.get("/guest-network", dependencies=[_require_admin_dep])
+async def guest_network(request: Request) -> dict[str, Any]:
+    """What the guest network IS, what it should be, and the difference (#553).
+
+    Read-shaped, and deliberately the only guest-network route: the CHANGE ships
+    as a `guest-network` artifact through propose -> approve-with-code -> apply,
+    so the record of who decided to rebuild the guest subnet lives in the
+    artifact store rather than in a POST nobody can find afterwards.
+
+    Never 503s for a missing piece. "No guest network is configured" and
+    "Proxmox is not wired up" are legitimate states of an instance, and a page
+    that cannot render them cannot tell an operator what to do next.
+    """
+    from ..provision.guest_network import guest_network_report
+
+    return await guest_network_report(request.app.state)
+
+
 @router.get("/settings/overrides", dependencies=[_require_admin_dep])
 async def list_setting_overrides(request: Request) -> dict[str, Any]:
     resolver = _resolver_or_503(request)

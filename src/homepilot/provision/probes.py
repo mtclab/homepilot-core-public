@@ -57,6 +57,11 @@ class ProbeContext:
     proxmox: Any | None = None
     node: str = ""
     bridge: str = ""
+    # The guest subnet currently in force (#553 guest network). A gateway and a
+    # DHCP range only mean anything relative to a subnet, so the probes for them
+    # are handed the one this instance already carries - exactly as the bridge
+    # probe is handed the node.
+    guest_subnet: str = ""
 
 
 ProbeFn = Callable[[Any, ProbeContext], Awaitable[ProbeResult]]
@@ -300,6 +305,133 @@ def _as_int(raw: Any) -> int:
         return -1
 
 
+# ── Guest-network shape probes (#553) ────────────────────────────────────────
+# LOCAL checks, and they say so. There is no cluster question to ask about a
+# subnet that does not exist yet - the cluster is asked by the guest-network
+# survey/plan, which is a read of its own. What CAN be checked before a value is
+# stored is whether the settings describe a network that could work at all, and
+# getting that wrong (a gateway outside its subnet, a DHCP range that hands out
+# the router's own address) produces a guest with no network and no explanation.
+# Each probe asks the same rule DesiredGuestNetwork enforces, one field at a
+# time, so the field an operator is editing is the field the refusal names.
+
+
+def _local(detail: str) -> ProbeResult:
+    return ProbeResult(True, f"Checked locally: {detail} No cluster call.")
+
+
+def _shape_probe(check: Callable[[Any, ProbeContext], str]) -> ProbeFn:
+    async def run(value: Any, ctx: ProbeContext) -> ProbeResult:
+        from homepilot.provision.guest_network import GuestNetworkError
+
+        try:
+            return _local(check(value, ctx))
+        except GuestNetworkError as exc:
+            return ProbeResult(False, str(exc))
+
+    return run
+
+
+def _check_zone(value: Any, _ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import validate_name
+
+    text = str(value or "").strip()
+    if not text:
+        return "no zone name: the guest network is not described yet."
+    return f"{validate_name(text, 'zone')} is a usable PVE zone name."
+
+
+def _check_vnet(value: Any, _ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import validate_name
+
+    text = str(value or "").strip()
+    if not text:
+        return "no vnet name: the guest network is not described yet."
+    return f"{validate_name(text, 'vnet')} is a usable PVE vnet name."
+
+
+def _check_subnet(value: Any, _ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import validate_network
+
+    text = str(value or "").strip()
+    if not text:
+        return "no guest subnet: guest provisioning fences nothing."
+    net = validate_network(text, "guest_network_subnet")
+    return f"{net} is a valid IPv4 subnet with {net.num_addresses - 2} usable addresses."
+
+
+def _check_gateway(value: Any, ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import (
+        GuestNetworkError,
+        validate_address,
+        validate_network,
+    )
+
+    text = str(value or "").strip()
+    if not text:
+        return "no gateway: the guest subnet cannot route yet."
+    addr = validate_address(text, "guest_network_gateway")
+    if not ctx.guest_subnet:
+        return (
+            f"{addr} is a valid IPv4 address. Set guest_network_subnet to check that "
+            "it sits inside the guest subnet."
+        )
+    net = validate_network(ctx.guest_subnet, "guest_network_subnet")
+    if addr not in net:
+        raise GuestNetworkError(
+            f"gateway {addr} is not inside the guest subnet {net}: a guest given this "
+            "gateway would have no route off its own wire"
+        )
+    return f"{addr} is inside the guest subnet {net}."
+
+
+def _check_dhcp_range(value: Any, ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import (
+        GuestNetworkError,
+        parse_range,
+        validate_network,
+    )
+
+    text = str(value or "").strip()
+    if not text:
+        return "no DHCP range: dnsmasq would have nothing to hand out."
+    start, end = parse_range(text)
+    if int(end) < int(start):
+        raise GuestNetworkError(f"dhcp_range ends before it starts: {start} - {end}")
+    if not ctx.guest_subnet:
+        return (
+            f"{start}-{end} is a well-formed range. Set guest_network_subnet to check "
+            "that it sits inside the guest subnet."
+        )
+    net = validate_network(ctx.guest_subnet, "guest_network_subnet")
+    for addr, which in ((start, "start"), (end, "end")):
+        if addr not in net:
+            raise GuestNetworkError(f"dhcp_range {which} address {addr} is not inside {net}")
+    return f"{start}-{end} is inside the guest subnet {net}."
+
+
+def _check_dns_server(value: Any, _ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import validate_address
+
+    text = str(value or "").strip()
+    if not text:
+        return "no DNS server override: guests are told to resolve at the gateway."
+    return f"{validate_address(text, 'guest_network_dhcp_dns_server')} is a valid IPv4 address."
+
+
+def _check_isolate_cidrs(value: Any, _ctx: ProbeContext) -> str:
+    from homepilot.provision.guest_network import split_cidrs, validate_network
+
+    cidrs = split_cidrs(value)
+    if not cidrs:
+        return (
+            "no isolate list: guests are NOT fenced off any network, and provisioning "
+            "writes no per-VM firewall rules."
+        )
+    nets = [str(validate_network(c, "guest_network_isolate_cidrs")) for c in cidrs]
+    return f"guests would be dropped towards {', '.join(nets)}."
+
+
 PROBES: dict[str, ProbeFn] = {
     "provision_default_node": probe_node,
     "provision_default_template_vmid": probe_template_vmid,
@@ -307,6 +439,13 @@ PROBES: dict[str, ProbeFn] = {
     "provision_default_bridge": probe_bridge,
     "provision_default_vlan_tag": probe_vlan_tag,
     "provision_default_ipconfig": probe_ipconfig,
+    "guest_network_zone": _shape_probe(_check_zone),
+    "guest_network_vnet": _shape_probe(_check_vnet),
+    "guest_network_subnet": _shape_probe(_check_subnet),
+    "guest_network_gateway": _shape_probe(_check_gateway),
+    "guest_network_dhcp_range": _shape_probe(_check_dhcp_range),
+    "guest_network_dhcp_dns_server": _shape_probe(_check_dns_server),
+    "guest_network_isolate_cidrs": _shape_probe(_check_isolate_cidrs),
 }
 
 __all__ = ["PROBES", "ProbeContext", "ProbeFn", "ProbeResult"]

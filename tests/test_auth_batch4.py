@@ -152,7 +152,10 @@ class TestMCPServerAuth:
         resp = client.get("/", headers={"Authorization": "Bearer wrong-token"})
         assert resp.status_code == 401
 
-    def test_mcp_http_without_token_configured(self):
+    def test_mcp_http_without_token_configured_refuses_everything(self):
+        """No static secret is no longer "no auth": the transport authenticates
+        API tokens (2026-08-26), so a process with nothing configured refuses
+        every caller rather than admitting them all."""
         from homepilot.mcp import server as mcp_mod
 
         mock_srv = MagicMock()
@@ -162,8 +165,8 @@ class TestMCPServerAuth:
             app = mcp_mod.create_http_app(mock_srv)
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.get("/")
-        assert resp.status_code != 401
+        assert client.get("/").status_code == 401
+        assert client.get("/", headers={"Authorization": "Bearer anything"}).status_code == 401
 
     def test_mcp_http_missing_auth_header(self):
         from homepilot.mcp import server as mcp_mod

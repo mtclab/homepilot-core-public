@@ -271,6 +271,86 @@ class TestCsrfProtection:
         assert resp.status_code == 200
 
 
+class TestAdminTokenMint:
+    """Owner rule (2026-08-26): "it should be ok to create tokens if one is
+    logged in with admin token". An admin-scope token is a first-class way in -
+    which is the only way in on a claim-installed instance, where no admin secret
+    was ever created.
+
+    Teeth: drop the bearer branch from _authorize_mint and
+    ``test_admin_token_mints_a_working_token`` fails with a 403."""
+
+    def _no_admin_secret(self, monkeypatch):
+        import homepilot.auth.router as router_mod
+
+        mock_settings = MagicMock()
+        mock_settings.admin_secret = ""
+        monkeypatch.setattr(router_mod, "get_settings", lambda: mock_settings)
+        router_mod._token_create_attempts.clear()
+
+    def test_admin_token_mints_a_working_token(self, setup, monkeypatch):
+        client, admin_token = setup  # the fixture's token has scope "*"
+        self._no_admin_secret(monkeypatch)
+
+        resp = client.post(
+            "/auth/tokens",
+            json={"label": "assistant", "scope": "read"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert resp.status_code == 201, resp.text
+        minted = resp.json()["token"]
+
+        # THE GOAL: the new token authenticates. A 201 alone proves nothing.
+        me = client.get("/auth/me", headers={"Authorization": f"Bearer {minted}"})
+        assert me.status_code == 200, me.text
+        assert me.json()["capabilities"] == ["read"]
+
+    def test_the_console_session_is_credential_enough(self, setup, monkeypatch):
+        """The browser journey: sign in, then mint - nothing else typed."""
+        client, admin_token = setup
+        self._no_admin_secret(monkeypatch)
+
+        assert client.post("/auth/login", json={"token": admin_token}).status_code == 200
+        csrf = client.cookies.get("hp_csrf")
+        resp = client.post(
+            "/auth/tokens",
+            json={"label": "assistant", "scope": "read"},
+            headers={"X-CSRF-Token": csrf, "X-Requested-With": "XMLHttpRequest"},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["token"].startswith("hp_")
+
+    def test_a_non_admin_token_cannot_mint(self, setup, monkeypatch):
+        client, admin_token = setup
+        self._no_admin_secret(monkeypatch)
+
+        made = client.post(
+            "/auth/tokens",
+            json={"label": "reader", "scope": "read"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert made.status_code == 201, made.text
+        reader = made.json()["token"]
+
+        resp = client.post(
+            "/auth/tokens",
+            json={"label": "escalation", "scope": "admin"},
+            headers={"Authorization": f"Bearer {reader}"},
+        )
+        assert resp.status_code == 403, resp.text
+        assert "admin" in resp.json()["detail"]
+
+    def test_an_invalid_token_cannot_mint(self, setup, monkeypatch):
+        client, _ = setup
+        self._no_admin_secret(monkeypatch)
+        resp = client.post(
+            "/auth/tokens",
+            json={"label": "x", "scope": "admin"},
+            headers={"Authorization": "Bearer hp_deadbeef"},
+        )
+        assert resp.status_code == 401, resp.text
+
+
 class TestAdminTokenCreate:
     def test_valid_secret_creates_token(self, setup, monkeypatch):
         client, _ = setup

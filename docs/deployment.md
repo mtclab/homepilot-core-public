@@ -184,6 +184,22 @@ time. `POST /guests/provision` and the `provision_guest` MCP tool fill the same
 gaps. Name neither a value nor a default and the call is refused, saying which
 setting would have filled it.
 
+### 2.3 The guest network
+
+The `HP_GUEST_NETWORK_*` settings describe the subnet a friend's machine lives
+on: an SDN zone, a vnet, a subnet with a gateway and DHCP, and - the point of
+the whole thing - the list of networks a guest must never reach. They have their
+own **Guest network** card on Settings -> Subsystems, with local shape probes
+(a gateway outside its subnet is refused before it is saved).
+
+Describing the network does NOT build it. `GET /admin/guest-network` (and the
+`query_guest_network` MCP tool) reports the survey, the desired state and the
+plan between them; the change itself ships as a **`guest-network` artifact** -
+propose, approve with the relayed code, apply - so the record of who decided to
+rebuild the guest subnet lives in the artifact store. See
+[docs/guest-portal.md](guest-portal.md) for the design and for why the per-VM
+firewall rules are the fence that actually holds on the legacy firewall stack.
+
 Each one is **checked against the live cluster before it is stored**. A value
 the cluster refutes comes back `422` with the cluster's own answer - *"no bridge
 vmbr7 on node pve1; node has: vmbr0, vmbr1"* - and nothing is saved. A cluster
@@ -642,8 +658,12 @@ pip install homepilot
 Start an HTTP MCP endpoint alongside the backend:
 
 ```bash
-HP_MCP_TOKEN=<secret> hp mcp-serve --transport http --host 0.0.0.0 --port 9000
+hp mcp-serve --transport http --host 0.0.0.0 --port 9000
 ```
+
+The client authenticates with an API token minted in Settings -> Tokens; the
+token's scope picks its tool tier. `HP_MCP_TOKEN=<secret>` still works as the
+legacy static credential.
 
 Or add it as a service in `docker-compose.override.yml`:
 
@@ -837,11 +857,12 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.5.1` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
-| `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred; must be non-empty to mint tokens) |
+| `HP_ADMIN_TOKEN` | — | An admin-scope API token for the CLI on the box (`hp token create`, `hp token list/revoke`, `hp agent …`). Falls back to `<data dir>/api-token`, which `hp init` and the browser claim write automatically |
+| `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred). One of the two ways to authorise minting; an admin-scope API token is the other, and a claim-installed instance has only the token |
 | `HP_VAULT_PASSPHRASE` | — | Vault encryption passphrase (auto-generated if not set) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to file containing vault passphrase (overrides `HP_VAULT_PASSPHRASE`) |
 | `HP_VAULT_AUTO_INIT` | `1` | A vault passphrase is generated and persisted when none is set. Set `0` to refuse, leaving the vault disabled. Never generated when `HP_ENV=production` |
@@ -854,6 +875,15 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROVISION_DEFAULT_BRIDGE` | — | Bridge the guest NIC is put on. Setting it is what makes provisioning write `net0` at all; empty leaves the template's NIC untouched |
 | `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
+| `HP_GUEST_NETWORK_ZONE` | `guest` | SDN zone the guest network lives in (1-8 characters, PVE's own limit) |
+| `HP_GUEST_NETWORK_VNET` | `innkeep` | Vnet guests attach to. Point `HP_PROVISION_DEFAULT_BRIDGE` at this name to put provisioned guests on it |
+| `HP_GUEST_NETWORK_SUBNET` | — | The guest subnet in CIDR form, e.g. `198.51.100.0/24`. Empty means this instance describes no guest network |
+| `HP_GUEST_NETWORK_GATEWAY` | — | The guest subnet's gateway; must be inside the subnet |
+| `HP_GUEST_NETWORK_SNAT` | `1` | `1` source-NATs guest traffic out of the node |
+| `HP_GUEST_NETWORK_DHCP` | `1` | `1` runs dnsmasq on the zone; needs the `dnsmasq` package on the node |
+| `HP_GUEST_NETWORK_DHCP_RANGE` | — | Addresses DHCP may hand out, as `<start>-<end>` |
+| `HP_GUEST_NETWORK_DHCP_DNS_SERVER` | — | Resolver handed to guests; empty means the gateway resolves for them |
+| `HP_GUEST_NETWORK_ISOLATE_CIDRS` | `10.0.0.1/24` | The networks a guest must never reach. This is the fence; empty means no fence and no per-VM firewall rules |
 | `HP_AGENT_HUB_ENABLED` | `true` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
 | `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |
@@ -867,7 +897,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_AGENT_TLS_INSECURE` | `false` | **Agent side, test-only:** skip hub cert/hostname verification (`CERT_NONE`); exposes MITM. Never in production |
 | `HP_ARTIFACTS_REMOTE` | — | Git remote URL for artifact backup |
 | `HP_ARTIFACTS_SSH_KEY` | — | Path to SSH deploy key for artifact push |
-| `HP_MCP_TOKEN` | — | Auth token for MCP HTTP endpoint |
+| `HP_MCP_TOKEN` | — | Legacy static credential for the MCP transports. An MCP client normally authenticates with an API token from Settings -> Tokens; this value still works, at `HP_MCP_TOKEN_SCOPE` |
 | `HP_RATE_LIMIT` | `60` | Max requests per IP per minute |
 | `HP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173` | Comma-separated allowed CORS origins (the four localhost dev origins by default) |
 | `HP_COOKIE_SECURE` | `true` | Set `false` only for plain-HTTP local dev |
@@ -906,7 +936,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROXMOX_PORT` | `8006` | Proxmox API port |
 | `HP_AGENT_HUB_HOST` | `0.0.0.0` | Agent Hub bind address |
 | `HP_AGENT_HUB_ALLOW_INSECURE` | `false` | Accepted alias of `HP_HUB_ALLOW_INSECURE` (same setting) |
-| `HP_MCP_TOKEN_SCOPE` | `full` | Tool tier granted to the MCP bearer token, mirroring the API scope ladder read < write < admin. `read_only` = read tools only; `full` = reads + mutators (the default), but NOT admin tools; `admin` = every tool except the permanently-forbidden approval one |
+| `HP_MCP_TOKEN_SCOPE` | `full` | Tool tier granted to the LEGACY `HP_MCP_TOKEN` value only - an API token brings its own tier, mapped from its scope (read -> read_only, write -> full, admin -> admin). Mirrors the API scope ladder read < write < admin. `read_only` = read tools only; `full` = reads + mutators (the default), but NOT admin tools; `admin` = every tool except the permanently-forbidden approval one |
 | `HP_EVENTS_WEBHOOK_URL` | — (off) | Webhook posted when an artifact is proposed. Empty = events are recorded and shown in the UI but forwarded nowhere. n8n is behind the `agents` profile and mints the path per workflow, so there is no default that works |
 | `HP_EVENTS_WEBHOOK_SECRET` | — | Webhook signing secret (vault `webhook-secret` preferred) |
 | `HP_N8N_API_KEY` | — | Optional API key sent to the n8n instance |
