@@ -481,3 +481,73 @@ class TestAGarbageWriteTokenDoesNotTakeReadsDown:
             verify_ssl=True,
         )
         assert _usable_write_token(creds) == creds.write_token
+
+
+def parked_pending_cluster() -> FakeCluster:
+    """A cluster the way PVE ACTUALLY reports created-but-unapplied objects.
+
+    Observed on the second live apply: `state: "new"`, the real field values
+    under `pending`, the top level EMPTY, and the subnet named by its composed
+    id (`<zone>-<ip>-<mask>`) with the CIDR in `cidr`. A fake that reported
+    freshly-created objects with their fields at the top level let a spurious
+    full-update (and a 501 on the slash-in-path CIDR) reach prod.
+    """
+    return FakeCluster(
+        zones=[
+            {
+                "zone": "guest",
+                "type": "simple",
+                "state": "new",
+                "pending": {"dhcp": "dnsmasq", "ipam": "pve"},
+            }
+        ],
+        vnets=[
+            {
+                "vnet": "innkeep",
+                "state": "new",
+                "pending": {"zone": "guest", "alias": "HomePilot guest network"},
+            }
+        ],
+        subnets=[
+            {
+                "subnet": "guest-198.51.100.0-24",
+                "id": "guest-198.51.100.0-24",
+                "cidr": "198.51.100.0/24",
+                "zone": "guest",
+                "vnet": "innkeep",
+                "type": "subnet",
+                "state": "new",
+                "dhcp-range": [],
+                "digest": None,
+                "pending": {
+                    "gateway": "198.51.100.1",
+                    "snat": 1,
+                    "dhcp-range": ["start-address=198.51.100.100,end-address=198.51.100.199"],
+                },
+            }
+        ],
+    )
+
+
+class TestPendingObjectsAreReadForWhatTheyWillBe:
+    async def test_a_parked_pending_cluster_plans_only_apply_and_firewall(self) -> None:
+        """The pending values ARE what apply-sdn will make true - comparing
+        desired against the empty top level planned a spurious update-zone +
+        update-subnet one step after the create (live catch #2)."""
+        current = await survey(parked_pending_cluster(), desired())
+        result = plan(desired(), current)
+        ids = [s.id for s in result.steps]
+        assert "update-zone" not in ids
+        assert "update-subnet" not in ids
+        assert ids[0] == "apply-sdn"
+
+    async def test_a_real_update_addresses_the_subnet_by_its_composed_id(self) -> None:
+        """When a subnet genuinely differs, the PUT must use PVE's composed id -
+        a raw CIDR in the path 501s on the slash (live catch #2b)."""
+        cluster = parked_pending_cluster()
+        cluster.subnets[0]["pending"]["gateway"] = "198.51.100.2"  # differs now
+        current = await survey(cluster, desired())
+        result = plan(desired(), current)
+        step = next(s for s in result.steps if s.id == "update-subnet")
+        assert step.params["subnet"] == "guest-198.51.100.0-24"
+        assert "/" not in step.params["subnet"]

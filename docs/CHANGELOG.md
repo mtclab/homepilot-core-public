@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.6.3 (2026-08-27)
+
+### Pending SDN objects are read for what they will be
+
+Second live apply: PVE reports created-but-unapplied objects with their real
+values under `pending` and the top level empty, so the plan diffed against
+emptiness and scheduled a spurious full update right after its own create -
+and the update then 501'd because a subnet is addressed by PVE's composed id,
+not its CIDR. Row reads now overlay the pending values (they are what
+apply-sdn makes true), real updates use the composed id, and the test fake
+now reproduces the observed pending semantics so this class stays caught
+without a cluster.
+
+
 ## v3.6.2 (2026-08-27)
 
 ### The vnet firewall waits for the cluster to catch up
