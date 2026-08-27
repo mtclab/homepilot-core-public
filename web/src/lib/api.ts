@@ -967,6 +967,25 @@ export const api = {
 			body: JSON.stringify({ enabled }),
 		});
 	},
+	// Retune a rule in place: only the fields present in `patch` change, the rest
+	// are left as stored. Same PATCH route as silencing, wider body (#593).
+	updateAlertRule(
+		ruleId: string,
+		patch: {
+			name?: string;
+			metric?: string;
+			comparison?: AlertComparison;
+			threshold?: number;
+			for_seconds?: number;
+			host_filter?: string;
+			enabled?: boolean;
+		},
+	) {
+		return req<AlertRule>(`/monitoring/rules/${encodeURIComponent(ruleId)}`, {
+			method: 'PATCH',
+			body: JSON.stringify(patch),
+		});
+	},
 	deleteAlertRule(ruleId: string) {
 		return req<{ id: string; deleted: boolean }>(`/monitoring/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });
 	},

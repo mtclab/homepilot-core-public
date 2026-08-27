@@ -278,6 +278,37 @@ def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, 
     return rules
 
 
+def fence_rule_writes(
+    desired: DesiredGuestNetwork, direction: str
+) -> list[tuple[int, dict[str, Any]]]:
+    """:func:`fence_rules` re-ordered for the WRITE, so the COMPILED chain matches it.
+
+    PVE's firewall-rule create PREPENDS: every new rule lands at the TOP of the
+    chain, and the ``pos`` handed to a create does not push it down. So POSTing
+    the fence straight through in :func:`fence_rules` order lands it fully
+    REVERSED - the gateway DROP above the DNS/DHCP ACCEPTs it shadows, which on a
+    live guest left a fenced box unable to resolve DNS or renew its lease (#599,
+    kernel-confirmed on dev: ``iptables -L tap<vmid>i0-OUT`` showed pos=0..N
+    POSTed in order compiling to E,D,C,B,A).
+
+    So we POST in REVERSE, each pinned to ``pos=0``: the last write ends up on
+    top, which is the first-listed rule. This is robust to both create
+    semantics - if PVE ignores ``pos`` and always prepends, reverse order alone
+    lands it right; if PVE honours ``pos``, ``pos=0`` forces the same top-insert.
+    The one thing ruled out by the live evidence (append-by-default) would not
+    have produced a reversed chain in the first place.
+
+    Returns ``(final_pos, body)`` pairs in the order they must be POSTed; each
+    body already carries ``pos=0`` and its ``final_pos`` is where it lands in the
+    compiled chain, for a plan an operator reads.
+    """
+    ordered = fence_rules(desired, direction)
+    writes: list[tuple[int, dict[str, Any]]] = []
+    for final_pos in range(len(ordered) - 1, -1, -1):
+        writes.append((final_pos, {**ordered[final_pos], "pos": 0}))
+    return writes
+
+
 def _rule_identity(rule: dict[str, Any]) -> tuple[str, ...]:
     """What makes two firewall rules the same rule. Comments and position do not."""
     return (
@@ -301,6 +332,10 @@ class GuestNetworkSurvey:
     subnets: list[dict[str, Any]] = field(default_factory=list)
     vnet_firewall_options: dict[str, Any] = field(default_factory=dict)
     vnet_firewall_rules: list[dict[str, Any]] = field(default_factory=list)
+    # The datacenter firewall master switch (#600). enable=1 is what makes the
+    # per-VM guest fence actually enforce; a missing key means it could not be
+    # read (an error is recorded), not that it is off.
+    datacenter_firewall_options: dict[str, Any] = field(default_factory=dict)
     node: str = ""
     nftables: bool | None = None
     pending: list[str] = field(default_factory=list)
@@ -326,6 +361,35 @@ class GuestNetworkSurvey:
             return "unknown"
         return "nftables" if self.nftables else "legacy"
 
+    @property
+    def datacenter_firewall_enabled(self) -> bool:
+        """Is the PVE datacenter firewall master switch on? (#600)
+
+        This is the switch that decides whether the per-VM guest fence is live
+        at all: with it OFF, the tap rules HomePilot wrote are stored but inert.
+        """
+        return _flag(self.datacenter_firewall_options.get("enable", 0))
+
+    @property
+    def datacenter_firewall_policy_in_safe(self) -> bool:
+        """Is the datacenter input policy something other than DROP? (#600)
+
+        A DROP input policy with no management-allow rule is the lockout PVE
+        compiled on dev pve1. HomePilot only ever enables at policy_in=ACCEPT.
+        """
+        from ..adapters.pve_sdn import datacenter_firewall_lockout_safe
+
+        return datacenter_firewall_lockout_safe(self.datacenter_firewall_options)
+
+    @property
+    def fence_enforced(self) -> bool:
+        """Does the per-VM guest fence actually enforce right now? (#600)
+
+        True only when the datacenter firewall is on: the tap rules are enforced
+        by both firewall stacks, but ONLY once the master switch is enabled.
+        """
+        return self.datacenter_firewall_enabled
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "zones": self.zones,
@@ -333,6 +397,9 @@ class GuestNetworkSurvey:
             "subnets": self.subnets,
             "vnet_firewall_options": self.vnet_firewall_options,
             "vnet_firewall_rules": self.vnet_firewall_rules,
+            "datacenter_firewall_options": self.datacenter_firewall_options,
+            "datacenter_firewall_enabled": self.datacenter_firewall_enabled,
+            "fence_enforced": self.fence_enforced,
             "node": self.node,
             "firewall_stack": self.firewall_stack,
             "pending": self.pending,
@@ -377,6 +444,7 @@ async def survey(
     subnets: list[dict[str, Any]] = []
     fw_options: dict[str, Any] = {}
     fw_rules: list[dict[str, Any]] = []
+    dc_fw_options: dict[str, Any] = {}
     pending: list[str] = []
     errors: list[str] = []
     nftables: bool | None = None
@@ -412,6 +480,15 @@ async def survey(
         except Exception as exc:
             errors.append(f"could not read the firewall rules of vnet {desired.vnet}: {exc}")
 
+    try:
+        dc_fw_options = await gateway.cluster_firewall_options()
+    except Exception as exc:
+        # Left empty and recorded, never guessed: plan() reads an unread master
+        # switch as "not known to be safely enabled" and enforcement_note says
+        # the enforcement state is unknown, rather than either claiming a fence
+        # is live or silently planning an enable off a read that failed.
+        errors.append(f"could not read the datacenter firewall options: {exc}")
+
     resolved_node = str(node or "").strip()
     if not resolved_node:
         try:
@@ -436,6 +513,7 @@ async def survey(
         subnets=subnets,
         vnet_firewall_options=fw_options,
         vnet_firewall_rules=fw_rules,
+        datacenter_firewall_options=dc_fw_options,
         node=resolved_node,
         nftables=nftables,
         pending=pending,
@@ -671,6 +749,11 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
             )
         )
     steps.extend(firewall_steps)
+    # LAST: flip the datacenter firewall master switch on (safely) so the fence
+    # actually enforces. Ordered after the fence rules exist, and only when a
+    # fence is intended - see _datacenter_firewall_steps.
+    if not blockers:
+        steps.extend(_datacenter_firewall_steps(desired, current))
 
     if blockers:
         # A blocked plan carries NO steps. Execute would refuse to run them
@@ -738,21 +821,64 @@ def _firewall_steps(
 
     have_rules = current.vnet_firewall_rules if vnet_exists else []
     existing = {_rule_identity(r) for r in have_rules}
-    for position, rule in enumerate(fence_rules(desired, "forward")):
+    # POST in reverse, each pinned to pos=0: PVE prepends every create, so this
+    # is what lands the fence in fence_rules() order in the compiled chain rather
+    # than reversed (#599). The step id names the rule's FINAL position, so the
+    # plan reads by outcome even though the writes run bottom-first.
+    for final_pos, rule in fence_rule_writes(desired, "forward"):
         if _rule_identity(rule) in existing:
             continue
         steps.append(
             Step(
-                id=f"vnet-firewall-rule-{position}",
+                id=f"vnet-firewall-rule-{final_pos}",
                 description=(
-                    f"vnet {desired.vnet} forward rule {position}: {rule['action']} "
+                    f"vnet {desired.vnet} forward rule {final_pos}: {rule['action']} "
                     f"{rule.get('proto', 'any')} -> {rule.get('dest', 'any')}"
                 ),
                 op="create_vnet_firewall_rule",
-                params={"vnet": desired.vnet, **rule, "pos": position},
+                params={"vnet": desired.vnet, **rule},
             )
         )
     return steps
+
+
+def _datacenter_firewall_steps(
+    desired: DesiredGuestNetwork,
+    current: GuestNetworkSurvey,
+) -> list[Step]:
+    """The one step that makes the fence enforce: enable the master switch (#600).
+
+    The per-VM guest fence HomePilot writes at provision time is stored but
+    INERT until the PVE datacenter firewall is on - that is a Proxmox fact. So
+    applying a guest network that fences something (``isolate_cidrs`` set) must
+    turn that switch on, as part of the SAME approved artifact apply, or the
+    fence is silently not enforced. It is turned on the ONLY safe way there is:
+    ``ensure_datacenter_firewall_enabled`` writes ``enable=1`` together with
+    ``policy_in=ACCEPT`` in one options write, so the host INPUT chain stays
+    open and there is no lockout - never a bare enable, never a DROP INPUT.
+
+    Idempotent: planned only when the switch is not already on-and-safe, so a
+    converged cluster plans nothing. An operator who fenced nothing
+    (``isolate_cidrs`` empty) gets no step - there is no fence to enforce, so no
+    reason to touch the cluster firewall at all.
+    """
+    from ..adapters.pve_sdn import safe_datacenter_firewall_enable
+
+    if not desired.isolate_cidrs:
+        return []
+    if safe_datacenter_firewall_enable(current.datacenter_firewall_options) is None:
+        return []
+    return [
+        Step(
+            id="ensure-datacenter-firewall",
+            description=(
+                "ensure datacenter firewall enabled (policy_in=ACCEPT) so the per-VM fence "
+                "enforces - host INPUT stays open, no lockout"
+            ),
+            op="ensure_datacenter_firewall_enabled",
+            params={},
+        )
+    ]
 
 
 # ── Execute ──────────────────────────────────────────────────────────────────
@@ -897,6 +1023,7 @@ async def guest_network_report(state: Any, proxmox: Any = None) -> dict[str, Any
         "plan": None,
         "detail": "",
         "enforcement": "",
+        "realization": REALIZATION_CAVEAT,
     }
 
     try:
@@ -945,6 +1072,7 @@ async def guest_network_report(state: Any, proxmox: Any = None) -> dict[str, Any
     result["survey"] = current.to_dict()
     result["plan"] = the_plan.to_dict()
     result["enforcement"] = enforcement_note(current)
+    result["realization"] = REALIZATION_CAVEAT
     if the_plan.converged:
         result["detail"] = "The cluster matches the desired guest network."
     elif the_plan.blockers:
@@ -958,30 +1086,90 @@ async def guest_network_report(state: Any, proxmox: Any = None) -> dict[str, Any
 
 
 def enforcement_note(current: GuestNetworkSurvey) -> str:
-    """What the vnet firewall rules are actually worth on THIS node's stack."""
+    """Whether the fence is actually ENFORCED, and what the vnet rules are worth (#600).
+
+    Two truths, in order of what bites first. The master switch comes first: the
+    per-VM guest fence is stored but INERT until the PVE datacenter firewall is
+    on, so "configured but not enforced" is a real, visible state, not a silent
+    one. The node's firewall stack comes second, because it only decides the
+    fate of the VNET forward rules (the per-VM tap rules are enforced by both
+    stacks once the master switch is on).
+    """
+    stack_note = _stack_note(current)
+
+    if "could not be read" in _dc_read_error(current):
+        return (
+            "Whether the datacenter firewall is enabled could not be read, so whether the "
+            "guest fence is ENFORCED is unknown. HomePilot enables it safely (policy_in=ACCEPT, "
+            f"no lockout) as part of applying the guest-network artifact. {stack_note}"
+        )
+    if not current.datacenter_firewall_enabled:
+        return (
+            "The PVE datacenter firewall is OFF, so the guest fence is CONFIGURED but NOT "
+            "ENFORCED - the per-VM tap rules are stored but inert until the master switch is on. "
+            "Applying the guest-network artifact enables it safely (enable=1, policy_in=ACCEPT: "
+            f"the host INPUT chain stays open, so no management lockout). {stack_note}"
+        )
+    if not current.datacenter_firewall_policy_in_safe:
+        # HomePilot never writes this, but the cluster can carry it independently.
+        return (
+            "The PVE datacenter firewall is ON but its input policy is DROP with no HomePilot "
+            "management-allow rule - a management-lockout risk that HomePilot did not create and "
+            f"will not deepen. The per-VM guest fence is enforced. {stack_note}"
+        )
+    return (
+        "The PVE datacenter firewall is ON with policy_in=ACCEPT (host INPUT open, no lockout), "
+        f"so the per-VM guest fence is ENFORCED. {stack_note}"
+    )
+
+
+def _dc_read_error(current: GuestNetworkSurvey) -> str:
+    for err in current.errors:
+        if "datacenter firewall options" in err:
+            return err
+    return ""
+
+
+def _stack_note(current: GuestNetworkSurvey) -> str:
+    """What the node's firewall stack means for the VNET forward rules."""
     if current.firewall_stack == "nftables":
         return (
-            f"Node {current.node} runs the nftables proxmox-firewall, so the vnet "
-            "forward rules below are enforced. The per-VM rules HomePilot writes at "
-            "provision time fence each guest as well."
+            f"Node {current.node} runs the nftables proxmox-firewall, so the vnet forward rules "
+            "are enforced too."
         )
     if current.firewall_stack == "legacy":
         return (
-            f"Node {current.node} runs the LEGACY iptables firewall, which stores vnet "
-            "firewall rules but does not enforce them on vnet forward traffic. The "
-            "fence that holds today is the per-VM rule set HomePilot writes at "
-            "provision time; the vnet rules become live if the node is switched to "
-            "the nftables proxmox-firewall."
+            f"Node {current.node} runs the LEGACY iptables firewall, which stores vnet forward "
+            "rules but does not enforce them; the per-VM tap rules are the fence that holds, and "
+            "the vnet rules become live if the node is switched to the nftables proxmox-firewall."
         )
     return (
-        "Which firewall stack the node runs could not be read, so whether the vnet "
-        "forward rules are enforced is unknown. The per-VM rules written at provision "
-        "time are enforced by both stacks."
+        "Which firewall stack the node runs could not be read, so whether the vnet forward rules "
+        "are enforced is unknown; the per-VM tap rules are enforced by both stacks."
     )
+
+
+# The one honest thing to say about vnet-bridge realization (#596). PVE's node
+# network listing is UNRELIABLE across versions - a live SDN vnet is sometimes
+# absent from it (seen on one node while the bridge was genuinely up) and a
+# never-realized vnet is absent for real. The two are indistinguishable through
+# the API, so HomePilot does NOT manufacture drift from the listing (that would
+# false-drift a working network). Realization is confirmed behaviourally: a
+# guest that provisions onto the vnet either boots (realized) or fails at start
+# with "bridge does not exist" - and that failure destroys the half-made guest
+# (#595) and is reported. This line makes the limit explicit rather than letting
+# a bare "in spec" imply the bridge is proven live.
+REALIZATION_CAVEAT = (
+    "The SDN config is applied; whether the vnet bridge is actually realized on "
+    "the node cannot be confirmed through the API and is verified when a guest "
+    "provisions onto it (a start failure means the node has not brought the "
+    "bridge up - commonly dnsmasq missing on the node for a DHCP zone)."
+)
 
 
 __all__ = [
     "KEYS",
+    "REALIZATION_CAVEAT",
     "DesiredGuestNetwork",
     "GuestNetworkError",
     "GuestNetworkSurvey",
@@ -990,6 +1178,7 @@ __all__ = [
     "desired_from_settings",
     "enforcement_note",
     "execute",
+    "fence_rule_writes",
     "fence_rules",
     "gateway_for",
     "guest_network_report",

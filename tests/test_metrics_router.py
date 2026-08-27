@@ -133,6 +133,50 @@ class TestAlertRuleApi:
         assert client.delete(f"/monitoring/rules/{rule_id}").status_code == 200
         assert client.get("/monitoring/rules").json()["total"] == 0
 
+    async def test_patch_retunes_the_condition_in_place(self, api):
+        # #593: PATCH used to accept only `enabled`, so retuning a threshold meant
+        # delete-and-recreate. Assert the new threshold/comparison/duration are
+        # stored and read back, and that unpassed fields are left unchanged.
+        client, _ = api
+        created = client.post("/monitoring/rules", json=self._rule_body())
+        rule_id = created.json()["id"]
+
+        resp = client.patch(
+            f"/monitoring/rules/{rule_id}",
+            json={"threshold": 91.5, "comparison": "gte", "for_seconds": 600},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["threshold"] == 91.5
+        assert resp.json()["comparison"] == "gte"
+        assert resp.json()["for_seconds"] == 600
+
+        reread = client.get("/monitoring/rules").json()["items"][0]
+        assert reread["threshold"] == 91.5
+        assert reread["comparison"] == "gte"
+        # metric/host_filter were not in the body, so they must be untouched.
+        assert reread["metric"] == self._rule_body()["metric"]
+        assert reread["host_filter"] == "*"
+
+    async def test_patch_with_no_enabled_field_leaves_it_unchanged(self, api):
+        # #593: omitting a field must not crash and must not null it. A body with
+        # only a threshold keeps the rule enabled as it was.
+        client, _ = api
+        created = client.post("/monitoring/rules", json=self._rule_body())
+        rule_id = created.json()["id"]
+        was_enabled = created.json()["enabled"]
+
+        resp = client.patch(f"/monitoring/rules/{rule_id}", json={"threshold": 7.0})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["threshold"] == 7.0
+        assert resp.json()["enabled"] == was_enabled
+
+    async def test_patch_rejects_a_bad_comparison(self, api):
+        client, _ = api
+        created = client.post("/monitoring/rules", json=self._rule_body())
+        rule_id = created.json()["id"]
+        resp = client.patch(f"/monitoring/rules/{rule_id}", json={"comparison": "roughly"})
+        assert resp.status_code == 422
+
     async def test_an_unknown_rule_is_a_404_on_both_paths(self, api):
         client, _ = api
         assert client.delete("/monitoring/rules/nope").status_code == 404

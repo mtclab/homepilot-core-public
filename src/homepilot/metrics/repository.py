@@ -254,13 +254,70 @@ class MetricsRepository:
         await self.db.conn.commit()
         return deleted
 
-    async def set_rule_enabled(self, rule_id: str, enabled: bool) -> bool:
+    # Columns a rule can be retuned in place. `name` and the whole condition
+    # (metric, comparison, threshold, for_seconds, host_filter) plus `enabled` -
+    # everything create_rule sets except the immutable id and timestamps. An
+    # operator who wants a different threshold must not have to delete and
+    # recreate the rule (and lose its firing state with it).
+    _UPDATABLE_COLUMNS = (
+        "name",
+        "metric",
+        "comparison",
+        "threshold",
+        "for_seconds",
+        "host_filter",
+        "enabled",
+    )
+
+    async def update_rule(self, rule_id: str, **fields: Any) -> dict[str, Any] | None:
+        """Update only the columns named in ``fields``; leave the rest untouched.
+
+        Returns the updated rule, or None if no rule has that id. An empty
+        ``fields`` is a no-op that still returns the (unchanged) rule, so a
+        caller can PATCH with a subset - or nothing - without special-casing it."""
+        unknown = set(fields) - set(self._UPDATABLE_COLUMNS)
+        if unknown:
+            raise ValueError(f"Cannot update unknown rule field(s): {', '.join(sorted(unknown))}")
+        if "comparison" in fields and fields["comparison"] not in VALID_COMPARISONS:
+            raise ValueError(
+                f"Invalid comparison {fields['comparison']!r}. Must be one of {VALID_COMPARISONS}"
+            )
+        if "for_seconds" in fields and int(fields["for_seconds"]) < 0:
+            raise ValueError("for_seconds must not be negative")
+
+        if not fields:
+            return await self.get_rule(rule_id)
+
+        # Coerce to the stored column types so a JSON int threshold or a bool
+        # enabled land the same way create_rule writes them.
+        coercers: dict[str, Any] = {
+            "threshold": float,
+            "for_seconds": int,
+            "enabled": lambda v: int(bool(v)),
+        }
+        assignments = []
+        values: list[Any] = []
+        for column in self._UPDATABLE_COLUMNS:
+            if column in fields:
+                assignments.append(f"{column} = ?")
+                coerce = coercers.get(column, lambda v: v)
+                values.append(coerce(fields[column]))
+        assignments.append("updated_at = ?")
+        values.append(_now())
+        values.append(rule_id)
+
         cursor = await self.db.execute(
-            "UPDATE alert_rules SET enabled = ?, updated_at = ? WHERE id = ?",
-            (int(enabled), _now(), rule_id),
+            f"UPDATE alert_rules SET {', '.join(assignments)} WHERE id = ?",
+            tuple(values),
         )
         await self.db.conn.commit()
-        return (cursor.rowcount or 0) > 0
+        if (cursor.rowcount or 0) == 0:
+            return None
+        return await self.get_rule(rule_id)
+
+    async def set_rule_enabled(self, rule_id: str, enabled: bool) -> bool:
+        """Thin wrapper over update_rule for the enable/silence-only path."""
+        return await self.update_rule(rule_id, enabled=enabled) is not None
 
     # ── Alert state ──────────────────────────────────────────────────────────
     async def get_alert_state(self, rule_id: str, hostname: str) -> dict[str, Any] | None:

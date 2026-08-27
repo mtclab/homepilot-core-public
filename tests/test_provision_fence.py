@@ -82,6 +82,12 @@ class FakeFirewall:
         self.fail = fail
         self.options: list[dict[str, Any]] = []
         self.rules: list[dict[str, Any]] = []
+        # The COMPILED chain, as PVE would store it. A rule create PREPENDS -
+        # every new rule lands at the top - so this fake inserts at the FRONT,
+        # and a test reading it back asserts the real on-tap order, not the order
+        # of the list HomePilot handed the API. Asserting only the latter is what
+        # let the reversed-chain bug (#599) ship green.
+        self.compiled: list[dict[str, Any]] = []
 
     async def set_vm_firewall_options(self, node: str, vmid: int, **options: Any) -> str:
         if self.fail:
@@ -93,6 +99,8 @@ class FakeFirewall:
         if self.fail:
             raise RuntimeError("403 Permission check failed (/vms/104, VM.Config.Network)")
         self.rules.append({"node": node, "vmid": vmid, **rule})
+        # Model PVE: the create PREPENDS, regardless of the `pos` it is handed.
+        self.compiled.insert(0, {"node": node, "vmid": vmid, **rule})
         return "ok"
 
 
@@ -207,17 +215,21 @@ class TestAGuestOnTheGuestVnetIsFenced:
         firewall = FakeFirewall()
         service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
         await _run(service)
+        # The property is the COMPILED chain, as PVE stores it after prepending
+        # every create - NOT the order of the list HomePilot POSTed. Asserting
+        # the compiled order is the gate the old test lacked: it read
+        # `firewall.rules` (the passed list) and stayed green while the real chain
+        # landed reversed, the gateway DROP shadowing the DNS/DHCP ACCEPTs (#599).
         assert [
-            (r["action"], r.get("proto"), r.get("dport"), r["dest"]) for r in firewall.rules
+            (r["action"], r.get("proto"), r.get("dport"), r["dest"]) for r in firewall.compiled
         ] == [
             ("ACCEPT", "udp", "67:68", "198.51.100.1"),
             ("ACCEPT", "udp", "53", "198.51.100.1"),
             ("ACCEPT", "tcp", "53", "198.51.100.1"),
             ("DROP", None, None, "192.0.2.0/24"),
             ("DROP", None, None, "198.51.100.1/32"),
-        ]
-        assert [r["pos"] for r in firewall.rules] == [0, 1, 2, 3, 4]
-        assert all(r["type"] == "out" for r in firewall.rules)
+        ], "the DNS/DHCP ACCEPTs must precede the gateway DROP in the compiled chain"
+        assert all(r["type"] == "out" for r in firewall.compiled)
 
     async def test_the_fence_is_written_before_the_guest_boots(self, db, proxmox) -> None:
         """A guest that boots unfenced is on the operator's LAN until somebody

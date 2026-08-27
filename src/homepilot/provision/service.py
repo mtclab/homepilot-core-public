@@ -15,7 +15,7 @@ from .defaults import ProvisioningDefaults, provisioning_defaults
 from .guest_network import (
     DesiredGuestNetwork,
     desired_from_settings,
-    fence_rules,
+    fence_rule_writes,
     gateway_for,
 )
 from .models import ProvisionRequest
@@ -180,6 +180,12 @@ class ProvisionService:
         vmid: int | None = None
         clone_issued = False
         inflight_upid: str | None = None
+        # Set once a path has already taken the guest back (today: the fence
+        # failure below, which destroys the unfenced guest and raises). The
+        # generic failure handler reads it so it does NOT try to destroy a guest
+        # that is already gone - which would turn a clean unwind into a spurious
+        # "cleanup FAILED" on a vmid that no longer exists (#595).
+        guest_unwound = False
         # The per-VM firewall this run actually wrote, for the provision record.
         # None means no fence was applied - the result says so rather than
         # leaving the question open.
@@ -238,6 +244,7 @@ class ProvisionService:
                     # reach, which is the one outcome the guest network exists
                     # to make impossible.
                     outcome = await self._destroy_unfenced(request, vmid)
+                    guest_unwound = True
                     raise RuntimeError(
                         f"could not write the guest firewall rules ({exc}); {outcome}"
                     ) from exc
@@ -323,8 +330,16 @@ class ProvisionService:
                 logger.warning("Provision cancel cleanup raised", exc_info=True)
             raise
         except Exception as exc:
-            error = f"{step}: {exc}"
             logger.exception("Provision task %s failed at step %s", task_id, step)
+            # A failure AFTER the clone leaves a guest on the node that this run
+            # created and nothing else will remove - clone_vm already made VM N,
+            # and a failure at (say) start_vm strands it, stopped, forever (#595:
+            # reproduced live, a start_vm failure left VM 101 orphaned). A
+            # failure BEFORE the clone has nothing to unwind, and the fence path
+            # has already taken its guest back, so neither destroys here.
+            error = f"failed at {step}: {exc}"
+            if clone_issued and vmid is not None and not guest_unwound:
+                error = f"{error}; {await self._destroy_after_failure(request, vmid)}"
             try:
                 await self.task_repo.update_task_status(task_id, "failed", error=error)
                 await self._audit(actor, request, "provision_failed", {"error": error})
@@ -453,12 +468,57 @@ class ProvisionService:
         await gateway.set_vm_firewall_options(
             node=request.node, vmid=vmid, enable=1, policy_out="ACCEPT"
         )
-        applied: list[dict[str, Any]] = []
-        for position, rule in enumerate(fence_rules(fence, "out")):
-            body = {**rule, "pos": position}
+        # POST in reverse, each pinned to pos=0: PVE prepends every rule create,
+        # so writing the fence straight through left the gateway DROP above the
+        # DNS/DHCP ACCEPTs it shadows and broke a fenced guest's DNS/DHCP (#599).
+        # `applied` is recorded in the FINAL compiled order (by final_pos), which
+        # is what the provision report shows an operator, not the write order.
+        writes = fence_rule_writes(fence, "out")
+        applied: list[dict[str, Any]] = [{} for _ in writes]
+        for final_pos, body in writes:
             await gateway.create_vm_firewall_rule(node=request.node, vmid=vmid, **body)
-            applied.append(body)
+            applied[final_pos] = body
         return applied
+
+    async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> str:
+        """Take back a guest a post-clone failure would otherwise strand (#595).
+
+        Unlike :meth:`_destroy_unfenced` (whose guest is always still stopped,
+        because the fence runs before the boot), a generic failure can land with
+        the guest already running - a start_vm that returned before the wait
+        timed out, a later step that raised. PVE refuses to destroy a running
+        guest, so this stops it first. Every call is best-effort and swallows its
+        own error: the point is that the recorded provision error names the
+        cleanup OUTCOME, so an operator knows whether a guest is still on the
+        node, rather than the cleanup itself becoming a second failure.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked clone_issued
+            return f"no Proxmox client to destroy with, vmid {vmid} may remain"
+        node = request.node
+        try:
+            current = await proxmox.get_vm_current(node, vmid)
+            status = str((current.get("data") or current).get("status") or "")
+            if status == "running":
+                stop_upid = await proxmox.stop_vm(node, vmid)
+                with contextlib.suppress(Exception):
+                    await proxmox.wait_for_task(
+                        node,
+                        stop_upid,
+                        timeout_s=self.task_timeout_s,
+                        poll_interval=self.poll_interval,
+                    )
+        except Exception as exc:
+            # A status read or stop that failed does not stop us trying the
+            # destroy - PVE may still take a stopped-enough guest, and if it
+            # refuses, the delete_vm error below is what gets reported.
+            logger.warning("Could not stop guest %s on %s before destroy: %s", vmid, node, exc)
+        try:
+            await proxmox.delete_vm(node, vmid)
+        except Exception as exc:
+            logger.error("Could not destroy the orphaned guest %s on %s: %s", vmid, node, exc)
+            return f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"
+        return f"destroyed guest vmid {vmid}"
 
     async def _destroy_unfenced(self, request: ProvisionRequest, vmid: int) -> str:
         """Take back a guest whose fence could not be written.

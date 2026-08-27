@@ -138,6 +138,38 @@ class TestAlertRuleAdmin:
         assert out["enabled"] in (0, False)
         assert (await estate.metrics_repo.get_rule(rule["id"]))["enabled"] in (0, False)
 
+    async def test_update_rule_retunes_threshold(self, ctx, estate) -> None:
+        # The #593 bug: update_alert_rule only toggled enabled, so an operator
+        # could not retune a threshold - they had to delete and recreate. Assert
+        # the new threshold is actually stored and read back.
+        rule = await estate.metrics_repo.create_rule(
+            name="r", metric="cpu.percent", comparison="gt", threshold=1.0
+        )
+        out = await _handle_tool(
+            "update_alert_rule",
+            {"rule_id": rule["id"], "threshold": 88.0, "comparison": "gte", "for_seconds": 120},
+            ctx,
+        )
+        assert out["threshold"] == 88.0
+        assert out["comparison"] == "gte"
+        stored = await estate.metrics_repo.get_rule(rule["id"])
+        assert stored["threshold"] == 88.0
+        assert stored["for_seconds"] == 120
+        # A field not passed is left as it was, not nulled.
+        assert stored["metric"] == "cpu.percent"
+        assert stored["enabled"] in (1, True)
+
+    async def test_update_rule_without_enabled_does_not_crash(self, ctx, estate) -> None:
+        # #593: `bool(arguments["enabled"])` raised a raw KeyError when enabled
+        # was omitted. Omitting it (and every other field) must be a no-op that
+        # returns the unchanged rule, not a crash.
+        rule = await estate.metrics_repo.create_rule(
+            name="r", metric="cpu.percent", comparison="gt", threshold=5.0
+        )
+        out = await _handle_tool("update_alert_rule", {"rule_id": rule["id"]}, ctx)
+        assert out["threshold"] == 5.0
+        assert out["enabled"] in (1, True)
+
     async def test_update_rule_unknown_id(self, ctx) -> None:
         with pytest.raises(ValueError, match="Alert rule not found"):
             await _handle_tool("update_alert_rule", {"rule_id": "nope", "enabled": True}, ctx)

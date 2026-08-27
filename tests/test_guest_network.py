@@ -83,6 +83,7 @@ class FakeCluster:
         subnets: list[dict[str, Any]] | None = None,
         fw_options: dict[str, Any] | None = None,
         fw_rules: list[dict[str, Any]] | None = None,
+        dc_fw_options: dict[str, Any] | None = None,
         nftables: int = 0,
         fail_on: str | None = None,
         failure: str = "dnsmasq is not installed on node elizabeth",
@@ -92,10 +93,18 @@ class FakeCluster:
         self.subnets = subnets or []
         self.fw_options = fw_options or {}
         self.fw_rules = fw_rules or []
+        # The datacenter firewall master switch (#600). Default OFF, as a fresh
+        # cluster is: enabling it (safely) is what an apply does.
+        self.dc_fw_options = dict(dc_fw_options or {})
         self.nftables = nftables
         self.fail_on = fail_on
         self.failure = failure
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # The COMPILED chain, as PVE would store it. A firewall-rule create
+        # PREPENDS - every new rule lands at the top - so this fake inserts at
+        # the FRONT, and a test that reads it back is asserting the real
+        # on-cluster order, not the order of the list we handed the API (#599).
+        self.compiled_fw_rules: list[dict[str, Any]] = []
 
     # reads
     async def list_nodes(self) -> list[dict[str, Any]]:
@@ -118,6 +127,9 @@ class FakeCluster:
 
     async def node_firewall_options(self, node: str) -> dict[str, Any]:
         return {"enable": 1, "nftables": self.nftables}
+
+    async def cluster_firewall_options(self) -> dict[str, Any]:
+        return dict(self.dc_fw_options)
 
     # mutations
     async def _record(self, op: str, params: dict[str, Any]) -> str:
@@ -145,10 +157,25 @@ class FakeCluster:
         return await self._record("set_vnet_firewall_options", params)
 
     async def create_vnet_firewall_rule(self, **params: Any) -> str:
-        return await self._record("create_vnet_firewall_rule", params)
+        result = await self._record("create_vnet_firewall_rule", params)
+        # Model PVE: the create PREPENDS, regardless of the `pos` it is handed.
+        self.compiled_fw_rules.insert(0, dict(params))
+        return result
 
     async def apply_sdn(self, **params: Any) -> str:
         return await self._record("apply_sdn", params)
+
+    async def ensure_datacenter_firewall_enabled(self, **params: Any) -> str:
+        # Model the real gateway op: read-then-safe-write, idempotent, and it
+        # NEVER produces policy_in=DROP. The fake mutates its own options so a
+        # test can read back that the master switch ended up on and safe.
+        from homepilot.adapters.pve_sdn import safe_datacenter_firewall_enable
+
+        result = await self._record("ensure_datacenter_firewall_enabled", params)
+        write = safe_datacenter_firewall_enable(self.dc_fw_options)
+        if write is not None:
+            self.dc_fw_options.update(write)
+        return result
 
 
 def converged_cluster() -> FakeCluster:
@@ -167,6 +194,9 @@ def converged_cluster() -> FakeCluster:
         ],
         fw_options={"enable": 1, "policy_forward": "ACCEPT"},
         fw_rules=list(fence_rules(want, "forward")),
+        # The master switch is on and safe, so a converged cluster plans no
+        # ensure-datacenter-firewall step either (#600).
+        dc_fw_options={"enable": 1, "policy_in": "ACCEPT"},
     )
 
 
@@ -224,11 +254,18 @@ class TestThePlan:
             # firewall API refuses a vnet the cluster has not applied yet.
             "apply-sdn",
             "vnet-firewall-options",
-            "vnet-firewall-rule-0",
-            "vnet-firewall-rule-1",
-            "vnet-firewall-rule-2",
-            "vnet-firewall-rule-3",
+            # The rule steps run bottom-first: PVE prepends every create, so to
+            # land the fence in fence_rules() order the highest final position is
+            # POSTed first and rule 0 (the first-listed ACCEPT) last (#599). The
+            # id names each rule's FINAL compiled position.
             "vnet-firewall-rule-4",
+            "vnet-firewall-rule-3",
+            "vnet-firewall-rule-2",
+            "vnet-firewall-rule-1",
+            "vnet-firewall-rule-0",
+            # LAST: flip the datacenter firewall master switch on (safely), so
+            # the fence actually enforces - after the rules exist (#600).
+            "ensure-datacenter-firewall",
         ]
         by_id = {s.id: s for s in result.steps}
         assert by_id["create-zone"].op == "create_zone"
@@ -400,6 +437,8 @@ class TestTheExecution:
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
+            # LAST: enable the datacenter firewall safely so the fence enforces (#600).
+            "ensure_datacenter_firewall_enabled",
         ]
         assert all(s["status"] == "done" for s in result["steps"])
 
@@ -412,10 +451,21 @@ class TestTheExecution:
             "enable": 1,
             "policy_forward": "ACCEPT",
         }
-        rules = [params for op, params in cluster.calls if op == "create_vnet_firewall_rule"]
-        assert [r["pos"] for r in rules] == [0, 1, 2, 3, 4]
-        assert rules[0]["type"] == "forward"
-        assert rules[-1]["action"] == "DROP" and rules[-1]["dest"] == "198.51.100.1/32"
+        # The property is the COMPILED order, not the order of the list we
+        # handed the API. This asserts the chain as the fake RECORDS it after
+        # PVE's prepend - which is what let the reversed-chain bug (#599) ship
+        # when the old assertion checked only the passed list.
+        compiled = cluster.compiled_fw_rules
+        assert [(r["action"], r.get("proto"), r.get("dport"), r["dest"]) for r in compiled] == [
+            ("ACCEPT", "udp", "67:68", "198.51.100.1"),
+            ("ACCEPT", "udp", "53", "198.51.100.1"),
+            ("ACCEPT", "tcp", "53", "198.51.100.1"),
+            ("DROP", None, None, "192.0.2.0/24"),
+            ("DROP", None, None, "198.51.100.1/32"),
+        ], "the ACCEPTs must precede the gateway DROP they would otherwise be shadowed by"
+        assert all(r["type"] == "forward" for r in compiled)
+        # The gateway DROP lands LAST in the chain, after the ACCEPTs, not first.
+        assert compiled[-1]["action"] == "DROP" and compiled[-1]["dest"] == "198.51.100.1/32"
 
     async def test_a_failed_step_repeats_the_clusters_own_words(self) -> None:
         cluster = FakeCluster(fail_on="apply_sdn")
@@ -451,7 +501,9 @@ class TestPlanIsPureAndTestableWithoutACluster:
         """The whole point of the split: idempotence is decided here, in a
         function a test can call with two plain values."""
         empty = GuestNetworkSurvey()
-        assert len(plan(desired(), empty).steps) == 10
+        # 10 SDN + firewall steps, plus the ensure-datacenter-firewall step that
+        # makes the fence actually enforce (#600).
+        assert len(plan(desired(), empty).steps) == 11
 
 
 class TestAGarbageWriteTokenDoesNotTakeReadsDown:
@@ -572,3 +624,27 @@ class TestAnAppliedRangeIsTheSameRange:
         ]
         result = plan(desired(), await survey(cluster, desired()))
         assert result.steps == ()
+
+
+class TestRealizationIsHonestNotDriftManufactured:
+    """#596: the API cannot reliably tell a realized vnet bridge from an
+    unrealized one (PVE's node listing omits live SDN vnets on some versions),
+    so HomePilot must NOT manufacture drift from bridge presence - that would
+    false-drift a working network. Instead it states the limit honestly and
+    lets provisioning confirm realization behaviourally (a start failure on an
+    unrealized bridge is caught + cleaned up, #595)."""
+
+    def test_the_caveat_names_provisioning_as_the_realization_check(self) -> None:
+        from homepilot.provision.guest_network import REALIZATION_CAVEAT
+
+        low = REALIZATION_CAVEAT.lower()
+        assert "provision" in low
+        assert "bridge" in low
+
+    async def test_a_converged_sdn_config_plans_nothing_regardless_of_node_bridges(self) -> None:
+        # A cluster whose SDN config matches desired plans nothing - realization
+        # is NOT a plan input (no false drift on the elizabeth-style omission).
+        current = await survey(converged_cluster(), desired())
+        result = plan(desired(), current)
+        assert result.steps == ()
+        assert result.blockers == ()

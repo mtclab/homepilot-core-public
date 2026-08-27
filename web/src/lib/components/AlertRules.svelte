@@ -71,6 +71,42 @@
 		}
 	}
 
+	// Retune an existing rule in place (#593). Silencing was the only edit before;
+	// changing a threshold meant delete-and-recreate, which dropped firing state.
+	let editingId: string | null = null;
+	let edit = { comparison: 'gt' as AlertComparison, threshold: 0, for_minutes: 0 };
+
+	function startEdit(rule: AlertRule) {
+		editingId = rule.id;
+		edit = {
+			comparison: rule.comparison,
+			threshold: rule.threshold,
+			for_minutes: Math.round(rule.for_seconds / 60)
+		};
+	}
+
+	function cancelEdit() {
+		editingId = null;
+	}
+
+	async function saveEdit(rule: AlertRule) {
+		savingRule = true;
+		try {
+			await api.updateAlertRule(rule.id, {
+				comparison: edit.comparison,
+				threshold: Number(edit.threshold),
+				for_seconds: Math.round(Number(edit.for_minutes) * 60)
+			});
+			editingId = null;
+			await loadRules();
+			notify('Alert rule updated', 'ok');
+		} catch (e) {
+			notify('Could not update the rule: ' + String(e), 'err');
+		} finally {
+			savingRule = false;
+		}
+	}
+
 	async function removeRule(rule: AlertRule) {
 		try {
 			await api.deleteAlertRule(rule.id);
@@ -99,7 +135,9 @@
 		Read the row as a sentence: <em>name</em> fires when <em>metric</em> is
 		<em>above/below</em> <em>threshold</em> for <em>minutes</em> on
 		<em>host</em> - where <span class="font-mono">*</span> means every host, and
-		a name is what you will see when it fires.
+		a name is what you will see when it fires. <em>Edit</em> retunes an existing
+		rule's comparison, threshold and duration in place - no need to delete and
+		recreate it.
 	</p>
 
 	<div class="flex flex-wrap items-end gap-2">
@@ -157,11 +195,42 @@
 				{#each rules as r (r.id)}
 					<tr class="border-b border-divider">
 						<td class="text-ink">{r.name}</td>
-						<td class="text-muted">
-							{metricLabel(r.metric)} {COMPARISON_LABELS[r.comparison]}
-							<span class="num-inline text-ink">{r.threshold}</span>
-							for {Math.round(r.for_seconds / 60)} min
-						</td>
+						{#if editingId === r.id}
+							<!-- Retune the condition in place: same sentence, now editable.
+							     Metric and host stay fixed here - change those by making a new
+							     rule - but the numbers you actually tune are inline (#593). -->
+							<td class="text-muted">
+								{metricLabel(r.metric)}
+								<select class="input" bind:value={edit.comparison} aria-label="Comparison">
+									{#each Object.entries(COMPARISON_LABELS) as [value, label] (value)}
+										<option {value}>{label}</option>
+									{/each}
+								</select>
+								<input
+									class="input num w-20"
+									type="number"
+									step="0.1"
+									bind:value={edit.threshold}
+									aria-label="Threshold"
+								/>
+								for
+								<input
+									class="input num w-16"
+									type="number"
+									min="0"
+									step="1"
+									bind:value={edit.for_minutes}
+									aria-label="For (minutes)"
+								/>
+								min
+							</td>
+						{:else}
+							<td class="text-muted">
+								{metricLabel(r.metric)} {COMPARISON_LABELS[r.comparison]}
+								<span class="num-inline text-ink">{r.threshold}</span>
+								for {Math.round(r.for_seconds / 60)} min
+							</td>
+						{/if}
 						<td class="text-muted font-mono">{r.host_filter}</td>
 						<td>
 							{#if r.enabled}
@@ -171,10 +240,22 @@
 							{/if}
 						</td>
 						<td class="space-x-1">
-							<button class="btn btn-ghost btn-xs" on:click={() => toggleRule(r)}>
-								{r.enabled ? 'Silence' : 'Enable'}
-							</button>
-							<button class="btn btn-ghost btn-xs" on:click={() => removeRule(r)}>Delete</button>
+							{#if editingId === r.id}
+								<button
+									class="btn btn-primary btn-xs"
+									on:click={() => saveEdit(r)}
+									disabled={savingRule}
+								>
+									{savingRule ? 'Saving…' : 'Save'}
+								</button>
+								<button class="btn btn-ghost btn-xs" on:click={cancelEdit}>Cancel</button>
+							{:else}
+								<button class="btn btn-ghost btn-xs" on:click={() => startEdit(r)}>Edit</button>
+								<button class="btn btn-ghost btn-xs" on:click={() => toggleRule(r)}>
+									{r.enabled ? 'Silence' : 'Enable'}
+								</button>
+								<button class="btn btn-ghost btn-xs" on:click={() => removeRule(r)}>Delete</button>
+							{/if}
 						</td>
 					</tr>
 				{/each}

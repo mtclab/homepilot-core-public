@@ -155,16 +155,33 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "update_alert_rule",
         "description": (
-            "Enable or silence an existing alert rule by id, without deleting it. "
-            "Returns the updated rule; an unknown id is an error. Admin only."
+            "Retune an existing alert rule by id, in place. Every field except "
+            "rule_id is optional and only the ones you pass change - the rest are "
+            "left as they were. Pass `enabled` to silence or re-enable it; pass "
+            "`threshold`, `comparison`, `metric`, `for_seconds`, `host_filter` or "
+            "`name` to change the condition without deleting and recreating the rule "
+            "(which would drop its firing state). Returns the updated rule; an "
+            "unknown id is an error. Admin only."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "rule_id": {"type": "string", "description": "The rule's id"},
+                "name": {"type": "string", "description": "Human-readable rule name"},
+                "metric": {"type": "string", "description": "Metric key, e.g. cpu.percent"},
+                "comparison": {"type": "string", "description": "One of gt, gte, lt, lte"},
+                "threshold": {"type": "number"},
+                "for_seconds": {
+                    "type": "integer",
+                    "description": "Seconds the condition must hold (0-86400)",
+                },
+                "host_filter": {
+                    "type": "string",
+                    "description": "Hostname glob the rule applies to",
+                },
                 "enabled": {"type": "boolean", "description": "New enabled state"},
             },
-            "required": ["rule_id", "enabled"],
+            "required": ["rule_id"],
         },
         "outputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
     },
@@ -273,12 +290,32 @@ async def handle_update_alert_rule(
 ) -> dict[str, Any]:
     repo = _repo(ctx)
     rule_id = str(arguments["rule_id"])
-    enabled = bool(arguments["enabled"])
-    if not await repo.set_rule_enabled(rule_id, enabled):
-        raise ValueError(f"Alert rule not found: {rule_id}")
-    rule = await repo.get_rule(rule_id)
+
+    # Only the fields the caller actually passed - a missing field means "leave
+    # it", never "set to null". No raw arguments["enabled"]: omitting it is a
+    # valid partial update, not a KeyError (#593).
+    fields: dict[str, Any] = {}
+    if "name" in arguments:
+        fields["name"] = str(arguments["name"])
+    if "metric" in arguments:
+        fields["metric"] = str(arguments["metric"])
+    if "comparison" in arguments:
+        comparison = str(arguments["comparison"])
+        if comparison not in VALID_COMPARISONS:
+            raise ValueError(f"comparison must be one of {', '.join(VALID_COMPARISONS)}")
+        fields["comparison"] = comparison
+    if "threshold" in arguments:
+        fields["threshold"] = float(arguments["threshold"])
+    if "for_seconds" in arguments:
+        fields["for_seconds"] = int(arguments["for_seconds"])
+    if "host_filter" in arguments:
+        fields["host_filter"] = str(arguments["host_filter"] or "*")
+    if "enabled" in arguments:
+        fields["enabled"] = bool(arguments["enabled"])
+
+    rule = await repo.update_rule(rule_id, **fields)
     if rule is None:
-        raise ValueError(f"Alert rule vanished while updating it: {rule_id}")
+        raise ValueError(f"Alert rule not found: {rule_id}")
     result: dict[str, Any] = rule
     return result
 
