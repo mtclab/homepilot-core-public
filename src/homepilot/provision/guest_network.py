@@ -307,15 +307,18 @@ class GuestNetworkSurvey:
     errors: list[str] = field(default_factory=list)
 
     def zone(self, name: str) -> dict[str, Any] | None:
-        return next((z for z in self.zones if str(z.get("zone", "")) == name), None)
+        row = next((z for z in self.zones if str(z.get("zone", "")) == name), None)
+        return _overlay_pending(row)
 
     def vnet(self, name: str) -> dict[str, Any] | None:
-        return next((v for v in self.vnets if str(v.get("vnet", "")) == name), None)
+        row = next((v for v in self.vnets if str(v.get("vnet", "")) == name), None)
+        return _overlay_pending(row)
 
     def subnet(self, cidr: str) -> dict[str, Any] | None:
         # PVE names a subnet `<zone>-<cidr with / as ->`, and also returns the
         # plain `cidr` field. Match on the field, never on the composed id.
-        return next((s for s in self.subnets if str(s.get("cidr", "")) == cidr), None)
+        row = next((s for s in self.subnets if str(s.get("cidr", "")) == cidr), None)
+        return _overlay_pending(row)
 
     @property
     def firewall_stack(self) -> str:
@@ -335,6 +338,25 @@ class GuestNetworkSurvey:
             "pending": self.pending,
             "errors": self.errors,
         }
+
+
+def _overlay_pending(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A row's truth, with its not-yet-applied values folded in.
+
+    PVE reports a created-but-unapplied SDN object with `state: new` and its
+    real fields under `pending`, the top level left empty - so a diff against
+    the top level plans a full spurious update one step after the create
+    (found on the second live apply). The pending values ARE what apply-sdn
+    will make true, so they are what desired must be compared against.
+    """
+    if not row:
+        return row
+    pending = row.get("pending")
+    if isinstance(pending, dict) and pending:
+        merged = dict(row)
+        merged.update(pending)
+        return merged
+    return row
 
 
 async def survey(
@@ -610,7 +632,10 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
                         op="update_subnet",
                         params={
                             "vnet": desired.vnet,
-                            "subnet": desired.subnet_cidr,
+                            # PVE addresses a subnet by its composed id
+                            # (`<zone>-<ip>-<mask>`), NOT the CIDR - a raw
+                            # 10.x.y.0/24 in the path 501s on the slash.
+                            "subnet": str(subnet_row.get("id") or subnet_row.get("subnet") or ""),
                             **changes,
                         },
                     )
