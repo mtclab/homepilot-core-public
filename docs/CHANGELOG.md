@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.6.2 (2026-08-27)
+
+### The vnet firewall waits for the cluster to catch up
+
+The first live guest-network apply built the zone, vnet and subnet and then
+failed writing the vnet firewall: PVE validates the vnet against the APPLIED
+SDN config, and the plan wrote firewall options while everything was still
+pending. Firewall steps now run after apply-sdn, an apply also commits
+leftovers a failed earlier run parked, and a firewall-only repair no longer
+runs a needless apply. The failed apply left nothing broken - the report
+named every step, done and not attempted, which is how the bug was found.
+
+
 ## v3.6.1 (2026-08-27)
 
 ### A garbage write token no longer takes the guest network down

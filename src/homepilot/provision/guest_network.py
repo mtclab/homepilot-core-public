@@ -520,6 +520,7 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
     talks to a cluster, so every branch is testable without one.
     """
     steps: list[Step] = []
+    firewall_steps: list[Step] = []
     blockers: list[str] = []
 
     zone_row = current.zone(desired.zone)
@@ -615,9 +616,16 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
                     )
                 )
 
-        steps.extend(_firewall_steps(desired, current, vnet_row is not None))
+        # Firewall steps are collected separately and ordered AFTER apply-sdn:
+        # PVE's vnet firewall API validates the vnet against the APPLIED SDN
+        # config, so options written while the vnet is still pending are
+        # refused with "invalid vnet" (found on the first live apply - the
+        # zone/vnet/subnet were created and the firewall step then 500'd).
+        firewall_steps = _firewall_steps(desired, current, vnet_row is not None)
 
-    if steps:
+    # apply-sdn commits whatever is pending - the steps above, or leftovers
+    # from an earlier run that failed before its own apply.
+    if steps or current.pending:
         steps.append(
             Step(
                 id="apply-sdn",
@@ -629,6 +637,7 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
                 params={},
             )
         )
+    steps.extend(firewall_steps)
 
     if blockers:
         # A blocked plan carries NO steps. Execute would refuse to run them
