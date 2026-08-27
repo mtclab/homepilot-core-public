@@ -57,6 +57,7 @@ class FakePVE:
     def __init__(self) -> None:
         self.seen: list[tuple[str, str]] = []
         self.bodies: dict[str, Any] = {}
+        self.destroyed: list[int] = []
 
     def handle(self, request: Request) -> Response:
         path = request.url.path.removeprefix("/api2/json")
@@ -68,6 +69,13 @@ class FakePVE:
             return Response(200, json={"data": 105})
         if path == "/nodes/pve1/qemu/9000/clone":
             return Response(200, json={"data": CLONE_UPID})
+        if path == "/nodes/pve1/qemu/105/status/current":
+            return Response(200, json={"data": {"status": "stopped"}})
+        if path == "/nodes/pve1/qemu/105/status/stop":
+            return Response(200, json={"data": "UPID:pve1:stop:"})
+        if request.method == "DELETE" and path == "/nodes/pve1/qemu/105":
+            self.destroyed.append(105)
+            return Response(200, json={"data": "UPID:pve1:destroy:"})
         if path.startswith("/nodes/pve1/tasks/") and path.endswith("/status"):
             return Response(200, json={"data": {"status": "stopped", "exitstatus": "OK"}})
         if path == "/nodes/pve1/qemu/105/config":
@@ -222,7 +230,9 @@ class TestProvisionJourney:
         sent_key = pve.bodies["/nodes/pve1/qemu/105/config"]["sshkeys"]
         assert unquote(sent_key) == PUBKEY
 
-    def test_a_pve_failure_lands_a_failed_task_not_a_stranded_one(self, app: FastAPI, db: Database):
+    def test_a_pve_failure_lands_a_failed_task_not_a_stranded_one(
+        self, app: FastAPI, db: Database, pve: FakePVE
+    ):
         # The clone task reports a non-OK exitstatus: the operator must SEE a
         # failed task naming the step, never a provision stuck 'running'.
         service = app.state.provision_service
@@ -240,7 +250,11 @@ class TestProvisionJourney:
             task = _poll_task(client, accepted.json()["task_id"])
 
         assert task["status"] == "failed"
-        assert task["error"].startswith("clone:")
+        assert task["error"].startswith("failed at clone:")
         assert "no space left on device" in task["error"]
         assert task["finished_at"] is not None
         assert _host_by_vmid(db.db_path, 105) is None
+        # The clone was issued before the wait failed, so the guest it may have
+        # left behind is destroyed, not orphaned (#595). The error says so.
+        assert pve.destroyed == [105]
+        assert "destroyed guest vmid 105" in task["error"]

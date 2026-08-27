@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
+
+if TYPE_CHECKING:
+    from homepilot.db.repository import Repository
 
 logger = logging.getLogger(__name__)
 
@@ -111,14 +114,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_kb_doc",
         "description": (
-            "One knowledge-base document's stored record by its numeric doc id, as "
-            "listed by list_kb: title, kind, target, source, path and when it was "
-            "indexed. Read-only."
+            "One knowledge-base document's stored record: title, kind, target, source, "
+            "path and when it was indexed. Read-only. Accepts either the numeric doc id "
+            "listed by list_kb/search_kb, OR the artifact-slug id record_fact returns "
+            "(e.g. `2026-08-27-kb-web01-a1b2c3`, with or without the `artifact:` prefix)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "doc_id": {"type": "integer", "description": "Numeric KB document id"},
+                "doc_id": {
+                    "type": ["integer", "string"],
+                    "description": (
+                        "Numeric KB row id, or the artifact-slug id record_fact returned "
+                        "(optionally prefixed `artifact:`)"
+                    ),
+                },
             },
             "required": ["doc_id"],
         },
@@ -135,14 +145,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "update_kb_doc",
         "description": (
-            "Edit an existing knowledge-base document by its numeric id: any of title, "
-            "content, kind or target. Only the fields you pass change. Returns the "
-            "updated record; an unknown id is an error."
+            "Edit an existing knowledge-base document: any of title, content, kind or "
+            "target. Only the fields you pass change. Returns the updated record; an "
+            "unknown id is an error. Accepts the numeric id from list_kb OR the "
+            "artifact-slug id record_fact returns - but note that artifact-backed notes "
+            "(source `artifact:...`) are immutable and cannot be edited in place: record "
+            "a superseding fact instead (record_fact with `supersedes`)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "doc_id": {"type": "integer", "description": "Numeric KB document id"},
+                "doc_id": {
+                    "type": ["integer", "string"],
+                    "description": (
+                        "Numeric KB row id, or the artifact-slug id record_fact returned "
+                        "(optionally prefixed `artifact:`)"
+                    ),
+                },
                 "title": {"type": ["string", "null"]},
                 "content": {"type": ["string", "null"]},
                 "kind": {"type": ["string", "null"]},
@@ -158,14 +177,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "delete_kb_doc",
         "description": (
-            "Permanently delete a knowledge-base document by its numeric id (as listed "
-            "by list_kb). Returns whether a row was removed; an unknown id is an error. "
-            "Admin only."
+            "Permanently delete a knowledge-base document. Returns whether a row was "
+            "removed; an unknown id is an error. Accepts the numeric id from list_kb OR "
+            "the artifact-slug id record_fact returns; deleting an artifact-backed note "
+            "revokes its backing artifact so the deletion sticks (a bare row delete would "
+            "be resurrected by the next reindex). Admin only."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "doc_id": {"type": "integer", "description": "Numeric KB document id"},
+                "doc_id": {
+                    "type": ["integer", "string"],
+                    "description": (
+                        "Numeric KB row id, or the artifact-slug id record_fact returned "
+                        "(optionally prefixed `artifact:`)"
+                    ),
+                },
             },
             "required": ["doc_id"],
         },
@@ -250,14 +277,55 @@ async def handle_list_kb(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
+async def _resolve_doc_row(repo: Repository, raw: Any) -> dict[str, Any]:
+    """Resolve a `doc_id` argument to its doc_metadata row.
+
+    The KB has two id spaces. `list_kb`/`search_kb` expose the integer row id;
+    `record_fact` returns the artifact slug it wrote (indexed as source
+    `artifact:<slug>`). Before #592 the read/update/delete handlers ran a bare
+    `int(doc_id)` on whatever they were given, so feeding back the id record_fact
+    just returned crashed with a raw `invalid literal for int()`.
+
+    Accepts:
+      * an integer, or a plain-digit string -> the numeric row id;
+      * `artifact:<slug>` (or any `<prefix>:<rest>` source) -> looked up by source;
+      * a bare `<slug>` -> looked up as source `artifact:<slug>`.
+
+    Raises a clean ValueError (never a leaked int() error) on bad input or an
+    unknown id; the MCP dispatch turns ValueError into a tool-error result.
+    """
+    if raw is None:
+        raise ValueError("doc_id is required")
+    # bool is an int subclass - reject it before the int branch swallows it.
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid doc_id: {raw!r}")
+    if isinstance(raw, int):
+        row = await repo.get_doc_metadata(raw)
+        if row is None:
+            raise ValueError(f"KB entry not found: {raw}")
+        return row
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            raise ValueError("doc_id is required")
+        if s.isdigit():
+            row = await repo.get_doc_metadata(int(s))
+            if row is None:
+                raise ValueError(f"KB entry not found: {s}")
+            return row
+        source = s if ":" in s else f"artifact:{s}"
+        row = await repo.get_doc_by_source(source)
+        if row is None:
+            raise ValueError(f"KB entry not found: {raw}")
+        return row
+    raise ValueError(f"invalid doc_id: {raw!r}")
+
+
 async def handle_get_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     repo = ctx.get("repo")
     if repo is None:
         raise RuntimeError("Repository not configured")
-    doc_id = int(arguments["doc_id"])
-    row = await repo.get_doc_metadata(doc_id)
-    if row is None:
-        raise ValueError(f"KB entry not found: {doc_id}")
+    row = await _resolve_doc_row(repo, arguments.get("doc_id"))
     return dict(row)
 
 
@@ -328,10 +396,8 @@ async def handle_update_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -
     repo = ctx.get("repo")
     if repo is None:
         raise RuntimeError("Repository not configured")
-    doc_id = int(arguments["doc_id"])
-    existing = await repo.get_doc_metadata(doc_id)
-    if existing is None:
-        raise ValueError(f"KB entry not found: {doc_id}")
+    existing = await _resolve_doc_row(repo, arguments.get("doc_id"))
+    doc_id = int(existing["id"])
     updates = {
         k: arguments[k]
         for k in ("title", "content", "kind", "target")
@@ -339,6 +405,20 @@ async def handle_update_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -
     }
     if not updates:
         return dict(existing)
+    # An artifact-backed note's doc_metadata row is a MIRROR the reindex rebuilds
+    # from the artifact body: an in-place edit here would be silently overwritten
+    # the next time the KB reindexes. Artifacts are immutable by design, so refuse
+    # the edit and point the caller at the real path - supersede via record_fact
+    # (#592). Integer/ingested/observed rows are the real record and edit freely.
+    source = str(existing.get("source") or "")
+    if source.startswith("artifact:"):
+        slug = source[len("artifact:") :]
+        raise ValueError(
+            f"KB entry {doc_id} is backed by artifact '{slug}' and cannot be edited in "
+            "place: artifact-backed notes are immutable and a reindex would overwrite "
+            f"the change. Record a superseding fact instead (record_fact with "
+            f"supersedes='{slug}')."
+        )
     result: dict[str, Any] | None = await repo.update_doc_metadata(doc_id, **updates)
     if result is None:
         raise ValueError(f"KB entry not found: {doc_id}")
@@ -354,7 +434,24 @@ async def handle_delete_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -
     repo = ctx.get("repo")
     if repo is None:
         raise RuntimeError("Repository not configured")
-    doc_id = int(arguments["doc_id"])
+    row = await _resolve_doc_row(repo, arguments.get("doc_id"))
+    doc_id = int(row["id"])
+    source = str(row.get("source") or "")
+    if source.startswith("artifact:"):
+        # Deleting only the doc_metadata mirror desyncs: the backing artifact is
+        # still `applied`, so the next reindex_if_needed re-creates the row. Revoke
+        # the artifact (the source of truth) so the deletion sticks, then drop the
+        # mirror row now for immediate consistency - revoke's own background
+        # reindex would also drop it, but callers expect it gone on return (#592).
+        lifecycle = ctx.get("lifecycle")
+        if lifecycle is None:
+            raise RuntimeError("Lifecycle not configured")
+        artifact_id = source[len("artifact:") :]
+        await lifecycle.revoke(
+            artifact_id, user=_mcp_caller_id(), reason="deleted via delete_kb_doc"
+        )
+        await repo.delete_doc_metadata(doc_id)
+        return {"id": doc_id, "deleted": True}
     deleted = await repo.delete_doc_metadata(doc_id)
     if not deleted:
         raise ValueError(f"KB entry not found: {doc_id}")

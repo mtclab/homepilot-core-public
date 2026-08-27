@@ -100,6 +100,7 @@ vi.mock('$lib/api', async () => {
 			createAlertRule: vi.fn(),
 			deleteAlertRule: vi.fn(),
 			setAlertRuleEnabled: vi.fn(),
+			updateAlertRule: vi.fn(),
 			getHostSeries: vi.fn().mockResolvedValue({ hostname: '', metric: '', points: [] }),
 			getHubToken: vi.fn(),
 			getBootstrapToken: vi.fn(),

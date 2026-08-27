@@ -236,6 +236,9 @@ class TestTheJourney:
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
             "create_vnet_firewall_rule",
+            # LAST in the SAME approved apply: enable the datacenter firewall
+            # safely (policy_in=ACCEPT) so the fence actually enforces (#600).
+            "ensure_datacenter_firewall_enabled",
         ]
         params = dict(cluster.calls)
         assert params["create_subnet"]["gateway"] == "198.51.100.1"
@@ -340,4 +343,7 @@ def _promote_fake_cluster(cluster: FakeCluster) -> None:
     cluster.subnets = done.subnets
     cluster.fw_options = done.fw_options
     cluster.fw_rules = done.fw_rules
+    # The master switch too: the apply enabled it safely, so a converged cluster
+    # reports it on and safe and plans no ensure-datacenter-firewall step (#600).
+    cluster.dc_fw_options = dict(done.dc_fw_options)
     cluster.calls.clear()

@@ -100,27 +100,38 @@ async def create_rule(request: Request, body: AlertRuleIn) -> dict[str, Any]:
 
 
 class AlertRuleUpdate(BaseModel):
-    """Silencing a rule without losing it. Deleting is the only alternative, and
-    an operator who has to delete a rule to quiet it for an afternoon simply
-    stops writing rules."""
+    """Retune a rule in place. Every field is optional and only the ones present
+    in the request body change - so a PATCH with just `enabled` silences a rule
+    (deleting is not the only way to quiet it for an afternoon), and a PATCH with
+    `threshold` retunes it without a delete-and-recreate that would drop its
+    firing state."""
 
-    enabled: bool
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    metric: str | None = Field(default=None, min_length=1, max_length=64)
+    comparison: str | None = None
+    threshold: float | None = None
+    # 0 means "fire on the first breaching sample"; above it, the condition must
+    # hold for that whole span.
+    for_seconds: int | None = Field(default=None, ge=0, le=86400)
+    host_filter: str | None = Field(default=None, max_length=253)
+    enabled: bool | None = None
 
 
 @router.patch("/rules/{rule_id}", dependencies=[_admin])
 async def update_rule(request: Request, rule_id: str, body: AlertRuleUpdate) -> dict[str, Any]:
     repo = _repo(request)
-    if not await repo.set_rule_enabled(rule_id, body.enabled):
-        raise HTTPException(status_code=404, detail=f"Alert rule not found: {rule_id}")
-    rule = await repo.get_rule(rule_id)
-    if rule is None:
-        # See #481: an assert here vanishes under `python -O`, turning a clear
-        # failure into a None returned from a dict-typed endpoint. The update
-        # above already confirmed the rule exists, so reaching this is a real
-        # fault and should say so.
+    # Only the fields the client actually sent - a missing field is "leave it",
+    # not "set it to null". exclude_unset keeps a default of None from being
+    # written over a real stored value.
+    fields = body.model_dump(exclude_unset=True)
+    if "comparison" in fields and fields["comparison"] not in VALID_COMPARISONS:
         raise HTTPException(
-            status_code=404, detail=f"Alert rule vanished while updating it: {rule_id}"
+            status_code=422,
+            detail=f"comparison must be one of {', '.join(VALID_COMPARISONS)}",
         )
+    rule = await repo.update_rule(rule_id, **fields)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"Alert rule not found: {rule_id}")
     return rule
 
 

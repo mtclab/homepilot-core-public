@@ -200,6 +200,25 @@ rebuild the guest subnet lives in the artifact store. See
 [docs/guest-portal.md](guest-portal.md) for the design and for why the per-VM
 firewall rules are the fence that actually holds on the legacy firewall stack.
 
+**The fence only enforces when the PVE datacenter firewall is on** - that is a
+Proxmox fact: the per-VM tap rules are stored but inert until the master switch
+is enabled. So applying a `guest-network` artifact that fences something
+(`HP_GUEST_NETWORK_ISOLATE_CIDRS` set) enables the datacenter firewall as part
+of the SAME approved apply, and only ever the safe way: `enable=1` together with
+`policy_in=ACCEPT` in one options write, so the host INPUT chain stays open. The
+`enforcement` field in the guest-network report says which state you are in -
+*enforced*, or *configured but not enforced because the switch is off*.
+
+> **Never enable a PVE firewall with a DROP input policy and no management-allow
+> rule.** Live incident, 2026-08-27 (dev pve1): a bare datacenter-firewall enable
+> compiled a default INPUT-DROP that severed SSH (22) and the API (8006) to the
+> node until IPMI console recovery (`pve-firewall stop && pvesh set
+> /cluster/firewall/options --enable 0`). PVE does not auto-allow SSH; a bare
+> enable is a self-lockout. HomePilot never issues one: it enables only at
+> `policy_in=ACCEPT`, refuses any enable that is not lockout-safe, and offers no
+> raw firewall-enable endpoint at all - the capability is reached only through
+> the approved guest-network artifact (#600).
+
 Each one is **checked against the live cluster before it is stored**. A value
 the cluster refutes comes back `422` with the cluster's own answer - *"no bridge
 vmbr7 on node pve1; node has: vmbr0, vmbr1"* - and nothing is saved. A cluster
@@ -857,7 +876,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.5` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.6` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |

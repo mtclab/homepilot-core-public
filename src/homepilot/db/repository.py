@@ -1458,6 +1458,19 @@ class Repository:
         row = await self.db.fetchone("SELECT * FROM doc_metadata WHERE id = ?", (doc_id,))
         return dict(row) if row is not None else None
 
+    async def get_doc_by_source(self, source: str) -> dict[str, Any] | None:
+        """One KB document by its `source` string (e.g. `artifact:<slug>`).
+
+        `create_doc_metadata` inserts with `INSERT OR IGNORE`, so a source is
+        effectively unique; the ORDER BY/LIMIT is belt-and-braces. Used to
+        resolve the artifact-slug id `record_fact` returns back to its indexed
+        row (#592).
+        """
+        row = await self.db.fetchone(
+            "SELECT * FROM doc_metadata WHERE source = ? ORDER BY id LIMIT 1", (source,)
+        )
+        return dict(row) if row is not None else None
+
     async def update_doc_metadata(self, doc_id: int, **fields: Any) -> dict[str, Any] | None:
         sets: list[str] = []
         vals: list[Any] = []

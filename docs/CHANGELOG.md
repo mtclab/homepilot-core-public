@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.6.6 (2026-08-27)
+
+The guest-network hardening round, all found by walking the real dev cluster.
+
+### The fence lands ACCEPT-first, and applying it enforces itself safely (#599 #600)
+
+Per-VM fence rules were compiled REVERSED (gateway DROP above the DNS/DHCP
+ACCEPTs it shadows), so a fenced guest lost DNS and DHCP - kernel-confirmed.
+They now land ACCEPT-first in the compiled chain (the test fakes model PVE's
+rule-prepend, so the gate asserts the real order). Applying a guest-network
+artifact now also enables the PVE datacenter firewall the safe way -
+enable=1 with policy_in=ACCEPT, so the per-VM fence actually enforces while
+the host INPUT chain stays open and management can never be locked out - and
+the report states whether the fence is ENFORCED or merely CONFIGURED.
+
+### Provision cleans up after itself, and the KB/monitoring rough edges (#595 #592 #593 #596)
+
+A provision that fails after the clone now destroys the half-made guest
+instead of orphaning it. record_fact's returned id works with
+get/update/delete_kb_doc. Alert rules are really updatable (threshold/
+comparison/duration), not just enable-toggled. Guest-network status reports
+vnet-bridge realization honestly (confirmed at provision) rather than a bare
+"in spec" the API cannot actually prove.
+
+
 ## v3.6.5 (2026-08-27)
 
 ### A vnet is a valid guest bridge

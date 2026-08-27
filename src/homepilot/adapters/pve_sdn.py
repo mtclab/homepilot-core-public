@@ -36,10 +36,88 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# ── The datacenter firewall master switch (#600) ─────────────────────────────
+# Enabling the PVE datacenter firewall is what makes the per-VM guest fence
+# actually enforce - the tap-level rules HomePilot writes at provision time are
+# stored but inert until the cluster firewall is on. It is ALSO the one way a
+# node locks itself out: PVE compiles a default INPUT policy of DROP the moment
+# the firewall is enabled, and it does NOT auto-allow SSH (22) or the API
+# (8006), so a bare `enable=1` severed management to dev pve1 until console
+# recovery (#600, live 2026-08-27). The safe primitive, verified on that same
+# node: enable WITH `policy_in=ACCEPT`. The host INPUT chain stays open, the
+# per-VM tap fences do the guest isolation, and nothing locks out. This module
+# NEVER writes `policy_in=DROP` - the guard below refuses it.
+
+
+class PveFirewallLockoutError(RuntimeError):
+    """A cluster firewall change that would sever the management plane.
+
+    Raised rather than sent to the wire: an enabled datacenter firewall with an
+    input policy of DROP has no management-allow rule PVE adds for you, so it
+    locks out SSH and the API. HomePilot refuses to be the thing that does that.
+    """
+
+
+def _fw_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _policy_in(options: Mapping[str, Any]) -> str:
+    """The input policy, upper-cased, defaulting to DROP when unset.
+
+    The default is the load-bearing part: PVE treats an ENABLED firewall with no
+    explicit `policy_in` as DROP, so "absent" is the lockout case, not a safe
+    blank. Reading it as DROP here is what makes the guard refuse a bare enable.
+    """
+    return str(options.get("policy_in", "") or "").strip().upper() or "DROP"
+
+
+def datacenter_firewall_lockout_safe(options: Mapping[str, Any]) -> bool:
+    """Would these cluster firewall options keep the management plane reachable?
+
+    The one rule: an ENABLED datacenter firewall must not carry an input policy
+    of DROP. At `policy_in=ACCEPT` PVE leaves the host INPUT chain open, so the
+    per-VM guest fences enforce without the node fencing itself off SSH and the
+    API. A disabled firewall cannot lock anyone out, so it is trivially safe.
+    """
+    if not _fw_flag(options.get("enable", 0)):
+        return True
+    return _policy_in(options) != "DROP"
+
+
+def safe_datacenter_firewall_enable(options: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The options write that safely enables the firewall, or None if none is needed.
+
+    ``None`` means already converged - the firewall is on AND its input policy
+    is already ACCEPT, so there is nothing to write and the caller must not
+    touch it. Otherwise this returns exactly ``{enable: 1, policy_in: ACCEPT}``,
+    the smallest write that turns the master switch on without ever producing a
+    DROP input policy (``policy_out`` is left untouched: the guest fence is
+    per-VM OUT rules, not the host output policy). The returned write is passed
+    back through :func:`datacenter_firewall_lockout_safe` before it is handed
+    out, so a lockout-shaped write can never leave this function.
+    """
+    already_enabled = _fw_flag(options.get("enable", 0))
+    if already_enabled and _policy_in(options) == "ACCEPT":
+        return None
+    write = {"enable": 1, "policy_in": "ACCEPT"}
+    if not datacenter_firewall_lockout_safe(write):  # pragma: no cover - safe by construction
+        raise PveFirewallLockoutError(
+            "refusing to compute a datacenter firewall enable that is not lockout-safe"
+        )
+    return write
+
 
 # Reads whose proxmox_mcp function exists but returns a formatted string that
 # has dropped the fields a plan needs. Each wants a structured core upstream
@@ -213,6 +291,12 @@ class PveSdnGateway:
     async def node_firewall_options(self, node: str) -> dict[str, Any]:
         return _obj(await self._client.safe_api_call(self._api().nodes(node).firewall.options.get))
 
+    async def cluster_firewall_options(self) -> dict[str, Any]:
+        # The datacenter firewall master switch (#600). Whether it is on, and
+        # whether its input policy is lockout-safe, is what decides if the guest
+        # fence actually ENFORCES - so a survey reads it, never guesses it.
+        return _obj(await self._client.safe_api_call(self._api().cluster.firewall.options.get))
+
     # ── Mutations ────────────────────────────────────────────────────────────
     # Through proxmox_mcp's own functions wherever it has one. `confirm=True` is
     # the library's guard against an accidental call, not a question to a human:
@@ -299,6 +383,43 @@ class PveSdnGateway:
 
         return str(await sdn.apply_sdn(self._client, confirm=True))
 
+    async def ensure_datacenter_firewall_enabled(self, **_params: Any) -> str:
+        """Turn the datacenter firewall on SAFELY, or say it was already on (#600).
+
+        Reads the current cluster options first, then writes at most once:
+
+        * already on with ``policy_in=ACCEPT`` -> no write, idempotent no-op;
+        * anything else -> ONE options PUT of ``{enable: 1, policy_in: ACCEPT}``,
+          so the master switch and the safe input policy land in the SAME write
+          and there is never a window where the firewall is on with a DROP INPUT.
+
+        It never sets ``policy_in=DROP``; the write is run back through the guard
+        before it is sent, and a would-be lockout raises
+        :class:`PveFirewallLockoutError` rather than reaching the cluster.
+        """
+        current = await self.cluster_firewall_options()
+        write = safe_datacenter_firewall_enable(current)
+        if write is None:
+            return (
+                "datacenter firewall already enabled with policy_in=ACCEPT "
+                "(host INPUT stays open; the per-VM guest fences enforce) - nothing to do"
+            )
+        if not datacenter_firewall_lockout_safe(write):  # pragma: no cover - guarded above
+            raise PveFirewallLockoutError(
+                "refusing to enable the datacenter firewall: the computed write would lock out "
+                "management"
+            )
+        elevated = self._client.get_client(elevated=True)
+        await self._client.safe_api_call(
+            elevated.cluster.firewall.options.put,
+            elevated=True,
+            **write,
+        )
+        return (
+            "datacenter firewall enabled with policy_in=ACCEPT (host INPUT stays open, so no "
+            "lockout; the per-VM guest fences now enforce)"
+        )
+
     # ── The per-VM fence ─────────────────────────────────────────────────────
 
     async def set_vm_firewall_options(self, node: str, vmid: int, **options: Any) -> str:
@@ -329,7 +450,10 @@ __all__ = [
     "UPSTREAM_COVERAGE_GAPS",
     "UPSTREAM_STRUCTURED_GAPS",
     "PveCredentials",
+    "PveFirewallLockoutError",
     "PveSdnGateway",
+    "datacenter_firewall_lockout_safe",
     "gateway_from",
     "multi_client_from",
+    "safe_datacenter_firewall_enable",
 ]

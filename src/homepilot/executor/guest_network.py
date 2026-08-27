@@ -24,6 +24,7 @@ from typing import Any
 
 from homepilot.artifacts.models import parse_guest_network_spec
 from homepilot.provision.guest_network import (
+    REALIZATION_CAVEAT,
     DesiredGuestNetwork,
     desired_from_settings,
     enforcement_note,
@@ -82,6 +83,7 @@ async def execute(
     header = [
         f"desired: {desired.to_dict()}",
         enforcement_note(current),
+        REALIZATION_CAVEAT,
     ]
     if current.errors:
         header.append("survey could not read: " + "; ".join(current.errors))

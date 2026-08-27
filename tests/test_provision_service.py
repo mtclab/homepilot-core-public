@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -258,7 +259,7 @@ class TestEveryFailingStepIsTerminal:
         # NOT stranded in running/pending — a terminal state, every time.
         assert task["status"] == "failed"
         assert task["finished_at"] is not None
-        assert task["error"].startswith(f"{step}:")
+        assert task["error"].startswith(f"failed at {step}:")
         assert "pve exploded" in task["error"]
 
     async def test_clone_task_that_fails_in_pve_fails_the_provision(
@@ -271,7 +272,7 @@ class TestEveryFailingStepIsTerminal:
         task = await _run_to_completion(service, _request())
 
         assert task["status"] == "failed"
-        assert task["error"].startswith("clone:")
+        assert task["error"].startswith("failed at clone:")
         assert "no space left" in task["error"]
 
     async def test_host_row_failure_still_terminates_the_task(
@@ -285,7 +286,7 @@ class TestEveryFailingStepIsTerminal:
         task = await _run_to_completion(service, _request())
 
         assert task["status"] == "failed"
-        assert task["error"].startswith("record_host:")
+        assert task["error"].startswith("failed at record_host:")
 
     async def test_no_proxmox_fails_the_task(self, service: ProvisionService):
         service.proxmox = None
@@ -301,6 +302,78 @@ class TestEveryFailingStepIsTerminal:
         proxmox.clone_vm.side_effect = ProxmoxError("POST", "/x", 500, "nope")
         await _run_to_completion(service, _request())
         assert not service.is_inflight("web-01")
+
+
+class TestPostCloneFailureIsUnwound:
+    """A provision that clones then fails must not orphan the guest (#595).
+
+    Reproduced live: a provision failed at start_vm and left a stopped VM 101 on
+    the node. clone_vm makes a guest; a failure at any later step strands it and
+    nothing else removes it. The recorded error must name the cleanup outcome so
+    an operator knows whether a guest is still on the node.
+    """
+
+    async def test_a_failure_after_clone_destroys_the_guest(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.start_vm.side_effect = ProxmoxError("POST", "/x", 500, "boom at boot")
+
+        task = await _run_to_completion(service, _request())
+
+        assert task["status"] == "failed"
+        # The guest clone_vm made is taken back, not left behind.
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        assert task["error"].startswith("failed at start_vm:")
+        assert "boom at boot" in task["error"]
+        # The error names the cleanup OUTCOME, not just the original failure.
+        assert "destroyed guest vmid 105" in task["error"]
+
+    async def test_a_running_guest_is_stopped_before_it_is_destroyed(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        # start_vm succeeded and the guest is up; the NEXT step fails.
+        proxmox.get_vm_current = AsyncMock(return_value={"data": {"status": "running"}})
+        proxmox.stop_vm = AsyncMock(return_value="UPID:pve1:stop:")
+
+        # Make the failure land at record_host (after start), guest running.
+        async def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("db is gone")
+
+        service.repo.create_host = boom  # type: ignore[method-assign]
+
+        task = await _run_to_completion(service, _request())
+
+        assert task["status"] == "failed"
+        proxmox.stop_vm.assert_awaited_once_with("pve1", 105)
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        assert "destroyed guest vmid 105" in task["error"]
+
+    async def test_a_failure_before_clone_destroys_nothing(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        # next_vmid is the one step before the clone is issued: a failure here has
+        # nothing on the node to unwind, and delete_vm must NOT be called.
+        proxmox.next_vmid = AsyncMock(side_effect=ProxmoxError("GET", "/x", 500, "no id"))
+
+        task = await _run_to_completion(service, _request())
+
+        assert task["status"] == "failed"
+        assert task["error"].startswith("failed at next_vmid:")
+        proxmox.delete_vm.assert_not_awaited()
+
+    async def test_a_cleanup_that_fails_says_the_guest_may_remain(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.start_vm.side_effect = ProxmoxError("POST", "/x", 500, "boom at boot")
+        proxmox.delete_vm = AsyncMock(side_effect=ProxmoxError("DELETE", "/x", 500, "busy"))
+
+        task = await _run_to_completion(service, _request())
+
+        assert task["status"] == "failed"
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        assert "cleanup FAILED" in task["error"]
+        assert "105" in task["error"] and "pve1" in task["error"]
+        assert "may remain" in task["error"]
 
 
 class TestInflightNames:
