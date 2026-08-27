@@ -306,10 +306,10 @@ class MetricsRepository:
         values.append(_now())
         values.append(rule_id)
 
-        cursor = await self.db.execute(
-            f"UPDATE alert_rules SET {', '.join(assignments)} WHERE id = ?",
-            tuple(values),
-        )
+        # columns are the fixed _UPDATABLE_COLUMNS allowlist, never caller input;
+        # every value is a bound ? parameter - no injection vector.
+        query = f"UPDATE alert_rules SET {', '.join(assignments)} WHERE id = ?"  # nosec B608
+        cursor = await self.db.execute(query, tuple(values))
         await self.db.conn.commit()
         if (cursor.rowcount or 0) == 0:
             return None
