@@ -4,7 +4,7 @@ The design's words: "an invite stops carrying raw infra details". The operator
 states the cluster's shape once - node, template, pool, bridge, VLAN, ipconfig -
 and the paths that build a guest fill the gaps from it:
 
-* invite mint takes node and template_vmid (and pool/ipconfig0) from here when
+* invite mint takes node and template_vmid (and pool/storage/ipconfig0) from here when
   the request does not name them, and refuses with the missing SETTING's name
   when neither side supplies one;
 * the provision API and the MCP tool fill the same gaps for a direct request;
@@ -31,6 +31,7 @@ KEYS = (
     "provision_default_node",
     "provision_default_template_vmid",
     "provision_default_pool",
+    "provision_default_storage",
     "provision_default_bridge",
     "provision_default_vlan_tag",
     "provision_default_ipconfig",
@@ -48,6 +49,7 @@ class ProvisioningDefaults:
     node: str = ""
     template_vmid: int = 0
     pool: str = ""
+    storage: str = ""
     bridge: str = ""
     vlan_tag: int = 0
     ipconfig: str = ""
@@ -101,6 +103,7 @@ async def provisioning_defaults(source: Any = None) -> ProvisioningDefaults:
         node=str(values["provision_default_node"] or ""),
         template_vmid=int(values["provision_default_template_vmid"] or 0),
         pool=str(values["provision_default_pool"] or ""),
+        storage=str(values["provision_default_storage"] or ""),
         bridge=str(values["provision_default_bridge"] or ""),
         vlan_tag=int(values["provision_default_vlan_tag"] or 0),
         ipconfig=str(values["provision_default_ipconfig"] or ""),
@@ -142,6 +145,19 @@ def resolve_pool(given: str | None, defaults: ProvisioningDefaults) -> str | Non
     return pool or None
 
 
+def resolve_storage(given: str | None, defaults: ProvisioningDefaults) -> str | None:
+    """The storage a clone's disks should land on, or None to inherit (#618).
+
+    None is the pre-#618 behaviour and stays the default: with no storage named
+    anywhere, the clone call carries no `storage` key at all and PVE puts the
+    disks wherever the template's are. Same shape as resolve_pool on purpose -
+    an empty answer is a real answer here, not a missing one, so there is no
+    MissingProvisioningDefaultError to raise.
+    """
+    storage = (given or "").strip() or defaults.storage
+    return storage or None
+
+
 def resolve_ipconfig(given: str | None, defaults: ProvisioningDefaults) -> str:
     # "ip=dhcp" is ProvisionRequest's own field default, so a caller who sent
     # nothing and a caller who sent the default are indistinguishable here. They
@@ -161,5 +177,6 @@ __all__ = [
     "resolve_ipconfig",
     "resolve_node",
     "resolve_pool",
+    "resolve_storage",
     "resolve_template_vmid",
 ]

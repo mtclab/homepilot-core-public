@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     provision_default_node: str = ""
     provision_default_template_vmid: int = 0
     provision_default_pool: str = ""
+    # Target storage for the clone's disks. Empty means "inherit the template's
+    # storage", which is what PVE does when the clone call carries no storage -
+    # and is the behaviour every install had before this setting existed.
+    provision_default_storage: str = ""
     # Only when a bridge is set does provisioning touch net0 at all; unset
     # leaves the template's own NIC exactly as it was cloned.
     provision_default_bridge: str = ""

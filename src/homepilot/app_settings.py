@@ -138,6 +138,26 @@ def _parse_ipconfig(raw: Any) -> str:
     return value
 
 
+# A PVE storage id, as PVE itself accepts it (#618). The same shape
+# provision.models.STORAGE_RE enforces on the per-request field - spelled here
+# too rather than imported, because provision.models reaches back into this
+# registry through provision.defaults and an import in this direction would be
+# a cycle. tests/test_provisioning_defaults.py pins the two to each other.
+_STORAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,62}$")
+
+
+def _parse_storage(raw: Any) -> str:
+    value = _parse_str(raw)
+    if value == "":
+        return ""
+    if not _STORAGE_RE.match(value):
+        raise SettingError(
+            f"{value!r} is not a PVE storage id: a letter followed by up to 62 "
+            "letters, digits, dots, dashes or underscores"
+        )
+    return value
+
+
 def _zero_or_one(raw: Any) -> int:
     """A switch stored as a number (#553 guest network).
 
@@ -316,6 +336,19 @@ REGISTRY: dict[str, SettingSpec] = {
             hot_reloadable=True,
             parse=_parse_str,
             probe=_cluster_probe("provision_default_pool"),
+        ),
+        SettingSpec(
+            key="provision_default_storage",
+            type_="str",
+            description=(
+                "PVE storage the clone's disks land on. Empty inherits the template's "
+                "own storage, which is what every install did before this setting "
+                "existed. Only ever applied to a FULL clone - a linked clone cannot "
+                "leave its template's storage at all."
+            ),
+            hot_reloadable=True,
+            parse=_parse_storage,
+            probe=_cluster_probe("provision_default_storage"),
         ),
         SettingSpec(
             key="provision_default_bridge",

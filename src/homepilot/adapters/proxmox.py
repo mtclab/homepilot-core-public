@@ -11,14 +11,28 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# The two collections PVE files guests under. A VMID alone does not say which
+# one a guest lives in, so every by-vmid path has to resolve the type first.
+GUEST_TYPES = ("qemu", "lxc")
+
+# Artifact target kinds that name a guest, mapped onto the PVE collection. PVE
+# spellings map to themselves so a caller may pass either vocabulary.
+TARGET_KIND_GUEST_TYPES = {"vm": "qemu", "qemu": "qemu", "lxc": "lxc"}
+
 
 class ProxmoxError(Exception):
-    def __init__(self, method: str, path: str, status_code: int, body: str):
+    def __init__(
+        self, method: str, path: str, status_code: int, body: str, hint: str | None = None
+    ):
         self.method = method
         self.path = path
         self.status_code = status_code
         self.body = body
-        super().__init__(f"{method} {path} -> {status_code}: {body[:200]}")
+        self.hint = hint
+        message = f"{method} {path} -> {status_code}: {body[:200]}"
+        if hint:
+            message = f"{message} ({hint})"
+        super().__init__(message)
 
 
 class ProxmoxClient:
@@ -116,31 +130,94 @@ class ProxmoxClient:
     async def read(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self.call("GET", path, query=query)
 
-    async def snapshot(self, node: str, vmid: int, name: str) -> dict[str, Any]:
-        try:
-            return await self.call(
-                "POST",
-                f"/nodes/{node}/qemu/{vmid}/snapshot",
-                body={"snapname": name},
-            )
-        except ProxmoxError:
-            return await self.call(
-                "POST",
-                f"/nodes/{node}/lxc/{vmid}/snapshot",
-                body={"snapname": name},
-            )
+    async def resolve_guest_type(self, vmid: int) -> str:
+        """Which collection a VMID lives in on THIS cluster - "qemu" or "lxc".
 
-    async def delete_snapshot(self, node: str, vmid: int, name: str) -> dict[str, Any]:
+        A VMID says nothing about its guest type, so anything addressing a guest
+        by id has to ask. `/cluster/resources?type=vm` carries the type of every
+        guest and template in the cluster, which settles it in one read.
+        """
+        result = await self.read("/cluster/resources", query={"type": "vm"})
+        rows = result.get("data", result)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    row_vmid = int(row["vmid"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if row_vmid != vmid:
+                    continue
+                guest_type = str(row.get("type", ""))
+                if guest_type in GUEST_TYPES:
+                    return guest_type
+        raise ProxmoxError(
+            "GET",
+            "/cluster/resources",
+            404,
+            f"no guest with vmid {vmid} on this cluster, so its type "
+            "(qemu or lxc) cannot be resolved",
+        )
+
+    async def _guest_type_for(self, vmid: int, guest_type: str | None) -> str:
+        """The caller's stated guest type, else the cluster's answer.
+
+        Accepts the artifact target vocabulary ("vm"/"lxc") as well as the PVE
+        one ("qemu"/"lxc"); anything else is ignored in favour of asking PVE.
+        """
+        resolved = TARGET_KIND_GUEST_TYPES.get((guest_type or "").lower())
+        if resolved is not None:
+            return resolved
+        return await self.resolve_guest_type(vmid)
+
+    @staticmethod
+    def _snapshot_error(exc: ProxmoxError, guest_type: str) -> ProxmoxError:
+        """The same failure, said out loud.
+
+        A snapshot failure used to surface as a bare status against whichever
+        collection was tried last, which named neither the collection nor the
+        credential as the possible cause (#617). Say both.
+        """
+        hint = f"guest resolved as {guest_type}"
+        if exc.status_code in (401, 403):
+            hint += (
+                "; PVE rejected the credential, so the write token may lack "
+                "snapshot rights on this guest (VM.Snapshot / VM.Audit) or may "
+                "not be valid for this cluster"
+            )
+        return ProxmoxError(
+            method=exc.method,
+            path=exc.path,
+            status_code=exc.status_code,
+            body=exc.body,
+            hint=hint,
+        )
+
+    async def snapshot(
+        self, node: str, vmid: int, name: str, guest_type: str | None = None
+    ) -> dict[str, Any]:
+        resolved = await self._guest_type_for(vmid, guest_type)
+        try:
+            return await self.call(
+                "POST",
+                f"/nodes/{node}/{resolved}/{vmid}/snapshot",
+                body={"snapname": name},
+            )
+        except ProxmoxError as exc:
+            raise self._snapshot_error(exc, resolved) from exc
+
+    async def delete_snapshot(
+        self, node: str, vmid: int, name: str, guest_type: str | None = None
+    ) -> dict[str, Any]:
+        resolved = await self._guest_type_for(vmid, guest_type)
         try:
             return await self.call(
                 "DELETE",
-                f"/nodes/{node}/qemu/{vmid}/snapshot/{name}",
+                f"/nodes/{node}/{resolved}/{vmid}/snapshot/{name}",
             )
-        except ProxmoxError:
-            return await self.call(
-                "DELETE",
-                f"/nodes/{node}/lxc/{vmid}/snapshot/{name}",
-            )
+        except ProxmoxError as exc:
+            raise self._snapshot_error(exc, resolved) from exc
 
     async def clone_vm(
         self,
@@ -150,8 +227,19 @@ class ProxmoxClient:
         name: str,
         full: bool = True,
         pool: str | None = None,
+        storage: str | None = None,
     ) -> str:
-        """Clone a template into a new VM. Returns the UPID of the clone task."""
+        """Clone a template into a new VM. Returns the UPID of the clone task.
+
+        ``storage`` targets the clone's disks at a storage other than the
+        template's (#618). It is sent ONLY when given: PVE's own behaviour for
+        an absent `storage` is "put the disks where the template's are", and
+        that inherit is what every install had before the option existed, so
+        nothing is guessed on the caller's behalf. PVE only honours it on a
+        FULL clone - a linked clone shares the template's disks and so cannot
+        leave its storage - which is why ``full`` defaults to True and this
+        product never sends a linked clone.
+        """
         body: dict[str, Any] = {
             "newid": new_vmid,
             "name": name,
@@ -159,6 +247,8 @@ class ProxmoxClient:
         }
         if pool:
             body["pool"] = pool
+        if storage:
+            body["storage"] = storage
         result = await self.call("POST", f"/nodes/{node}/qemu/{template_vmid}/clone", body=body)
         return str(result.get("data", ""))
 

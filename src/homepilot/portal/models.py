@@ -27,6 +27,11 @@ class InviteCaps(BaseModel):
     template_vmid: int = Field(gt=0)
     node: str = Field(min_length=1)
     pool: str | None = None
+    # Frozen at mint like node and template_vmid (#618): the storage an invite
+    # promises is part of the machine it is good for, so a default changed
+    # after the invite left the operator's hands must not re-target it. None
+    # means the clone inherits the template's storage.
+    storage: str | None = None
     cores: int | None = None
     memory_mb: int | None = None
     disk_gb: int | None = None
@@ -45,6 +50,7 @@ class InviteCaps(BaseModel):
             disk=self.disk,
             ipconfig0=self.ipconfig0,
             pool=self.pool,
+            storage=self.storage,
         )
         return self
 
@@ -86,11 +92,27 @@ class RedemptionIdentity(BaseModel):
         return validate_tailscale_auth_key(v)
 
 
+def _optional_column(row: Any, column: str) -> Any:
+    """A column that may not be there yet, as None rather than an exception.
+
+    Rows come back as sqlite3.Row, where `in` tests the VALUES, not the column
+    names - so the membership test has to go through `keys()` explicitly (and
+    through a list, because `x in row.keys()` is the very idiom the linter
+    rewrites into the wrong thing for a Row).
+    """
+    return row[column] if column in list(row.keys()) else None
+
+
 def caps_from_row(row: dict[str, Any]) -> InviteCaps:
     return InviteCaps(
         template_vmid=int(row["template_vmid"]),
         node=str(row["node"]),
         pool=row["pool"],
+        # Absent on rows minted before #618 added the column, and on any row
+        # written by a build that predates it - `.get`-shaped access rather
+        # than row["storage"] so an old invite still redeems, inheriting the
+        # template's storage exactly as it did when it was minted.
+        storage=_optional_column(row, "storage"),
         cores=row["cores"],
         memory_mb=row["memory_mb"],
         disk_gb=row["disk_gb"],
@@ -120,6 +142,7 @@ def build_provision_request(
         disk=caps.disk,
         ipconfig0=caps.ipconfig0,
         pool=caps.pool,
+        storage=caps.storage,
         ciuser=identity.ciuser,
         ssh_authorized_key=identity.ssh_authorized_key,
         tailscale_auth_key=identity.tailscale_auth_key,

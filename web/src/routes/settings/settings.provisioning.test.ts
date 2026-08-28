@@ -67,6 +67,7 @@ const OVERRIDES = [
 	setting('provision_default_node', { value: 'pve1', source: 'db' }),
 	setting('provision_default_template_vmid', { value: 9000, type: 'int', source: 'db' }),
 	setting('provision_default_pool', { value: 'guests', source: 'db' }),
+	setting('provision_default_storage', { value: '', source: 'default' }),
 	setting('provision_default_bridge', { value: 'vmbr0', source: 'db' }),
 	setting('provision_default_vlan_tag', { value: 0, type: 'int' }),
 	setting('provision_default_ipconfig', { value: 'ip=dhcp' }),
@@ -100,12 +101,13 @@ describe('Subsystems tab: provisioning defaults, checked against the cluster', (
 		const card = bridge.closest('.card');
 		expect(card).toBeTruthy();
 		expect(card!.textContent).toContain('Provisioning defaults');
-		// Every one of the six, on the one card - a default reachable only through
-		// an env var is the state C3 exists to end.
+		// Every one of the seven, on the one card - a default reachable only
+		// through an env var is the state C3 exists to end.
 		for (const key of [
 			'provision_default_node',
 			'provision_default_template_vmid',
 			'provision_default_pool',
+			'provision_default_storage',
 			'provision_default_bridge',
 			'provision_default_vlan_tag',
 			'provision_default_ipconfig',

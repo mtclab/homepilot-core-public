@@ -52,6 +52,7 @@ from homepilot.provision.probes import (
     probe_ipconfig,
     probe_node,
     probe_pool,
+    probe_storage,
     probe_template_vmid,
     probe_vlan_tag,
 )
@@ -85,6 +86,14 @@ RESOURCES = [
     {"type": "lxc", "vmid": 200, "name": "a-container", "node": "pve1"},
 ]
 POOLS = [{"poolid": "guests"}, {"poolid": "infra"}]
+# What `GET /nodes/pve1/storage` answers. `backups` is the trap #618's probe
+# exists to catch: PVE reports it happily, and a clone aimed at it dies inside
+# the clone task because it holds no `images` content.
+STORAGES = [
+    {"storage": "local", "content": "vztmpl,iso,images"},
+    {"storage": "local-zfs", "content": "images,rootdir"},
+    {"storage": "backups", "content": "backup,iso"},
+]
 NETWORK = [
     {"iface": "vmbr0", "type": "bridge", "bridge_vlan_aware": 1},
     {"iface": "vmbr1", "type": "bridge", "bridge_vlan_aware": 0},
@@ -110,6 +119,8 @@ class FakeCluster:
             return {"data": RESOURCES}
         if path == "/pools":
             return {"data": POOLS}
+        if path.endswith("/storage"):
+            return {"data": STORAGES}
         if path.endswith("/network"):
             return {"data": self.network}
         if path == "/cluster/sdn/vnets":
@@ -469,6 +480,8 @@ class JourneyPVE(FakePVE):
             return Response(200, json={"data": POOLS})
         if path == "/nodes/pve1/network":
             return Response(200, json={"data": NETWORK})
+        if path == "/nodes/pve1/storage":
+            return Response(200, json={"data": STORAGES})
         return super().handle(request)
 
 
@@ -660,6 +673,7 @@ class TestTheWholeJourney:
             "node": "pve2",
             "template_vmid": 9100,
             "pool": None,
+            "storage": None,
             "ipconfig0": "ip=dhcp",
         }
 
@@ -907,3 +921,241 @@ class TestTheBridgeProbeAcceptsSdnVnets:
         result = await probe_bridge("vmbr9", ProbeContext(proxmox=Px(), node="elizabeth"))
         assert result.ok is False
         assert "SDN vnets: innkeep" in result.detail
+
+
+# ── Target storage for the clone (#618) ──────────────────────────────────────
+#
+# THE DEFECT THIS FORBIDS: provisioning had no way to say WHERE a guest's disks
+# land, so every clone inherited the template's storage - the whole cluster's
+# guests piling onto whatever storage the template happened to sit on, with no
+# setting, no request field and no invite cap able to move them.
+#
+# Every assertion below is on the body PVE actually received, because "the
+# setting saved" says nothing about where a disk ended up. Two properties ride
+# along with the new option and are asserted everywhere it appears:
+#
+#   * `full=1` is in EVERY clone body, storage or no storage. A linked clone
+#     binds the guest to its template forever and cannot leave the template's
+#     storage at all, so a target storage would be silently meaningless - and
+#     the owner's standing rule is that this product never mints one.
+#   * NO `storage` key at all when nothing names one. Sending an empty string,
+#     or guessing at 'local', would move every existing install's disks.
+
+
+async def _mint_and_redeem(app: FastAPI, admin_defaults: dict[str, Any]) -> None:
+    """Drive the real operator+friend journey: set defaults, mint, redeem, wait.
+
+    Returned nothing on purpose - what happened is read off the fake PVE, which
+    is the only witness that cannot agree with a bug in the code under test.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as admin:
+        await TestTheWholeJourney()._set_defaults(admin, **admin_defaults)
+        minted = await admin.post(
+            "/admin/guests/invites",
+            json={"cn": CN_A, "cores": 2, "memory_mb": 2048, "disk_gb": 20},
+        )
+        assert minted.status_code == 201, minted.text
+        token = minted.json()["token"]
+
+    async with client_for(app) as guest:
+        posted = await guest.post(
+            f"/invite/{token}",
+            data={"ciuser": "olli", "ssh_authorized_key": PUBKEY, "hostname": "lab-box"},
+            headers=cert_headers(),
+        )
+        assert posted.status_code in (302, 303), posted.text
+        status = await poll_status(guest, token)
+        assert "Ready" in status.text, status.text
+
+
+class TestTheTargetStorageReachesTheCloneCall:
+    async def test_the_default_storage_is_what_pve_is_asked_to_clone_onto(self, journey_db):
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+
+        await _mint_and_redeem(
+            app,
+            {
+                "provision_default_node": "pve1",
+                "provision_default_template_vmid": 9000,
+                "provision_default_storage": "local-zfs",
+            },
+        )
+
+        clone = pve.bodies["/nodes/pve1/qemu/9000/clone"]
+        assert clone["storage"] == "local-zfs"
+        # The regression gate: a target storage is only honoured on a FULL
+        # clone, and a linked clone is never what this product hands a friend.
+        assert clone["full"] == 1
+
+    async def test_with_no_storage_anywhere_the_clone_body_carries_no_storage_key(self, journey_db):
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+
+        await _mint_and_redeem(
+            app,
+            {
+                "provision_default_node": "pve1",
+                "provision_default_template_vmid": 9000,
+            },
+        )
+
+        clone = pve.bodies["/nodes/pve1/qemu/9000/clone"]
+        # INHERIT, and inherit by saying nothing: an empty string or a guessed
+        # 'local' would move the disks of every install that upgrades into this.
+        assert "storage" not in clone
+        assert clone["full"] == 1
+
+    async def test_a_storage_named_in_the_request_beats_the_instance_default(self, journey_db):
+        from homepilot.mcp.tools.guest_tools import handle_provision_guest
+
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as admin:
+            await TestTheWholeJourney()._set_defaults(
+                admin,
+                provision_default_node="pve1",
+                provision_default_template_vmid=9000,
+                provision_default_storage="local-zfs",
+            )
+
+        service = app.state.provision_service
+        result = await handle_provision_guest(
+            {"name": "web-01", "ssh_authorized_key": PUBKEY, "storage": "local"},
+            {"provision_service": service, "repo": app.state.repo},
+        )
+        for task in list(service._running_tasks):
+            await task
+        row = await service.task_repo.get_task(result["task_id"])
+        assert row is not None and row["status"] == "succeeded", row["error"]
+
+        clone = pve.bodies["/nodes/pve1/qemu/9000/clone"]
+        assert clone["storage"] == "local"
+        assert clone["full"] == 1
+
+    async def test_an_invite_keeps_the_storage_it_was_minted_with(self, journey_db):
+        """The frozen-caps property, proven where it can actually hurt.
+
+        Not "the row still says local-zfs" but "the guest built after the
+        operator changed their mind still LANDS on local-zfs": the invite is a
+        promise about a machine, and the disks are part of that machine.
+        """
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as admin:
+            await TestTheWholeJourney()._set_defaults(
+                admin,
+                provision_default_node="pve1",
+                provision_default_template_vmid=9000,
+                provision_default_storage="local-zfs",
+            )
+            minted = await admin.post(
+                "/admin/guests/invites",
+                json={"cn": CN_A, "cores": 2, "memory_mb": 2048, "disk_gb": 20},
+            )
+            assert minted.status_code == 201, minted.text
+            assert minted.json()["caps"]["storage"] == "local-zfs"
+            token = minted.json()["token"]
+
+            # The operator repoints the instance AFTER the invite is in
+            # someone's inbox.
+            await admin.put(
+                "/admin/settings/overrides/provision_default_storage", json={"value": "local"}
+            )
+
+        async with client_for(app) as guest:
+            posted = await guest.post(
+                f"/invite/{token}",
+                data={"ciuser": "olli", "ssh_authorized_key": PUBKEY, "hostname": "lab-box"},
+                headers=cert_headers(),
+            )
+            assert posted.status_code in (302, 303), posted.text
+            assert "Ready" in (await poll_status(guest, token)).text
+
+        clone = pve.bodies["/nodes/pve1/qemu/9000/clone"]
+        assert clone["storage"] == "local-zfs"
+        assert clone["full"] == 1
+
+    async def test_a_storage_named_in_the_mint_beats_the_default_and_is_frozen(self, journey_db):
+        from homepilot.portal.repository import InviteRepository
+
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as admin:
+            await TestTheWholeJourney()._set_defaults(
+                admin,
+                provision_default_node="pve1",
+                provision_default_template_vmid=9000,
+                provision_default_storage="local-zfs",
+            )
+            minted = await admin.post(
+                "/admin/guests/invites",
+                json={
+                    "cn": CN_A,
+                    "storage": "local",
+                    "cores": 2,
+                    "memory_mb": 2048,
+                    "disk_gb": 20,
+                },
+            )
+            assert minted.status_code == 201, minted.text
+            assert minted.json()["caps"]["storage"] == "local"
+
+        rows = await InviteRepository(journey_db).list_invites()
+        assert [row["storage"] for row in rows] == ["local"]
+
+
+class TestTheStorageProbeRefusesWhatCannotHoldADisk:
+    async def test_a_storage_without_images_content_is_refused_saying_what_it_holds(self):
+        result = await probe_storage("backups", ctx(FakeCluster(), node="pve1"))
+        assert result.ok is False
+        assert "does not hold 'images' content" in result.detail
+        # The cluster's own answer, repeated - an operator can act on this.
+        assert "it holds: backup, iso" in result.detail
+
+    async def test_the_settings_api_refuses_it_too_and_saves_nothing(self, journey_db):
+        pve = JourneyPVE()
+        app = _journey_app(journey_db, pve)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as admin:
+            await TestTheWholeJourney()._set_defaults(admin, provision_default_node="pve1")
+            refused = await admin.put(
+                "/admin/settings/overrides/provision_default_storage",
+                json={"value": "backups"},
+            )
+            assert refused.status_code == 422, refused.text
+            assert "does not hold 'images' content" in refused.text
+
+        # Nothing was stored: a refused probe must never leave the value behind.
+        assert (await provisioning_defaults(app.state)).storage == ""
+
+    async def test_a_storage_the_node_does_not_have_lists_the_ones_it_does(self):
+        result = await probe_storage("nvme9", ctx(FakeCluster(), node="pve1"))
+        assert result.ok is False
+        assert result.detail == (
+            "no storage nvme9 on node pve1; node has: backups, local, local-zfs"
+        )
+
+    async def test_a_storage_that_holds_images_is_confirmed(self):
+        result = await probe_storage("local-zfs", ctx(FakeCluster(), node="pve1"))
+        assert result.ok is True
+
+    async def test_an_empty_storage_is_allowed_and_asks_the_cluster_nothing(self):
+        cluster = FakeCluster()
+        result = await probe_storage("", ctx(cluster, node="pve1"))
+        assert result.ok is True
+        assert cluster.reads == []
+
+    async def test_without_a_node_it_refuses_rather_than_guessing_where_to_look(self):
+        cluster = FakeCluster()
+        result = await probe_storage("local-zfs", ctx(cluster, node=""))
+        assert result.ok is False
+        assert "set the node first" in result.detail
+        assert cluster.reads == []

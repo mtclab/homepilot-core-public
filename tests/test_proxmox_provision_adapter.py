@@ -8,6 +8,7 @@ and request-body shape.
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 from urllib.parse import unquote
 
 import pytest
@@ -60,6 +61,51 @@ class TestCloneVm:
         body = json.loads(route.calls[0].request.read())
         assert body["full"] == 0
         assert body["pool"] == "lab"
+
+    @pytest.mark.parametrize("storage", [None, "", "local-zfs"])
+    async def test_the_clone_is_always_a_full_clone_whatever_the_storage(
+        self, client: ProxmoxClient, storage: str | None
+    ):
+        """THE STANDING GATE (#618): `full=1` is in every clone body.
+
+        A linked clone binds the guest to its template forever - the template
+        can never be deleted or moved, and the guest cannot leave the
+        template's storage - which is both the owner's standing "never a linked
+        clone" rule and the reason a target storage means anything at all: PVE
+        only honours `storage` on a full clone. Adding the storage option must
+        not become the change that quietly makes a linked clone reachable.
+        """
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(f"{API}/nodes/pve1/qemu/9000/clone").mock(
+                return_value=Response(200, json={"data": UPID})
+            )
+            await client.clone_vm(
+                node="pve1", template_vmid=9000, new_vmid=105, name="web-01", storage=storage
+            )
+
+        body = json.loads(route.calls[0].request.read())
+        assert body["full"] == 1
+
+    async def test_a_storage_is_sent_only_when_one_is_given(self, client: ProxmoxClient):
+        """Absent, not empty: PVE's own meaning for a missing `storage` is
+        "put the disks where the template's are", which is exactly the
+        behaviour every install had before #618. An empty string sent instead
+        would be a value PVE has to interpret."""
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(f"{API}/nodes/pve1/qemu/9000/clone").mock(
+                return_value=Response(200, json={"data": UPID})
+            )
+            await client.clone_vm(
+                node="pve1", template_vmid=9000, new_vmid=105, name="web-01", storage="local-zfs"
+            )
+            await client.clone_vm(
+                node="pve1", template_vmid=9000, new_vmid=106, name="web-02", storage=None
+            )
+
+        with_storage = json.loads(route.calls[0].request.read())
+        without = json.loads(route.calls[1].request.read())
+        assert with_storage["storage"] == "local-zfs"
+        assert "storage" not in without
 
     async def test_http_error_is_wrapped(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
@@ -238,3 +284,107 @@ class TestCancelUnwind:
                 await client.delete_vm("pve1", 105)
 
         assert "storage is busy" in str(excinfo.value)
+
+
+class TestSnapshotGuestType:
+    """A VMID is not a guest type (#617).
+
+    The snapshot calls used to try /qemu/ and fall back to /lxc/ on ANY error,
+    so a QEMU guest whose snapshot was refused (401) was reported as an /lxc/
+    failure. The collection is resolved now, and the failure says which one it
+    used and what PVE answered.
+    """
+
+    RESOURCES: ClassVar[dict] = {
+        "data": [
+            {"vmid": 9001, "type": "qemu", "node": "elizabeth"},
+            {"vmid": 9002, "type": "lxc", "node": "elizabeth"},
+        ]
+    }
+
+    async def test_stated_vm_kind_snapshots_the_qemu_collection(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9001/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            await client.snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+
+        assert qemu.called
+        assert not lxc.called
+
+    async def test_stated_lxc_kind_snapshots_the_lxc_collection(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9002/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9002/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            await client.snapshot("elizabeth", 9002, "hp-pre-x", guest_type="lxc")
+
+        assert lxc.called
+        assert not qemu.called
+
+    async def test_unstated_kind_asks_the_cluster(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.get(f"{API}/cluster/resources").mock(
+                return_value=Response(200, json=self.RESOURCES)
+            )
+            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9001/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            await client.snapshot("elizabeth", 9001, "hp-pre-x")
+
+        assert qemu.called
+        assert not lxc.called
+
+    async def test_unknown_vmid_fails_instead_of_guessing(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.get(f"{API}/cluster/resources").mock(
+                return_value=Response(200, json=self.RESOURCES)
+            )
+            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/4242/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/4242/snapshot").mock(
+                return_value=Response(200, json={"data": "UPID:snap"})
+            )
+            with pytest.raises(ProxmoxError) as excinfo:
+                await client.snapshot("elizabeth", 4242, "hp-pre-x")
+
+        assert "4242" in str(excinfo.value)
+        assert not qemu.called
+        assert not lxc.called
+
+    async def test_401_names_the_path_status_and_the_write_token(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+                return_value=Response(401, json={"errors": "permission denied"})
+            )
+            with pytest.raises(ProxmoxError) as excinfo:
+                await client.snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+
+        message = str(excinfo.value)
+        assert "nodes/elizabeth/qemu/9001/snapshot" in message
+        assert "401" in message
+        assert "write token" in message
+        assert "qemu" in message
+
+    async def test_delete_snapshot_uses_the_stated_collection(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            qemu = mock.delete(f"{API}/nodes/elizabeth/qemu/9001/snapshot/hp-pre-x").mock(
+                return_value=Response(200, json={"data": None})
+            )
+            lxc = mock.delete(f"{API}/nodes/elizabeth/lxc/9001/snapshot/hp-pre-x").mock(
+                return_value=Response(200, json={"data": None})
+            )
+            await client.delete_snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+
+        assert qemu.called
+        assert not lxc.called

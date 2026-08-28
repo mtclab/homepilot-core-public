@@ -175,14 +175,35 @@ the vault, and cannot be read or written through it.
 ### 2.2 Provisioning defaults, checked against the cluster
 
 `HP_PROVISION_DEFAULT_NODE`, `HP_PROVISION_DEFAULT_TEMPLATE_VMID`,
-`HP_PROVISION_DEFAULT_POOL`, `HP_PROVISION_DEFAULT_BRIDGE`,
-`HP_PROVISION_DEFAULT_VLAN_TAG` and `HP_PROVISION_DEFAULT_IPCONFIG` are the
-same kind of setting, on their own **Provisioning defaults** card, and they are
-what lets an invite stop carrying raw infra details: mint an invite without a
-node or a template and it takes both from here, frozen into the invite at mint
-time. `POST /guests/provision` and the `provision_guest` MCP tool fill the same
-gaps. Name neither a value nor a default and the call is refused, saying which
-setting would have filled it.
+`HP_PROVISION_DEFAULT_POOL`, `HP_PROVISION_DEFAULT_STORAGE`,
+`HP_PROVISION_DEFAULT_BRIDGE`, `HP_PROVISION_DEFAULT_VLAN_TAG` and
+`HP_PROVISION_DEFAULT_IPCONFIG` are the same kind of setting, on their own
+**Provisioning defaults** card, and they are what lets an invite stop carrying
+raw infra details: mint an invite without a node or a template and it takes
+both from here, frozen into the invite at mint time. `POST /guests/provision`
+and the `provision_guest` MCP tool fill the same gaps. Name neither a value nor
+a default and the call is refused, saying which setting would have filled it.
+
+#### Where the disks land (#618)
+
+`HP_PROVISION_DEFAULT_STORAGE` is the storage a clone's disks go onto. Empty -
+the default - means **inherit the template's storage**: the clone call then
+carries no `storage` at all, which is what every install did before the option
+existed. A `storage` named on the provision request, on the `provision_guest`
+tool call, on `hp invite create --storage`, or in the mint body wins over the
+setting; an invite freezes whichever it got AT MINT, beside its node and
+template, so repointing the default never re-targets an invite already sent.
+
+The probe asks the node two questions before the value is stored: does the
+storage exist there (a storage may be restricted to particular nodes, so the
+default node must be set first), and does it carry `images` content? A
+backup-or-ISO-only storage is reported cheerfully by PVE and then fails deep
+inside the clone task, which the operator sees as a half-provisioned guest.
+
+Provisioning always makes a **full** clone, and #618 does not change that: PVE
+honours a target storage only on a full clone, and a linked clone would bind
+the guest to its template forever - it could never leave the template's
+storage, and the template could no longer be deleted or moved.
 
 #### Building the template itself (#594)
 
@@ -910,7 +931,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.8` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.9` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -925,6 +946,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROVISION_DEFAULT_NODE` | — | Node guests are cloned on when the request does not name one |
 | `HP_PROVISION_DEFAULT_TEMPLATE_VMID` | `0` | Template cloned when the request does not name one; `0` means no default |
 | `HP_PROVISION_DEFAULT_POOL` | — | PVE resource pool provisioned guests join |
+| `HP_PROVISION_DEFAULT_STORAGE` | — | Storage the clone's disks land on. Empty inherits the template's own storage (the clone call then carries no `storage` at all) |
 | `HP_PROVISION_DEFAULT_BRIDGE` | — | Bridge the guest NIC is put on. Setting it is what makes provisioning write `net0` at all; empty leaves the template's NIC untouched |
 | `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |

@@ -1891,6 +1891,9 @@ def invite_create(
     template: int = typer.Option(..., "--template", help="Proxmox template VMID to clone"),
     node: str = typer.Option(..., "--node", help="Proxmox node to build on"),
     pool: str = typer.Option("", "--pool", help="Proxmox pool for the new guest"),
+    storage: str = typer.Option(
+        "", "--storage", help="Proxmox storage for the guest's disks (empty = the template's)"
+    ),
     cores: int = typer.Option(0, "--cores", help="CPU cores (0 = template default)"),
     ram: int = typer.Option(0, "--ram", help="Memory in MB (0 = template default)"),
     disk: int = typer.Option(0, "--disk", help="Disk size in GB (0 = template default)"),
@@ -1921,6 +1924,7 @@ def invite_create(
             template_vmid=template,
             node=node,
             pool=pool or None,
+            storage=storage or None,
             cores=cores or None,
             memory_mb=ram or None,
             disk_gb=disk or None,

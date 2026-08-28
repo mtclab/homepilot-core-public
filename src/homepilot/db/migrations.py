@@ -855,6 +855,22 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     ],
+    29: [
+        # Target storage as an invite cap (#618). NULLable, and NULL means
+        # "inherit the template's storage" - the behaviour of every invite
+        # minted before this column existed, so nothing about them changes.
+        #
+        # A cap column rather than a value read at redemption time, for the
+        # reason the whole caps table exists: what an invite promises is frozen
+        # at mint. An operator who repoints provision_default_storage next week
+        # must not silently re-target a machine somebody was already invited to
+        # build.
+        (
+            "ALTER TABLE invites ADD COLUMN storage TEXT",
+            "invites",
+            "storage",
+        ),
+    ],
 }
 
 

@@ -12,7 +12,7 @@ from .tokens import PREFIX_LENGTH, generate_invite_token, validate_token
 # nothing outside redemption ever needs it, and an operator listing must not
 # print material that helps replay an invite.
 _LIST_COLUMNS = (
-    "id, token_prefix, bound_cn, template_vmid, node, pool, cores, memory_mb, "
+    "id, token_prefix, bound_cn, template_vmid, node, pool, storage, cores, memory_mb, "
     "disk_gb, disk, ipconfig0, expires_at, created_by, created_at, redeemed_at, "
     "redeemed_cn, resulting_host_id, resulting_task_id, revoked_at"
 )
@@ -75,8 +75,9 @@ class InviteRepository:
         await self.db.execute(
             """INSERT INTO invites (
                    id, token_prefix, token_hash, bound_cn, template_vmid, node, pool,
-                   cores, memory_mb, disk_gb, disk, ipconfig0, expires_at, created_by, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   storage, cores, memory_mb, disk_gb, disk, ipconfig0, expires_at,
+                   created_by, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 invite_id,
                 prefix,
@@ -85,6 +86,7 @@ class InviteRepository:
                 caps.template_vmid,
                 caps.node,
                 caps.pool,
+                caps.storage,
                 caps.cores,
                 caps.memory_mb,
                 caps.disk_gb,

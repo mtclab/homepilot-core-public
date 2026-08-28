@@ -422,6 +422,13 @@ class TestProvisionGuest:
         service = MagicMock()
         service.proxmox = MagicMock()
         service.start = AsyncMock(return_value="task-prov-123")
+        # An explicit None, not a MagicMock attribute: a mock here reads back as
+        # a mock RESOLVER, and every provisioning default then resolves to the
+        # repr of a MagicMock. That already put a nonsense pool on the request
+        # this test asserts about (it went unnoticed because pool has no shape
+        # rule); the storage field's validator (#618) is what surfaced it. None
+        # means "this process has no defaults", which is what a bare service is.
+        service.defaults_source = None
         return service
 
     async def test_starts_a_provision_task_via_the_service(self, ctx) -> None:
