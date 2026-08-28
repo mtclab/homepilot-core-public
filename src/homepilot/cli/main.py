@@ -331,12 +331,12 @@ def init(
             token_type="personal",
             prefix=token_prefix,
             hash=token_hash,
-            # "full" normalizes to "*" - the admin scope the browser claim hands
+            # "all" normalizes to "*" - the admin scope the browser claim hands
             # its first credential. It used to be "read,write", which could not
             # open Settings -> Tokens (admin) and, now that minting requires an
             # admin, could not mint either: the box's only token was locked out
             # of managing tokens.
-            scope="full",
+            scope="all",
             label="admin",
             expires_at=None,
         )
@@ -1678,9 +1678,9 @@ def token_create(
         "--scope",
         "-s",
         help=(
-            "Comma-separated scopes (e.g. read,write). NOTE: API scope 'full' "
-            "means '*' (everything, superuser) - it is NOT the MCP tier named "
-            "'full' (= write). The write-tier API scope is 'write'."
+            "Comma-separated scopes (e.g. read,write), or 'all' for the "
+            "superuser scope '*'. ('full' is a legacy alias for 'all' - the "
+            "write-tier API scope is 'write', not 'full'.)"
         ),
     ),
     output: str = typer.Option("plain", "--output", "-o", help="Output format: plain or json"),
@@ -1695,10 +1695,10 @@ def token_create(
     `hp agent` does its work. The old path survives for the one case that cannot
     be authenticated - an instance with no live token to authenticate WITH.
     """
-    if scope.strip() in ("full", "*"):
+    if scope.strip() in ("all", "full", "*"):
+        legacy = " ('full' is the legacy name for 'all')" if scope.strip() == "full" else ""
         typer.secho(
-            "note: API scope 'full' = '*' (EVERYTHING, superuser) - not the MCP "
-            "tier named 'full', which is the write tier (API scope 'write'). "
+            f"note: this mints a SUPERUSER token (scope '*', everything){legacy}. "
             "Pass --scope read,write if you meant a write-capable token. (#579)",
             fg=typer.colors.YELLOW,
             err=True,

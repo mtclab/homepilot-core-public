@@ -11,7 +11,7 @@
 
 	let showCreate = false;
 	let newLabel = '';
-	let newScope = 'full';
+	let newScope = 'read,write';
 	let createdToken = '';
 	let creating = false;
 	let revoking: string | null = null;
@@ -53,7 +53,7 @@
 			createdToken = res.token;
 			notify('Token created — copy it now, it will not be shown again', 'ok');
 			newLabel = '';
-			newScope = 'full';
+			newScope = 'read,write';
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
@@ -107,8 +107,9 @@
 
 	function scopeDisplay(scope: string | null, role: string | null): string {
 		if (role) return role;
-		if (scope === '*' || scope === 'full') return 'full';
+		if (scope === '*' || scope === 'full' || scope === 'all') return 'all';
 		if (scope === 'read_only') return 'read_only';
+		if (scope === 'read,write') return 'write';
 		return scope || 'none';
 	}
 
@@ -132,7 +133,7 @@
 		An API token is how everything that is not a browser signs in to this
 		instance: the CLI, MCP clients, CI, scripts. Scopes are a ladder -
 		<span class="font-mono">read_only</span> can look,
-		<span class="font-mono">full</span> can change things, and
+		<span class="font-mono">write</span> can change things, and
 		<span class="font-mono">admin</span> can also manage tokens and secrets - so
 		give each token the smallest one that does its job. A new token is shown
 		once, here; only a prefix and a hash of it are stored, so a lost token is
@@ -166,7 +167,7 @@
 						<span class="block mb-1">Scope</span>
 						<select class="input text-sm" aria-describedby="token-scope-note" bind:value={newScope}>
 							<option value="read_only">read_only</option>
-							<option value="full">full</option>
+							<option value="read,write">write</option>
 							<option value="admin">admin</option>
 						</select>
 					</label>
@@ -236,7 +237,7 @@
 							</td>
 							<td class="text-ink">{t.label || '—'}</td>
 							<td>
-								<span class="badge {t.scope === '*' || t.scope === 'full' ? 'badge-applied' : t.scope === 'read_only' ? 'badge-proposed' : 'badge-failed'}">
+								<span class="badge {t.scope === '*' || t.scope === 'full' || t.scope === 'all' ? 'badge-applied' : t.scope === 'read_only' ? 'badge-proposed' : 'badge-failed'}">
 									{scopeDisplay(t.scope, t.role)}
 								</span>
 							</td>

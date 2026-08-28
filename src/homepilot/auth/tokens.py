@@ -16,7 +16,8 @@ PREFIX = "hp_"
 TOKEN_BYTES = 32
 PREFIX_LENGTH = 16
 
-SCOPE_FULL = "full"
+SCOPE_ALL = "all"
+SCOPE_FULL_LEGACY = "full"  # accepted forever; never advertised (#579)
 SCOPE_READ_ONLY = "read_only"
 
 _READ_ONLY_SCOPES = {"read"}
@@ -27,19 +28,19 @@ _MUTATING_ACTIONS = {"write"}
 def normalize_scope(scope: str | None, role: str | None = None) -> list[str]:
     """Normalize a scope string to the stored scope list.
 
-    VOCABULARY COLLISION (#579): the API scope word "full" means "*" -
-    everything, the superuser scope `hp init` mints. The MCP tool ladder
-    ALSO uses the word "full", but there it names the WRITE tier
-    (read_only < full < admin), which maps to API scope "write", not to
-    this "full". When writing docs, UI copy or reviews, say "API full
-    (= *)" or "MCP full tier (= write)" - never bare "full".
+    The superuser scope (= "*", everything - what `hp init` mints) is
+    ADVERTISED as "all". The word "full" used to name it and collided with
+    the MCP tool tier "full" (= the WRITE tier, API scope "write") - #579.
+    "full" is still accepted here forever so no existing token or script
+    breaks, but nothing operator-facing says it any more; the only "full"
+    an operator now reads is the MCP write tier.
     """
     if role and role in ROLE_SCOPES:
         return list(ROLE_SCOPES[role])
     if not scope:
         return []
     stripped = scope.strip()
-    if stripped in (SCOPE_FULL, "*"):
+    if stripped in (SCOPE_ALL, SCOPE_FULL_LEGACY, "*"):
         return ["*"]
     if stripped == SCOPE_READ_ONLY:
         return ["read"]

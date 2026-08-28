@@ -184,7 +184,7 @@ class LoginRequest(BaseModel):
 
 class TokenCreateRequest(BaseModel):
     label: str = "admin"
-    scope: str = "full"
+    scope: str = "all"
 
 
 async def _validate_bearer(token: str, db: Repository) -> dict[str, Any]:
@@ -221,7 +221,7 @@ async def me(
     label = row.get("label") or row.get("prefix", "")
     # Expose the token prefix and a normalized capability list so the UI stops
     # re-deriving scope logic (which it did incorrectly). normalize_scope maps
-    # scope+role to base capabilities and expands "*"/"full" to the full set.
+    # scope+role to base capabilities and expands "*"/"all" (legacy "full") to every capability.
     normalized = normalize_scope(row.get("scope"), row.get("role"))
     if "*" in normalized:
         capabilities = ["read", "write", "admin"]

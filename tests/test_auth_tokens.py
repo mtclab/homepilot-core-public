@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 
 from homepilot.auth.deps import require_scope, require_token
 from homepilot.auth.tokens import (
-    SCOPE_FULL,
+    SCOPE_ALL,
+    SCOPE_FULL_LEGACY,
     SCOPE_READ_ONLY,
     generate_api_token,
     normalize_scope,
@@ -25,8 +26,15 @@ from homepilot.db.repository import Repository
 
 
 class TestNormalizeScope:
-    def test_full_normalizes_to_star(self):
-        assert normalize_scope(SCOPE_FULL) == ["*"]
+    def test_all_normalizes_to_star(self):
+        assert normalize_scope(SCOPE_ALL) == ["*"]
+
+    def test_legacy_full_normalizes_to_star_forever(self):
+        """#579: 'full' was the old spelling of 'all'. Existing tokens and
+        scripts carry it, so it must keep normalizing to '*' for as long as
+        this function exists - removing the alias bricks every token minted
+        before the rename."""
+        assert normalize_scope(SCOPE_FULL_LEGACY) == ["*"]
 
     def test_read_only_normalizes_to_read(self):
         assert normalize_scope(SCOPE_READ_ONLY) == ["read"]
@@ -46,10 +54,10 @@ class TestNormalizeScope:
 
 class TestScopeAllows:
     def test_full_allows_write(self):
-        assert scope_allows(SCOPE_FULL, "write") is True
+        assert scope_allows(SCOPE_FULL_LEGACY, "write") is True
 
     def test_full_allows_read(self):
-        assert scope_allows(SCOPE_FULL, "read") is True
+        assert scope_allows(SCOPE_FULL_LEGACY, "read") is True
 
     def test_read_only_allows_read(self):
         assert scope_allows(SCOPE_READ_ONLY, "read") is True
