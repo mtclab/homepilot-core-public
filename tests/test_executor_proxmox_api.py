@@ -359,3 +359,106 @@ steps:
         assert "[step1]" in result["execution_log"]
         assert "SKIPPED" in result["execution_log"]
         assert mock_proxmox.call.call_count == 1
+
+
+# --- The steps must not race the cluster (#629/#626) -------------------------
+#
+# PVE answers a stop, a clone or a destroy with a UPID the instant it ACCEPTS
+# the work. The executor logged "-> OK" on that acceptance and went straight to
+# the next step, so a sequence outran its own cluster: on dev the stop step
+# reported OK and the destroy behind it got back "VM 101 is running - destroy
+# failed", leaving the guest up. It also called an asynchronously-failed task a
+# success. These assert the OUTCOME an operator gets, not that execute()
+# returned.
+
+STOP_THEN_DESTROY_BODY = """\
+```yaml proxmox-api-spec
+steps:
+  - id: stop-101
+    method: POST
+    path: /nodes/pve/qemu/101/status/stop
+  - id: destroy-101
+    method: DELETE
+    path: /nodes/pve/qemu/101
+```
+"""
+
+STOP_UPID = "UPID:pve:00001234:0000ABCD:66000000:qmstop:101:root@pam:"
+
+
+async def test_a_step_waits_for_the_task_it_spawned_before_the_next_one_runs(mock_proxmox, fm):
+    """The destroy must not be issued until the stop task has actually finished."""
+    order: list[str] = []
+
+    async def call(method, path, body=None):
+        order.append(f"call {method} {path}")
+        if path.endswith("/status/stop"):
+            return {"data": STOP_UPID}
+        return {"data": None}
+
+    async def wait_for_task(node, upid, **kwargs):
+        order.append(f"wait {node} {upid}")
+        return {"status": "stopped", "exitstatus": "OK"}
+
+    mock_proxmox.call = AsyncMock(side_effect=call)
+    mock_proxmox.wait_for_task = AsyncMock(side_effect=wait_for_task)
+
+    result = await proxmox_api_execute(fm, STOP_THEN_DESTROY_BODY, {}, mock_proxmox)
+
+    assert result["success"] is True
+    assert order == [
+        "call POST /nodes/pve/qemu/101/status/stop",
+        f"wait pve {STOP_UPID}",
+        "call DELETE /nodes/pve/qemu/101",
+    ], "the destroy was issued before the stop task finished"
+
+
+async def test_a_task_that_fails_asynchronously_fails_the_step(mock_proxmox, fm):
+    """Acceptance is not success: a task that dies must not be logged as OK."""
+
+    async def call(method, path, body=None):
+        return {"data": STOP_UPID} if path.endswith("/status/stop") else {"data": None}
+
+    mock_proxmox.call = AsyncMock(side_effect=call)
+    mock_proxmox.wait_for_task = AsyncMock(
+        side_effect=ProxmoxError("GET", "/tasks", 0, "exitstatus 'shutdown timeout'")
+    )
+
+    result = await proxmox_api_execute(fm, STOP_THEN_DESTROY_BODY, {}, mock_proxmox)
+
+    assert result["success"] is False
+    assert "stop-101" in result["failure_reason"]
+    # The step behind the dead task must never have been attempted.
+    assert all(c.args[1] != "/nodes/pve/qemu/101" for c in mock_proxmox.call.call_args_list), (
+        "the destroy ran behind a stop that never finished"
+    )
+
+
+async def test_the_node_comes_from_the_upid_not_the_target(mock_proxmox, fm):
+    """A step may address a node the target does not name; the UPID always does."""
+    seen: list[str] = []
+
+    async def call(method, path, body=None):
+        return {"data": STOP_UPID} if path.endswith("/status/stop") else {"data": None}
+
+    async def wait_for_task(node, upid, **kwargs):
+        seen.append(node)
+        return {"status": "stopped", "exitstatus": "OK"}
+
+    mock_proxmox.call = AsyncMock(side_effect=call)
+    mock_proxmox.wait_for_task = AsyncMock(side_effect=wait_for_task)
+
+    await proxmox_api_execute(fm, STOP_THEN_DESTROY_BODY, {"node": "other-node"}, mock_proxmox)
+
+    assert seen == ["pve"]
+
+
+async def test_a_synchronous_call_is_not_waited_on(mock_proxmox, fm):
+    """A config write answers with null - there is no task, and no hang."""
+    mock_proxmox.call = AsyncMock(return_value={"data": None})
+    mock_proxmox.wait_for_task = AsyncMock()
+
+    result = await proxmox_api_execute(fm, MULTI_STEP_BODY, {}, mock_proxmox)
+
+    assert result["success"] is True
+    mock_proxmox.wait_for_task.assert_not_called()

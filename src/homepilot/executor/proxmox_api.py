@@ -19,6 +19,49 @@ logger = logging.getLogger(__name__)
 _SPEC_FENCE = "proxmox-api-spec"
 _ROLLBACK_FENCE = "proxmox-api-rollback"
 
+# A clone or a destroy of a large disk is minutes of real work, so the wait has
+# to outlast it; the poll matches ProvisionService so one cluster sees one
+# polling cadence.
+DEFAULT_TASK_TIMEOUT_S = 600.0
+DEFAULT_POLL_INTERVAL_S = 2.0
+
+
+def _node_for_task(context: dict[str, Any], upid: str) -> str | None:
+    """The node whose task list holds this UPID.
+
+    A UPID is `UPID:<node>:...`, so it names its own node - which is the right
+    source, because a step may address a node other than the target's.
+    """
+    parts = upid.split(":")
+    if len(parts) > 1 and parts[1]:
+        return parts[1]
+    node = (context.get("target") or {}).get("node")
+    return str(node) if node else None
+
+
+async def _await_pve_task(
+    proxmox: ProxmoxClient,
+    context: dict[str, Any],
+    resp: Any,
+    timeout_s: float,
+    poll_interval: float,
+) -> str:
+    """Block until the task this step spawned finishes; raise if it failed.
+
+    Returns the text to append to the step log, or "" when the call was
+    synchronous and there was nothing to wait for.
+    """
+    upid = ProxmoxClient.upid_of(resp)
+    if not upid:
+        return ""
+    node = _node_for_task(context, upid)
+    if not node:
+        # Nothing to poll against. Say so rather than implying the task
+        # finished - a silent skip here is the very bug this code fixes.
+        return " (task not waited on: no node in the UPID or the target)"
+    await proxmox.wait_for_task(node, upid, timeout_s=timeout_s, poll_interval=poll_interval)
+    return " (task finished OK)"
+
 
 def _extract_steps(body: str, tag: str) -> list[dict[str, Any]] | None:
     pattern = re.compile(rf"```yaml\s+{tag}\s*\n(.*?)```", re.DOTALL)
@@ -40,6 +83,8 @@ async def execute(
     proxmox: ProxmoxClient,
     vault: Any | None = None,
     rollback: bool = False,
+    task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
+    poll_interval: float = DEFAULT_POLL_INTERVAL_S,
 ) -> dict[str, Any]:
     tag = _ROLLBACK_FENCE if rollback else _SPEC_FENCE
     steps = _extract_steps(body, tag)
@@ -111,6 +156,17 @@ async def execute(
             else:
                 resp = await proxmox.call(method, path)
             step_log += f" {method} {path} -> OK"
+            # A PVE call that spawns a worker answers with a UPID and returns
+            # IMMEDIATELY - the work has only been ACCEPTED. Logging "OK" and
+            # moving on made every sequence race the cluster: a stop step was
+            # reported done while the guest was still shutting down, and the
+            # destroy step behind it got "VM 101 is running - destroy failed",
+            # leaving the guest on the node (seen live on dev, #629/#626). It
+            # also hid outright failure: a task that dies asynchronously was
+            # still logged as OK. Wait for the task and report what it did.
+            waited = await _await_pve_task(proxmox, context, resp, task_timeout_s, poll_interval)
+            if waited:
+                step_log += waited
             applied_steps.append({"step": step_id, "status": "ok"})
         except ProxmoxError as e:
             step_log += f" {method} {path} -> ERROR {e.status_code}: {e.body[:200]}"

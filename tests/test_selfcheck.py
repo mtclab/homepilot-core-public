@@ -144,6 +144,37 @@ class TestOffIsNotBroken:
         assert entry["state"] == STATE_UNREACHABLE
         assert entry["configured"] is True
 
+    async def test_vault_configured_proxmox_is_not_reported_as_off(self):
+        """The env half is not the whole configuration.
+
+        An install whose Proxmox address comes from the vault's
+        'proxmox-config' secret has an EMPTY settings.proxmox_host - the
+        resolved address is carried on the app state. Reading settings alone
+        made the report tell such an operator "No hypervisor is configured, so
+        inventory stays empty and guest provisioning is unavailable" while the
+        very same install was listing inventory and provisioning guests off
+        that address. Found live on dev 3.6.9.
+        """
+        proxmox = MagicMock()
+        proxmox.test_connection = AsyncMock(return_value=True)
+        state = _stock_state(proxmox=proxmox, proxmox_host="pve.example.com")
+
+        entry = _by_name(await selfcheck_report(state, _stock_settings(proxmox_host="")))["proxmox"]
+
+        assert entry["configured"] is True, "a vault-configured hypervisor reported as unconfigured"
+        assert entry["state"] == STATE_OK
+        assert entry["target"] == redact_endpoint("pve.example.com")
+        assert "No hypervisor is configured" not in entry["consequence"]
+
+    async def test_vault_configured_but_dead_proxmox_is_unreachable_not_off(self):
+        """Same resolution, the broken arm: configured-but-dead must stay red."""
+        state = _stock_state(proxmox=None, proxmox_host="pve.example.com")
+
+        entry = _by_name(await selfcheck_report(state, _stock_settings(proxmox_host="")))["proxmox"]
+
+        assert entry["state"] == STATE_UNREACHABLE
+        assert entry["configured"] is True
+
     async def test_enabled_hub_that_never_bound_is_unreachable_not_off(self):
         hub = MagicMock()
         hub.is_listening.return_value = False

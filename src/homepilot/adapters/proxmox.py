@@ -252,6 +252,20 @@ class ProxmoxClient:
         result = await self.call("POST", f"/nodes/{node}/qemu/{template_vmid}/clone", body=body)
         return str(result.get("data", ""))
 
+    @staticmethod
+    def upid_of(result: Any) -> str | None:
+        """The UPID inside a PVE response, or None when the call was synchronous.
+
+        PVE answers some calls with a task id and others with ``null`` (a config
+        write that needed no worker). Treating "no UPID" as an error would fail
+        perfectly good runs; waiting on a non-UPID string would hang. So: a
+        string that starts with ``UPID:`` is a task, anything else is not.
+        """
+        data = result.get("data", result) if isinstance(result, dict) else result
+        if isinstance(data, str) and data.startswith("UPID:"):
+            return data
+        return None
+
     async def wait_for_task(
         self,
         node: str,
