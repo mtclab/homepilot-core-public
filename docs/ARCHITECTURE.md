@@ -260,11 +260,11 @@ The token's API scope selects its tool tier through one shared map (`homepilot.a
 | `write` | `full` |
 | `admin` | `admin` |
 
-> **Vocabulary collision (#579):** the *API scope* named `full` is NOT in this
-> table - it normalizes to `*` (everything; it is what `hp init` mints) and
-> resolves to the `admin` tier. The *MCP tier* named `full` is the write tier
-> and corresponds to API scope `write`. When speaking or writing, qualify the
-> word: "API `full` (= `*`)" vs "MCP `full` tier (= write)".
+> **Vocabulary (#579):** the superuser API scope (= `*`, everything - what
+> `hp init` mints) is spelled **`all`**. It resolves to the `admin` tier and is
+> deliberately NOT in this table. `full` is a legacy alias for `all`, accepted
+> forever but advertised nowhere - so the only "full" an operator reads is the
+> MCP write tier above, which corresponds to API scope `write`.
 
 `HP_MCP_TOKEN` remains as a **legacy static fallback**: a value equal to it authenticates at `HP_MCP_TOKEN_SCOPE`. Precedence is exact - a token that verifies as an API token wins its own scope's tier; a token carrying the `hp_` API prefix that does NOT verify is refused outright and never falls through to the static compare (a revoked assistant token must not be able to resurrect itself); anything else is refused. Both transports follow this one rule: the HTTP `/mcp` mount, and the stdio server through the `HP_MCP_TOKEN` entry in its client's `env` block.
 

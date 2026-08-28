@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.6.8 - 2026-08-28
+
+### The console's token ladder mints what it says (#614), and the superuser scope is spelled "all" (#579)
+
+The Tokens panel offered read_only / full / admin and described full as "can
+change things" - but posted scope=full, which normalizes to `*`: the SUPERUSER
+scope, strictly above the admin rung beside it. An operator following the UI's
+own advice minted a token-managing, secret-reading credential believing it was
+a write token. The middle rung now mints `read,write` labeled **write**, and
+superuser minting is not offered in the console at all.
+
+Underneath, the superuser API scope is now advertised as **all** everywhere
+(hp init, the claim, CLI, docs); `full` remains accepted forever as a silent
+legacy alias - a unit gate pins the alias so removing it (which would brick
+every pre-rename token) fails the suite. The only "full" an operator reads now
+is the MCP write tier.
+
 ## 3.6.7 - 2026-08-28
 
 ### Provisioning can finally build its own template (#594)

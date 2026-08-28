@@ -126,23 +126,40 @@ class TestBootstrapMint:
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout.strip())["scope"] == "*"
 
-    def test_full_scope_names_the_collision(self, tmp_path):
-        """#579: 'full' is two words in one - API full (= '*', everything) vs
-        the MCP full tier (= write). An operator typing --scope full is warned
-        which one they are getting, BEFORE the token exists in their history.
+    def test_superuser_scopes_say_what_they_mint(self, tmp_path):
+        """#579: minting '*' deserves a said-out-loud moment. 'all' (and the
+        legacy 'full') warn that this is a SUPERUSER token before it exists in
+        anyone's history; 'full' is additionally named as the legacy alias.
         Teeth: remove the secho in token_create and this fails."""
+        with patch.dict("os.environ", _offline_env(tmp_path)):
+            result = runner.invoke(app, ["token", "create", "--scope", "all", "--output", "json"])
+        assert result.exit_code == 0, result.output
+        assert "SUPERUSER" in result.stderr
+        # The scope is stored as typed; what makes it superuser is how it
+        # NORMALIZES at validation time - assert that, not the echo.
+        from homepilot.auth.tokens import normalize_scope
+
+        assert normalize_scope(json.loads(result.stdout.strip())["scope"]) == ["*"]
+
+    def test_legacy_full_still_mints_and_is_named_legacy(self, tmp_path):
+        """'full' keeps working forever (#579) - but the warning tells the
+        operator it is the legacy spelling of 'all'."""
         with patch.dict("os.environ", _offline_env(tmp_path)):
             result = runner.invoke(app, ["token", "create", "--scope", "full", "--output", "json"])
         assert result.exit_code == 0, result.output
-        assert "EVERYTHING" in result.stderr
-        assert "MCP" in result.stderr and "write" in result.stderr
+        assert "SUPERUSER" in result.stderr
+        assert "legacy" in result.stderr
+        from homepilot.auth.tokens import normalize_scope
+
+        assert normalize_scope(json.loads(result.stdout.strip())["scope"]) == ["*"]
 
     def test_ordinary_scopes_are_not_nagged(self, tmp_path):
-        """The collision note is for 'full' only - read,write mints quietly."""
+        """The superuser note is for '*'-minting scopes only - read,write
+        mints quietly."""
         with patch.dict("os.environ", _offline_env(tmp_path)):
             result = runner.invoke(app, ["token", "create", "--scope", "read,write"])
         assert result.exit_code == 0, result.output
-        assert "EVERYTHING" not in result.stderr
+        assert "SUPERUSER" not in result.stderr
 
 
 class TestUnauthenticatedMintRefused:

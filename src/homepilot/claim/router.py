@@ -33,10 +33,10 @@ _claim_attempts = SlidingWindowLimiter(
     limit=_CLAIM_ATTEMPT_LIMIT, window_seconds=_CLAIM_ATTEMPT_WINDOW_SECONDS
 )
 
-# The scope the first credential carries. 'full' normalizes to '*', which is
+# The scope the first credential carries. 'all' normalizes to '*', which is
 # what makes it an ADMIN token - the same scope `hp init` and POST /auth/tokens
 # hand out, so the claimed instance behaves exactly like a bootstrapped one.
-_ADMIN_SCOPE = "full"
+_ADMIN_SCOPE = "all"
 
 # The label of the box's own autocreated CLI credential (see
 # _store_local_cli_token). Visible and revocable in Settings -> Tokens like any
