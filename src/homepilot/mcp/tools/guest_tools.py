@@ -3,7 +3,9 @@
 The operator's assistant can do what the console's Guests card does: see every
 guest's usage against their budget, adjust a budget, revoke an invite, and -
 since the owner's 2026-08-25 decision - provision a guest (provision_guest,
-admin tier, mirroring POST /guests/provision).
+admin tier, mirroring POST /guests/provision). It can also BUILD the cloud-init
+template provisioning clones (create_guest_template, admin tier, #594), which
+until now needed root on the PVE node and so had no product path at all.
 
 What is deliberately NOT here: minting invites. A minted token is a secret
 that provisions a machine, and an MCP transcript is not a safe place for one -
@@ -60,6 +62,40 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "usage": {"type": "object"},
             },
             "required": ["cn", "limits", "usage"],
+        },
+    },
+    {
+        # A separate REMOVAL tool, not "pass nulls to set_guest_quota" (#607).
+        # Nulls already mean "unlimited on this axis" in set_guest_quota, and a
+        # word cannot mean two things on one surface: an assistant told that all-
+        # null removes the budget would also read a partly-null set as a partial
+        # removal. The neighbours name removals with their own verb the same way
+        # - delete_kb_doc, delete_alert_rule, delete_auth_token, delete_host.
+        "name": "delete_guest_quota",
+        "description": (
+            "Remove a guest's resource budget entirely: from then on their "
+            "provisions are gated by invites alone, exactly as for a guest who "
+            "never had a budget. This is NOT the same as setting every axis to "
+            "null (that keeps a budget which happens to be unlimited). Machines "
+            "they already have are never touched. Reports removed=false when the "
+            "guest had no budget to begin with."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cn": {"type": "string", "description": "The guest's certificate CN"},
+            },
+            "required": ["cn"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "cn": {"type": "string"},
+                "removed": {"type": "boolean"},
+                "limits": {"type": ["object", "null"]},
+                "usage": {"type": "object"},
+            },
+            "required": ["cn", "removed", "limits", "usage"],
         },
     },
     {
@@ -137,6 +173,74 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "full": {"type": "boolean", "description": "Full clone (default true)"},
             },
             "required": ["name"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}, "status": {"type": "string"}},
+            "required": ["task_id", "status"],
+        },
+    },
+    {
+        # Admin tier, like provision_guest: this WRITES to the cluster (it can
+        # add a content type to a storage and it creates a VM), and the template
+        # it builds is what every later provision clones.
+        "name": "create_guest_template",
+        "description": (
+            "Build the cloud-init TEMPLATE that provision_guest clones, using the "
+            "Proxmox API only (no node root needed). STARTS AN ASYNC task and returns "
+            "its task_id with status 'pending'; poll get_task_result for the outcome. "
+            "It stages a cloud image (source_volid, already on the storage - or "
+            "download_url, fetched by the node), creates a VM, imports the image as "
+            "its disk, adds the cloud-init drive, serial console and guest agent, and "
+            "converts it to a template. Adds the 'import' content type to the storage "
+            "if it is missing, and says so on the result. REFUSES an already-used "
+            "template_vmid rather than overwriting it; any failure after the VM is "
+            "created destroys the half-made VM. Give exactly one of source_volid or "
+            "download_url. node and template_vmid may be omitted when the instance "
+            "has provisioning defaults. Admin only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Template name (default ubuntu-2404-cloudinit)",
+                },
+                "node": {
+                    "type": "string",
+                    "description": (
+                        "Proxmox node to build on; omit to use the instance's "
+                        "provision_default_node"
+                    ),
+                },
+                "template_vmid": {
+                    "type": "integer",
+                    "description": (
+                        "VMID for the new template; omit to use the instance's "
+                        "provision_default_template_vmid. Refused if already in use."
+                    ),
+                },
+                "storage": {
+                    "type": "string",
+                    "description": "PVE storage for the image, disk and cloud-init drive (local)",
+                },
+                "source_volid": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "A cloud image already on the storage, e.g. local:import/ubuntu-24.04.qcow2"
+                    ),
+                },
+                "download_url": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "http(s) URL of a cloud image (.qcow2/.img) for the NODE to "
+                        "fetch onto the storage"
+                    ),
+                },
+                "memory_mb": {"type": "integer", "description": "RAM in MB (256-65536, 2048)"},
+                "cores": {"type": "integer", "description": "vCPUs (1-32, 2)"},
+            },
+            "required": [],
         },
         "outputSchema": {
             "type": "object",
@@ -248,6 +352,46 @@ async def handle_set_guest_quota(arguments: dict[str, Any], ctx: dict[str, Any])
     }
 
 
+async def handle_delete_guest_quota(
+    arguments: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Mirror of DELETE /admin/guests/quota/{cn} (#607), same repository call.
+
+    Unlike the route this reports removed=false instead of raising for a guest
+    who had no budget: over MCP "there was nothing to remove" is an answer the
+    assistant can act on, and the end state the caller asked for holds either way.
+    """
+    from ...guest.quota import delete_quota, usage_for
+
+    repo = ctx["repo"]
+    cn = str(arguments.get("cn") or "").strip()
+    if not cn:
+        return {"error": "cn is required"}
+
+    removed = await delete_quota(repo, cn)
+    if removed:
+        await repo.log_audit(
+            user_id=ctx.get("caller_id", "mcp"),
+            source="mcp",
+            action="guest_quota_removed",
+            target_host=cn,
+        )
+    used = await usage_for(repo, cn)
+    return {
+        "cn": cn,
+        "removed": removed,
+        # Null, not an all-null limits object: the guest now has NO budget, and
+        # this is the same shape query_guests reports for a guest without one.
+        "limits": None,
+        "usage": {
+            "vms": used.vms,
+            "cores": used.cores,
+            "memory_mb": used.memory_mb,
+            "disk_gb": used.disk_gb,
+        },
+    }
+
+
 async def handle_revoke_guest_invite(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
@@ -294,5 +438,38 @@ async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any])
     try:
         task_id = await service.start(body, actor=actor)
     except ProvisionConflictError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+async def handle_create_guest_template(
+    arguments: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Queue a template build through GuestTemplateService (#594).
+
+    Validation and refusals come from the GuestTemplateRequest model and the
+    service, never re-implemented here - the same discipline
+    handle_provision_guest follows, and the reason the two surfaces cannot drift
+    apart on what they accept."""
+    from pydantic import ValidationError
+
+    from ...provision.defaults import MissingProvisioningDefaultError, provisioning_defaults
+    from ...provision.models import GuestTemplateRequestIn
+    from ...provision.template import GuestTemplateConflictError
+
+    service = ctx.get("guest_template_service")
+    if service is None or getattr(service, "proxmox", None) is None:
+        raise ValueError("Proxmox not configured")
+    try:
+        given = GuestTemplateRequestIn(**arguments)
+        body = given.resolve(await provisioning_defaults(getattr(service, "defaults_source", None)))
+    except MissingProvisioningDefaultError as exc:
+        raise ValueError(str(exc)) from exc
+    except ValidationError as exc:
+        raise ValueError(f"Invalid template request: {exc}") from exc
+    actor = str(ctx.get("_mcp_caller_id") or "mcp")
+    try:
+        task_id = await service.start(body, actor=actor)
+    except GuestTemplateConflictError as exc:
         raise ValueError(str(exc)) from exc
     return {"task_id": task_id, "status": "pending"}

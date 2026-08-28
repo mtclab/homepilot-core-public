@@ -179,6 +179,7 @@ vi.mock('$lib/api', async () => {
 			getGuests: vi.fn().mockResolvedValue({ guests: [], invites: [] }),
 			mintGuestInvite: vi.fn(),
 			setGuestQuota: vi.fn(),
+			deleteGuestQuota: vi.fn(),
 			revokeGuestInvite: vi.fn(),
 			listTokens: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			createToken: vi.fn(),

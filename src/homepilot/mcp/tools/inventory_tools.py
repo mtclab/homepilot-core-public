@@ -9,6 +9,7 @@ from mcp.types import TextContent
 
 from homepilot.adapters.proxmox import ProxmoxError
 from homepilot.db.repository import Repository
+from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -116,13 +117,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Add a host HomePilot cannot learn from Proxmox - the NAS, the router, the "
             "Pi, an old tower - to the inventory. Recorded as source=manual and adopted "
             "on the spot (a machine typed in by hand is not a discovery awaiting "
-            "triage), and never declared absent by a Proxmox sync. hostname must be a "
-            "DNS hostname or an IPv4 address; a duplicate hostname is refused."
+            "triage), and never declared absent by a Proxmox sync. host must be a "
+            "DNS hostname or an IPv4 address; a duplicate name is refused."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hostname": {"type": "string", "description": "DNS hostname or IPv4 address"},
+                **host_properties("DNS hostname or IPv4 address"),
                 "ip_address": {"type": ["string", "null"]},
                 "role": {"type": "string", "description": "Default 'guest'"},
                 "host_type": {"type": "string", "description": "Default 'baremetal'"},
@@ -130,7 +131,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "tags": {"type": ["string", "null"]},
                 "fqdn": {"type": ["string", "null"]},
             },
-            "required": ["hostname"],
+            "required": ["host"],
         },
         "outputSchema": {
             "type": "object",
@@ -408,12 +409,17 @@ async def handle_add_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dic
         create_manual_host_record,
     )
 
+    # #608: the tool takes `host`; the REQUEST MODEL (and the row, and the API
+    # body) call the field `hostname`, so the standard name is translated here
+    # rather than renaming a database column to tidy a tool signature.
+    host, warning = host_arg(arguments)
+    fields = {k: v for k, v in arguments.items() if k not in ("host", "hostname")}
     try:
-        body = HostCreateRequest(**arguments)
+        body = HostCreateRequest(hostname=host, **fields)
     except ValidationError as exc:
         raise ValueError(f"Invalid host: {exc}") from exc
     try:
-        return await create_manual_host_record(_require_repo(ctx), body)
+        return with_host_warning(await create_manual_host_record(_require_repo(ctx), body), warning)
     except InventoryError as exc:
         raise ValueError(exc.detail) from exc
 

@@ -126,6 +126,24 @@ class TestBootstrapMint:
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout.strip())["scope"] == "*"
 
+    def test_full_scope_names_the_collision(self, tmp_path):
+        """#579: 'full' is two words in one - API full (= '*', everything) vs
+        the MCP full tier (= write). An operator typing --scope full is warned
+        which one they are getting, BEFORE the token exists in their history.
+        Teeth: remove the secho in token_create and this fails."""
+        with patch.dict("os.environ", _offline_env(tmp_path)):
+            result = runner.invoke(app, ["token", "create", "--scope", "full", "--output", "json"])
+        assert result.exit_code == 0, result.output
+        assert "EVERYTHING" in result.stderr
+        assert "MCP" in result.stderr and "write" in result.stderr
+
+    def test_ordinary_scopes_are_not_nagged(self, tmp_path):
+        """The collision note is for 'full' only - read,write mints quietly."""
+        with patch.dict("os.environ", _offline_env(tmp_path)):
+            result = runner.invoke(app, ["token", "create", "--scope", "read,write"])
+        assert result.exit_code == 0, result.output
+        assert "EVERYTHING" not in result.stderr
+
 
 class TestUnauthenticatedMintRefused:
     """THE gate. With a live token on the instance, an unauthenticated mint is

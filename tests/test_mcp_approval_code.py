@@ -352,10 +352,22 @@ class TestMigration:
         from homepilot.db import migrations as mig
 
         # Bring a DB up to the version BEFORE this feature's migration.
-        target = max(mig.MIGRATIONS.keys())
-        feature_version = target  # 27 is the last key; the table lives there
-        saved = mig.MIGRATIONS[feature_version]
-        monkeypatch.delitem(mig.MIGRATIONS, feature_version)
+        #
+        # The feature's version is found by LOOKING for the migration that
+        # creates the table, not by assuming it is the last key. It used to
+        # assume that, so the next feature to add a migration broke this test by
+        # merely existing (#594's did).
+        feature_version = next(
+            version
+            for version, statements in sorted(mig.MIGRATIONS.items())
+            if any("artifact_approval_codes" in str(entry) for entry in statements)
+        )
+        # Everything from that version UP is removed, not just that one key:
+        # run_migrations walks a contiguous range, so a hole in the middle is a
+        # KeyError rather than an older schema. monkeypatch puts the rest back.
+        saved = {v: s for v, s in mig.MIGRATIONS.items() if v >= feature_version}
+        for version in saved:
+            monkeypatch.delitem(mig.MIGRATIONS, version)
 
         db = Database(str(tmp_path / "upgrade.db"))
         await db.connect()
@@ -369,7 +381,7 @@ class TestMigration:
             await db.conn.commit()
 
             # Restore the feature migration and upgrade in place.
-            monkeypatch.setitem(mig.MIGRATIONS, feature_version, saved)
+            monkeypatch.setitem(mig.MIGRATIONS, feature_version, saved[feature_version])
             await run_migrations(db)
             assert "artifact_approval_codes" in await _tables(db)
             probe = await db.fetchone("SELECT value FROM settings WHERE key='probe'")

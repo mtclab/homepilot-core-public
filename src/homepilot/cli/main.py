@@ -1674,7 +1674,14 @@ async def _mint_token_via_api(
 def token_create(
     label: str = typer.Option("admin", "--label", "-l", help="Display name for the token owner"),
     scope: str = typer.Option(
-        "read,write", "--scope", "-s", help="Comma-separated scopes (e.g. read,write)"
+        "read,write",
+        "--scope",
+        "-s",
+        help=(
+            "Comma-separated scopes (e.g. read,write). NOTE: API scope 'full' "
+            "means '*' (everything, superuser) - it is NOT the MCP tier named "
+            "'full' (= write). The write-tier API scope is 'write'."
+        ),
     ),
     output: str = typer.Option("plain", "--output", "-o", help="Output format: plain or json"),
 ) -> None:
@@ -1688,6 +1695,15 @@ def token_create(
     `hp agent` does its work. The old path survives for the one case that cannot
     be authenticated - an instance with no live token to authenticate WITH.
     """
+    if scope.strip() in ("full", "*"):
+        typer.secho(
+            "note: API scope 'full' = '*' (EVERYTHING, superuser) - not the MCP "
+            "tier named 'full', which is the write tier (API scope 'write'). "
+            "Pass --scope read,write if you meant a write-capable token. (#579)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
     bootstrapped = False
 
     async def _create() -> str:

@@ -63,6 +63,8 @@ from .tools.guest_tools import (
     TOOL_DEFINITIONS as GUEST_TOOL_DEFS,
 )
 from .tools.guest_tools import (
+    handle_create_guest_template,
+    handle_delete_guest_quota,
     handle_provision_guest,
     handle_query_guests,
     handle_revoke_guest_invite,
@@ -212,10 +214,17 @@ _ADMIN_TOOLS = frozenset(
         # 3 - they were escalation debt at read_only/full before it existed).
         "query_guests",
         "set_guest_quota",
+        # #607: removing a budget is the same admin authority as setting one -
+        # DELETE /admin/guests/quota/{cn} is require_scope("admin").
+        "delete_guest_quota",
         "revoke_guest_invite",
         # Guest provisioning (owner decision 2026-08-25): POST /guests/provision is
         # API admin; it clones a Proxmox template into a running guest.
         "provision_guest",
+        # Building that template (#594). MCP-only for now - there is no HTTP
+        # route to mirror - and it sits with the provisioning tools it feeds: it
+        # writes to the cluster (a VM, and possibly a storage content type).
+        "create_guest_template",
         # KB admin: delete a doc, ingest sources, reindex, and the embedding
         # status read (an API-admin GET, so admin-tier even though it is a read).
         "delete_kb_doc",
@@ -398,6 +407,7 @@ async def _bootstrap() -> dict[str, Any]:
     # does (apply_reconciler is built only when an executor exists), so an apply
     # over MCP runs through the one engine, not a weaker second path.
     from homepilot.provision.service import ProvisionService
+    from homepilot.provision.template import GuestTemplateService
     from homepilot.reconciler.apply import ApplyReconciler
     from homepilot.tasks.runner import TaskRunner
 
@@ -414,6 +424,11 @@ async def _bootstrap() -> dict[str, Any]:
         store=state.artifact_store,
     )
     provision_service = ProvisionService(
+        proxmox=proxmox,
+        task_repo=task_repo,
+        repo=state.repo,
+    )
+    guest_template_service = GuestTemplateService(
         proxmox=proxmox,
         task_repo=task_repo,
         repo=state.repo,
@@ -447,6 +462,11 @@ async def _bootstrap() -> dict[str, Any]:
         # other (the same trap TestBothTransportsCarryTheSameToolContext guards).
         "task_runner": task_runner,
         "provision_service": provision_service,
+        # Building the template provisioning clones (#594). Carried in BOTH
+        # contexts, like the provision service: a tool that works over one
+        # transport and errors on the other is the exact trap
+        # TestBothTransportsCarryTheSameToolContext guards.
+        "guest_template_service": guest_template_service,
         # The hub's live registry, for the reachability check. None when the hub
         # is not running in this process, which the handler reports as "unknown"
         # rather than as "reachable".
@@ -487,8 +507,10 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "get_artifact_status": handle_get_artifact_status,
     "query_guests": handle_query_guests,
     "set_guest_quota": handle_set_guest_quota,
+    "delete_guest_quota": handle_delete_guest_quota,
     "revoke_guest_invite": handle_revoke_guest_invite,
     "provision_guest": handle_provision_guest,
+    "create_guest_template": handle_create_guest_template,
     # Read parity with the management API, wave 1. Every one is read-only and
     # calls the same repo/service its management route calls.
     "list_agents": handle_list_agents,

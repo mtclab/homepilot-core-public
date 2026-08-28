@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 from homepilot.metrics.repository import MAX_SERIES_POINTS, VALID_COMPARISONS
 from homepilot.metrics.router import MAX_WINDOW_HOURS
 
@@ -65,9 +66,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hostname": {"type": "string", "description": "The host's name"},
+                **host_properties("The host's name"),
             },
-            "required": ["hostname"],
+            "required": ["host"],
         },
         "outputSchema": {
             "type": "object",
@@ -91,7 +92,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hostname": {"type": "string", "description": "The host's name"},
+                **host_properties("The host's name"),
                 "metric": {
                     "type": "string",
                     "description": 'Metric name, e.g. "cpu.percent" or "disk.free_gb"',
@@ -105,7 +106,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": f"Maximum points to return (max {MAX_SERIES_POINTS})",
                 },
             },
-            "required": ["hostname", "metric"],
+            "required": ["host", "metric"],
         },
         "outputSchema": {
             "type": "object",
@@ -227,14 +228,18 @@ async def handle_get_monitoring_alerts(
 
 
 async def handle_get_host_metrics(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
-    hostname = str(arguments["hostname"])
-    return {"hostname": hostname, "metrics": await _repo(ctx).latest(hostname)}
+    hostname, warning = host_arg(arguments)
+    # The ANSWER keeps the `hostname` key: it mirrors GET /metrics/hosts/{hostname}
+    # /latest, and #608 standardised the PARAMETER, not the payload.
+    return with_host_warning(
+        {"hostname": hostname, "metrics": await _repo(ctx).latest(hostname)}, warning
+    )
 
 
 async def handle_get_host_metrics_series(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    hostname = str(arguments["hostname"])
+    hostname, warning = host_arg(arguments)
     metric = str(arguments["metric"])
 
     # The route's Query(...) constraints are the product's limits, not FastAPI
@@ -253,14 +258,17 @@ async def handle_get_host_metrics_series(
 
     since = int(time.time() - hours * 3600)
     points, truncated = await _repo(ctx).series(hostname, metric, since, limit=limit)
-    return {
-        "hostname": hostname,
-        "metric": metric,
-        "since": since,
-        "points": points,
-        "truncated": truncated,
-        "max_points": limit,
-    }
+    return with_host_warning(
+        {
+            "hostname": hostname,
+            "metric": metric,
+            "since": since,
+            "points": points,
+            "truncated": truncated,
+            "max_points": limit,
+        },
+        warning,
+    )
 
 
 # ── Admin-tier handlers (wave 3). Call the SAME MetricsRepository methods the

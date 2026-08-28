@@ -581,8 +581,13 @@ _ADMIN_TOOL_CALLS: list[tuple[str, dict[str, Any]]] = [
     ("delete_auth_token", {"prefix": "p"}),
     ("query_guests", {}),
     ("set_guest_quota", {"cn": "x"}),
+    ("delete_guest_quota", {"cn": "x"}),
     ("revoke_guest_invite", {"prefix": "p"}),
     ("provision_guest", {"name": "g1", "node": "pve1", "template_vmid": 9000}),
+    (
+        "create_guest_template",
+        {"node": "pve1", "template_vmid": 9000, "source_volid": "local:import/u.qcow2"},
+    ),
     ("get_kb_embedding_status", {}),
 ]
 

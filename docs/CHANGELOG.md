@@ -1,5 +1,51 @@
 # Changelog
 
+## 3.6.7 - 2026-08-28
+
+### Provisioning can finally build its own template (#594)
+
+`provision_guest` clones `template_vmid`, so a cloud-init template had to
+already exist - and there was no product path to CREATE one: the manual route
+needs root on the PVE node, which HomePilot's scoped token deliberately does
+not have ("Only root can pass arbitrary filesystem paths"), so provisioning was
+undeliverable on a cluster nobody had hand-prepared. The new
+**`create_guest_template`** MCP tool (admin tier) builds the template over the
+API alone - stage or download a cloud image, create a VM, import the image as
+its disk, add the cloud-init drive, serial console and guest agent, convert -
+tracked as a `create_guest_template` background task like a provision. It
+refuses a `template_vmid` already in use rather than overwriting it, destroys
+the half-made VM on any later failure, and adds the `import` content type to
+the storage when it is missing, saying so on the task result.
+
+### A guest budget can be removed, not only set (#607)
+
+`DELETE /admin/guests/quota/{cn}` (404 when there is none, audited) plus the
+`delete_guest_quota` MCP tool and a "Remove budget" console action. Removal
+deletes the ROW - a row of nulls is an unlimited budget, not the absence of
+one - so after it the guest's own `/guest/quota` answers `limits: null`.
+
+### One name for "which machine" (#608)
+
+Every host-addressed MCP tool now takes `host`; the four that said `hostname`
+still accept it as a deprecated alias (declared in the schema, warned in the
+result), so existing callers keep working. A registry-driven gate asserts the
+whole surface stays uniform.
+
+### The word "full" is two words, said out loud (#579)
+
+API scope `full` (= `*`, everything - what `hp init` mints) and the MCP tier
+`full` (= write) collide. The collision is now named in `normalize_scope`, the
+ARCHITECTURE tier table, the `--scope` help, and a stderr note when
+`hp token create --scope full` is about to mint a superuser token. The rename
+stays an open owner decision on #579.
+
+### The local gate runs the same security audits CI runs (#548)
+
+`make gate` gained `gate-security`: the mirror integration job's exact bandit
+and detect-secrets invocations, failing on any finding - so secret-scan and
+bandit hits stop costing a 15-minute mirror round-trip to discover.
+
+
 ## v3.6.6 (2026-08-27)
 
 The guest-network hardening round, all found by walking the real dev cluster.

@@ -20,6 +20,7 @@ from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
 from homepilot.mcp.tools.guest_tools import (
+    handle_delete_guest_quota,
     handle_query_guests,
     handle_revoke_guest_invite,
     handle_set_guest_quota,
@@ -84,6 +85,58 @@ class TestTheToolsWork:
         alice = next(g for g in overview["guests"] if g["cn"] == "alice")
         assert alice["limits"]["cores"] == 8 and alice["usage"]["vms"] == 1
 
+    async def test_deleting_a_quota_removes_the_budget_the_guest_is_shown(self, ctx):
+        """#607: set_guest_quota had no undo over MCP.
+
+        The assertion is the OUTCOME on the guest-facing surfaces - the portal's
+        own /guest/quota answer and the provisioning gate - not the tool's
+        return value. Both are read straight from the same database the tool
+        wrote to.
+        """
+        from homepilot.guest.quota import check_provision, get_quota
+
+        context, _db = ctx
+        repo = context["repo"]
+        await repo.create_host(hostname="a0", host_type="vm", owner="alice", cpu_cores=4)
+        await handle_set_guest_quota({"cn": "alice", "max_vms": 1}, context)
+        blocked = await check_provision(repo, "alice", cores=1, memory_mb=512, disk_gb=1)
+        assert not blocked.allowed, "the budget was never binding, so removing it proves nothing"
+
+        res = await handle_delete_guest_quota({"cn": "alice"}, context)
+        assert res["removed"] is True and res["limits"] is None
+
+        assert await get_quota(repo, "alice") is None, "a quota row survived the removal"
+        allowed = await check_provision(repo, "alice", cores=1, memory_mb=512, disk_gb=1)
+        assert allowed.allowed, "provisioning is still gated by a budget that was removed"
+        overview = await handle_query_guests({}, context)
+        alice = next(g for g in overview["guests"] if g["cn"] == "alice")
+        assert alice["limits"] is None, "query_guests still reports the removed budget"
+
+    async def test_deleting_a_quota_that_is_not_there_is_reported_not_raised(self, ctx):
+        context, _db = ctx
+        res = await handle_delete_guest_quota({"cn": "nobody"}, context)
+        assert res["removed"] is False and res["limits"] is None
+
+    async def test_null_axes_are_still_an_unlimited_budget_not_a_removal(self, ctx):
+        """The reason removal is its OWN tool: null already means "unlimited on
+        this axis" to set_guest_quota, and one word cannot mean two things."""
+        from homepilot.guest.quota import get_quota
+
+        context, _db = ctx
+        await handle_set_guest_quota(
+            {
+                "cn": "alice",
+                "max_vms": None,
+                "max_cores": None,
+                "max_memory_mb": None,
+                "max_disk_gb": None,
+            },
+            context,
+        )
+        assert await get_quota(context["repo"], "alice") is not None, (
+            "an all-null set_guest_quota removed the budget - nulls must stay 'unlimited'"
+        )
+
     async def test_revoke_by_prefix_lands(self, ctx):
         context, _db = ctx
         _invite_id, full_token = await _mint(context["invite_repo"])
@@ -104,7 +157,12 @@ class TestScope:
         `full` MCP token can no longer see or change guests - only an `admin` one."""
         from homepilot.mcp.server import _ADMIN_TOOLS, _MUTATING_TOOLS, _READ_ONLY_TOOLS
 
-        guest_tools = {"query_guests", "set_guest_quota", "revoke_guest_invite"}
+        guest_tools = {
+            "query_guests",
+            "set_guest_quota",
+            "delete_guest_quota",
+            "revoke_guest_invite",
+        }
         assert guest_tools <= _ADMIN_TOOLS, (
             "the guest tools mirror API-admin routes and must sit at the admin tier"
         )

@@ -30,7 +30,7 @@ from ..provision.defaults import (
     resolve_pool,
     resolve_template_vmid,
 )
-from .quota import get_quota, set_quota, usage_for
+from .quota import delete_quota, get_quota, set_quota, usage_for
 
 router = APIRouter(prefix="/admin/guests", tags=["guests"])
 
@@ -163,6 +163,38 @@ async def put_quota(request: Request, body: QuotaIn) -> dict[str, Any]:
             "memory_mb": quota.get("max_memory_mb") if quota else None,
             "disk_gb": quota.get("max_disk_gb") if quota else None,
         },
+        "usage": {
+            "vms": used.vms,
+            "cores": used.cores,
+            "memory_mb": used.memory_mb,
+            "disk_gb": used.disk_gb,
+        },
+    }
+
+
+@router.delete("/quota/{cn}", dependencies=[_admin])
+async def drop_quota(request: Request, cn: str) -> dict[str, Any]:
+    """Remove a guest's budget (#607): the set route had no undo.
+
+    DELETE with the CN in the path, matching every other removal in this API
+    (DELETE /auth/tokens/{prefix}, /monitoring/rules/{rule_id},
+    /admin/settings/overrides/{key}). "Set every axis to null" is NOT the same
+    thing - it leaves a quota row that the console keeps showing as a budget,
+    unlimited on every axis - so removal has its own route.
+
+    404 when the guest has no budget, like revoking an invite that is not open:
+    the operator asked for a change that did not happen, and a cheerful 200
+    would tell them they removed something they did not.
+    """
+    repo = _repo(request)
+    removed = await delete_quota(repo, cn)
+    if not removed:
+        raise HTTPException(status_code=404, detail="That guest has no budget set")
+    await repo.log_audit(user_id="ui", source="ui", action="guest_quota_removed", target_host=cn)
+    used = await usage_for(repo, cn)
+    return {
+        "cn": cn,
+        "limits": None,
         "usage": {
             "vms": used.vms,
             "cores": used.cores,

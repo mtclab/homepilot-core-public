@@ -74,7 +74,7 @@ def ctx(estate):
 
 class TestInventoryMutators:
     async def test_add_host_writes_a_manual_adopted_host(self, ctx, estate) -> None:
-        out = await _handle_tool("add_host", {"hostname": "nas01", "role": "storage"}, ctx)
+        out = await _handle_tool("add_host", {"host": "nas01", "role": "storage"}, ctx)
         # The write really landed, and the return is the stored row.
         stored = await estate.repo.get_host_by_hostname("nas01")
         assert stored is not None
@@ -84,13 +84,13 @@ class TestInventoryMutators:
         assert out["role"] == "storage"
 
     async def test_add_host_refuses_a_duplicate(self, ctx) -> None:
-        await _handle_tool("add_host", {"hostname": "nas01"}, ctx)
+        await _handle_tool("add_host", {"host": "nas01"}, ctx)
         with pytest.raises(ValueError, match="already in inventory"):
-            await _handle_tool("add_host", {"hostname": "nas01"}, ctx)
+            await _handle_tool("add_host", {"host": "nas01"}, ctx)
 
     async def test_add_host_refuses_a_non_hostname(self, ctx) -> None:
         with pytest.raises(ValueError, match="Invalid host"):
-            await _handle_tool("add_host", {"hostname": "http://x/;rm -rf /"}, ctx)
+            await _handle_tool("add_host", {"host": "http://x/;rm -rf /"}, ctx)
 
     async def test_update_host_pins_the_edited_fields(self, ctx, estate) -> None:
         out = await _handle_tool(
@@ -121,7 +121,7 @@ class TestInventoryMutators:
         assert reread["import_state"] == "adopted"
 
     async def test_delete_host_forgets_a_manual_host(self, ctx, estate) -> None:
-        created = await _handle_tool("add_host", {"hostname": "nas01"}, ctx)
+        created = await _handle_tool("add_host", {"host": "nas01"}, ctx)
         out = await _handle_tool("delete_host", {"host_id": created["id"]}, ctx)
         assert out["forgotten"] is True
         assert await estate.repo.get_host(created["id"]) is None
@@ -411,7 +411,7 @@ class TestArtifactRejectApplyReplay:
 # are NOT here - they must be REACHABLE by a read_only token, asserted above).
 _NEW_MUTATORS: list[tuple[str, dict[str, Any]]] = [
     ("cancel_task", {"task_id": "x"}),
-    ("add_host", {"hostname": "z"}),
+    ("add_host", {"host": "z"}),
     ("adopt_host", {"host_id": "1"}),
     ("ignore_host", {"host_id": "1"}),
     ("update_host", {"host_id": "1", "status": "running"}),
@@ -441,7 +441,7 @@ class TestReadOnlyScopeIsRefusedEveryMutator:
         """Guard the guard: the SAME harness must NOT refuse a full-scope call, so
         the refusals above are the scope check firing, not a blanket failure."""
         out = await _handle_tool(
-            "add_host", {"hostname": "through01"}, {**ctx, "_mcp_token_scope": "full"}
+            "add_host", {"host": "through01"}, {**ctx, "_mcp_token_scope": "full"}
         )
         assert out["hostname"] == "through01"
 

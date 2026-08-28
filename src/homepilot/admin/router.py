@@ -535,6 +535,9 @@ async def _do_reload(request: Request) -> dict[str, Any]:
                 provision_service = getattr(request.app.state, "provision_service", None)
                 if provision_service is not None:
                     provision_service.proxmox = new_proxmox
+                template_service = getattr(request.app.state, "guest_template_service", None)
+                if template_service is not None:
+                    template_service.proxmox = new_proxmox
                 enroll_service = getattr(request.app.state, "agent_enroll_service", None)
                 if enroll_service is not None:
                     enroll_service.proxmox = new_proxmox
