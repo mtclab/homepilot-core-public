@@ -152,7 +152,7 @@ export interface Task {
 	id: string;
 	// null for artifactless tasks (provision creates infrastructure, not intent)
 	artifact_id: string | null;
-	action: 'apply' | 'revoke' | 'replay' | 'provision' | 'install_agent';
+	action: 'apply' | 'revoke' | 'replay' | 'provision' | 'install_agent' | 'create_guest_template';
 	status: TaskStatus;
 	result_json: string | null;
 	created_at: string;
@@ -1016,6 +1016,11 @@ export const api = {
 	},
 	setGuestQuota(body: { cn: string; max_vms: number | null; max_cores: number | null; max_memory_mb: number | null; max_disk_gb: number | null }) {
 		return req<unknown>('/admin/guests/quota', { method: 'POST', body: JSON.stringify(body) });
+	},
+	// #607: the removal half. NOT "save every axis empty" - that keeps a budget
+	// which happens to be unlimited, and the table would go on calling it a budget.
+	deleteGuestQuota(cn: string) {
+		return req<{ cn: string; limits: null }>(`/admin/guests/quota/${encodeURIComponent(cn)}`, { method: 'DELETE' });
 	},
 
 	// --- Operator settings (#553 C2) ---

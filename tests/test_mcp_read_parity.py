@@ -306,6 +306,8 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     # Guest management (#442). These routes are API `admin`; wave 3 moved the tools
     # to the admin tier so tool and route now match (no exemption).
     ("POST", "/admin/guests/quota"): "set_guest_quota",
+    # #607: the removal half of the same admin authority.
+    ("DELETE", "/admin/guests/quota/{cn}"): "delete_guest_quota",
     ("POST", "/admin/guests/invites/{prefix}/revoke"): "revoke_guest_invite",
     # Guest provisioning (owner decision 2026-08-25): POST /guests/provision is API
     # admin; it clones a Proxmox template into a running guest.
@@ -849,7 +851,7 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
     async def test_get_agent_by_id_and_by_hostname(self, api, ctx) -> None:
         route = await _get(api, f"/agents/{AGENT_ID}")
         by_id = await _handle_tool("get_agent", {"agent_id": AGENT_ID}, ctx)
-        by_host = await _handle_tool("get_agent", {"hostname": HOSTNAME}, ctx)
+        by_host = await _handle_tool("get_agent", {"host": HOSTNAME}, ctx)
         assert by_id == route
         assert by_host == await _get(api, f"/agents/hostname/{HOSTNAME}")
         assert by_id["system_info"]["agent_version"] == "9.9.9"
@@ -950,7 +952,7 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
 
     async def test_get_host_metrics(self, api, ctx) -> None:
         route = await _get(api, f"/monitoring/hosts/{HOSTNAME}/latest")
-        tool = await _handle_tool("get_host_metrics", {"hostname": HOSTNAME}, ctx)
+        tool = await _handle_tool("get_host_metrics", {"host": HOSTNAME}, ctx)
         assert tool == route
         assert [m["metric"] for m in tool["metrics"]] == ["cpu.percent"]
         assert tool["metrics"][0]["value"] == 13.5
@@ -964,7 +966,7 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
         )
         tool = await _handle_tool(
             "get_host_metrics_series",
-            {"hostname": HOSTNAME, "metric": "cpu.percent", "hours": 1},
+            {"host": HOSTNAME, "metric": "cpu.percent", "hours": 1},
             ctx,
         )
         assert tool["points"] == route["points"]
@@ -980,13 +982,13 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
         with pytest.raises(ValueError, match="hours"):
             await _handle_tool(
                 "get_host_metrics_series",
-                {"hostname": HOSTNAME, "metric": "cpu.percent", "hours": MAX_WINDOW_HOURS + 1},
+                {"host": HOSTNAME, "metric": "cpu.percent", "hours": MAX_WINDOW_HOURS + 1},
                 ctx,
             )
         with pytest.raises(ValueError, match="limit"):
             await _handle_tool(
                 "get_host_metrics_series",
-                {"hostname": HOSTNAME, "metric": "cpu.percent", "limit": MAX_SERIES_POINTS + 1},
+                {"host": HOSTNAME, "metric": "cpu.percent", "limit": MAX_SERIES_POINTS + 1},
                 ctx,
             )
 
@@ -1114,8 +1116,8 @@ class TestReadOnlyScopeCanCallEveryReadTool:
             ("get_enrolment_window", {}),
             ("list_alert_rules", {}),
             ("get_monitoring_alerts", {}),
-            ("get_host_metrics", {"hostname": HOSTNAME}),
-            ("get_host_metrics_series", {"hostname": HOSTNAME, "metric": "cpu.percent"}),
+            ("get_host_metrics", {"host": HOSTNAME}),
+            ("get_host_metrics_series", {"host": HOSTNAME, "metric": "cpu.percent"}),
             ("list_tasks", {}),
             ("get_audit_log", {}),
             ("get_dashboard_summary", {}),

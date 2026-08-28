@@ -184,6 +184,40 @@ time. `POST /guests/provision` and the `provision_guest` MCP tool fill the same
 gaps. Name neither a value nor a default and the call is refused, saying which
 setting would have filled it.
 
+#### Building the template itself (#594)
+
+Provisioning CLONES `template_vmid`, so a cloud-init template has to exist -
+and building one by hand needs root on the PVE node, which HomePilot's scoped
+token deliberately does not have. The **`create_guest_template`** MCP tool
+(admin tier) builds it over the API alone: it stages a cloud image, creates a
+VM, imports the image as its disk, adds the cloud-init drive, serial console
+and guest agent, and converts the result to a template. It returns a `task_id`
+straight away; poll `get_task_result` (or the Tasks page) for the outcome.
+
+Give it exactly one image source:
+
+* `source_volid` - an image already on the storage, e.g.
+  `local:import/ubuntu-24.04.qcow2`;
+* `download_url` - an http(s) URL to a `.qcow2`/`.img` cloud image, which the
+  NODE fetches onto the storage itself.
+
+`node` and `template_vmid` default to `provision_default_node` and
+`provision_default_template_vmid`, so by default an instance builds exactly the
+template it then clones. Two properties are guaranteed:
+
+* **it never overwrites.** A `template_vmid` already in use anywhere on the
+  cluster is refused before a single write - converting to a template is
+  one-way, and the id could be somebody's running machine;
+* **it never orphans.** Any failure after the VM exists destroys the half-made
+  VM, and the recorded error names the cleanup outcome, so you know whether
+  anything is still on the node.
+
+One thing it may CHANGE about your cluster: if the target storage does not
+declare the `import` content type, the tool adds it (the existing content types
+are preserved) - without an import-capable storage the API-only path is
+impossible. The addition is left in place afterwards and is reported on the task
+result as `storage_import_content_added`.
+
 ### 2.3 The guest network
 
 The `HP_GUEST_NETWORK_*` settings describe the subnet a friend's machine lives
@@ -876,7 +910,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.6` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.7` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |

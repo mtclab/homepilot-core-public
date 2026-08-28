@@ -818,6 +818,43 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             updated_at      TEXT NOT NULL
         )""",
     ],
+    28: [
+        # Guest-template creation (#594): the tasks CHECK constraint must admit
+        # the 'create_guest_template' action. Artifactless like 'provision' and
+        # 'install_agent' - it BUILDS the template provisioning clones rather
+        # than applying authored intent - so it relies on the same NULL
+        # artifact_id to stay out of the artifact-scoped dedup/active-task
+        # queries.
+        #
+        # Same rebuild dance as migrations 14, 15 and 18 (a CHECK constraint is
+        # not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
+        # recreate the indexes AFTER the drop, because the old indexes ride the
+        # rename and only vanish with the old table.
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT, "
+            "action TEXT NOT NULL "
+            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+            "'create_guest_template')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    ],
 }
 
 

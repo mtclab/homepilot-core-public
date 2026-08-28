@@ -12,6 +12,7 @@ from mcp.types import TextContent
 
 from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient
+from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 from homepilot.mcp.tools.ssrf_guard import SSRFError, _PinnedTransport, validate_url
 from homepilot.vault import VaultManager
 
@@ -137,10 +138,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {
-                    "type": "string",
-                    "description": "Guest hostname",
-                },
+                **host_properties("Guest hostname"),
                 "path": {
                     "type": "string",
                     "description": "Absolute file path on the guest",
@@ -161,10 +159,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {
-                    "type": "string",
-                    "description": "Guest hostname",
-                },
+                **host_properties("Guest hostname"),
                 "command": {
                     "type": "string",
                     "description": "Read-only command to execute",
@@ -193,7 +188,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Hostname to check"},
+                **host_properties("Hostname to check"),
             },
             "required": ["host"],
         },
@@ -296,7 +291,10 @@ async def handle_read_file_on_guest(
     agent_adapter: AgentAdapter | None = ctx.get("agent_adapter")
     if agent_adapter is None:
         raise RuntimeError("no agent hub — host operations unavailable")
-    host = arguments["host"]
+    # No `warning` channel here: this handler answers with the FILE'S CONTENT,
+    # and appending a deprecation line to a file the caller asked to read would
+    # corrupt the answer. The schema carries the deprecation for this one.
+    host, _warning = host_arg(arguments)
     path = arguments["path"]
     _check_guest_read_path(path)
     content = await agent_adapter.read_file(host, path)
@@ -309,10 +307,10 @@ async def handle_exec_on_guest_readonly(
     agent_adapter: AgentAdapter | None = ctx.get("agent_adapter")
     if agent_adapter is None:
         raise RuntimeError("no agent hub — host operations unavailable")
-    host = arguments["host"]
+    host, warning = host_arg(arguments)
     command = arguments["command"]
     exit_code, stdout, stderr = await agent_adapter.exec_readonly(host, command)
-    return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
+    return with_host_warning({"exit_code": exit_code, "stdout": stdout, "stderr": stderr}, warning)
 
 
 async def handle_check_host_reachable(
@@ -328,32 +326,43 @@ async def handle_check_host_reachable(
     question is whether the control plane can reach it, and a check that itself
     needs the host to be up cannot answer that.
     """
-    host = arguments["host"]
+    host, warning = host_arg(arguments)
     registry = ctx.get("agent_registry")
     if registry is None:
         from homepilot.app_state import get_agent_registry
 
         registry = get_agent_registry()
     if registry is None:
-        return {
-            "host": host,
-            "reachable": False,
-            "reason": "the agent hub is not running in this process, so reachability is unknown",
-            "agent_version": None,
-        }
+        return with_host_warning(
+            {
+                "host": host,
+                "reachable": False,
+                "reason": (
+                    "the agent hub is not running in this process, so reachability is unknown"
+                ),
+                "agent_version": None,
+            },
+            warning,
+        )
 
     agent = registry.get_by_hostname(host)
     if agent is None:
-        return {
-            "host": host,
-            "reachable": False,
-            "reason": "no agent is connected for this host right now",
-            "agent_version": None,
-        }
+        return with_host_warning(
+            {
+                "host": host,
+                "reachable": False,
+                "reason": "no agent is connected for this host right now",
+                "agent_version": None,
+            },
+            warning,
+        )
     version = (agent.system_info or {}).get("agent_version")
-    return {
-        "host": host,
-        "reachable": True,
-        "reason": "an agent is connected",
-        "agent_version": str(version) if version else None,
-    }
+    return with_host_warning(
+        {
+            "host": host,
+            "reachable": True,
+            "reason": "an agent is connected",
+            "agent_version": str(version) if version else None,
+        },
+        warning,
+    )

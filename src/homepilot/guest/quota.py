@@ -60,6 +60,21 @@ async def set_quota(
     await repo.db.conn.commit()
 
 
+async def delete_quota(repo: Any, cn: str) -> bool:
+    """Remove a guest's budget entirely (#607). Returns whether a row went.
+
+    Deleting the ROW is the removal, not writing a row of NULLs: "no row" is
+    what `check_provision` reads as "this friend has no budget", and a row of
+    NULLs would leave a guest_quotas entry behind that the console and
+    query_guests both keep listing as a guest with limits set to unlimited.
+    The two states look identical to the enforcement path and are NOT identical
+    to the operator, so removal means the row is gone.
+    """
+    cursor = await repo.db.execute("DELETE FROM guest_quotas WHERE cn = ?", (cn,))
+    await repo.db.conn.commit()
+    return bool(getattr(cursor, "rowcount", 0) > 0)
+
+
 async def usage_for(repo: Any, cn: str) -> GuestUsage:
     row = await repo.db.fetchone(
         """SELECT COUNT(*) AS vms,

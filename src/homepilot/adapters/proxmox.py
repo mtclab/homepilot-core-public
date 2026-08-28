@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import Any
@@ -340,6 +341,75 @@ class ProxmoxClient:
     async def next_vmid(self, node: str) -> int:
         result = await self.read("/cluster/nextid")
         return int(result.get("data", result))
+
+    async def cluster_vmids(self) -> set[int]:
+        """Every VMID the cluster currently holds — guests AND templates.
+
+        Cluster-wide rather than per node on purpose: a VMID is unique across
+        the whole cluster, so a per-node listing would call an id free that PVE
+        then refuses. Used to REFUSE a template build onto an id that is already
+        taken, which is the one guard between "create a template" and
+        "overwrite somebody's VM".
+        """
+        result = await self.read("/cluster/resources", query={"type": "vm"})
+        rows = result.get("data", result)
+        out: set[int] = set()
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict) or row.get("vmid") is None:
+                    continue
+                with contextlib.suppress(TypeError, ValueError):
+                    out.add(int(row["vmid"]))
+        return out
+
+    async def get_storage(self, storage: str) -> dict[str, Any]:
+        """One storage's cluster-level definition (type, `content` list, path)."""
+        result = await self.read(f"/storage/{storage}")
+        data = result.get("data", result)
+        return data if isinstance(data, dict) else {}
+
+    async def set_storage_content(self, storage: str, content: str) -> dict[str, Any]:
+        """REPLACE a storage's content-type list with `content` (a CSV).
+
+        PVE takes the whole list, never a delta, so a caller that means "add one
+        type" must send the existing ones back with it — dropping them would
+        un-declare content the storage is already holding.
+        """
+        return await self.call("PUT", f"/storage/{storage}", body={"content": content})
+
+    async def download_url_to_storage(
+        self, node: str, storage: str, url: str, filename: str, content: str = "import"
+    ) -> str:
+        """Have the NODE fetch a file straight onto a storage. Returns the UPID.
+
+        The endpoint accepts `iso`, `vztmpl` and `import` content only; a cloud
+        image (qcow2) is `import` content, which is what makes it usable as an
+        `import-from` source without root on the node.
+        """
+        result = await self.call(
+            "POST",
+            f"/nodes/{node}/storage/{storage}/download-url",
+            body={"content": content, "filename": filename, "url": url},
+        )
+        return str(result.get("data", "") or "")
+
+    async def create_vm(self, node: str, vmid: int, config: dict[str, Any]) -> str:
+        """Create an empty guest shell at `vmid`. Returns the UPID, if PVE gives one.
+
+        NOT a clone: this is the first half of building a cloud-init TEMPLATE,
+        where there is nothing to clone from yet.
+        """
+        result = await self.call("POST", f"/nodes/{node}/qemu", body={"vmid": vmid, **config})
+        return str(result.get("data", "") or "")
+
+    async def convert_vm_to_template(self, node: str, vmid: int) -> str:
+        """Turn a stopped guest into a template. Returns the UPID, if any.
+
+        One-way: PVE has no un-template call, which is why the caller must be
+        sure of the vmid before it gets here.
+        """
+        result = await self.call("POST", f"/nodes/{node}/qemu/{vmid}/template")
+        return str(result.get("data", "") or "")
 
     async def test_connection(self) -> bool:
         try:

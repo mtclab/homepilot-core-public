@@ -25,6 +25,15 @@ _MUTATING_ACTIONS = {"write"}
 
 
 def normalize_scope(scope: str | None, role: str | None = None) -> list[str]:
+    """Normalize a scope string to the stored scope list.
+
+    VOCABULARY COLLISION (#579): the API scope word "full" means "*" -
+    everything, the superuser scope `hp init` mints. The MCP tool ladder
+    ALSO uses the word "full", but there it names the WRITE tier
+    (read_only < full < admin), which maps to API scope "write", not to
+    this "full". When writing docs, UI copy or reviews, say "API full
+    (= *)" or "MCP full tier (= write)" - never bare "full".
+    """
     if role and role in ROLE_SCOPES:
         return list(ROLE_SCOPES[role])
     if not scope:

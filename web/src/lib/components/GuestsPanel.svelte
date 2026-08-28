@@ -110,6 +110,19 @@
 		}
 	}
 
+	async function removeQuota(cn: string) {
+		working = true;
+		try {
+			await api.deleteGuestQuota(cn);
+			notify(`Budget removed for ${cn}`);
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
 	async function revoke(prefix: string) {
 		try {
 			await api.revokeGuestInvite(prefix);
@@ -151,6 +164,7 @@
 						<th class="text-left">Cores</th>
 						<th class="text-left">Memory (MB)</th>
 						<th class="text-left">Disk (GB)</th>
+						<th class="text-left"></th>
 					</tr>
 				</thead>
 				<tbody>
@@ -161,6 +175,16 @@
 							<td class="num-inline">{g.usage.cores} / {lim(g.limits?.cores)}</td>
 							<td class="num-inline">{g.usage.memory_mb} / {lim(g.limits?.memory_mb)}</td>
 							<td class="num-inline">{g.usage.disk_gb} / {lim(g.limits?.disk_gb)}</td>
+							<td>
+								{#if g.limits}
+									<button
+										class="btn btn-ghost btn-xs text-danger"
+										disabled={working}
+										title="Remove this friend's budget - their machines are untouched, and new ones are capped by their invites alone"
+										on:click={() => removeQuota(g.cn)}>Remove budget</button
+									>
+								{/if}
+							</td>
 						</tr>
 					{/each}
 				</tbody>

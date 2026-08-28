@@ -5,7 +5,7 @@ import binascii
 import re
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: defaults reads the registry
     from .defaults import ProvisioningDefaults
@@ -167,3 +167,136 @@ class ProvisionRequestIn(ProvisionRequest):
         payload["pool"] = resolve_pool(self.pool, defaults)
         payload["ipconfig0"] = resolve_ipconfig(self.ipconfig0, defaults)
         return ProvisionRequest(**payload)
+
+
+# ── Guest-template creation (#594) ───────────────────────────────────────────
+
+# A PVE storage id, as PVE itself accepts it. Validated here because it is
+# interpolated into an API PATH (/storage/{id}, /nodes/{n}/storage/{id}/...),
+# where a slash or a '..' would address something else entirely.
+STORAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,62}$")
+
+# A volume id as PVE prints it: '<storage>:<content>/<filename>'. The staged
+# cloud image is named this way whether it sits under `import` or `iso` content.
+VOLID_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9._-]{0,62}:[A-Za-z0-9]+/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
+
+# The file name a download is stored under. It becomes the tail of a volid and a
+# file on the node, so no path separators and no leading dot.
+IMAGE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _image_filename_from_url(url: str) -> str:
+    """The file name a cloud-image URL will be stored under on the node.
+
+    Derived rather than asked for: an operator pasting a download URL should not
+    also have to name the file, and a name derived from the URL is the one that
+    matches what they see on the storage afterwards. Anything that does not come
+    out as a plain file name is refused rather than sanitised — a silently
+    rewritten name would put the image somewhere the caller did not expect.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("download_url must be an http(s) URL")
+    name = parsed.path.rsplit("/", 1)[-1]
+    if not IMAGE_FILENAME_RE.match(name):
+        raise ValueError(
+            "download_url must end in a plain image file name "
+            "(letters, digits, dot, dash, underscore), e.g. .../ubuntu-24.04.qcow2"
+        )
+    return name
+
+
+class GuestTemplateRequest(BaseModel):
+    """A request to BUILD the cloud-init template that provisioning clones (#594).
+
+    Provisioning has always needed a template to exist and had no way to make
+    one: building it by hand needs root on the node, which HomePilot's scoped
+    PVE token deliberately does not have. This request describes the API-only
+    path instead — stage (or download) a cloud image as `import` content, create
+    a shell, import the disk into it, add the cloud-init drive, convert.
+    """
+
+    name: str = "ubuntu-2404-cloudinit"
+    node: str = Field(min_length=1)
+    template_vmid: int = Field(gt=0)
+    storage: str = "local"
+    # Exactly one of these two. A volid points at an image already staged on the
+    # storage; a URL has the NODE fetch one. Both is ambiguous (which wins?) and
+    # neither leaves nothing to import, so the validator refuses either.
+    source_volid: str | None = None
+    download_url: str | None = None
+    memory_mb: int = Field(default=2048, ge=256, le=65536)
+    cores: int = Field(default=2, ge=1, le=32)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, v: str) -> str:
+        return _validate_name(v, "name")
+
+    @field_validator("storage")
+    @classmethod
+    def _check_storage(cls, v: str) -> str:
+        if not STORAGE_RE.match(v):
+            raise ValueError("storage must be a PVE storage id (letters, digits, dot, dash, _)")
+        return v
+
+    @field_validator("source_volid")
+    @classmethod
+    def _check_volid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not VOLID_RE.match(v):
+            raise ValueError(
+                "source_volid must look like '<storage>:<content>/<file>', "
+                "e.g. local:import/ubuntu-24.04.qcow2"
+            )
+        return v
+
+    @field_validator("download_url")
+    @classmethod
+    def _check_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        _image_filename_from_url(v)
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> GuestTemplateRequest:
+        if bool(self.source_volid) == bool(self.download_url):
+            raise ValueError(
+                "give exactly one of source_volid (an image already on the storage) "
+                "or download_url (an image for the node to fetch)"
+            )
+        return self
+
+    @property
+    def image_filename(self) -> str | None:
+        """The file the download will land as, or None when a volid was given."""
+        return None if self.download_url is None else _image_filename_from_url(self.download_url)
+
+
+class GuestTemplateRequestIn(GuestTemplateRequest):
+    """The same request with node/template_vmid allowed to be OMITTED.
+
+    A subclass for the same reason ProvisionRequestIn is one: every field and
+    validator comes from the strict model, so the callable surface cannot drift
+    from what template creation actually accepts. ``resolve`` turns it back into
+    a strict request or refuses, naming the setting that would have filled the
+    gap — and it is the SAME pair of settings provisioning resolves, so the
+    template an instance builds is by construction the template it clones.
+    """
+
+    node: str = ""
+    template_vmid: int = 0
+
+    def resolve(self, defaults: ProvisioningDefaults) -> GuestTemplateRequest:
+        from .defaults import resolve_node, resolve_template_vmid
+
+        payload = self.model_dump()
+        payload["node"] = resolve_node(self.node, defaults)
+        payload["template_vmid"] = resolve_template_vmid(self.template_vmid, defaults)
+        return GuestTemplateRequest(**payload)

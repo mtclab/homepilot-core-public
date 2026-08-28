@@ -406,6 +406,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         defaults_source=app.state,
     )
 
+    from .provision.template import GuestTemplateService
+
+    # Always constructed too, and for the same reason: Proxmox may be configured
+    # later through the admin settings UI, and _do_reload rebinds .proxmox onto
+    # this same instance.
+    app.state.guest_template_service = GuestTemplateService(
+        proxmox=state.proxmox,
+        task_repo=task_repo,
+        repo=state.repo,
+        defaults_source=app.state,
+    )
+
     from .agent_hub.enroll import AgentEnrollService
 
     # Always constructed, like ProvisionService: Proxmox can be configured later
@@ -539,6 +551,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # same (TestBothTransportsCarryTheSameToolContext).
             "task_runner": task_runner,
             "provision_service": app.state.provision_service,
+            "guest_template_service": app.state.guest_template_service,
         }
     )
 
@@ -626,6 +639,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         drainable = (
             ("task runner", getattr(app.state, "task_runner", None)),
             ("provision service", getattr(app.state, "provision_service", None)),
+            ("guest template service", getattr(app.state, "guest_template_service", None)),
             ("agent enrolment service", getattr(app.state, "agent_enroll_service", None)),
             # Also drained inside agent_hub.stop(), but the registry outlives a
             # DISABLED hub: create_app_state leaves agent_hub None when the

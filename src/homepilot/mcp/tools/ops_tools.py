@@ -267,6 +267,7 @@ async def handle_cancel_task(arguments: dict[str, Any], ctx: dict[str, Any]) -> 
         task_repo=task_repo,
         provision_service=ctx.get("provision_service"),
         task_runner=ctx.get("task_runner"),
+        guest_template_service=ctx.get("guest_template_service"),
     )
     if result is None:
         raise ValueError(f"Task not found: {task_id}")

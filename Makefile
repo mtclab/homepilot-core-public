@@ -26,10 +26,25 @@ GO_BIN ?= go
 GOCACHE ?= /tmp/gocache
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image
+.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security
 
-gate: gate-py gate-web gate-go gate-go-race
+gate: gate-py gate-web gate-go gate-go-race gate-security
 	@echo "gate: all sub-gates passed"
+
+gate-security:
+	# Mirror CI's integration job runs these exact audits; a local gate that
+	# never runs the command CI runs is not a gate (#548 - bandit and
+	# detect-secrets findings kept surfacing only after the ~15 min
+	# scrub+mirror+CI round-trip, e.g. #547 and the 3.6.6 B608).
+	$(VENV)/bandit -r src/homepilot/ -c pyproject.toml -b .bandit_baseline.json -q
+	@$(VENV)/detect-secrets scan --all-files --force-use-all-plugins src/ > /tmp/hp-secrets-report.json; \
+	FINDINGS=$$($(VENV)/python -c "import json;print(sum(len(v) for v in json.load(open('/tmp/hp-secrets-report.json'))['results'].values()))"); \
+	if [ "$$FINDINGS" != "0" ]; then \
+		echo "gate-security: detect-secrets found $$FINDINGS potential secrets:"; \
+		$(VENV)/python -c "import json;d=json.load(open('/tmp/hp-secrets-report.json'))['results'];[print(f'  {f}:{i[\"line_number\"]} {i[\"type\"]}') for f,its in d.items() for i in its]"; \
+		exit 1; \
+	fi
+	@echo "gate-security: bandit + detect-secrets clean"
 
 gate-py:
 	$(VENV)/ruff check src tests scripts

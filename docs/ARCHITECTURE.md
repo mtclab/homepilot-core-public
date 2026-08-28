@@ -38,7 +38,7 @@
 ║  │   ops         get_dashboard_summary  get_audit_log           │   ║
 ║  │               get_selfcheck  get_proxmox_settings            │   ║
 ║  │   guests      query_guests  set_guest_quota                  │   ║
-║  │               revoke_guest_invite                            │   ║
+║  │               delete_guest_quota  revoke_guest_invite        │   ║
 ║  │   settings    query_settings_overrides set_setting_override  │   ║
 ║  │               clear_setting_override probe_setting_override  │   ║
 ║  │   raw access  proxmox_api_read  http_call_read               │   ║
@@ -233,6 +233,8 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `check_artifact_drift` | no | read | Check whether an applied artifact has drifted from desired state |
 | `query_guests` | no | read | Every portal guest's usage vs budget, plus invites (prefixes only - never tokens) |
 | `set_guest_quota` | quota table | write | Set a guest's resource budget (totals across all their machines) |
+| `delete_guest_quota` | quota table | write | Remove a guest's budget entirely, so invites alone gate their provisions (#607). NOT the same as setting every axis to null - that keeps a budget which is unlimited |
+| `create_guest_template` | a VM + possibly a storage content type | admin | Build the cloud-init TEMPLATE `provision_guest` clones, over the Proxmox API alone (no node root). Stages a cloud image (`source_volid` or `download_url`), creates a VM, imports the disk, adds the cloud-init drive/serial console/guest agent, converts. Refuses a `template_vmid` already in use; destroys the half-made VM on any later failure (#594) |
 | `revoke_guest_invite` | invite state | write | Revoke an open invite by prefix. Minting is deliberately NOT over MCP: the token is a machine-provisioning secret and a transcript is not a safe channel - mint in Settings -> Guests or `hp invite create` |
 | `query_settings_overrides` | no | admin | Every operator setting with its value, source (env/db/default), hot-reloadability, probeability and env var. Only NON-SECRET settings exist in the registry, so no token, passphrase or signing secret can be listed (#553 C4) |
 | `set_setting_override` | settings table | admin | Persist one operator setting through the same `checked_set` the admin route uses. Refused - storing nothing - for an unknown key (which is every secret), a key the environment already decides, a value of the wrong shape, or a value the live cluster refutes or cannot be asked about |
@@ -241,6 +243,8 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
 | `approve_artifact` | triggers flow | write | Exposed, but gated by a per-artifact approval code a human relays: the code is generated at propose time and returned by no MCP read, so the assistant cannot approve its own proposal (#385 follow-up) |
+
+**Naming.** Every tool that addresses a machine by name takes `host` (#608). `hostname` is accepted as a deprecated alias so older callers keep working, and tools that answer with a dict say so in a `warning` field; new tools must use `host` alone. `tests/test_mcp_host_param.py` walks the registry and enforces it.
 
 `propose_artifact` initiates a change (requires write scope). Approval used to be refused over MCP outright, because the MCP credential is a single shared token and an LLM able to approve would both propose and approve its own mutations (#385); the relayed approval code replaced the blanket ban with a gate the assistant cannot pass on its own.
 
@@ -256,6 +260,12 @@ The token's API scope selects its tool tier through one shared map (`homepilot.a
 | `write` | `full` |
 | `admin` | `admin` |
 
+> **Vocabulary collision (#579):** the *API scope* named `full` is NOT in this
+> table - it normalizes to `*` (everything; it is what `hp init` mints) and
+> resolves to the `admin` tier. The *MCP tier* named `full` is the write tier
+> and corresponds to API scope `write`. When speaking or writing, qualify the
+> word: "API `full` (= `*`)" vs "MCP `full` tier (= write)".
+
 `HP_MCP_TOKEN` remains as a **legacy static fallback**: a value equal to it authenticates at `HP_MCP_TOKEN_SCOPE`. Precedence is exact - a token that verifies as an API token wins its own scope's tier; a token carrying the `hp_` API prefix that does NOT verify is refused outright and never falls through to the static compare (a revoked assistant token must not be able to resurrect itself); anything else is refused. Both transports follow this one rule: the HTTP `/mcp` mount, and the stdio server through the `HP_MCP_TOKEN` entry in its client's `env` block.
 
 The `/mcp` mount is unconditional and always authenticated. A backend with no credential configured at all refuses every MCP request rather than serving an open control plane.
@@ -264,9 +274,9 @@ The tier ladder mirrors the API scope ladder read < write < admin:
 
 - `read_only` — read tools only.
 - `full` (default) — reads plus the standard mutators (`add_host`, `apply_artifact`, `revoke_artifact`, …), but NOT admin tools.
-- `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest`, `delete_auth_token`, the operator-settings tools, …).
+- `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest` and `create_guest_template`, `delete_auth_token`, the operator-settings tools, …).
 
-Each tool's tier equals the API scope of the route it mirrors; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces that equality so a lesser MCP token can never do what the API reserves for a greater one.
+Each tool's tier equals the API scope of the route it mirrors; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces that equality so a lesser MCP token can never do what the API reserves for a greater one. `create_guest_template` is the one tool with no route to mirror - it is MCP-only for now - so it is placed by hand at the admin tier, next to the `provision_guest` it feeds.
 
 ---
 

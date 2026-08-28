@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_agents",
@@ -46,7 +48,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_agent",
         "description": (
-            "One CONNECTED agent by agent_id or by hostname: agent_id, hostname, "
+            "One CONNECTED agent by agent_id or by host name: agent_id, hostname, "
             "system_info, state, connected_at, last_heartbeat. Answers from the hub's "
             "live registry, so an agent that is enrolled but not connected right now "
             "is reported as not found - use list_agents to see stored agents that are "
@@ -56,10 +58,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "agent_id": {"type": "string", "description": "The agent's id"},
-                "hostname": {
-                    "type": "string",
-                    "description": "The host's name, as an alternative to agent_id",
-                },
+                **host_properties("The host's name, as an alternative to agent_id"),
             },
         },
         "outputSchema": {
@@ -244,7 +243,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Managed host's name"},
+                **host_properties("Managed host's name"),
                 "command": {"type": "string", "description": "Command to run"},
                 "timeout": {"type": "integer", "description": "Seconds (default 30)"},
             },
@@ -271,7 +270,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Managed host's name"},
+                **host_properties("Managed host's name"),
                 "path": {"type": "string", "description": "Absolute file path on the host"},
                 "content": {"type": "string", "description": "New file content"},
             },
@@ -313,14 +312,16 @@ async def handle_get_agent(arguments: dict[str, Any], ctx: dict[str, Any]) -> di
 
     registry = _registry(ctx)
     agent_id = str(arguments.get("agent_id") or "").strip()
-    hostname = str(arguments.get("hostname") or "").strip()
-    if not agent_id and not hostname:
-        raise ValueError("pass agent_id or hostname")
+    host, warning = host_arg(arguments, required=False)
+    if not agent_id and not host:
+        raise ValueError("pass agent_id or host")
 
-    agent = registry.get(agent_id) if agent_id else registry.get_by_hostname(hostname)
+    agent = registry.get(agent_id) if agent_id else registry.get_by_hostname(host)
     if not agent:
-        raise ValueError(f"Agent not connected: {agent_id or hostname}")
-    return agent_detail(agent)
+        raise ValueError(f"Agent not connected: {agent_id or host}")
+    # The ANSWER still calls the field `hostname` - it mirrors GET /agents/{id},
+    # and #608 standardised what a caller passes, not what the payload is named.
+    return with_host_warning(agent_detail(agent), warning if not agent_id else None)
 
 
 async def handle_get_agent_audit(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -488,13 +489,13 @@ async def handle_exec_on_host(arguments: dict[str, Any], ctx: dict[str, Any]) ->
     adapter = ctx.get("agent_adapter")
     if adapter is None:
         raise RuntimeError("no agent hub — host operations unavailable")
-    host = str(arguments["host"])
+    host, warning = host_arg(arguments)
     command = str(arguments["command"])
     timeout = int(arguments.get("timeout", 30))
     # adapter.exec keeps the PVE-node guard; the agent enforces its own protections.
     # This is the raw exec the API's POST /agents/host/exec runs - no allowlist.
     exit_code, stdout, stderr = await adapter.exec(host, command, timeout=timeout)
-    return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr}
+    return with_host_warning({"exit_code": exit_code, "stdout": stdout, "stderr": stderr}, warning)
 
 
 async def handle_write_file_on_host(
@@ -503,11 +504,11 @@ async def handle_write_file_on_host(
     adapter = ctx.get("agent_adapter")
     if adapter is None:
         raise RuntimeError("no agent hub — host operations unavailable")
-    host = str(arguments["host"])
+    host, warning = host_arg(arguments)
     path = str(arguments["path"])
     content = str(arguments["content"])
     # adapter.write_file keeps the PVE-node guard; the agent enforces the write
     # allowlist and symlink safety (the real enforcement point), so this does not
     # bypass the path guard - it mirrors POST /agents/host/write-file.
     result: dict[str, Any] = await adapter.write_file(host, path, content)
-    return result
+    return with_host_warning(result, warning)
