@@ -25,7 +25,7 @@ async def provision_guest(
 ) -> dict[str, Any]:
     """Queue a clone-from-template provision. Progress is read via /tasks/{id}.
 
-    node, template_vmid, pool and ipconfig0 may be omitted when this instance
+    node, template_vmid, pool, storage and ipconfig0 may be omitted when this instance
     has provisioning defaults for them (#553 C3); a request that names them is
     unchanged, and one that names neither is refused saying which setting would
     have filled the gap.

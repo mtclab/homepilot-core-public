@@ -1,6 +1,41 @@
 # Changelog
 
+## 3.6.9 - 2026-08-28
+
+### Provisioning can choose where a guest's disks land (#618)
+
+Every clone inherited the template's storage, because the clone call never
+carried one - so a cluster's guests piled onto whatever storage the template
+happened to sit on, and no setting, request field or invite could move them.
+A new **`provision_default_storage`** setting (Settings -> Provisioning
+defaults, `HP_PROVISION_DEFAULT_STORAGE`) names the target storage; the
+`POST /guests/provision` body, the `provision_guest` MCP tool, `hp invite
+create --storage` and the mint route all take a `storage` of their own that
+wins over it.
+
+**Empty still means inherit**, and it means it by sending no `storage` key at
+all - the pre-#618 behaviour, unchanged for every existing install. The clone
+stays a FULL clone in every case: PVE only honours a target storage on one, and
+a linked clone would bind the guest to its template forever.
+
+Like its siblings the setting is probed against the live cluster before it is
+saved, and the probe asks the question that actually bites: a storage the node
+does not have is refused with the ones it does, and a storage that holds no
+`images` content is refused too - PVE reports a backup-only storage happily,
+and a clone aimed at it dies deep inside the clone task. An invite freezes its
+storage AT MINT beside its node and template, so repointing the default never
+re-targets an invite already in somebody's inbox.
+
 ## 3.6.8 - 2026-08-28
+
+### A pre-apply snapshot goes to the guest's own collection (#617)
+
+The executor's snapshot tried qemu, swallowed its error, retried lxc - so a
+failing snapshot on prod showed the WRONG collection's 401 while the real
+cause (a write token without VM.Snapshot) stayed hidden. The guest type is
+now resolved and exactly one collection is hit, and a 401/403 names the path,
+the status and the credential possibility out loud.
+
 
 ### The console's token ladder mints what it says (#614), and the superuser scope is spelled "all" (#579)
 

@@ -28,6 +28,7 @@ from ..provision.defaults import (
     resolve_ipconfig,
     resolve_node,
     resolve_pool,
+    resolve_storage,
     resolve_template_vmid,
 )
 from .quota import delete_quota, get_quota, set_quota, usage_for
@@ -57,6 +58,10 @@ class InviteIn(BaseModel):
     cn: str = Field(min_length=1, max_length=128)
     template_vmid: int | None = Field(default=None, ge=100)
     node: str | None = Field(default=None, min_length=1)
+    # Where the guest's disks land (#618). Optional the same way node is: named
+    # here it wins, omitted it comes from provision_default_storage, and absent
+    # from both the clone inherits the template's storage.
+    storage: str | None = Field(default=None, min_length=1, max_length=63)
     cores: int = Field(ge=1, le=64)
     memory_mb: int = Field(ge=256)
     disk_gb: int = Field(ge=1)
@@ -221,6 +226,7 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
         template_vmid=template_vmid,
         node=node,
         pool=resolve_pool(None, defaults),
+        storage=resolve_storage(body.storage, defaults),
         ipconfig0=resolve_ipconfig(None, defaults),
         cores=body.cores,
         memory_mb=body.memory_mb,
@@ -246,6 +252,7 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
             "node": caps.node,
             "template_vmid": caps.template_vmid,
             "pool": caps.pool,
+            "storage": caps.storage,
             "ipconfig0": caps.ipconfig0,
         },
     }

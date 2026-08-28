@@ -148,10 +148,13 @@ https://portal.example.net/invite/hpi_9f3c...
 HomePilot keeps only the prefix and a hash, so there is no way to print it
 again. If you lose it, revoke and mint a new one.
 
-`--pool` puts the guest in a Proxmox pool; `--disk-device` picks the disk to
-resize (default `scsi0`). Caps are validated against the same model that
-provisioning uses, so a mint that would fail at build time fails at mint time
-instead.
+`--pool` puts the guest in a Proxmox pool; `--storage` names the storage its
+disks land on (omit it and the clone inherits the template's storage);
+`--disk-device` picks the disk to resize (default `scsi0`). Caps are validated
+against the same model that provisioning uses, so a mint that would fail at
+build time fails at mint time instead - and every cap, storage included, is
+FROZEN at mint, so changing an instance default afterwards never re-points an
+invite already sent.
 
 **2. Send the URL** to the holder of that certificate. Only they can use it.
 

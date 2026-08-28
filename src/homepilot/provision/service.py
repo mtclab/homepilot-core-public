@@ -213,6 +213,9 @@ class ProvisionService:
                 name=request.name,
                 full=request.full,
                 pool=request.pool,
+                # None means "inherit the template's storage" all the way down
+                # to the PVE body, which then carries no storage key at all.
+                storage=request.storage,
             )
             inflight_upid = upid
             await proxmox.wait_for_task(

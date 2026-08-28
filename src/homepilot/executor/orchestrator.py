@@ -323,8 +323,13 @@ class ArtifactExecutor:
         if not vmid or not node:
             return None
         snap_name = f"hp-pre-{fm['id']}"
+        # The target already knows what the guest IS ("vm" => qemu, "lxc" =>
+        # lxc). Handing it over stops the snapshot call guessing a collection
+        # from the VMID and posting a QEMU guest to /lxc/ (#617); a target that
+        # says neither leaves the adapter to ask the cluster.
+        guest_type = target.get("kind")
         try:
-            result = await self.proxmox.snapshot(node, vmid, snap_name)
+            result = await self.proxmox.snapshot(node, vmid, snap_name, guest_type=guest_type)
             snap_result: Any = result.get("data", snap_name)
             return str(snap_result) if snap_result is not None else snap_name
         except (ProxmoxError, httpx.RequestError, httpx.TimeoutException) as exc:

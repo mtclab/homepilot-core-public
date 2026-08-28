@@ -18,6 +18,13 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 # Disk PVE will accept for a resize on a qemu guest.
 DISK_RE = re.compile(r"^(scsi|virtio|sata|ide)\d{1,2}$")
 
+# A PVE storage id, as PVE itself accepts it. Validated because it is
+# interpolated into an API PATH by the template builder (/storage/{id},
+# /nodes/{n}/storage/{id}/...), where a slash or a '..' would address something
+# else entirely - and because provisioning now sends one to the clone call
+# (#618), where a value nobody checked becomes a clone that fails halfway.
+STORAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,62}$")
+
 # Key types an authorized_keys line may open with. Deliberately narrow: no
 # ssh-dss (disabled by default in modern OpenSSH), no bare 'ssh-' wildcard.
 _KEY_TYPE_RE = re.compile(r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[A-Za-z0-9.@-]+|sk-[A-Za-z0-9.@-]+)$")
@@ -104,6 +111,15 @@ class ProvisionRequest(BaseModel):
     ipconfig0: str = "ip=dhcp"
     owner: str | None = Field(default=None, max_length=64)
     pool: str | None = None
+    # Where the clone's disks land (#618). None inherits the template's own
+    # storage - the pre-#618 behaviour, and what PVE does when the clone call
+    # carries no storage key at all.
+    storage: str | None = None
+    # NEVER flip this to False. A linked clone binds the guest to the template
+    # forever (the template can no longer be deleted or moved, and the guest
+    # cannot leave its storage), which is not what this product hands a friend.
+    # It is also what makes `storage` above mean anything: PVE only honours a
+    # target storage on a FULL clone.
     full: bool = True
 
     @field_validator("name")
@@ -122,6 +138,19 @@ class ProvisionRequest(BaseModel):
         if not DISK_RE.match(v):
             raise ValueError("disk must be a PVE disk name such as 'scsi0' or 'virtio0'")
         return v
+
+    @field_validator("storage")
+    @classmethod
+    def _check_storage(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        value = v.strip()
+        if not STORAGE_RE.match(value):
+            raise ValueError(
+                "storage must be a PVE storage id: a letter followed by up to 62 "
+                "letters, digits, dots, dashes or underscores"
+            )
+        return value
 
     @field_validator("ssh_authorized_key")
     @classmethod
@@ -158,6 +187,7 @@ class ProvisionRequestIn(ProvisionRequest):
             resolve_ipconfig,
             resolve_node,
             resolve_pool,
+            resolve_storage,
             resolve_template_vmid,
         )
 
@@ -165,16 +195,12 @@ class ProvisionRequestIn(ProvisionRequest):
         payload["node"] = resolve_node(self.node, defaults)
         payload["template_vmid"] = resolve_template_vmid(self.template_vmid, defaults)
         payload["pool"] = resolve_pool(self.pool, defaults)
+        payload["storage"] = resolve_storage(self.storage, defaults)
         payload["ipconfig0"] = resolve_ipconfig(self.ipconfig0, defaults)
         return ProvisionRequest(**payload)
 
 
 # ── Guest-template creation (#594) ───────────────────────────────────────────
-
-# A PVE storage id, as PVE itself accepts it. Validated here because it is
-# interpolated into an API PATH (/storage/{id}, /nodes/{n}/storage/{id}/...),
-# where a slash or a '..' would address something else entirely.
-STORAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,62}$")
 
 # A volume id as PVE prints it: '<storage>:<content>/<filename>'. The staged
 # cloud image is named this way whether it sits under `import` or `iso` content.

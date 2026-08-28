@@ -123,7 +123,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "get_task_result for the outcome. Refuses (an error) when Proxmox is not "
             "configured, when the request is invalid (name, disk, or authorized-key "
             "shapes), or when a provision for the same name is already in flight. "
-            "node, template_vmid, pool and ipconfig0 may be omitted when the instance "
+            "node, template_vmid, pool, storage and ipconfig0 may be omitted when the instance "
             "has provisioning defaults configured; without both a value and a default "
             "the call is refused naming the missing setting. Admin only."
         ),
@@ -170,6 +170,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "ipconfig0": {"type": "string", "description": "cloud-init net config (ip=dhcp)"},
                 "owner": {"type": ["string", "null"], "description": "Owner CN for the guest"},
                 "pool": {"type": ["string", "null"], "description": "PVE resource pool"},
+                "storage": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "PVE storage the clone's disks land on; omit to use the "
+                        "instance's provision_default_storage, and with neither set "
+                        "the clone inherits the template's own storage"
+                    ),
+                },
                 "full": {"type": "boolean", "description": "Full clone (default true)"},
             },
             "required": ["name"],

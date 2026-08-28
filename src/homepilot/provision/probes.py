@@ -202,6 +202,65 @@ async def probe_pool(value: Any, ctx: ProbeContext) -> ProbeResult:
     )
 
 
+async def probe_storage(value: Any, ctx: ProbeContext) -> ProbeResult:
+    """Does this storage exist on the provision node, and can it hold disks?
+
+    Two questions, not one, and the second is the one that bites: PVE happily
+    reports a storage that only carries `iso`/`backup`/`vztmpl` content, and a
+    clone targeted at it fails deep inside the clone task with a message the
+    operator sees as a half-provisioned guest. `images` is the content type a
+    VM disk needs, so a storage without it is refused HERE, before it is stored
+    as the default every future provision will use.
+    """
+    storage = str(value or "").strip()
+    if not storage:
+        return ProbeResult(True, "No default storage: clones inherit the template's own storage.")
+    if not ctx.node:
+        # A storage may be node-restricted, so "does it exist" has no
+        # cluster-wide answer until the provision node is known - the same
+        # reason the bridge probe asks for the node first.
+        return ProbeResult(
+            False,
+            f"set the node first: a storage may be restricted to particular nodes, "
+            f"so there is nothing to check {storage} against until "
+            "provision_default_node names one",
+        )
+    try:
+        rows = _rows(await _read(ctx, f"/nodes/{ctx.node}/storage"))
+    except _NotConfiguredError:
+        return _NO_CLUSTER
+    except Exception as exc:
+        return _unreachable(exc)
+    names = sorted(str(r.get("storage", "")) for r in rows if r.get("storage"))
+    match = next((r for r in rows if str(r.get("storage", "")) == storage), None)
+    if match is None:
+        return ProbeResult(
+            False,
+            f"no storage {storage} on node {ctx.node}; node has: {', '.join(names) or '(none)'}",
+        )
+    content = _content_types(match)
+    if "images" not in content:
+        return ProbeResult(
+            False,
+            f"storage {storage} on node {ctx.node} does not hold 'images' content, so "
+            f"a cloned disk cannot land on it; it holds: {', '.join(content) or '(none)'}",
+        )
+    return ProbeResult(True, f"Storage {storage} on node {ctx.node} holds VM images.")
+
+
+def _content_types(row: dict[str, Any]) -> list[str]:
+    """The content types PVE reports for a storage, as a list.
+
+    PVE spells this as a comma-separated string in the node storage listing;
+    accept a list too rather than assume, because the same field comes back as
+    one in other shapes of this API.
+    """
+    raw = row.get("content", "")
+    if isinstance(raw, list):
+        return sorted(str(item).strip() for item in raw if str(item).strip())
+    return sorted(part.strip() for part in str(raw).split(",") if part.strip())
+
+
 async def probe_bridge(value: Any, ctx: ProbeContext) -> ProbeResult:
     bridge = str(value or "").strip()
     if not bridge:
@@ -464,6 +523,7 @@ PROBES: dict[str, ProbeFn] = {
     "provision_default_node": probe_node,
     "provision_default_template_vmid": probe_template_vmid,
     "provision_default_pool": probe_pool,
+    "provision_default_storage": probe_storage,
     "provision_default_bridge": probe_bridge,
     "provision_default_vlan_tag": probe_vlan_tag,
     "provision_default_ipconfig": probe_ipconfig,

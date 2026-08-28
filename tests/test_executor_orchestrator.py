@@ -1,3 +1,4 @@
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -902,3 +903,173 @@ Install nginx
         fm, _ = store.read(aid)
         assert fm["status"] == "revoked"
         mock_ssh.exec.assert_called()
+
+
+QEMU_GUEST_SPEC_BODY = """\
+## Plan
+Set the description on the VM
+
+## Spec
+
+```yaml proxmox-api-spec
+steps:
+  - id: describe
+    method: POST
+    path: /nodes/elizabeth/qemu/9001/config
+    body:
+      description: hp
+    on_error: halt
+```
+"""
+
+LXC_GUEST_SPEC_BODY = """\
+## Plan
+Set the description on the container
+
+## Spec
+
+```yaml proxmox-api-spec
+steps:
+  - id: describe
+    method: POST
+    path: /nodes/elizabeth/lxc/9002/config
+    body:
+      description: hp
+    on_error: halt
+```
+"""
+
+
+class _RecordingPVE:
+    """A PVE that answers everything and remembers what it was asked.
+
+    Wired under a real ``ProxmoxClient`` so an apply goes over the wire the way
+    it does in production - the pre-apply snapshot included, which is the whole
+    point: the path it POSTs to is the defect (#617), and a mocked
+    ``proxmox.snapshot`` cannot see it.
+    """
+
+    # What actually lives on this fake cluster: 9001 is a VM, 9002 a container.
+    GUESTS: ClassVar[dict[int, str]] = {9001: "qemu", 9002: "lxc"}
+
+    def __init__(self, snapshot_status: int = 200):
+        self.requests: list[tuple[str, str]] = []
+        self.snapshot_status = snapshot_status
+
+    def handle(self, request):
+        import httpx
+
+        path = request.url.path
+        self.requests.append((request.method, path))
+        if path.endswith("/snapshot") and request.method == "POST":
+            if self.snapshot_status != 200:
+                return httpx.Response(self.snapshot_status, json={"errors": "permission denied"})
+            # PVE has no guest of the other type under that id, exactly as the
+            # real cluster answers a snapshot aimed at the wrong collection.
+            parts = path.split("/")
+            collection, vmid = parts[-3], int(parts[-2])
+            if self.GUESTS.get(vmid) != collection:
+                return httpx.Response(500, json={"errors": f"no such {collection} guest {vmid}"})
+            return httpx.Response(200, json={"data": "UPID:snap"})
+        if path.endswith("/cluster/resources"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"vmid": 9001, "type": "qemu", "node": "elizabeth"},
+                        {"vmid": 9002, "type": "lxc", "node": "elizabeth"},
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"data": {}})
+
+    @property
+    def snapshot_paths(self) -> list[str]:
+        return [p for m, p in self.requests if m == "POST" and p.endswith("/snapshot")]
+
+
+def _client_over(pve: _RecordingPVE):
+    import httpx
+
+    from homepilot.adapters.proxmox import ProxmoxClient
+
+    client = ProxmoxClient(base_url="https://pve.example:8006", token="root@pam!t=uuid")
+    fake = httpx.AsyncClient(
+        base_url="https://pve.example:8006/api2/json",
+        transport=httpx.MockTransport(pve.handle),
+    )
+    client._client = fake
+    client._write_client = fake
+    return client
+
+
+class TestSnapshotHitsTheGuestsOwnCollection:
+    """#617: applying to a QEMU guest snapshotted /lxc/{vmid}/snapshot.
+
+    Found on prod: a `vm` target with vmid 9001 failed before step 1 with a 401
+    from the LXC collection, because the snapshot call tried qemu and fell back
+    to lxc on ANY error. These drive a real apply and assert the collection the
+    snapshot actually goes to.
+    """
+
+    async def _apply(self, tmp_artifacts_dir, pve, target, body):
+        store = ArtifactStore(tmp_artifacts_dir)
+        lifecycle = ArtifactLifecycle(store=store)
+        executor = ArtifactExecutor(
+            store=store,
+            lifecycle=lifecycle,
+            repo=AsyncMock(),
+            proxmox=_client_over(pve),
+            agent=AsyncMock(),
+            vault=AsyncMock(),
+            pve_nodes=["elizabeth"],
+        )
+        spec = _make_spec(kind="proxmox-api-sequence", body=body, target=target)
+        aid = await lifecycle.propose(spec)
+        await lifecycle.approve(aid, user="admin")
+        return await executor.apply(aid, approved_by="admin")
+
+    async def test_vm_target_snapshots_the_qemu_collection(self, tmp_artifacts_dir):
+        pve = _RecordingPVE()
+        result = await self._apply(
+            tmp_artifacts_dir,
+            pve,
+            {"kind": "vm", "vmid": 9001, "node": "elizabeth", "host": "web1"},
+            QEMU_GUEST_SPEC_BODY,
+        )
+
+        assert result.success
+        assert pve.snapshot_paths == ["/api2/json/nodes/elizabeth/qemu/9001/snapshot"]
+        assert not any("/lxc/" in p for p in pve.snapshot_paths)
+
+    async def test_lxc_target_snapshots_the_lxc_collection(self, tmp_artifacts_dir):
+        pve = _RecordingPVE()
+        result = await self._apply(
+            tmp_artifacts_dir,
+            pve,
+            {"kind": "lxc", "vmid": 9002, "node": "elizabeth", "host": "ct1"},
+            LXC_GUEST_SPEC_BODY,
+        )
+
+        assert result.success
+        assert pve.snapshot_paths == ["/api2/json/nodes/elizabeth/lxc/9002/snapshot"]
+        assert not any("/qemu/" in p for p in pve.snapshot_paths)
+
+    async def test_snapshot_401_names_the_path_the_status_and_the_token(self, tmp_artifacts_dir):
+        # The prod message named neither the collection nor the credential, so
+        # an operator could not tell a wrong-path bug from a missing right.
+        pve = _RecordingPVE(snapshot_status=401)
+        result = await self._apply(
+            tmp_artifacts_dir,
+            pve,
+            {"kind": "vm", "vmid": 9001, "node": "elizabeth", "host": "web1"},
+            QEMU_GUEST_SPEC_BODY,
+        )
+
+        assert not result.success
+        reason = result.failure_reason or ""
+        assert "nodes/elizabeth/qemu/9001/snapshot" in reason
+        assert "401" in reason
+        assert "write token" in reason
+        # And the apply stopped: no config write reached the guest.
+        assert not any(p.endswith("/config") for _, p in pve.requests)
