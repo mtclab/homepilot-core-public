@@ -402,6 +402,68 @@ class TestOrchestratorSnapshot:
         assert result.snapshot_id is not None
         mock_proxmox.snapshot.assert_called_once()
 
+    async def test_the_steps_wait_for_the_pre_apply_snapshot_to_finish(self, tmp_artifacts_dir):
+        """The safety net must be TAKEN before the change it protects runs.
+
+        PVE answers the snapshot with a UPID and returns at once, leaving the
+        guest locked (snapshot) while the task runs. Starting the steps on that
+        answer raced the snapshot: on dev 3.6.10 the first step came straight
+        back with "VM is locked (snapshot)" and the apply failed on a guest
+        that was perfectly fine. Worse than a failed step - proceeding here
+        mutates a guest whose rollback point is not finished being taken.
+        """
+        store = ArtifactStore(tmp_artifacts_dir)
+        lifecycle = ArtifactLifecycle(store=store)
+        mock_ssh = AsyncMock()
+        mock_ssh.exec = AsyncMock(return_value=(0, "", ""))
+        mock_ssh._validate_guest_only = MagicMock()
+
+        snap_upid = "UPID:pve1:0000FFFF:0000AAAA:66000000:qmsnapshot:101:root@pam:"
+        order: list[str] = []
+
+        mock_proxmox = AsyncMock()
+
+        async def snapshot(node, vmid, name, guest_type=None):
+            order.append("snapshot")
+            return {"data": snap_upid}
+
+        async def wait_for_task(node, upid, **kwargs):
+            order.append("wait")
+            return {"status": "stopped", "exitstatus": "OK"}
+
+        async def call(method, path, body=None):
+            order.append("step")
+            return {"data": {}}
+
+        mock_proxmox.snapshot = AsyncMock(side_effect=snapshot)
+        mock_proxmox.wait_for_task = AsyncMock(side_effect=wait_for_task)
+        mock_proxmox.call = AsyncMock(side_effect=call)
+
+        executor = ArtifactExecutor(
+            store=store,
+            lifecycle=lifecycle,
+            repo=AsyncMock(),
+            proxmox=mock_proxmox,
+            agent=mock_ssh,
+            vault=AsyncMock(),
+            pve_nodes=["pve1"],
+        )
+
+        spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
+        aid = await lifecycle.propose(spec)
+        await lifecycle.approve(aid, user="admin")
+
+        result = await executor.apply(aid, approved_by="admin")
+
+        assert result.success
+        assert order[:2] == ["snapshot", "wait"], (
+            "a step ran before the pre-apply snapshot task finished"
+        )
+        assert "step" in order
+        # The recorded id is the snapshot an operator rolls back TO, not the
+        # UPID of the task that took it.
+        assert result.snapshot_id == f"hp-pre-{aid}"
+
     async def test_snapshot_skipped_when_disabled(self, tmp_artifacts_dir):
         store = ArtifactStore(tmp_artifacts_dir)
         lifecycle = ArtifactLifecycle(store=store)
@@ -970,7 +1032,19 @@ class _RecordingPVE:
             collection, vmid = parts[-3], int(parts[-2])
             if self.GUESTS.get(vmid) != collection:
                 return httpx.Response(500, json={"errors": f"no such {collection} guest {vmid}"})
-            return httpx.Response(200, json={"data": "UPID:snap"})
+            # A REAL UPID: the executor now waits for the snapshot task before
+            # it runs a step (a guest is locked while the snapshot is taken),
+            # and it reads the node out of field 1 to know whose task list to
+            # poll. A placeholder string would be waited on against a node
+            # named "snap" and never finish.
+            return httpx.Response(
+                200,
+                json={
+                    "data": "UPID:elizabeth:0000FFFF:0000AAAA:66000000:qmsnapshot:9001:root@pam:"
+                },
+            )
+        if "/tasks/" in path and path.endswith("/status"):
+            return httpx.Response(200, json={"data": {"status": "stopped", "exitstatus": "OK"}})
         if path.endswith("/cluster/resources"):
             return httpx.Response(
                 200,
