@@ -330,8 +330,19 @@ class ArtifactExecutor:
         guest_type = target.get("kind")
         try:
             result = await self.proxmox.snapshot(node, vmid, snap_name, guest_type=guest_type)
-            snap_result: Any = result.get("data", snap_name)
-            return str(snap_result) if snap_result is not None else snap_name
+            # PVE answers the snapshot with a UPID and returns at once: the
+            # guest is LOCKED (snapshot) while the task runs. Starting the
+            # steps on that answer raced the safety net itself - the first
+            # step came straight back with "VM is locked (snapshot)" and the
+            # apply failed on a guest that was fine (seen live on dev 3.6.10).
+            # Worse than a failed step: proceeding would mutate a guest whose
+            # rollback point is not finished being taken.
+            upid = ProxmoxClient.upid_of(result)
+            if upid:
+                await self.proxmox.wait_for_task(node, upid)
+            # The snapshot's NAME is what an operator rolls back to; the UPID
+            # is the task that took it and is worthless once it has finished.
+            return snap_name
         except (ProxmoxError, httpx.RequestError, httpx.TimeoutException) as exc:
             # A requested pre-apply snapshot is the rollback safety net. If it
             # fails we must NOT silently proceed to mutate the guest with no way
