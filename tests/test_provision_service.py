@@ -484,6 +484,66 @@ class TestCancelReachesProxmox:
             "cleanup": "deleted",
         }
 
+    async def test_cancel_stops_a_running_guest_before_destroying_it(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#626 - the cleanup must reach a guest that already booted.
+
+        WHAT THIS FORBIDS: a cancel that fires the destroy at a RUNNING guest.
+        PVE refuses that outright ("VM 101 is running - destroy failed"), and
+        the cancel then records a failed cleanup while the guest stays up and
+        billing - which is exactly what happened on dev: a cancelled provision
+        left vmid 101 running on the node for the rest of the session.
+        """
+        gate = self._block_wait_for_task(proxmox)
+        proxmox.get_vm_current = AsyncMock(return_value={"data": {"status": "running"}})
+
+        # The order is the whole point: PVE refuses a destroy on a running
+        # guest, so the stop must be issued first.
+        order: list[str] = []
+
+        async def stop_vm(node, vmid):
+            order.append("stop")
+            return "UPID:pve1:qmstop:"
+
+        async def delete_vm(node, vmid):
+            order.append("destroy")
+            return "UPID:pve1:destroy:"
+
+        proxmox.stop_vm = AsyncMock(side_effect=stop_vm)
+        proxmox.delete_vm = AsyncMock(side_effect=delete_vm)
+
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        proxmox.stop_vm.assert_awaited_once_with("pve1", 105)
+        proxmox.delete_vm.assert_awaited_once_with("pve1", 105)
+        assert order == ["stop", "destroy"], "the destroy was issued before the guest was stopped"
+
+        final = await service.task_repo.get_task(task_id)
+        assert final["status"] == "cancelled"
+        assert final["error"] is None, "cleanup must not fail on a running guest"
+        assert json.loads(final["result_json"])["cleanup"] == "deleted"
+
+    async def test_cancel_waits_for_the_destroy_task_before_calling_it_deleted(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """A destroy UPID is acceptance, not removal - "deleted" must mean gone."""
+        gate = self._block_wait_for_task(proxmox)
+        proxmox.get_vm_current = AsyncMock(return_value={"data": {"status": "stopped"}})
+
+        task_id = await service.start(_request(), actor="tester")
+        await self._spin(lambda: proxmox.wait_for_task.await_count == 1)
+        await service.cancel(task_id)
+        gate.set()
+        await self._settle(service)
+
+        waited = [c.args[1] for c in proxmox.wait_for_task.await_args_list if len(c.args) > 1]
+        assert "UPID:pve1:destroy:" in waited, "the destroy task was never waited on"
+
     async def test_cancel_writes_an_audit_row_and_releases_the_name(
         self, service: ProvisionService, proxmox: AsyncMock, db: Database
     ):

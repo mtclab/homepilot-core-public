@@ -173,7 +173,14 @@ def _events_webhook_subsystem(settings: Any) -> Subsystem:
 
 
 def _proxmox_subsystem(state: Any, settings: Any) -> Subsystem:
-    host = (getattr(settings, "proxmox_host", "") or "").strip()
+    # The RESOLVED host (vault overrides env) is carried on the app state;
+    # settings.proxmox_host is the env half only. Reading settings alone
+    # reported "No hypervisor is configured" on an install whose Proxmox
+    # address lives in the vault - while its inventory and provisioning were
+    # working off that very address.
+    host = (getattr(state, "proxmox_host", "") or "").strip()
+    if not host:
+        host = (getattr(settings, "proxmox_host", "") or "").strip()
     client = getattr(state, "proxmox", None)
     target = redact_endpoint(host)
 

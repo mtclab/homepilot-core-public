@@ -72,17 +72,13 @@ class GuestTemplateExistsError(Exception):
 
 
 def upid_of(result: Any) -> str | None:
-    """The UPID inside a PVE response, or None when the call was synchronous.
+    """The UPID inside a PVE response - see ProxmoxClient.upid_of.
 
-    PVE answers some of these calls with a task id and others with ``null`` (a
-    config write that needed no worker). Treating "no UPID" as an error would
-    fail perfectly good runs; waiting on a non-UPID string would hang. So: a
-    string that starts with ``UPID:`` is a task, anything else is not.
+    Kept as a module-level name because this module reads better for it; the
+    rule itself lives on the adapter, so the api-sequence executor and this
+    both decide "is there a task to wait for" the same way.
     """
-    data = result.get("data", result) if isinstance(result, dict) else result
-    if isinstance(data, str) and data.startswith("UPID:"):
-        return data
-    return None
+    return ProxmoxClient.upid_of(result)
 
 
 class GuestTemplateService:

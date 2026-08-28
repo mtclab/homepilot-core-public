@@ -57,23 +57,14 @@ class ProxmoxConfigOut(BaseModel):
 
 
 async def _resolve_proxmox_config(state: Any) -> tuple[str, int, bool]:
-    settings = getattr(state, "settings", None)
-    host = getattr(settings, "proxmox_host", "") if settings else ""
-    port = getattr(settings, "proxmox_port", 8006) if settings else 8006
-    verify_ssl = getattr(settings, "proxmox_verify_ssl", True) if settings else True
-    vault = getattr(state, "vault", None)
-    if vault is not None:
-        try:
-            config_secret = await vault.get_secret("proxmox-config")
-            if config_secret:
-                host = config_secret.get("host", host) or host
-                port = config_secret.get("port", port) or port
-                verify_ssl = config_secret.get("verify_ssl", verify_ssl)
-                if isinstance(verify_ssl, str):
-                    verify_ssl = verify_ssl.lower() in ("true", "1", "yes")
-        except Exception:
-            logger.debug("Vault 'proxmox-config' unavailable, using defaults", exc_info=True)
-    return host, port, verify_ssl
+    """Delegates to the one resolver in `homepilot.proxmox_config`."""
+    from ..proxmox_config import resolve_proxmox_config
+
+    return tuple(  # type: ignore[return-value]
+        await resolve_proxmox_config(
+            getattr(state, "settings", None), getattr(state, "vault", None)
+        )
+    )
 
 
 async def _resolve_proxmox_token(state: Any) -> tuple[str, str]:

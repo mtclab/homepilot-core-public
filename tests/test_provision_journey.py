@@ -237,10 +237,16 @@ class TestProvisionJourney:
         # failed task naming the step, never a provision stuck 'running'.
         service = app.state.provision_service
 
-        async def failing_wait(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        # Only the CLONE task fails. The cleanup behind it stops and destroys
+        # the half-made guest, and those are PVE tasks too - a fake that failed
+        # every wait would also fail the destroy's wait and make this assert
+        # the wrong thing (that a successful cleanup reports as failed).
+        async def failing_wait(node: Any, upid: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
             from homepilot.adapters.proxmox import ProxmoxError
 
-            raise ProxmoxError("GET", "/tasks", 0, "exitstatus 'no space left on device'")
+            if "clone" in str(upid):
+                raise ProxmoxError("GET", "/tasks", 0, "exitstatus 'no space left on device'")
+            return {"status": "stopped", "exitstatus": "OK"}
 
         service.proxmox.wait_for_task = failing_wait
 

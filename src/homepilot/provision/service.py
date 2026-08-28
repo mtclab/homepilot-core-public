@@ -393,7 +393,10 @@ class ProvisionService:
                 outcome["cleanup"] = "nothing_created"
             else:
                 try:
-                    await proxmox.delete_vm(node, vmid)
+                    # Stop-then-destroy, waiting on both tasks: a cancel lands
+                    # on a guest that may already be RUNNING, and PVE refuses
+                    # to destroy one of those (#626).
+                    await self._stop_then_destroy(node, vmid)
                     outcome["cleanup"] = "deleted"
                 except Exception as exc:
                     logger.warning("Could not destroy guest vmid %s on %s", vmid, node)
@@ -483,22 +486,24 @@ class ProvisionService:
             applied[final_pos] = body
         return applied
 
-    async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> str:
-        """Take back a guest a post-clone failure would otherwise strand (#595).
+    async def _stop_then_destroy(self, node: str, vmid: int) -> None:
+        """Stop a guest if it is running, then destroy it, waiting on both tasks.
 
-        Unlike :meth:`_destroy_unfenced` (whose guest is always still stopped,
-        because the fence runs before the boot), a generic failure can land with
-        the guest already running - a start_vm that returned before the wait
-        timed out, a later step that raised. PVE refuses to destroy a running
-        guest, so this stops it first. Every call is best-effort and swallows its
-        own error: the point is that the recorded provision error names the
-        cleanup OUTCOME, so an operator knows whether a guest is still on the
-        node, rather than the cleanup itself becoming a second failure.
+        PVE refuses to destroy a RUNNING guest, and both `stop` and `destroy`
+        are asynchronous - they answer with a UPID the moment the work is
+        accepted. A cleanup that fired the destroy without stopping first, or
+        that took the destroy's UPID for a finished destroy, reported a guest
+        gone while it was still on the node. Cancelling a provision did exactly
+        that on dev: "cancelled but cleanup failed at delete_vm: VM 101 is
+        running - destroy failed", and the guest stayed up (#626).
+
+        Raises whatever Proxmox raises on the destroy: the CALLER decides how a
+        failed cleanup is reported, because a cancel and a failed provision say
+        it in different words.
         """
         proxmox = self.proxmox
-        if proxmox is None:  # pragma: no cover - the caller checked clone_issued
-            return f"no Proxmox client to destroy with, vmid {vmid} may remain"
-        node = request.node
+        if proxmox is None:  # pragma: no cover - every caller checks first
+            raise RuntimeError("Proxmox not configured")
         try:
             current = await proxmox.get_vm_current(node, vmid)
             status = str((current.get("data") or current).get("status") or "")
@@ -514,10 +519,35 @@ class ProvisionService:
         except Exception as exc:
             # A status read or stop that failed does not stop us trying the
             # destroy - PVE may still take a stopped-enough guest, and if it
-            # refuses, the delete_vm error below is what gets reported.
+            # refuses, the destroy's own error is what the caller reports.
             logger.warning("Could not stop guest %s on %s before destroy: %s", vmid, node, exc)
+
+        destroy_upid = await proxmox.delete_vm(node, vmid)
+        if destroy_upid:
+            await proxmox.wait_for_task(
+                node,
+                destroy_upid,
+                timeout_s=self.task_timeout_s,
+                poll_interval=self.poll_interval,
+            )
+
+    async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> str:
+        """Take back a guest a post-clone failure would otherwise strand (#595).
+
+        Unlike :meth:`_destroy_unfenced` (whose guest is always still stopped,
+        because the fence runs before the boot), a generic failure can land with
+        the guest already running - a start_vm that returned before the wait
+        timed out, a later step that raised. PVE refuses to destroy a running
+        guest, so this stops it first. Every call is best-effort and swallows its
+        own error: the point is that the recorded provision error names the
+        cleanup OUTCOME, so an operator knows whether a guest is still on the
+        node, rather than the cleanup itself becoming a second failure.
+        """
+        if self.proxmox is None:  # pragma: no cover - the caller checked clone_issued
+            return f"no Proxmox client to destroy with, vmid {vmid} may remain"
+        node = request.node
         try:
-            await proxmox.delete_vm(node, vmid)
+            await self._stop_then_destroy(node, vmid)
         except Exception as exc:
             logger.error("Could not destroy the orphaned guest %s on %s: %s", vmid, node, exc)
             return f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"

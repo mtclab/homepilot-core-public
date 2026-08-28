@@ -87,6 +87,32 @@ def _vault_state(settings: Any) -> str:
     return "unlocked"
 
 
+def _pve_host(settings: Any) -> str:
+    """The PVE address in force, for display.
+
+    Reading settings.proxmox_host alone printed "(not configured)" on an
+    install whose hypervisor is stored in the vault - the same wrong claim the
+    self-check made (found live on dev 3.6.9). Resolve it the way the running
+    backend does.
+    """
+    from homepilot.proxmox_config import resolve_proxmox_config
+
+    vault: Any = None
+    if settings.vault_passphrase:
+        try:
+            from homepilot.vault import VaultManager
+
+            vault = VaultManager(Path(settings.data_dir), settings.vault_passphrase)
+        except Exception:
+            vault = None
+    try:
+        config = asyncio.run(resolve_proxmox_config(settings, vault))
+    except Exception:
+        config = None
+    host = config.host if config else (settings.proxmox_host or "")
+    return host or "(not configured)"
+
+
 async def _migrate_or_refuse(database: Any, what: str) -> None:
     """Run migrations from the CLI, unless a backend holds this data directory.
 
@@ -455,7 +481,7 @@ def status() -> None:
 
     table.add_row("Data dir", str(data_dir))
     table.add_row("Artifacts dir", str(Path(settings.artifacts_dir)))
-    table.add_row("PVE host", settings.proxmox_host or "(not configured)")
+    table.add_row("PVE host", _pve_host(settings))
     table.add_row("Vault", _vault_state(settings))
 
     store = _get_artifact_store()

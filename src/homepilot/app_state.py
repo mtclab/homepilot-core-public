@@ -50,6 +50,12 @@ class AppState:
     kb_service: Any = None
     sse_bus: Any = None
     pve_token_source: str = ""
+    # The Proxmox host actually in force, after the vault's 'proxmox-config'
+    # secret has overridden the environment. settings.proxmox_host is only the
+    # ENV half, so anything reading it alone calls a vault-configured install
+    # "no hypervisor configured" while inventory and provisioning are working
+    # off this address (the selfcheck report did exactly that).
+    proxmox_host: str = ""
     webhook_secret_source: str = ""
     n8n_key_source: str = ""
     agent_hub: Any = None
@@ -106,26 +112,13 @@ async def create_app_state(settings: Any | None = None) -> AppState:
     try:
         from .adapters.proxmox import ProxmoxClient
 
-        # Resolve Proxmox config: vault overrides env
-        proxmox_port = settings.proxmox_port
-        proxmox_verify_ssl = settings.proxmox_verify_ssl
-        if vault:
-            try:
-                proxmox_config_secret = await vault.get_secret("proxmox-config")
-                if proxmox_config_secret:
-                    proxmox_host = proxmox_config_secret.get("host", proxmox_host) or proxmox_host
-                    proxmox_port = proxmox_config_secret.get("port", proxmox_port) or proxmox_port
-                    proxmox_verify_ssl_val = proxmox_config_secret.get(
-                        "verify_ssl", proxmox_verify_ssl
-                    )
-                    if isinstance(proxmox_verify_ssl_val, str):
-                        proxmox_verify_ssl = proxmox_verify_ssl_val.lower() in ("true", "1", "yes")
-                    elif isinstance(proxmox_verify_ssl_val, bool):
-                        proxmox_verify_ssl = proxmox_verify_ssl_val
-            except Exception:
-                logger.debug(
-                    "Vault 'proxmox-config' unavailable, using env defaults", exc_info=True
-                )
+        # Resolve Proxmox config: vault overrides env (one shared resolver, so
+        # the self-check and `hp status` cannot disagree with this client).
+        from .proxmox_config import resolve_proxmox_config
+
+        proxmox_host, proxmox_port, proxmox_verify_ssl = await resolve_proxmox_config(
+            settings, vault
+        )
 
         if proxmox_host:
             token = ""
@@ -433,6 +426,7 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         kb_service=kb_service,
         sse_bus=sse_bus,
         pve_token_source=pve_token_source if proxmox_host else "",
+        proxmox_host=proxmox_host,
         webhook_secret_source=webhook_secret_source,
         n8n_key_source=n8n_key_source,
         agent_hub=agent_hub,
