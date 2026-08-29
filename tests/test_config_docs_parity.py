@@ -31,6 +31,8 @@ Teeth (proven by planting the defect):
     ``test_deployment_table_has_no_inert_names`` fails.
   * Bump a compose / ``.env.example`` / table ``HP_IMAGE_TAG`` off the packaged
     version -> ``test_image_tag_matches_version`` fails.
+  * Bump the version without writing a ``docs/CHANGELOG.md`` entry ->
+    ``test_the_changelog_has_an_entry_for_the_packaged_version`` fails.
   * Point an ``EXTERNAL_ENV`` entry at a file that does not read it ->
     ``test_external_env_allowlist_is_not_stale`` fails.
   * Reintroduce a removed dead field -> ``test_removed_dead_fields_stay_removed``
@@ -192,6 +194,26 @@ def test_external_env_allowlist_is_not_stale() -> None:
     assert not stale, (
         f"EXTERNAL_ENV allowlists names no listed consumer reads any more: {stale}. "
         "Drop them from the allowlist and from the docs."
+    )
+
+
+def test_the_changelog_has_an_entry_for_the_packaged_version() -> None:
+    """A release the changelog does not mention did not happen, as far as anyone
+    reading the repo can tell.
+
+    Every `chore: release` commit updated docs/CHANGELOG.md - until three in a
+    row did not (3.6.10, 3.6.11, 3.6.12), which were exactly the three no test
+    covered. The version parity net already holds six files; the changelog was
+    the one place where the discipline was a habit rather than a gate, so it was
+    the one place the habit broke.
+    """
+    version = _pyproject_version()
+    changelog = REPO_ROOT / "docs" / "CHANGELOG.md"
+    headings = re.findall(r"^## (\S+)", changelog.read_text(), re.MULTILINE)
+    assert version in headings, (
+        f"docs/CHANGELOG.md has no '## {version}' entry, but that is the packaged "
+        f"version. Newest entries present: {headings[:3]}. Write the release note "
+        "as part of the release, not after it."
     )
 
 

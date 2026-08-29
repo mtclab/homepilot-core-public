@@ -108,8 +108,14 @@ def safe_datacenter_firewall_enable(options: Mapping[str, Any]) -> dict[str, Any
     back through :func:`datacenter_firewall_lockout_safe` before it is handed
     out, so a lockout-shaped write can never leave this function.
     """
-    already_enabled = _fw_flag(options.get("enable", 0))
-    if already_enabled and _policy_in(options) == "ACCEPT":
+    # An ALREADY-ENABLED firewall is the operator's, and HomePilot does not
+    # write to it. Full stop. It used to return {enable:1, policy_in:ACCEPT}
+    # for an enabled firewall whose policy was anything but ACCEPT - which
+    # would have REWRITTEN a cluster input policy the operator set deliberately,
+    # on a node carrying 34 of their own hand-built rules, in the name of a
+    # lockout that was not happening. Enabling is the only thing HomePilot has
+    # any business doing here, so a firewall that is already on needs nothing.
+    if _fw_flag(options.get("enable", 0)):
         return None
     write = {"enable": 1, "policy_in": "ACCEPT"}
     if not datacenter_firewall_lockout_safe(write):  # pragma: no cover - safe by construction
@@ -290,6 +296,17 @@ class PveSdnGateway:
 
     async def node_firewall_options(self, node: str) -> dict[str, Any]:
         return _obj(await self._client.safe_api_call(self._api().nodes(node).firewall.options.get))
+
+    async def node_services(self, node: str) -> list[dict[str, Any]]:
+        """The node's service list, used to tell the firewall STACK apart.
+
+        The node firewall options carry an `nftables` key only on some
+        installs, so its ABSENCE proves nothing - a node running the nftables
+        `proxmox-firewall` can answer options with no such key at all (seen on
+        a live node). The running service is the evidence; the missing key was
+        never more than a hint.
+        """
+        return _rows(await self._client.safe_api_call(self._api().nodes(node).services.get))
 
     async def cluster_firewall_options(self) -> dict[str, Any]:
         # The datacenter firewall master switch (#600). Whether it is on, and

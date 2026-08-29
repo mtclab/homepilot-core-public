@@ -44,6 +44,7 @@ from homepilot.provision.guest_network import (
     DesiredGuestNetwork,
     GuestNetworkError,
     GuestNetworkSurvey,
+    enforcement_note,
     execute,
     fence_rules,
     plan,
@@ -84,7 +85,8 @@ class FakeCluster:
         fw_options: dict[str, Any] | None = None,
         fw_rules: list[dict[str, Any]] | None = None,
         dc_fw_options: dict[str, Any] | None = None,
-        nftables: int = 0,
+        nftables: int | None = 0,
+        services: list[dict[str, Any]] | None = None,
         fail_on: str | None = None,
         failure: str = "dnsmasq is not installed on node elizabeth",
     ) -> None:
@@ -97,6 +99,9 @@ class FakeCluster:
         # cluster is: enabling it (safely) is what an apply does.
         self.dc_fw_options = dict(dc_fw_options or {})
         self.nftables = nftables
+        # What is RUNNING on the node - the evidence for which firewall stack
+        # is in force when the options carry no `nftables` key.
+        self.services = [] if services is None else list(services)
         self.fail_on = fail_on
         self.failure = failure
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -126,7 +131,14 @@ class FakeCluster:
         return list(self.fw_rules)
 
     async def node_firewall_options(self, node: str) -> dict[str, Any]:
+        # `nftables` OMITTED when it is None: a real node answers this way, and
+        # reading its absence as "legacy" is the bug the gates below forbid.
+        if self.nftables is None:
+            return {"enable": 1}
         return {"enable": 1, "nftables": self.nftables}
+
+    async def node_services(self, node: str) -> list[dict[str, Any]]:
+        return list(self.services)
 
     async def cluster_firewall_options(self) -> dict[str, Any]:
         return dict(self.dc_fw_options)
@@ -380,7 +392,122 @@ class TestTheSurvey:
             async def node_firewall_options(self, node: str) -> dict[str, Any]:
                 raise RuntimeError("permission denied")
 
+            async def node_services(self, node: str) -> list[dict[str, Any]]:
+                raise RuntimeError("permission denied")
+
         current = await survey(Broken(), desired())
+        assert current.firewall_stack == "unknown"
+
+    async def test_a_survey_that_could_not_read_everything_plans_nothing(self) -> None:
+        """#642 - an empty field is not evidence of an empty cluster.
+
+        WHAT THIS FORBIDS: planning a write off a read that failed. Every read
+        in `survey` leaves its field empty and records the reason, so a failed
+        `list_zones` read as "there is no zone" and planned create-zone over the
+        operator's working one; a failed firewall-rules read re-planned every
+        fence DROP on top of the rules already there. The executor printed those
+        errors in its log header, beside the writes they should have stopped.
+        """
+        for broken, expect in (
+            ("list_zones", "SDN zones"),
+            ("list_vnets", "SDN vnets"),
+            ("vnet_firewall_rules", "firewall rules"),
+        ):
+
+            class Unreadable(FakeCluster):
+                target = broken
+
+                async def _boom(self, *args: Any, **kwargs: Any) -> Any:
+                    raise RuntimeError("permission denied")
+
+            setattr(Unreadable, broken, Unreadable._boom)
+            current = await survey(
+                Unreadable(vnets=[{"vnet": "innkeep", "zone": "guest"}]), desired()
+            )
+            the_plan = plan(desired(), current)
+
+            assert the_plan.steps == (), (
+                f"a failed {broken} read still planned {len(the_plan.steps)} write(s)"
+            )
+            assert the_plan.blockers, f"a failed {broken} read planned nothing and said nothing"
+            assert any(expect in b for b in the_plan.blockers)
+            assert not the_plan.converged, "an unreadable cluster must never read as converged"
+
+    async def test_a_cluster_that_answers_completely_still_plans_its_changes(self) -> None:
+        """The honest other arm: "plan nothing" must not become the answer to
+        everything, or the guest network could never be built at all."""
+        current = await survey(FakeCluster(dc_fw_options={}), desired())
+
+        assert current.errors == []
+        assert plan(desired(), current).steps, "a readable, empty cluster planned no work"
+
+    async def test_an_unread_master_switch_does_not_plan_a_firewall_write(self) -> None:
+        """WHAT THIS FORBIDS: writing to a firewall HomePilot could not read.
+
+        A failed read left the options as `{}` - which is exactly what a fresh
+        cluster with nothing set answers - so the plan concluded "off, enable
+        it" and would have written enable=1/policy_in=ACCEPT to the operator's
+        cluster firewall off evidence it never obtained. The comment beside the
+        read claimed it did not do this. The code did.
+        """
+
+        class Unreadable(FakeCluster):
+            async def cluster_firewall_options(self) -> dict[str, Any]:
+                raise RuntimeError("permission denied")
+
+        current = await survey(Unreadable(), desired())
+
+        assert current.datacenter_firewall_read is False
+        assert any("datacenter firewall" in e for e in current.errors)
+        the_plan = plan(desired(), current)
+        assert not any(s.id == "ensure-datacenter-firewall" for s in the_plan.steps), (
+            "a firewall write was planned off a read that failed"
+        )
+        # And the report must not claim the fence is enforced either way.
+        assert "unknown" in enforcement_note(current).lower()
+
+    async def test_a_read_that_says_nothing_is_set_still_plans_the_enable(self) -> None:
+        """The honest other arm: a fresh cluster genuinely IS off, and gets the step.
+
+        Without this, "never plan a write" could be satisfied by never planning
+        anything, which would leave the guest fence permanently inert.
+        """
+        current = await survey(FakeCluster(dc_fw_options={}), desired())
+
+        assert current.datacenter_firewall_read is True
+        the_plan = plan(desired(), current)
+        assert any(s.id == "ensure-datacenter-firewall" for s in the_plan.steps)
+
+    async def test_a_missing_nftables_key_is_not_proof_of_legacy(self) -> None:
+        """The node's own options need not carry the key at all.
+
+        WHAT THIS FORBIDS: reading the ABSENCE of `nftables` as "legacy". A live
+        node answered its firewall options with nothing but enable and a digest
+        while running the nftables proxmox-firewall the whole time - so the
+        report told its operator the vnet forward rules were stored but inert
+        when they were being enforced.
+        """
+        running_nft = [
+            {"service": "pve-firewall", "state": "running"},
+            {"service": "proxmox-firewall", "state": "running"},
+        ]
+        current = await survey(FakeCluster(nftables=None, services=running_nft), desired())
+
+        assert current.firewall_stack == "nftables", (
+            "a node running proxmox-firewall was reported as legacy"
+        )
+        assert "LEGACY" not in enforcement_note(current)
+
+    async def test_a_node_running_only_pve_firewall_is_legacy(self) -> None:
+        """The honest other arm - the evidence has to be able to say legacy too."""
+        current = await survey(
+            FakeCluster(nftables=None, services=[{"service": "pve-firewall", "state": "running"}]),
+            desired(),
+        )
+        assert current.firewall_stack == "legacy"
+
+    async def test_neither_service_running_is_unknown_not_legacy(self) -> None:
+        current = await survey(FakeCluster(nftables=None, services=[]), desired())
         assert current.firewall_stack == "unknown"
 
 
@@ -500,7 +627,11 @@ class TestPlanIsPureAndTestableWithoutACluster:
     async def test_plan_needs_no_io_at_all(self) -> None:
         """The whole point of the split: idempotence is decided here, in a
         function a test can call with two plain values."""
-        empty = GuestNetworkSurvey()
+        # datacenter_firewall_read=True: a cluster that ANSWERED, saying nothing
+        # is set. A bare survey defaults it to False, which means "never read"
+        # - and an unread master switch is deliberately not planned against, so
+        # the default would drop a step for the wrong reason.
+        empty = GuestNetworkSurvey(datacenter_firewall_read=True)
         # 10 SDN + firewall steps, plus the ensure-datacenter-firewall step that
         # makes the fence actually enforce (#600).
         assert len(plan(desired(), empty).steps) == 11

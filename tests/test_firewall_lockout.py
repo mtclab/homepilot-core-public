@@ -111,22 +111,55 @@ class TestTheSafeEnablePrimitive:
         assert client.store["puts"] == [], "an already-safe cluster must not be written"
         assert "nothing to do" in said
 
-    async def test_it_never_produces_a_drop_input_policy(self) -> None:
-        # Even starting from the dangerous state PVE left on pve1, the safe
-        # enable REPAIRS it to ACCEPT - it never writes, keeps, or produces DROP.
+    async def test_it_never_writes_a_drop_input_policy(self) -> None:
+        """About what HomePilot WRITES, not what it finds.
+
+        An operator's existing DROP is left exactly where it is (see
+        test_an_enabled_firewall_is_never_written_to_at_all) - what must never
+        happen is HomePilot putting a DROP input policy onto the wire itself.
+        """
         for start in ({}, {"enable": 1, "policy_in": "DROP"}, {"enable": 0}):
             client = _FakeClient(dict(start))
             gw = PveSdnGateway(client)
             await gw.ensure_datacenter_firewall_enabled()
             for put in client.store["puts"]:
                 assert str(put.get("policy_in", "")).upper() != "DROP"
-            assert str(client.store["options"].get("policy_in", "")).upper() != "DROP"
+
+    async def test_an_enabled_firewall_is_never_written_to_at_all(self) -> None:
+        """THE OWNER'S RULE: "We do not touch rules already there and we will
+        not break them."
+
+        WHAT THIS FORBIDS: rewriting the input policy of a firewall that is
+        already on. The old behaviour "repaired" an enabled DROP to ACCEPT,
+        which on a real cluster meant reaching into a hand-built firewall - 34
+        operator rules, ipsets, the lot - and loosening its input policy, to
+        avert a lockout that was not happening. An enabled firewall belongs to
+        the operator; the only thing HomePilot may do is turn a DISABLED one on.
+        """
+        for start in (
+            {"enable": 1},
+            {"enable": 1, "policy_in": "DROP"},
+            {"enable": 1, "policy_in": "REJECT"},
+            {"enable": 1, "policy_in": "ACCEPT"},
+        ):
+            client = _FakeClient(dict(start))
+            gw = PveSdnGateway(client)
+            said = await gw.ensure_datacenter_firewall_enabled()
+
+            assert client.store["puts"] == [], (
+                f"HomePilot wrote to an already-enabled firewall: {start} -> {client.store['puts']}"
+            )
+            assert client.store["options"] == start, "the operator's options were modified"
+            assert "nothing to do" in said
 
     async def test_the_pure_helper_agrees(self) -> None:
         assert safe_datacenter_firewall_enable({}) == {"enable": 1, "policy_in": "ACCEPT"}
+        # ALREADY ON = not ours. Whatever the policy says, there is no write.
         assert safe_datacenter_firewall_enable({"enable": 1, "policy_in": "ACCEPT"}) is None
-        # Enabled-but-DROP is NOT converged: it must be repaired to ACCEPT.
-        assert safe_datacenter_firewall_enable({"enable": 1, "policy_in": "DROP"}) == {
+        assert safe_datacenter_firewall_enable({"enable": 1, "policy_in": "DROP"}) is None
+        assert safe_datacenter_firewall_enable({"enable": 1}) is None
+        # Only a DISABLED firewall is ever turned on, and only at ACCEPT.
+        assert safe_datacenter_firewall_enable({"enable": 0, "policy_in": "DROP"}) == {
             "enable": 1,
             "policy_in": "ACCEPT",
         }
@@ -194,10 +227,34 @@ class TestTheReportSurfacesTheTruth:
             FakeCluster(dc_fw_options={"enable": 1, "policy_in": "ACCEPT"}), desired()
         )
         assert current.datacenter_firewall_enabled is True
-        assert current.datacenter_firewall_policy_in_safe is True
+        assert current.datacenter_firewall_policy_in == "ACCEPT"
         assert current.fence_enforced is True
         note = enforcement_note(current)
         assert "ENFORCED" in note and "NOT ENFORCED" not in note
+
+    async def test_the_report_never_calls_the_operators_policy_a_lockout_risk(self) -> None:
+        """It reported a "management-lockout risk" from ONE field.
+
+        WHAT THIS FORBIDS: turning the cluster input policy into a verdict. The
+        claim was made without reading the cluster rules, the node rules or the
+        ipsets that decide reachability, and it was wrong on a live cluster -
+        the operator was talking to the node while being told they were about
+        to lose it. HomePilot writes no deny of any kind, so it has no finding
+        to report here: it states the policy and says whose it is.
+        """
+        for policy in ("DROP", "REJECT", None):
+            options = {"enable": 1}
+            if policy:
+                options["policy_in"] = policy
+            current = await survey(FakeCluster(dc_fw_options=options), desired())
+            note = enforcement_note(current)
+
+            assert "lockout" not in note.lower(), f"policy_in={policy} still reported as a lockout"
+            assert "risk" not in note.lower()
+            # The fence IS enforced, which is the thing HomePilot actually knows.
+            assert current.fence_enforced is True
+            assert "ENFORCED" in note and "NOT ENFORCED" not in note
+            assert current.datacenter_firewall_policy_in == (policy or "unset")
 
     async def test_the_survey_dict_carries_the_enforcement_fields(self) -> None:
         current = await survey(

@@ -106,6 +106,19 @@ def mcp_transport_running(mcp_app: Any) -> bool:
     return getattr(session_manager, "_task_group", None) is not None
 
 
+def agent_hub_listening(hub: Any) -> bool:
+    """Whether the agent hub is ACTUALLY listening.
+
+    The same lesson as `mcp_transport_running`, and shared with /health for the
+    same reason: a hub OBJECT existing is not proof it bound. /health used to
+    report `agent_hub: ok` from `agent_registry is not None` alone, so a hub
+    that refused its transport - the case `agent_hub_disabled_reason` exists to
+    describe - was reported healthy to the liveness probe an orchestrator acts
+    on. Both surfaces now ask the hub itself.
+    """
+    return hub is not None and bool(hub.is_listening())
+
+
 def _embeddings_subsystem(settings: Any) -> Subsystem:
     primary = (getattr(settings, "embedding_service_url", "") or "").strip()
     fallback = (getattr(settings, "embedding_fallback_url", "") or "").strip()
@@ -220,7 +233,7 @@ def _agent_hub_subsystem(state: Any, settings: Any) -> Subsystem:
     disabled_reason = str(getattr(state, "agent_hub_disabled_reason", "") or "")
 
     async def probe() -> bool:
-        return hub is not None and bool(hub.is_listening())
+        return agent_hub_listening(hub)
 
     return Subsystem(
         name="agent_hub",

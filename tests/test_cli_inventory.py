@@ -178,3 +178,27 @@ class TestInventoryRefresh:
             result = runner.invoke(app, ["inventory", "refresh"])
         assert result.exit_code == 0, result.output
         assert "1 hosts" in result.output
+
+
+class TestTheSuiteIsNotAtTheMercyOfTheTerminal:
+    """#642 - a gate whose result depends on the caller's environment.
+
+    `rich` decides at import time whether to emit ANSI escapes, so exporting
+    FORCE_COLOR=3 turned six CLI tests red: they assert on the text a command
+    prints and the text arrived wrapped in escape codes. Nothing was wrong with
+    the code. conftest.py now clears the colour environment before anything
+    imports rich; this asserts the outcome that protects.
+    """
+
+    def test_cli_output_carries_no_ansi_escapes(self, db_env, monkeypatch):
+        # Even with the environment shouting for colour, the captured output a
+        # test reads must be plain text.
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.setenv("COLORTERM", "truecolor")
+
+        result = runner.invoke(app, ["inventory", "refresh"], env=db_env)
+
+        assert "\x1b[" not in result.output, (
+            f"ANSI escapes reached a test assertion: {result.output!r}"
+        )
+        assert "Sync complete" in result.output

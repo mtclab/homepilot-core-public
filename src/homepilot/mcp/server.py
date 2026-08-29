@@ -387,7 +387,11 @@ async def _bootstrap() -> dict[str, Any]:
         state.repo,
         proxmox=proxmox,
         kb_service=state.kb_service,
-        proxmox_host=settings.proxmox_host,
+        # The RESOLVED host (vault over env), not the env half. This is
+        # the node-IP fallback, so reading settings alone stored every
+        # node with a blank IP on a vault-configured install - and a
+        # blank IP makes derive_status answer "unknown" (#631/#642).
+        proxmox_host=getattr(state, "proxmox_host", "") or settings.proxmox_host,
     )
 
     executor_ref = getattr(lifecycle, "_executor_ref", None)

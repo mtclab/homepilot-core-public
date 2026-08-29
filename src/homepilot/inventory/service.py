@@ -344,6 +344,13 @@ class InventoryService:
 
     async def refresh_inventory(self, scope: str | None = None) -> dict[str, Any]:
         refreshed: dict[str, Any] = {"hosts": 0, "services": 0, "proxmox_host_ids": []}
+        # Did every listing this sweep depends on actually SUCCEED? The absent
+        # sweep below deletes state on the strength of "I saw everything the
+        # hypervisor reports", and that sentence is only true if nothing was
+        # swallowed on the way. One node read failing - which is what a node
+        # does while it reboots - used to be enough to mark every live guest on
+        # it absent (#642).
+        listings_complete = True
 
         if self.proxmox is None:
             return refreshed
@@ -352,6 +359,12 @@ class InventoryService:
             nodes = await self.proxmox.read("/nodes")
             node_list = nodes.get("data", nodes)
             if not isinstance(node_list, list):
+                # An answer we cannot read is not "a cluster with no nodes".
+                # Falling through with an empty list would take the sweep below
+                # past an empty seen-set and mark the ENTIRE inventory absent
+                # (#642).
+                logger.warning("Could not read the cluster's node list: unexpected shape")
+                listings_complete = False
                 node_list = []
 
             for node_info in node_list:
@@ -454,6 +467,8 @@ class InventoryService:
                             refreshed["hosts"] += 1
                     except Exception as e:
                         logger.warning("Failed to refresh %s on %s: %s", guest_type, node_name, e)
+                        # The guests on this node are now UNSEEN, not gone.
+                        listings_complete = False
 
                 refreshed["hosts"] += 1
 
@@ -461,9 +476,23 @@ class InventoryService:
             # hypervisor-derived that was NOT is gone from the hypervisor (#445
             # A5). Only done for a FULL refresh: a scoped sync looks at one node,
             # so every guest on every other node would look absent.
-            if scope is None:
+            #
+            # And only when every listing SUCCEEDED. The sweep is a write - it
+            # stamps absent_since and blanks status/pve_status - so it may only
+            # run off a complete picture. A swallowed listing failure left the
+            # guests on that node out of proxmox_host_ids while the sweep ran
+            # anyway, declaring live machines gone on a timer with no operator
+            # action (#642). The scoped case above is the same hazard, already
+            # guarded; this is the other half of it.
+            if scope is None and listings_complete:
                 refreshed["absent"] = await self.repo.mark_hosts_absent(
                     set(refreshed["proxmox_host_ids"]), _HYPERVISOR_SOURCES
+                )
+            elif scope is None:
+                refreshed["absent_skipped"] = "a guest listing failed; nothing marked absent"
+                logger.warning(
+                    "Skipping the absent sweep: a guest listing failed, so the set of "
+                    "guests actually seen is incomplete"
                 )
         except Exception as e:
             logger.warning("Failed to refresh proxmox inventory: %s", e)
