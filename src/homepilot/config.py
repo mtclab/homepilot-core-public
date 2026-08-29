@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # storage", which is what PVE does when the clone call carries no storage -
     # and is the behaviour every install had before this setting existed.
     provision_default_storage: str = ""
+    provision_tailscale_install: int = 1
     # Only when a bridge is set does provisioning touch net0 at all; unset
     # leaves the template's own NIC exactly as it was cloned.
     provision_default_bridge: str = ""

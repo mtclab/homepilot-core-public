@@ -180,6 +180,32 @@ class TestHappyPath:
         assert rows[0]["user_id"] == "tester"
 
 
+def _guest(proxmox: AsyncMock, *, has_tailscale: bool = True, rc: int = 0) -> list[str]:
+    """A guest that answers agent_run, recording the scripts it was asked to run.
+
+    `agent_run` is the real exec-and-WAIT: the join used to report success off
+    the pid alone, so a `tailscale up` that exited non-zero looked identical to
+    one that worked (#628). Driving the outcome through rc is what lets these
+    tests tell those apart.
+    """
+    scripts: list[str] = []
+    state = {"installed": has_tailscale}
+
+    async def run(node, vmid, script, **kwargs):
+        scripts.append(script)
+        if script.startswith("command -v tailscale"):
+            return (0 if state["installed"] else 1, "", "")
+        if "install.sh" in script:
+            state["installed"] = True
+            return (0, "", "")
+        return (rc, "", "")
+
+    proxmox.agent_run = AsyncMock(side_effect=run)
+    proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
+    proxmox.agent_write_file = AsyncMock(return_value={"data": {}})
+    return scripts
+
+
 class TestTailnetJoin:
     """A requester's own tailscale key joins their guest, and never fails the build."""
 
@@ -187,8 +213,7 @@ class TestTailnetJoin:
         self, service: ProvisionService, proxmox: AsyncMock
     ):
         key = "tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk"
-        proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
-        proxmox.agent_write_file = AsyncMock(return_value={"data": {}})
+        scripts = _guest(proxmox)
 
         task = await _run_to_completion(service, _request(tailscale_auth_key=key))
 
@@ -202,9 +227,8 @@ class TestTailnetJoin:
         proxmox.agent_write_file.assert_awaited_once()
         written_path, written_content = proxmox.agent_write_file.await_args.args[2:4]
         assert written_content == key
-        command = proxmox.agent_exec.await_args.args[2]
-        assert key not in " ".join(command), "the auth key must never appear in an argv"
-        script = command[-1]
+        script = scripts[-1]
+        assert key not in script, "the auth key must never appear in an argv"
         assert "tailscale up" in script
         assert written_path in script and f"rm -f {written_path}" in script, (
             "the staged key file must be deleted by the same shell that reads it"
@@ -216,9 +240,10 @@ class TestTailnetJoin:
     async def test_a_join_that_fails_does_not_fail_the_provision(
         self, service: ProvisionService, proxmox: AsyncMock
     ):
-        proxmox.agent_exec = AsyncMock(
+        proxmox.agent_run = AsyncMock(
             side_effect=ProxmoxError("POST", "/agent/exec", 500, "no guest agent")
         )
+        proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
 
         task = await _run_to_completion(
             service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
@@ -227,15 +252,86 @@ class TestTailnetJoin:
         assert task["status"] == "succeeded", task["error"]
         assert json.loads(task["result_json"])["tailnet"] == "failed"
 
+    async def test_a_guest_without_tailscale_gets_it_installed_first(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#628 - the join could NEVER succeed, because nothing installed it.
+
+        WHAT THIS FORBIDS: running `tailscale up` at a stock cloud image and
+        calling the result the requester's problem. The first real guest was
+        given a valid key, recorded tailnet "failed", and no retry could ever
+        have worked - the binary was not there and nothing was going to put it
+        there.
+        """
+        scripts = _guest(proxmox, has_tailscale=False)
+
+        task = await _run_to_completion(
+            service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
+        )
+
+        assert json.loads(task["result_json"])["tailnet"] == "joined"
+        assert any("install.sh" in s for s in scripts), "a guest with no tailscale got no installer"
+        # Order matters: installing after the join is no use to anyone.
+        assert scripts.index(next(s for s in scripts if "install.sh" in s)) < scripts.index(
+            next(s for s in scripts if "tailscale up" in s)
+        )
+
+    async def test_an_image_that_already_has_tailscale_is_not_reinstalled(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        scripts = _guest(proxmox, has_tailscale=True)
+
+        await _run_to_completion(
+            service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
+        )
+
+        assert not any("install.sh" in s for s in scripts)
+
+    async def test_a_join_that_exits_nonzero_is_reported_failed_not_joined(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#628 - acceptance is not success, one layer below a PVE task.
+
+        WHAT THIS FORBIDS: reporting "joined" off the guest agent's pid. The
+        exec is fire-and-forget, so a `tailscale up` that exits 1 on an expired
+        or already-used key was recorded as a successful join - and the status
+        page told the requester their machine was on the tailnet when it was
+        not.
+        """
+        _guest(proxmox, rc=1)
+
+        task = await _run_to_completion(
+            service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
+        )
+
+        assert task["status"] == "succeeded", task["error"]
+        assert json.loads(task["result_json"])["tailnet"] == "failed", (
+            "a tailscale up that exited non-zero was reported as joined"
+        )
+
+    async def test_install_can_be_turned_off_for_an_image_that_ships_its_own(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """Off means off: no installer, and an honest 'failed' rather than a hang."""
+        service.tailscale_install = False
+        scripts = _guest(proxmox, has_tailscale=False)
+
+        task = await _run_to_completion(
+            service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
+        )
+
+        assert not any("install.sh" in s for s in scripts)
+        assert json.loads(task["result_json"])["tailnet"] == "failed"
+
     async def test_no_key_means_no_guest_command_at_all(
         self, service: ProvisionService, proxmox: AsyncMock
     ):
-        proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
+        scripts = _guest(proxmox)
 
         task = await _run_to_completion(service, _request())
 
         assert json.loads(task["result_json"])["tailnet"] is None
-        proxmox.agent_exec.assert_not_awaited()
+        assert scripts == [], "a provision with no key still ran commands in the guest"
 
 
 class TestEveryFailingStepIsTerminal:

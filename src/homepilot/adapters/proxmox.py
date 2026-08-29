@@ -427,6 +427,75 @@ class ProxmoxClient:
             query={"pid": pid},
         )
 
+    @staticmethod
+    def exec_pid(payload: dict[str, Any] | None) -> int | None:
+        """The pid inside an agent-exec answer, or None if it carried none."""
+        if not payload:
+            return None
+        data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            return None
+        pid = data.get("pid")
+        if pid is None:
+            return None
+        try:
+            return int(pid)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _exec_text(value: Any) -> str:
+        """Guest output as text.
+
+        PVE hands stdout back as a string, but a guest agent that returns bytes
+        must not turn into an unreadable error message.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    async def agent_run(
+        self,
+        node: str,
+        vmid: int,
+        script: str,
+        timeout_s: float = 300.0,
+        poll_interval: float = 2.0,
+    ) -> tuple[int, str, str]:
+        """Run a shell script in a guest and WAIT for it, returning (rc, out, err).
+
+        `agent_exec` is fire-and-forget: it answers with a pid, not a result. A
+        caller that does not poll exec-status has no idea whether the command
+        ran, let alone whether it worked - the tailnet join reported "joined"
+        off the pid alone, so a `tailscale up` that failed was recorded as a
+        success (#628). The same mistake as a PVE UPID, one layer down.
+
+        Raises ProxmoxError if the agent refuses the command, RuntimeError if it
+        accepts it without a pid, and TimeoutError if it never exits.
+        """
+        started = await self.agent_exec(node, vmid, ["sh", "-c", script], capture_output=True)
+        # Reached on the CLASS, not through self: these two are fixed rules for
+        # reading a PVE answer, not behaviour a subclass or a test double should
+        # be able to replace out from under the wait loop.
+        pid = ProxmoxClient.exec_pid(started)
+        if pid is None:
+            raise RuntimeError("the guest agent accepted the command but returned no pid")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            status = await self.agent_exec_status(node, vmid, pid)
+            data = status.get("data", status)
+            if isinstance(data, dict) and data.get("exited"):
+                return (
+                    int(data.get("exitcode") or 0),
+                    ProxmoxClient._exec_text(data.get("out-data")),
+                    ProxmoxClient._exec_text(data.get("err-data")),
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"the guest command did not finish within {timeout_s:.0f}s")
+            await asyncio.sleep(poll_interval)
+
     async def agent_write_file(
         self, node: str, vmid: int, path: str, content: str
     ) -> dict[str, Any]:

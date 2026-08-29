@@ -76,12 +76,19 @@ async def delete_quota(repo: Any, cn: str) -> bool:
 
 
 async def usage_for(repo: Any, cn: str) -> GuestUsage:
+    # ABSENT machines do not count. The inventory reconciler stamps
+    # absent_since the moment the hypervisor stops reporting a guest, so a
+    # machine destroyed out of band is provably gone - and billing a guest for
+    # it locks them out of their own budget forever. Live on prod: a guest's
+    # VM was destroyed, HomePilot recorded absent_since within four minutes,
+    # and his quota still read 1/1 machines used, so his next invite would have
+    # been refused at redemption with "Cannot build machines right now" (#613).
     row = await repo.db.fetchone(
         """SELECT COUNT(*) AS vms,
                   COALESCE(SUM(cpu_cores), 0) AS cores,
                   COALESCE(SUM(memory_mb), 0) AS memory_mb,
                   COALESCE(SUM(disk_gb), 0) AS disk_gb
-           FROM hosts WHERE owner = ?""",
+           FROM hosts WHERE owner = ? AND absent_since IS NULL""",
         (cn,),
     )
     r = dict(row or {})

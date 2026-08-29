@@ -348,27 +348,13 @@ class AgentEnrollService:
         proxmox = self.proxmox
         if proxmox is None:
             raise RuntimeError("Proxmox not configured")
-        started = await proxmox.agent_exec(
-            node, vmid, ["sh", "-c", _install_script()], capture_output=True
+        return await proxmox.agent_run(
+            node,
+            vmid,
+            _install_script(),
+            timeout_s=self.install_timeout_s,
+            poll_interval=self.poll_interval,
         )
-        pid = _exec_pid(started)
-        if pid is None:
-            raise RuntimeError("the guest agent accepted the command but returned no pid")
-        deadline = time.monotonic() + self.install_timeout_s
-        while True:
-            status = await proxmox.agent_exec_status(node, vmid, pid)
-            data = status.get("data", status)
-            if isinstance(data, dict) and data.get("exited"):
-                return (
-                    int(data.get("exitcode") or 0),
-                    _as_text(data.get("out-data")),
-                    _as_text(data.get("err-data")),
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"the installer did not finish within {self.install_timeout_s:.0f}s"
-                )
-            await asyncio.sleep(self.poll_interval)
 
     async def _wait_for_enrolment(self, agent_id: str | None, hostname: str) -> tuple[str, str]:
         """Wait until the installed agent is CONNECTED to this hub.

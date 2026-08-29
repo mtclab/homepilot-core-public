@@ -1044,8 +1044,17 @@ class Repository:
         if seen:
             seen_clause = f" AND id NOT IN ({', '.join('?' for _ in seen)})"
             params.extend(seen)
+        # The live status goes with it. A host the hypervisor stopped reporting
+        # kept whatever it was last seen as, so a DESTROYED guest went on
+        # answering pve_status "running" / status "online" to every reader that
+        # does not also look at absent_since (#613). We genuinely do not know
+        # what it is any more, and "unknown" is the vocabulary for that; the
+        # date in absent_since remains the precise fact. Guarded by
+        # `absent_since IS NULL` like the stamp itself, so this happens once -
+        # and a host that is SEEN again is restatused by the sync that saw it.
         cursor = await self.db.execute(
-            f"UPDATE hosts SET absent_since = ?, updated_at = ? "
+            f"UPDATE hosts SET absent_since = ?, updated_at = ?, "
+            f"status = 'unknown', pve_status = 'unknown' "
             f"WHERE source IN ({placeholders}) AND absent_since IS NULL{seen_clause}",
             [now(), now(), *params],
         )

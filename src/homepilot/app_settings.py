@@ -351,6 +351,19 @@ REGISTRY: dict[str, SettingSpec] = {
             probe=_cluster_probe("provision_default_storage"),
         ),
         SettingSpec(
+            key="provision_tailscale_install",
+            type_="int",
+            description=(
+                "1 to install tailscale in a guest that has none before joining it to "
+                "the requester's tailnet. Nothing used to install it, so a join against "
+                "a stock cloud image could never succeed. 0 is for an image that ships "
+                "tailscale itself, or a guest with no route to the internet - the join "
+                "is then reported failed rather than attempted."
+            ),
+            hot_reloadable=True,
+            parse=_zero_or_one,
+        ),
+        SettingSpec(
             key="provision_default_bridge",
             type_="str",
             description=(

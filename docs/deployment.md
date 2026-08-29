@@ -184,6 +184,29 @@ both from here, frozen into the invite at mint time. `POST /guests/provision`
 and the `provision_guest` MCP tool fill the same gaps. Name neither a value nor
 a default and the call is refused, saying which setting would have filled it.
 
+#### Joining the requester's tailnet (#628)
+
+A redeemer may hand in a tailscale auth key, and the guest is joined to their
+tailnet after it boots. Nothing used to INSTALL tailscale, so that join ran
+`tailscale up` at a stock cloud image and could never succeed: the first real
+guest recorded `tailnet: failed` and no retry would have helped.
+
+`HP_PROVISION_TAILSCALE_INSTALL` (default `1`) fixes that: when a key is
+supplied and the guest has no `tailscale`, the vendor's own installer is run
+first. It needs the guest to reach the internet - a fenced guest still routes
+out, it is only the LAN it may not touch - and it is skipped entirely when no
+key was given, so a provision without a tailnet request runs no guest commands
+at all.
+
+Set it to `0` for an image that ships tailscale itself, or an air-gapped guest
+where the installer could not reach the internet anyway. The join is then
+reported `failed` rather than attempted, which is the honest answer.
+
+The join is waited for and its exit status checked. PVE's guest-agent exec is
+fire-and-forget - it answers with a pid, not a result - so a `tailscale up`
+that exits non-zero on an expired or already-used key used to be recorded as a
+successful join.
+
 #### Where the disks land (#618)
 
 `HP_PROVISION_DEFAULT_STORAGE` is the storage a clone's disks go onto. Empty -
@@ -931,7 +954,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.11` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.12` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -950,6 +973,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROVISION_DEFAULT_BRIDGE` | — | Bridge the guest NIC is put on. Setting it is what makes provisioning write `net0` at all; empty leaves the template's NIC untouched |
 | `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
+| `HP_PROVISION_TAILSCALE_INSTALL` | `1` | Install tailscale in a guest that has none before joining it to the requester's tailnet. `0` for an image that ships tailscale itself, or a guest with no route out - the join is then reported failed rather than attempted |
 | `HP_GUEST_NETWORK_ZONE` | `guest` | SDN zone the guest network lives in (1-8 characters, PVE's own limit) |
 | `HP_GUEST_NETWORK_VNET` | `innkeep` | Vnet guests attach to. Point `HP_PROVISION_DEFAULT_BRIDGE` at this name to put provisioned guests on it |
 | `HP_GUEST_NETWORK_SUBNET` | — | The guest subnet in CIDR form, e.g. `198.51.100.0/24`. Empty means this instance describes no guest network |

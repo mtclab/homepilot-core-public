@@ -59,6 +59,58 @@ class TestTheBudgetMath:
         used = await usage_for(repo, CN)
         assert (used.vms, used.cores, used.memory_mb, used.disk_gb) == (2, 6, 6144, 60)
 
+    async def test_a_machine_the_hypervisor_no_longer_reports_stops_counting(self, repo):
+        """#613 - a destroyed machine must not spend the guest's budget forever.
+
+        WHAT THIS FORBIDS: billing a guest for a machine HomePilot has itself
+        recorded as gone. On prod a guest's VM was destroyed out of band, the
+        reconciler stamped absent_since within four minutes, and his usage
+        still read 1/1 machines - which locks him out of his own budget with
+        no way to spend it back.
+        """
+        await repo.create_host(
+            hostname="destroyed",
+            host_type="vm",
+            owner=CN,
+            cpu_cores=1,
+            memory_mb=1024,
+            disk_gb=30,
+            source="hp_created",
+        )
+        await repo.create_host(
+            hostname="alive", host_type="vm", owner=CN, cpu_cores=2, memory_mb=2048, disk_gb=20
+        )
+
+        before = await usage_for(repo, CN)
+        assert before.vms == 2
+
+        # The hypervisor stops reporting it: exactly what the sync does.
+        marked = await repo.mark_hosts_absent(seen_ids=set(), sources=("hp_created",))
+        assert marked == 1
+
+        used = await usage_for(repo, CN)
+        assert (used.vms, used.cores, used.memory_mb, used.disk_gb) == (1, 2, 2048, 20), (
+            "a machine recorded as gone is still being billed to the guest"
+        )
+
+    async def test_an_absent_machine_stops_reporting_itself_as_running(self, repo):
+        """The stale live status goes with it - nothing may call it running."""
+        await repo.create_host(
+            hostname="destroyed",
+            host_type="vm",
+            owner=CN,
+            source="hp_created",
+            status="online",
+            pve_status="running",
+        )
+
+        await repo.mark_hosts_absent(seen_ids=set(), sources=("hp_created",))
+
+        row = dict(await repo.db.fetchone("SELECT * FROM hosts WHERE hostname = ?", ("destroyed",)))
+        assert row["absent_since"] is not None
+        assert row["pve_status"] != "running", "a destroyed guest still answers pve_status running"
+        assert row["status"] != "online", "a destroyed guest still answers status online"
+
     async def test_no_quota_row_means_no_quota(self, repo):
         decision = await check_provision(repo, CN, cores=128, memory_mb=1, disk_gb=1)
         assert decision.allowed
@@ -150,6 +202,52 @@ class TestRedemptionStopsAtTheLine:
         assert row is not None and invite_state(row) == "open", (
             "the blocked redemption consumed the invite"
         )
+
+    async def test_a_guest_whose_machine_was_destroyed_can_redeem_again(self, db, repo, portal_app):
+        """#613, as the JOURNEY: the destroyed machine must free the budget.
+
+        WHAT THIS FORBIDS: the exact prod situation. A guest is given one
+        machine, it is destroyed out of band, HomePilot records it as gone -
+        and his next invite is refused with "Cannot build machines right now"
+        because the corpse still occupies his only slot. He cannot fix this
+        himself and neither can a new invite; only an operator editing the
+        database can.
+
+        Asserting the OUTCOME he gets: the redemption goes through and a clone
+        reaches the hypervisor. Asserting `usage_for` alone would have passed
+        with the redemption still broken.
+        """
+        app, pve = portal_app
+        await set_quota(repo, CN, max_vms=1, max_cores=None, max_memory_mb=None, max_disk_gb=None)
+        await repo.create_host(
+            hostname="destroyed-out-of-band",
+            host_type="vm",
+            owner=CN,
+            cpu_cores=1,
+            memory_mb=1024,
+            disk_gb=30,
+            source="hp_created",
+        )
+        await repo.mark_hosts_absent(seen_ids=set(), sources=("hp_created",))
+        token = await self._mint(db, CN)
+
+        async with client_for(app) as client:
+            res = await client.post(
+                f"/invite/{token}",
+                data={"ciuser": "alice", "ssh_authorized_key": PUBKEY},
+                headers=cert_headers(cn=CN),
+            )
+
+        assert res.status_code == 303, (
+            f"a destroyed machine still blocks the guest's next machine: {res.text[:400]}"
+        )
+        import asyncio
+
+        for _ in range(100):
+            if pve.seen:
+                break
+            await asyncio.sleep(0.05)
+        assert pve.seen, "the redemption was allowed but never reached the hypervisor"
 
     async def test_within_budget_redeems_normally(self, db, repo, portal_app):
         app, pve = portal_app
