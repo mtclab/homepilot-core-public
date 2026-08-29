@@ -14,6 +14,14 @@ def client():
 
 
 def _setup_state(client, db=None, proxmox=None, vault=None, settings=None):
+    # `app` is a module-level singleton, so its state SURVIVES between tests.
+    # Anything a test attaches and does not remove silently becomes the next
+    # test's starting condition - which is how a passing hub test made an
+    # unrelated one fail here. Cleared on every setup so each test states its
+    # own world.
+    for leaked in ("agent_registry", "agent_hub", "mcp_app", "proxmox_host"):
+        if hasattr(client.app.state, leaked):
+            delattr(client.app.state, leaked)
     if db is not None:
         client.app.state.db = db
     if proxmox is not None:
@@ -33,6 +41,85 @@ def _setup_state(client, db=None, proxmox=None, vault=None, settings=None):
             client.app.state.settings = MagicMock(
                 proxmox_host="", agent_hub_enabled=False, cors_origins="http://localhost:5173"
             )
+
+
+class TestTheAgentHubVerdictIsAskedOfTheHub:
+    """/health is the LIVENESS probe an orchestrator acts on.
+
+    It reported `agent_hub: ok` from `agent_registry is not None` alone. The
+    registry object is built whether or not the hub ever bound, so a hub that
+    refused its own transport - the case `agent_hub_disabled_reason` exists to
+    describe - was reported healthy while no managed host could reach it. The
+    same mistake the MCP check was fixed for in #382, one block further up.
+    """
+
+    @staticmethod
+    def _state(client, *, listening: bool, enabled: bool = True):
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=None)
+        settings = MagicMock(agent_hub_enabled=enabled, cors_origins="http://localhost:5173")
+        settings.proxmox_host = ""
+        _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=settings)
+
+        registry = MagicMock()
+        registry.list_connected = MagicMock(return_value=[])
+        hub = MagicMock()
+        hub.is_listening = MagicMock(return_value=listening)
+        client.app.state.agent_registry = registry
+        client.app.state.agent_hub = hub
+
+    def test_a_hub_that_never_bound_is_not_ok(self, client):
+        self._state(client, listening=False)
+
+        checks = client.get("/health").json()["checks"]
+
+        assert checks["agent_hub"] == "error", (
+            "a hub that is not listening was reported healthy to the liveness probe"
+        )
+
+    def test_a_listening_hub_is_ok(self, client):
+        self._state(client, listening=True)
+
+        checks = client.get("/health").json()["checks"]
+
+        assert checks["agent_hub"] == "ok"
+        assert checks["agents_connected"] == "0"
+
+
+class TestProxmoxIsJudgedFromTheResolvedAddress:
+    """#642 - #631's bug, unfixed on the liveness surface.
+
+    An install claimed through the web UI keeps its hypervisor in the vault, so
+    `settings.proxmox_host` is empty and the resolved address lives on the app
+    state. /health read settings alone, so a vault-configured install whose
+    client failed to build answered `not_configured` - an OFF-BY-CHOICE verdict,
+    which the rollup counts as HEALTHY - about a hypervisor it is configured to
+    use and cannot reach.
+    """
+
+    @staticmethod
+    def _no_client(client, *, resolved_host: str):
+        mock_db = MagicMock()
+        mock_db.execute = AsyncMock(return_value=None)
+        settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
+        settings.proxmox_host = ""  # the ENV half says nothing
+        _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=settings)
+        client.app.state.proxmox_host = resolved_host
+        return client.get("/health").json()
+
+    def test_a_vault_configured_hypervisor_reads_unreachable_not_unconfigured(self, client):
+        data = self._no_client(client, resolved_host="pve.vault.example")
+
+        assert data["checks"]["proxmox"] == "unreachable", (
+            "a configured-but-unreachable hypervisor was reported as not configured"
+        )
+        assert data["status"] != "ok", "an unreachable hypervisor was rolled up as healthy"
+
+    def test_a_genuinely_unconfigured_hypervisor_still_says_so(self, client):
+        """The honest arm: no address anywhere is still an off-by-choice answer."""
+        data = self._no_client(client, resolved_host="")
+
+        assert data["checks"]["proxmox"] == "not_configured"
 
 
 class TestHealthEndpoint:
@@ -393,12 +480,16 @@ class TestInformationalFieldsAreNotStatuses:
         mock_settings.proxmox_host = ""
         registry = MagicMock()
         registry.list_connected = MagicMock(return_value=[{"agent_id": "a"}] * int(connected))
+        # "hub up" means LISTENING, not merely "a registry object exists" - the
+        # registry is built either way, so a hub that never bound would
+        # otherwise satisfy this fixture and these tests would be asserting a
+        # healthy verdict over a hub nothing can reach.
+        hub = MagicMock()
+        hub.is_listening = MagicMock(return_value=True)
         _setup_state(client, db=mock_db, proxmox=None, vault=mock_vault, settings=mock_settings)
         client.app.state.agent_registry = registry
-        try:
-            return client.get("/health")
-        finally:
-            client.app.state.agent_registry = None
+        client.app.state.agent_hub = hub
+        return client.get("/health")
 
     def test_a_healthy_instance_with_no_agents_is_ok(self, client):
         """The default install: hub running, nothing enrolled yet. That is a

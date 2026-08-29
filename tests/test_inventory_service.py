@@ -159,6 +159,92 @@ class TestWritesArePersisted:
 # ── InventoryService.refresh_inventory ───────────────────────────────────────
 
 
+class TestAFailedListingNeverMarksAnythingAbsent:
+    """#642 - the absent sweep is a WRITE, so it needs a complete picture.
+
+    WHAT THIS FORBIDS: running the sweep after a swallowed listing failure. The
+    per-node guest listing is wrapped in a `except Exception` that logs and
+    carries on, which left every guest on that node out of the seen-set while
+    the sweep ran anyway - stamping absent_since and blanking status/pve_status
+    on live machines. It fires on a schedule, with no operator action, and it
+    tells a guest their machine is gone. A node rebooting is enough to trigger
+    it.
+    """
+
+    @staticmethod
+    def _pve(fail_on: str | None = None, nodes_shape: object | None = None):
+        def _read(path):
+            if path == "/nodes":
+                return (
+                    {"data": nodes_shape}
+                    if nodes_shape is not None
+                    else {"data": [{"node": "pve1", "ip": "10.0.0.1"}]}
+                )
+            if fail_on and path == fail_on:
+                raise RuntimeError("node is rebooting")
+            if path == "/nodes/pve1/qemu":
+                return {"data": [{"vmid": 100, "name": "web-vm", "status": "running"}]}
+            return {"data": []}
+
+        px = AsyncMock()
+        px.read = AsyncMock(side_effect=_read)
+        return px
+
+    async def _seed_a_live_guest(self, repo):
+        svc = InventoryService(repo=repo, proxmox=self._pve())
+        await svc.refresh_inventory()
+        guest = await repo.get_host_by_proxmox_id(100)
+        assert guest is not None and guest["absent_since"] is None
+        return guest["id"]
+
+    async def test_a_failed_guest_listing_marks_nothing_absent(self, repo):
+        await self._seed_a_live_guest(repo)
+
+        # The next sweep cannot see that node's guests at all.
+        svc = InventoryService(repo=repo, proxmox=self._pve(fail_on="/nodes/pve1/qemu"))
+        result = await svc.refresh_inventory()
+
+        guest = await repo.get_host_by_proxmox_id(100)
+        assert guest["absent_since"] is None, (
+            "a live guest was marked absent because ONE listing failed"
+        )
+        assert guest["pve_status"] == "running", "a live guest's status was blanked"
+        assert "absent_skipped" in result
+
+    async def test_an_unreadable_node_list_marks_nothing_absent(self, repo):
+        """The worst shape: a malformed answer became an empty node list, so the
+        sweep ran past an empty seen-set and would have marked the ENTIRE
+        inventory absent."""
+        await self._seed_a_live_guest(repo)
+
+        svc = InventoryService(repo=repo, proxmox=self._pve(nodes_shape="not-a-list"))
+        await svc.refresh_inventory()
+
+        guest = await repo.get_host_by_proxmox_id(100)
+        assert guest["absent_since"] is None, "an unreadable node list swept the whole inventory"
+
+    async def test_a_clean_sweep_still_marks_a_genuinely_gone_guest(self, repo):
+        """The honest other arm.
+
+        Without this, "never mark absent" could be satisfied by never sweeping,
+        which would leave destroyed guests billing their owner forever (#613).
+        """
+        await self._seed_a_live_guest(repo)
+
+        # The cluster answers fine and simply no longer lists vmid 100.
+        px = AsyncMock()
+        px.read = AsyncMock(
+            side_effect=lambda path: (
+                {"data": [{"node": "pve1", "ip": "10.0.0.1"}]} if path == "/nodes" else {"data": []}
+            )
+        )
+        svc = InventoryService(repo=repo, proxmox=px)
+        await svc.refresh_inventory()
+
+        guest = await repo.get_host_by_proxmox_id(100)
+        assert guest["absent_since"] is not None, "a genuinely gone guest was not marked absent"
+
+
 class TestRefreshInventory:
     async def test_no_proxmox_returns_empty(self, svc):
         result = await svc.refresh_inventory()

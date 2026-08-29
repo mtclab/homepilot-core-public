@@ -195,13 +195,22 @@ async def _pick_cluster_node(proxmox: ProxmoxClient) -> str | None:
         nodes = await proxmox.read("/nodes")
         data = nodes.get("data", nodes)
         if isinstance(data, list):
+            # `status == "online" or n.get("node")` made the status test DEAD:
+            # every row carries a `node` key, so the right operand was always
+            # truthy and the first row won whatever state it was in. A
+            # cluster-scoped apply could be routed at an offline node (#642).
             for n in data:
-                if n.get("status") == "online" or n.get("node"):
+                if str(n.get("status") or "").strip().lower() == "online":
                     val = n.get("node") or n.get("name")
-                    return str(val) if val is not None else None
-            if data:
-                val = data[0].get("node") or data[0].get("name")
-                return str(val) if val is not None else None
+                    if val is not None:
+                        return str(val)
+            # No node SAID it was online. Falling back to the first row would be
+            # the same guess in a quieter voice, so say nothing instead and let
+            # the caller use the target's own node.
+            logger.warning(
+                "No cluster node reported itself online; not guessing one for a cluster target"
+            )
+            return None
     except ProxmoxError:
         logger.warning("Failed to pick cluster node, executor will use default")
     return None

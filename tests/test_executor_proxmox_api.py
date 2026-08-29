@@ -462,3 +462,51 @@ async def test_a_synchronous_call_is_not_waited_on(mock_proxmox, fm):
 
     assert result["success"] is True
     mock_proxmox.wait_for_task.assert_not_called()
+
+
+# --- A cluster target picks an ONLINE node (#642) ----------------------------
+
+CLUSTER_NODE_BODY = """\
+```yaml proxmox-api-spec
+steps:
+  - id: step1
+    method: GET
+    path: /nodes/{{ target.node }}/status
+```
+"""
+
+
+async def test_an_offline_node_is_never_picked_for_a_cluster_target(mock_proxmox, fm):
+    """WHAT THIS FORBIDS: `status == "online" or n.get("node")`.
+
+    Every node row carries a `node` key, so the right operand was always truthy
+    and the status test was dead code - the FIRST row won whatever state it was
+    in, and a cluster-scoped apply could be routed at an offline node.
+    """
+    mock_proxmox.read = AsyncMock(
+        return_value={
+            "data": [
+                {"node": "dead-node", "status": "offline"},
+                {"node": "live-node", "status": "online"},
+            ]
+        }
+    )
+    mock_proxmox.call = AsyncMock(return_value={"data": {}})
+
+    result = await proxmox_api_execute(fm, CLUSTER_NODE_BODY, {"kind": "cluster"}, mock_proxmox)
+
+    assert result["success"] is True
+    path = mock_proxmox.call.await_args.args[1]
+    assert "live-node" in path, f"an offline node was chosen for a cluster apply: {path}"
+    assert "dead-node" not in path
+
+
+async def test_no_online_node_means_no_guess(mock_proxmox, fm):
+    """The honest arm: falling back to the first row is the same guess, quieter."""
+    mock_proxmox.read = AsyncMock(return_value={"data": [{"node": "dead-1", "status": "offline"}]})
+    mock_proxmox.call = AsyncMock(return_value={"data": {}})
+
+    await proxmox_api_execute(fm, CLUSTER_NODE_BODY, {"kind": "cluster"}, mock_proxmox)
+
+    path = mock_proxmox.call.await_args.args[1]
+    assert "dead-1" not in path, "an offline node was used as a fallback"

@@ -336,6 +336,10 @@ class GuestNetworkSurvey:
     # per-VM guest fence actually enforce; a missing key means it could not be
     # read (an error is recorded), not that it is off.
     datacenter_firewall_options: dict[str, Any] = field(default_factory=dict)
+    # Whether those options were actually READ. An empty dict is what a fresh
+    # cluster with nothing set answers, so it cannot stand in for "we do not
+    # know" - and the difference decides whether HomePilot may plan a write.
+    datacenter_firewall_read: bool = False
     node: str = ""
     nftables: bool | None = None
     pending: list[str] = field(default_factory=list)
@@ -371,15 +375,17 @@ class GuestNetworkSurvey:
         return _flag(self.datacenter_firewall_options.get("enable", 0))
 
     @property
-    def datacenter_firewall_policy_in_safe(self) -> bool:
-        """Is the datacenter input policy something other than DROP? (#600)
+    def datacenter_firewall_policy_in(self) -> str:
+        """The cluster input policy as the cluster reports it, or "unset".
 
-        A DROP input policy with no management-allow rule is the lockout PVE
-        compiled on dev pve1. HomePilot only ever enables at policy_in=ACCEPT.
+        REPORTED, never judged. HomePilot used to turn this one field into a
+        "management-lockout risk" verdict without reading the rules, the
+        ipsets, or anything else that decides reachability - and was wrong on a
+        live cluster. It is the operator's setting; HomePilot states it and
+        stops there.
         """
-        from ..adapters.pve_sdn import datacenter_firewall_lockout_safe
-
-        return datacenter_firewall_lockout_safe(self.datacenter_firewall_options)
+        value = str(self.datacenter_firewall_options.get("policy_in", "") or "").strip()
+        return value.upper() if value else "unset"
 
     @property
     def fence_enforced(self) -> bool:
@@ -445,6 +451,7 @@ async def survey(
     fw_options: dict[str, Any] = {}
     fw_rules: list[dict[str, Any]] = []
     dc_fw_options: dict[str, Any] = {}
+    dc_fw_read = False
     pending: list[str] = []
     errors: list[str] = []
     nftables: bool | None = None
@@ -482,11 +489,15 @@ async def survey(
 
     try:
         dc_fw_options = await gateway.cluster_firewall_options()
+        dc_fw_read = True
     except Exception as exc:
-        # Left empty and recorded, never guessed: plan() reads an unread master
-        # switch as "not known to be safely enabled" and enforcement_note says
-        # the enforcement state is unknown, rather than either claiming a fence
-        # is live or silently planning an enable off a read that failed.
+        # `dc_fw_read` stays False, and that is the load-bearing part. An empty
+        # dict is indistinguishable from a cluster that answered with no
+        # options set - and a FRESH cluster answers exactly that way, which
+        # `safe_datacenter_firewall_enable` correctly reads as "off, enable
+        # it". So a failed read was planning a WRITE to the operator's cluster
+        # firewall off evidence it never obtained. The comment here used to
+        # claim it did not do that; the code did.
         errors.append(f"could not read the datacenter firewall options: {exc}")
 
     resolved_node = str(node or "").strip()
@@ -499,13 +510,24 @@ async def survey(
             errors.append(f"could not list the cluster's nodes: {exc}")
 
     if resolved_node:
+        # Which stack the node runs decides whether the VNET forward rules are
+        # enforced, so it must be READ, not inferred from a missing key. The
+        # `nftables` option is present on some installs and absent on others;
+        # treating its absence as "legacy" told an operator their vnet rules
+        # were inert on a node that was running the nftables proxmox-firewall
+        # the whole time. Absence is now UNKNOWN, and the running service - the
+        # actual evidence - is what answers.
         try:
             options = await gateway.node_firewall_options(resolved_node)
-            # The flag is ABSENT on a legacy node rather than false, so its
-            # absence is the answer - but only once the read itself succeeded.
-            nftables = _flag(options.get("nftables", 0))
+            if "nftables" in options:
+                nftables = _flag(options.get("nftables", 0))
         except Exception as exc:
             errors.append(f"could not read the firewall options of node {resolved_node}: {exc}")
+        if nftables is None:
+            try:
+                nftables = _nftables_from_services(await gateway.node_services(resolved_node))
+            except Exception as exc:
+                errors.append(f"could not read the services of node {resolved_node}: {exc}")
 
     return GuestNetworkSurvey(
         zones=zones,
@@ -514,6 +536,7 @@ async def survey(
         vnet_firewall_options=fw_options,
         vnet_firewall_rules=fw_rules,
         datacenter_firewall_options=dc_fw_options,
+        datacenter_firewall_read=dc_fw_read,
         node=resolved_node,
         nftables=nftables,
         pending=pending,
@@ -627,6 +650,28 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
     the drift check is honest because it asks this same question. Nothing here
     talks to a cluster, so every branch is testable without one.
     """
+    # A SURVEY THAT COULD NOT READ EVERYTHING PLANS NOTHING.
+    #
+    # Every read in `survey` leaves its field empty on failure and records the
+    # reason in `errors` - and an empty field is indistinguishable from "the
+    # cluster has none". So a failed `list_zones` read as "no zone" and planned
+    # create-zone; a failed `vnet_firewall_rules` read as "no rules" and
+    # re-planned every fence DROP on top of the operator's existing ones. The
+    # executor printed those errors in its log HEADER, beside the writes they
+    # should have stopped (#642).
+    #
+    # This is a blocker, not a step: the cluster is in a state this slice
+    # refuses to act on, and `execute` already refuses a plan carrying one
+    # rather than doing the first half of it.
+    if current.errors:
+        return Plan(
+            steps=(),
+            blockers=tuple(
+                f"the cluster could not be fully surveyed, so no change is planned: {err}"
+                for err in current.errors
+            ),
+        )
+
     steps: list[Step] = []
     firewall_steps: list[Step] = []
     blockers: list[str] = []
@@ -866,6 +911,14 @@ def _datacenter_firewall_steps(
 
     if not desired.isolate_cidrs:
         return []
+    if not current.datacenter_firewall_read:
+        # The master switch could not be read, so whether it needs enabling is
+        # UNKNOWN - and an unknown is not a licence to write to the operator's
+        # cluster firewall. An unread read left the options as {}, which is
+        # exactly what a fresh cluster answers, so this planned a real enable
+        # off evidence it never had. enforcement_note already says the state is
+        # unknown; the plan now agrees with it instead of acting.
+        return []
     if safe_datacenter_firewall_enable(current.datacenter_firewall_options) is None:
         return []
     return [
@@ -1097,11 +1150,17 @@ def enforcement_note(current: GuestNetworkSurvey) -> str:
     """
     stack_note = _stack_note(current)
 
-    if "could not be read" in _dc_read_error(current):
+    # Asked of the SURVEY, not of an error string. This used to substring-match
+    # "could not be read" against the recorded error, which reads "could not
+    # read the datacenter firewall options" - so the match never fired and an
+    # UNREAD master switch was reported as definitively OFF, with a fence
+    # "CONFIGURED but NOT ENFORCED". Two guesses dressed as facts, from a read
+    # that never happened.
+    if not current.datacenter_firewall_read:
         return (
-            "Whether the datacenter firewall is enabled could not be read, so whether the "
-            "guest fence is ENFORCED is unknown. HomePilot enables it safely (policy_in=ACCEPT, "
-            f"no lockout) as part of applying the guest-network artifact. {stack_note}"
+            "Whether the datacenter firewall is enabled could not be READ, so whether the guest "
+            "fence is ENFORCED is unknown - and HomePilot will not write to a firewall it cannot "
+            f"see, so applying the artifact changes nothing about it. {stack_note}"
         )
     if not current.datacenter_firewall_enabled:
         return (
@@ -1110,24 +1169,50 @@ def enforcement_note(current: GuestNetworkSurvey) -> str:
             "Applying the guest-network artifact enables it safely (enable=1, policy_in=ACCEPT: "
             f"the host INPUT chain stays open, so no management lockout). {stack_note}"
         )
-    if not current.datacenter_firewall_policy_in_safe:
-        # HomePilot never writes this, but the cluster can carry it independently.
-        return (
-            "The PVE datacenter firewall is ON but its input policy is DROP with no HomePilot "
-            "management-allow rule - a management-lockout risk that HomePilot did not create and "
-            f"will not deepen. The per-VM guest fence is enforced. {stack_note}"
-        )
+    # NOTHING about the host input policy is reported here any more.
+    #
+    # This used to call an enabled firewall whose policy_in was not ACCEPT a
+    # "management-lockout risk". That claim was made from a SINGLE field, with
+    # every piece of evidence that would have settled it left unread: the
+    # cluster rules, the node rules, the ipsets they resolve, and the plain
+    # fact that the operator was talking to the node while being told they
+    # were about to be locked out of it. It was wrong on a live cluster.
+    #
+    # And it was never HomePilot's question to raise. HomePilot writes no DROP,
+    # no deny, and no rule of any kind into a firewall that is already on - so
+    # there is no change of its making that could sever anything, and warning
+    # about someone else's policy is speculation dressed as a finding. What
+    # this function answers is the one thing HomePilot actually knows: whether
+    # the guest fence is ENFORCED.
+    policy_note = (
+        f" Its input policy is {current.datacenter_firewall_policy_in}, which is the operator's "
+        "to set - HomePilot writes nothing to a firewall that is already on."
+    )
     return (
-        "The PVE datacenter firewall is ON with policy_in=ACCEPT (host INPUT open, no lockout), "
-        f"so the per-VM guest fence is ENFORCED. {stack_note}"
+        "The PVE datacenter firewall is ON, so the per-VM guest fence is ENFORCED."
+        f"{policy_note} {stack_note}"
     )
 
 
-def _dc_read_error(current: GuestNetworkSurvey) -> str:
-    for err in current.errors:
-        if "datacenter firewall options" in err:
-            return err
-    return ""
+def _nftables_from_services(services: list[dict[str, Any]]) -> bool | None:
+    """Is the node on the nftables stack, judged by what is RUNNING on it?
+
+    `proxmox-firewall` is the nftables daemon and `pve-firewall` is the legacy
+    one; a node in transition runs both, and then nftables is what is in force.
+    Returns None when neither is in the list, because "the list did not mention
+    it" is not evidence of either stack - which is the whole mistake this
+    replaces.
+    """
+    running = {
+        str(svc.get("service") or svc.get("name") or "")
+        for svc in services
+        if str(svc.get("state") or "").lower() == "running"
+    }
+    if "proxmox-firewall" in running:
+        return True
+    if "pve-firewall" in running:
+        return False
+    return None
 
 
 def _stack_note(current: GuestNetworkSurvey) -> str:

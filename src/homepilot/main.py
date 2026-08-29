@@ -31,7 +31,7 @@ from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
 from .instance_lock import InstanceLock
-from .selfcheck import mcp_transport_running, schedule_boot_selfcheck
+from .selfcheck import agent_hub_listening, mcp_transport_running, schedule_boot_selfcheck
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.settings_resolver = settings_resolver
     bind_resolver(settings_resolver)
     app.state.pve_token_source = state.pve_token_source
+    # The RESOLVED Proxmox address (vault over env). Carried onto app.state
+    # unconditionally - including when the client failed to BUILD, which is
+    # exactly the case /health has to tell apart from "no hypervisor
+    # configured" (#642).
+    app.state.proxmox_host = state.proxmox_host
 
     if state.proxmox is not None:
         app.state.proxmox = state.proxmox
@@ -217,7 +222,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         state.repo,
         proxmox=state.proxmox,
         kb_service=None,
-        proxmox_host=settings.proxmox_host,
+        # The RESOLVED host (vault over env), not the env half. This is
+        # the node-IP fallback, so reading settings alone stored every
+        # node with a blank IP on a vault-configured install - and a
+        # blank IP makes derive_status answer "unknown" (#631/#642).
+        proxmox_host=getattr(state, "proxmox_host", "") or settings.proxmox_host,
     )
     inventory_service.kb_service = state.kb_service
     app.state.inventory_service = inventory_service
@@ -1128,7 +1137,15 @@ async def health(request: Request) -> JSONResponse:
 
     proxmox = getattr(request.app.state, "proxmox", None)
     settings = getattr(request.app.state, "settings", None)
-    proxmox_host = getattr(settings, "proxmox_host", "") if settings else ""
+    # The RESOLVED host, carried on the app state. Reading settings alone is
+    # only the ENV half, so a vault-configured install whose client failed to
+    # build answered "not_configured" - an OFF-BY-CHOICE verdict, which the
+    # rollup below counts as healthy - about a hypervisor it was configured to
+    # use. Same bug as #631, which fixed the self-check and `hp status` and
+    # missed this one (#642).
+    proxmox_host = getattr(request.app.state, "proxmox_host", "") or (
+        getattr(settings, "proxmox_host", "") if settings else ""
+    )
     if proxmox is None:
         proxmox_status = "unreachable" if proxmox_host else "not_configured"
     else:
@@ -1153,12 +1170,22 @@ async def health(request: Request) -> JSONResponse:
             vault_status = "locked"
     checks["vault"] = vault_status
 
+    # "ok" only when the hub is ACTUALLY LISTENING - the same rule the MCP check
+    # below learned from #382, and for the same reason. This read
+    # `agent_registry is not None` and called that ok, so a hub that refused its
+    # own transport (exactly what `agent_hub_disabled_reason` exists to
+    # describe, #468) was reported healthy to the LIVENESS probe an
+    # orchestrator acts on, while no managed host could reach it. The registry
+    # object is built whether or not the hub ever bound; only the hub knows.
     agent_registry = getattr(request.app.state, "agent_registry", None)
+    agent_hub = getattr(request.app.state, "agent_hub", None)
     if agent_registry is not None:
-        connected = agent_registry.list_connected()
+        checks["agents_connected"] = str(len(agent_registry.list_connected()))
+    if agent_registry is not None and agent_hub_listening(agent_hub):
         checks["agent_hub"] = "ok"
-        checks["agents_connected"] = str(len(connected))
-    elif settings and settings.agent_hub_enabled:
+    elif (settings and settings.agent_hub_enabled) or agent_registry is not None:
+        # Built, or asked for, and not listening. That is the fault worth
+        # reporting - the same distinction the MCP check draws below.
         checks["agent_hub"] = "error"
     else:
         checks["agent_hub"] = "not_configured"

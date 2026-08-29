@@ -1,7 +1,23 @@
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# COLOUR OFF, BEFORE ANYTHING IMPORTS RICH.
+#
+# `rich` builds its Console at import time and decides then whether to emit ANSI
+# escapes. A developer (or an agent harness) exporting FORCE_COLOR=3 therefore
+# turned six CLI tests red - they assert on the text a command prints, and the
+# text arrived wrapped in escape codes. The gate is meant to answer "is the code
+# correct", not "what is this terminal like", and a suite whose result depends on
+# the caller's environment is not a gate at all (the same house rule that makes a
+# flaky test a defect, #622).
+#
+# Set here rather than in the Makefile so it holds for a bare `pytest` too.
+os.environ.pop("FORCE_COLOR", None)
+os.environ["NO_COLOR"] = "1"
+os.environ["TERM"] = "dumb"
 
 
 @pytest.fixture(scope="session", autouse=True)

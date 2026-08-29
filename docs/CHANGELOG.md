@@ -1,5 +1,149 @@
 # Changelog
 
+## 3.6.13 - 2026-08-29
+
+### An unread is not a fact (#642)
+
+Five separate bugs were fixed in 3.6.10-3.6.12 before the pattern behind them was
+named: a surface states a conclusion it has not established, drawing a verdict
+from one signal while the evidence that would settle it sits unread. Where the
+unknown case defaults to a confident answer that authorises a WRITE, HomePilot
+changes the estate off evidence it never obtained.
+
+The project already had the rule, in the one place that got it right (#425):
+"I looked and it matches" and "I could not look" are different answers.
+
+**The absent sweep ran off an incomplete picture.** The per-node guest listing is
+wrapped in a handler that logs and carries on, so a node that failed to answer
+left its guests out of the seen-set while the sweep ran anyway - stamping
+`absent_since` and blanking `status`/`pve_status` on live machines. It fires on a
+schedule, with no operator action, and it tells a guest their machine is gone. A
+node rebooting is enough. A malformed node list was worse: it became an empty
+list, so the sweep ran past an empty seen-set and would have marked the entire
+inventory absent.
+
+**A guest-network survey that could not read everything now plans nothing.**
+Every read leaves its field empty on failure, and an empty field is
+indistinguishable from "the cluster has none" - so a failed zone listing planned
+`create-zone` over the operator's working one, and a failed firewall-rules read
+re-planned every fence DROP on top of the rules already there. Ten writes, off
+one failed read. The plan now carries blockers instead, and the executor already
+refuses a plan that has one.
+
+**An offline node could take a cluster-scoped apply.** `status == "online" or
+node` made the status test dead code: every row carries a node key, so the first
+row always won. Only a node that says it is online is picked now, and when none
+does, nothing is guessed.
+
+**And #631's bug in three more places** - `/health` and both `InventoryService`
+constructions still read the environment half of the Proxmox address. `/health`
+answered `not_configured`, an off-by-choice verdict counted as healthy, about a
+vault-configured hypervisor it could not reach.
+
+### Two gates that were not there
+
+Every release commit updated this file until three in a row did not - which were
+exactly the three no test covered. The version parity net now holds the changelog
+beside the six files it already guarded.
+
+And six CLI tests failed on one machine while passing on another: `rich` decides
+at import time whether to emit ANSI escapes, so `FORCE_COLOR` in the environment
+wrapped the output those tests assert on. A suite whose result depends on the
+caller's terminal is not a gate; the colour environment is now cleared before
+anything imports rich.
+
+## 3.6.12 - 2026-08-29
+
+### A destroyed machine stops counting against its owner (#613)
+
+The inventory reconciler stamps `absent_since` the moment the hypervisor stops
+reporting a guest, and three readers ignored it. A guest's VM was destroyed out
+of band on prod; four minutes later HomePilot had recorded it as gone, and his
+usage still read **1/1 machines**. His next invite would have been refused with
+"Cannot build machines right now", and neither he nor a fresh invite could have
+cleared it - only an operator editing the database.
+
+`usage_for` now counts only machines that are still there. The guest page reads
+`gone` with a `gone_since` rather than passing the last-seen `online` through -
+that page is the guest's only window onto whether their machine exists. And
+marking a host absent clears its `status`/`pve_status` to `unknown`, so a
+destroyed guest stops answering "running" to every reader that does not also
+check `absent_since`.
+
+### A tailnet join can succeed at all (#628)
+
+**Nothing installed tailscale.** The join ran `tailscale up` inside a stock
+cloud image, so a guest handed a perfectly good auth key recorded
+`tailnet: failed` and no retry would ever have helped. A guest without tailscale
+now gets the vendor's installer first, behind **`HP_PROVISION_TAILSCALE_INSTALL`**
+(default `1`, resolved at use time like the other provisioning defaults; `0` for
+an image that ships its own or a guest with no route out).
+
+The join is also waited for now. PVE's guest-agent exec is fire-and-forget - it
+answers with a pid, not a result - so a `tailscale up` that exited non-zero on an
+expired key was recorded as a successful join. The exec-and-wait loop moved onto
+`ProxmoxClient.agent_run`, shared with the agent installer, which had the only
+correct copy of it.
+
+## 3.6.11 - 2026-08-29
+
+### The pre-apply snapshot finishes before the change it protects runs (#636)
+
+PVE answers a snapshot with a UPID and returns at once, leaving the guest LOCKED
+while the task runs. The executor POSTed its snapshot and went straight to the
+first step, which arrived at a locked guest:
+
+```
+[stop-101] POST /nodes/pve/qemu/101/status/stop -> ERROR 0: PVE task
+           ...qmstop... finished with exitstatus 'VM is locked (snapshot)'
+```
+
+A raced step fails loudly. A raced snapshot is worse: the apply proceeds to
+change a guest whose rollback point is not finished being taken, so the artifact
+believes it has a safety net it does not have. The recorded `snapshot_id` was
+also the task's UPID rather than the snapshot name an operator would roll back
+to; it is now the name.
+
+Third and last call site of the same mistake 3.6.10 fixed for sequence steps and
+cancel cleanup.
+
+## 3.6.10 - 2026-08-29
+
+### The hypervisor is reported as configured when it is (#631)
+
+`get_selfcheck` reported "No hypervisor is configured, so inventory stays empty
+and guest provisioning is unavailable", and `hp status` printed
+"PVE host | (not configured)" - on an install that was listing nine inventory
+items and provisioning guests off 10.0.0.1.
+
+`settings.proxmox_host` is only the ENVIRONMENT half. An install claimed through
+the web UI keeps its hypervisor in the vault, and that secret wins - but the
+resolved value was never written back, so the two surfaces that read settings
+directly lied about a working install. There is one resolver now,
+`homepilot/proxmox_config.py`; `app_state` and the admin router delegate to it,
+`AppState` carries the resolved host, and both surfaces read that.
+
+### A UPID is acceptance, not completion (#629, #626)
+
+A PVE call that spawns a worker answers with a UPID the instant the work is
+ACCEPTED. `proxmox-api-sequence` logged `-> OK` on that and ran the next step, so
+a sequence outran its own cluster:
+
+```
+[stop-101]    POST /nodes/pve/qemu/101/status/stop -> OK
+[destroy-101] DELETE /nodes/pve/qemu/101 -> ERROR 500: "VM 101 is running - destroy failed"
+```
+
+It also called an asynchronously-failed task a success. Each mutating step now
+waits on its task and fails the step when that task ends non-OK; the node comes
+from the UPID itself, because a step may address a node the target does not name.
+
+The cancel path had the same mistake with a worse ending: it fired `delete_vm` at
+a guest that may already be running, which PVE refuses - so a cancelled provision
+recorded "cleanup failed" and left a live VM on the node. Cancel now shares the
+stop-then-destroy the post-failure cleanup already had, and waits for the destroy
+task, so "deleted" means gone.
+
 ## 3.6.9 - 2026-08-28
 
 ### Provisioning can choose where a guest's disks land (#618)
