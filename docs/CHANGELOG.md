@@ -1,5 +1,93 @@
 # Changelog
 
+## 3.6.15 - 2026-08-29
+
+The first three tranches of the platform review (#648). Everything here was
+found by DRIVING the product, not by reading it - the suite was green
+throughout and found none of it.
+
+### The read tier could take a managed host off the air, and lift the fleet's key
+
+One allowlisted, **read-scope** command (`ls -laR /usr`) produced a reply larger
+than the hub's frame budget. On a replay-protected connection - which is what
+every shipped agent negotiates - the hub cannot MAC-verify a frame it will not
+parse, so it closed the socket and unregistered the agent. A denial of service
+against any managed host, from the weakest credential the product mints,
+repeatable on demand, and silent: the agent reconnects moments later and nothing
+tells an operator it happened.
+
+The test guarding that path registered an agent **without** replay protection - a
+shape no shipped agent uses. Green, and guarding a branch the product never
+takes. The fix belongs in the agent, which must never produce a frame the hub
+cannot accept: reads and command output are now bounded and say what they
+dropped.
+
+The same tier could **read any managed host's `/etc` as root** through
+`read_file_on_guest` - including the unit file and env file holding the fleet's
+shared enrolment token, the credential the MCP surface refuses to serve by name
+elsewhere. The identical call over HTTP is admin-only; the tier gate never
+compared them because those routes sat in an exclusion list. The agent now
+refuses to hand back its own credentials, every tool must be mapped or declared,
+and no tool may sit in zero tier sets.
+
+### Revoking your last admin token reopened first-run claim
+
+`is_claimed()` answered from "an admin token exists". On any instance that never
+went through `POST /claim` - `hp init`, a console-minted token, anything
+predating the claim - that token was the ONLY thing holding the claim shut.
+Delete it, which is the ordinary first half of a rotation, and the instance
+answered `unclaimed`: a codeless `POST /claim` from the LAN then minted a fresh
+superuser token. The claim now latches at boot.
+
+### The idempotence guarantee was decorative, and failed open
+
+`idempotence: via-precheck` is what the spec REQUIRES for the mutating steps of
+`proxmox-api-sequence`. It failed open three ways at once: the documented
+binding (`response.status_code`, `response.json`) did not exist, because the
+executor bound Proxmox's raw envelope instead of the documented proxy - so the
+expression evaluated to `None`, `None == 200` is `False`, **and `False` is the
+branch that mutates**. A precheck whose own call errored fell through to the
+step. And every evaluator failure became `False` rather than raising.
+
+Every precheck written the way the spec documents ran its step, every time.
+
+### The sanctioned way to do multi-target work did not work
+
+The spec says approving a composite approves its proposed steps, and names
+`composite` as the answer to multi-target operations. Nothing implemented the
+cascade: the composite went `approved`, its sub-artifacts stayed `proposed`, and
+the apply died. The documented answer to "how do I change 50 hosts" was one the
+product could not execute. The cascade is now atomic, recursive and audited.
+
+### A failed read was recorded as absence, and the file was overwritten
+
+`capture_pre_state`'s own docstring says a read that fails is recorded as
+"unknown", because rolling back to a guess is how an undo deletes something. The
+code wrote `existed: False`. A read fails for permission, for size, for a denied
+path - none of which mean the file is not there. The apply then overwrote it as
+a first write and the revoke reported it "created by this artifact". The prior
+bytes were gone, with nothing recording that they had existed.
+
+### Also
+
+The audit trail recorded every REFUSED command as `success` and every
+MCP-issued operation as `caller: unknown` - so "what was blocked on my hosts?"
+returned nothing, and fleet-root operations from the primary interface were
+unattributed. `exec_on_host`'s tool description claimed to be unrestricted when
+the agent enforces its allowlist on everyone. #642's A5 and A10 were still live:
+a failed agent count read as "new install" and PERSISTED a transport flip that
+strands the plaintext fleet; an unreadable hub certificate was regenerated,
+re-pinning every agent. #627 (a snapshot name over PVE's 40-char cap killing any
+apply with a long artifact id) and #635 (a validation error reaching MCP callers
+as "Internal server error") are both fixed.
+
+`hp token create` hung for ever, minted nothing, and left an orphaned process.
+Not the suspected sqlite lock: it opened an aiosqlite connection, raised on a
+schema guard, and left it open, so CPython joined the worker at exit. **No test
+in the suite had ever spawned the CLI** - fourteen files drive it in-process -
+so a defect whose entire symptom is "the process does not exit" was invisible by
+construction. Its gate now runs the real binary with a deadline.
+
 ## 3.6.14 - 2026-08-29
 
 ### A confined guest agent is not a broken network

@@ -234,11 +234,16 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "exec_on_host",
         "description": (
-            "Run an arbitrary command on a managed host through the connected hp-agent "
-            "(agent hub) and return exit_code, stdout and stderr. This is the "
-            "UNRESTRICTED host exec - unlike exec_on_guest_readonly it is not limited to "
-            "an allowlist - so it is admin-tier and audited. PVE hypervisor nodes are "
-            "refused (use the Proxmox API for those)."
+            "Run a command on a managed host through the connected hp-agent (agent hub) "
+            "and return exit_code, stdout and stderr. This is the ADMIN-tier exec: it "
+            "skips the hub-side read-only filter that exec_on_guest_readonly applies, so "
+            "it can reach the agent's PRIVILEGED tier (docker, systemctl start/stop, "
+            "mkdir/chmod/cp/mv, apt) on a host whose agent was installed privileged. It "
+            "is NOT unrestricted: the agent enforces its own command allowlist on every "
+            "exec, so shell metacharacters and anything outside the allowlist are refused "
+            'with exit_code -1 and a "command blocked" stderr, whoever asks. Output is '
+            "capped per reply and truncation is stated in the output. Audited. PVE "
+            "hypervisor nodes are refused (use the Proxmox API for those)."
         ),
         "inputSchema": {
             "type": "object",

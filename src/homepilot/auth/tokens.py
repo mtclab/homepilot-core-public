@@ -50,6 +50,46 @@ def normalize_scope(scope: str | None, role: str | None = None) -> list[str]:
     return parts
 
 
+# Every spelling a mint may be asked for. Reading is deliberately laxer than
+# writing (normalize_scope must keep understanding whatever is already stored),
+# but MINTING a scope the product cannot honour is a request it should refuse.
+_MINTABLE_ATOMS = frozenset({SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN})
+_MINTABLE_WHOLE = frozenset({SCOPE_ALL, SCOPE_FULL_LEGACY, "*", SCOPE_READ_ONLY})
+
+
+def validate_scope(scope: str | None) -> list[str]:
+    """The normalized scope a mint would store, or ValueError naming the problem.
+
+    `POST /auth/tokens` and `hp token create` used to store the scope string
+    verbatim, whatever it was. A typo - `"Read"`, `"read write"` with a space,
+    `"readonly"` - minted a token that AUTHENTICATES and is refused by every
+    scoped route, and the operator found out at first use rather than at the
+    mint. The endpoint answered 201 with a credential it knew nothing could do.
+
+    Reading is untouched: normalize_scope still accepts anything, because rows
+    written before this check exist and must keep working exactly as they did.
+    """
+    raw = (scope or "").strip()
+    if not raw:
+        raise ValueError(
+            "A token needs a scope. Use 'read_only', 'read,write', 'admin', "
+            "or 'all' for the superuser scope."
+        )
+    if raw in _MINTABLE_WHOLE:
+        return normalize_scope(raw)
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    unknown = [p for p in parts if p not in _MINTABLE_ATOMS]
+    if unknown or not parts:
+        raise ValueError(
+            f"Unknown scope {', '.join(repr(u) for u in unknown) or repr(raw)}. "
+            "The ladder is 'read' < 'write' < 'admin', comma-separated "
+            "(e.g. 'read,write'); 'read_only' and 'all' are the two shorthands. "
+            "Note 'full' is a legacy alias for 'all' (the SUPERUSER scope), not "
+            "the write tier."
+        )
+    return normalize_scope(raw)
+
+
 def scope_allows(scope: str | None, action: str, role: str | None = None) -> bool:
     normalized = normalize_scope(scope, role)
     if not normalized:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -31,6 +32,37 @@ from .rollback import kind_can_roll_back
 from .shell_script import execute as shell_script_execute
 
 logger = logging.getLogger(__name__)
+
+# PVE refuses a `snapname` longer than this, so `hp-pre-<artifact id>` failed the
+# apply of any artifact whose id ran past 33 characters - BEFORE step 1, on a
+# guest that was fine. Hit twice on prod 3.6.9 and twice more on dev (#627).
+PVE_SNAPNAME_MAX = 40
+_SNAP_PREFIX = "hp-pre-"
+# When the id has to be shortened, a hash of the WHOLE id rides along so two long
+# ids that share a prefix cannot land on one snapshot.
+_SNAP_HASH_LEN = 7
+
+
+def snapshot_name_for(artifact_id: str) -> str:
+    """The pre-apply snapshot name for this artifact, always ≤ 40 chars (#627).
+
+    Short ids keep the exact `hp-pre-<id>` they have always had, so nothing that
+    already exists on a cluster is renamed.
+    """
+    candidate = f"{_SNAP_PREFIX}{artifact_id}"
+    if len(candidate) <= PVE_SNAPNAME_MAX:
+        return candidate
+    digest = hashlib.sha256(artifact_id.encode()).hexdigest()[:_SNAP_HASH_LEN]
+    room = PVE_SNAPNAME_MAX - len(_SNAP_PREFIX) - 1 - _SNAP_HASH_LEN
+    return f"{_SNAP_PREFIX}{artifact_id[:room]}-{digest}"
+
+
+# The target kinds a Proxmox snapshot can actually be taken of. ARTIFACT_SPEC §3
+# defaults `requires_snapshot` to true "for `mutating: true` against VM/LXC
+# targets, `false` otherwise" - but an artifact that SETS it true against any
+# other kind used to have that request silently dropped, with nothing said to the
+# operator who read `requires_snapshot: true` on the review screen (#642 A7).
+SNAPSHOTTABLE_TARGET_KINDS = ("vm", "lxc")
 
 
 @dataclass
@@ -110,12 +142,10 @@ class ArtifactExecutor:
         if current_hash != fm.get("hash"):
             raise TamperError(f"Hash mismatch for {artifact_id}: body tampered after approval")
 
-        not_replay_safe = fm.get("replay_safe") is False
-        already_applied = ArtifactStatus(fm["status"]) == ArtifactStatus.APPLIED
-        if not_replay_safe and already_applied:
-            raise ExecutorError(
-                f"Artifact {artifact_id} is not replay-safe and cannot be re-applied"
-            )
+        # (The `replay_safe` re-apply guard that used to sit here could never
+        # fire: the status check above has already refused anything but
+        # `approved`, so its `status == applied` test was dead. The real guard is
+        # in `replay()`, which is the path an already-applied artifact takes.)
 
         snapshot_id: str | None = None
         mutating = fm.get("mutating", True)
@@ -123,7 +153,7 @@ class ArtifactExecutor:
         target_kind = target_data.get("kind", "")
 
         try:
-            if mutating and target_kind in ("vm", "lxc"):
+            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -194,7 +224,7 @@ class ArtifactExecutor:
         mutating = fm.get("mutating", True)
 
         try:
-            if mutating and target_kind in ("vm", "lxc"):
+            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -320,9 +350,17 @@ class ArtifactExecutor:
             return None
         vmid = target.get("vmid")
         node = target.get("node")
-        if not vmid or not node:
-            return None
-        snap_name = f"hp-pre-{fm['id']}"
+        if vmid is None or not node:
+            # A REQUIRED snapshot that cannot be addressed is not a snapshot that
+            # was not needed. Returning None here silently dropped the safety net
+            # the artifact asked for and let the apply proceed (#642 A7); the
+            # docstring on the failure branch below has forbidden exactly that
+            # since #388.
+            raise ExecutorError(
+                f"Pre-apply snapshot required for {fm.get('id')} but the target names "
+                f"no {'vmid' if vmid is None else 'node'} to snapshot"
+            )
+        snap_name = snapshot_name_for(str(fm["id"]))
         # The target already knows what the guest IS ("vm" => qemu, "lxc" =>
         # lxc). Handing it over stops the snapshot call guessing a collection
         # from the VMID and posting a QEMU guest to /lxc/ (#617); a target that

@@ -48,6 +48,15 @@
 	let cookieSession = false;
 	let currentScope = '';
 	let currentLabel = '';
+	// The NORMALIZED capability list /auth/me hands us. This panel used to test
+	// the raw scope string against ('full' | '*' | 'admin'), which is wrong in
+	// both directions since the #579 rename: a superuser token minted as `all`
+	// matched none of them (so the most privileged token in the product was
+	// told it lacked privilege and had its "Manage API tokens" link hidden),
+	// and `full` is the LEGACY superuser alias, not the write tier it reads as.
+	// $lib/capabilities says it in as many words: never re-derive from `scope`.
+	let currentCaps: string[] = [];
+	$: sessionIsAdmin = capIsAdmin(currentCaps) || isAdminUser;
 
 	$: urlValidation = validateApiBase(apiBase);
 
@@ -249,6 +258,7 @@
 		if (cookieSession || tokenVal) {
 			api.me().then((info) => {
 				currentScope = info.scope || '';
+				currentCaps = info.capabilities ?? [];
 				currentLabel = info.token_label || '';
 			}).catch(() => {});
 		}
@@ -282,6 +292,7 @@
 				// the capability gating pick the new session up immediately.
 				const info = await refreshSession();
 				currentScope = info?.scope || '';
+				currentCaps = info?.capabilities ?? [];
 				currentLabel = info?.token_label || '';
 				notify('Settings saved — session cookie set');
 				const params = new URLSearchParams(window.location.search);
@@ -296,10 +307,12 @@
 				const info = await refreshSession();
 				if (info) {
 					currentScope = info.scope || '';
+					currentCaps = info.capabilities ?? [];
 					currentLabel = info.token_label || '';
 					notify('Settings saved — no cookie; using the in-memory token (cleared on page reload)');
 				} else {
 					currentScope = '';
+					currentCaps = [];
 					currentLabel = '';
 					notify('Settings saved, but the token was rejected — check it and try again', 'err');
 				}
@@ -319,6 +332,7 @@
 		tokenVal = '';
 		cookieSession = false;
 		currentScope = '';
+		currentCaps = [];
 		currentLabel = '';
 		notify('Logged out');
 	}
@@ -401,16 +415,16 @@
 							{#if cookieSession}
 								Session active — token stored in HttpOnly cookie, cleared on browser close.
 								{#if currentScope}
-									<span class="text-muted">Scope: <span class="{currentScope === 'full' || currentScope === '*' || currentScope === 'admin' ? 'text-ok' : 'text-warn'}">{currentScope}</span></span>
-									{#if currentScope !== 'full' && currentScope !== '*' && currentScope !== 'admin'}
-										<br /><span class="text-warn">Write actions (save settings, manage tokens) require an admin/full-scope token.</span>
+									<span class="text-muted">Scope: <span class="{sessionIsAdmin ? 'text-ok' : 'text-warn'}">{currentScope}</span></span>
+									{#if !sessionIsAdmin}
+										<br /><span class="text-warn">Saving Proxmox settings and managing tokens need an <code>admin</code>-scope token; this one cannot do either.</span>
 									{/if}
 								{/if}
 							{:else}
 								No active session. Paste token and save to log in. Create tokens with <code class="text-muted">hp token create</code>.
 							{/if}
 						</p>
-						{#if cookieSession && (currentScope === 'full' || currentScope === '*' || currentScope === 'admin')}
+						{#if cookieSession && sessionIsAdmin}
 							<a href="{base}/settings?tab=tokens" class="text-xs text-accent hover:underline">Manage API tokens →</a>
 						{/if}
 					</div>

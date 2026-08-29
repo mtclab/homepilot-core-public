@@ -187,7 +187,12 @@ async def test_step_failure_continue(mock_proxmox, fm):
 
     mock_proxmox.call.side_effect = _call
     result = await proxmox_api_execute(fm, CONTINUE_ON_ERROR_BODY, {}, mock_proxmox)
-    assert result["success"] is True
+    # `continue` means the sequence keeps GOING; it does not entitle the artifact
+    # to report `applied` over a step that failed (#642 B5, review #648). Both
+    # halves asserted: every step was attempted, and the outcome says so.
+    assert call_count == 3
+    assert result["success"] is False
+    assert "step2" in result["failure_reason"]
 
 
 async def test_precheck_skip_if(mock_proxmox, fm):
@@ -201,7 +206,11 @@ async def test_precheck_unreachable_halts(mock_proxmox, fm):
     mock_proxmox.call.side_effect = ProxmoxError("GET", "/x", 0, "unreachable")
     result = await proxmox_api_execute(fm, PRECHECK_UNREACHABLE_BODY, {}, mock_proxmox)
     assert result["success"] is False
-    assert "precheck unreachable" in result["failure_reason"]
+    # The wording moved with the fix; what matters is that the reason says the
+    # STEP did not run because its precheck could not be decided, and that no
+    # mutating call went out behind it (review #648).
+    assert "could not be decided" in result["failure_reason"]
+    assert [c.args[0] for c in mock_proxmox.call.call_args_list] == ["GET"]
 
 
 async def test_cluster_target_picks_node(mock_proxmox, fm):
@@ -236,11 +245,20 @@ async def test_rollback_uses_rollback_fence(mock_proxmox, fm):
 
 
 async def test_pick_cluster_node_proxmox_error(mock_proxmox, fm):
+    """No node picked, and the body names one: the step is REFUSED.
+
+    This asserted `success is True`, and it was true because the unresolved
+    `{{ target.node }}` rendered as the empty string and the call went out at
+    `/nodes//status` - a request nobody wrote, against a node nobody chose
+    (review #648). ARTIFACT_SPEC §11.7 forbids `{{ target.node }}` in a
+    cluster artifact's path for exactly this reason.
+    """
     mock_proxmox.call.return_value = {"data": {}}
     mock_proxmox.read = AsyncMock(side_effect=ProxmoxError("GET", "/nodes", 500, "cluster error"))
     target = {"kind": "cluster"}
     result = await proxmox_api_execute(fm, CLUSTER_TARGET_BODY, target, mock_proxmox)
-    assert result["success"] is True
+    assert result["success"] is False
+    assert mock_proxmox.call.call_count == 0
 
 
 async def test_pick_cluster_node_empty_nodes(mock_proxmox, fm):
@@ -248,7 +266,8 @@ async def test_pick_cluster_node_empty_nodes(mock_proxmox, fm):
     mock_proxmox.read.return_value = {"data": []}
     target = {"kind": "cluster"}
     result = await proxmox_api_execute(fm, CLUSTER_TARGET_BODY, target, mock_proxmox)
-    assert result["success"] is True
+    assert result["success"] is False
+    assert mock_proxmox.call.call_count == 0
 
 
 class TestProxmoxApiIntegration:
@@ -338,12 +357,16 @@ steps:
         used_path = mock_proxmox.call.call_args[0][1]
         assert "pve3" in used_path
 
-    async def test_cluster_target_no_online_node_still_succeeds(self, mock_proxmox, fm):
+    async def test_cluster_target_no_online_node_sends_nothing(self, mock_proxmox, fm):
+        """Renamed from "…_still_succeeds". Succeeding WAS the defect: with no
+        node picked, `{{ target.node }}` blanked and the request went to
+        `/nodes//status` (review #648)."""
         mock_proxmox.read.return_value = {"data": [{"node": "pve5"}]}
         mock_proxmox.call.return_value = {"data": {}}
         target = {"kind": "cluster"}
         result = await proxmox_api_execute(fm, CLUSTER_TARGET_BODY, target, mock_proxmox)
-        assert result["success"] is True
+        assert result["success"] is False
+        assert mock_proxmox.call.call_count == 0
 
     async def test_execution_log_tracks_applied_steps(self, mock_proxmox, fm):
         mock_proxmox.call.return_value = {"data": {}}
@@ -508,5 +531,9 @@ async def test_no_online_node_means_no_guess(mock_proxmox, fm):
 
     await proxmox_api_execute(fm, CLUSTER_NODE_BODY, {"kind": "cluster"}, mock_proxmox)
 
-    path = mock_proxmox.call.await_args.args[1]
-    assert "dead-1" not in path, "an offline node was used as a fallback"
+    paths = [c.args[1] for c in mock_proxmox.call.call_args_list]
+    assert not any("dead-1" in p for p in paths), "an offline node was used as a fallback"
+    # Stronger than it was: with no node picked there is no path to send, so
+    # nothing goes out at all. The old assertion read the path of a request that
+    # had ALREADY been issued with an empty node segment (review #648).
+    assert paths == []

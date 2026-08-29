@@ -179,18 +179,50 @@ class TestOneBackendPerDataDirectory:
 
 
 class TestTheCliWillNotMigrateUnderARunningServer:
-    async def test_every_cli_migration_goes_through_the_guard(self):
-        """Five copies of a guard is five chances to forget the fifth, so the
-        rule is that the CLI never calls `run_migrations` directly."""
-        source = (
+    def _cli_source(self) -> str:
+        return (
             Path(__file__).resolve().parents[1] / "src" / "homepilot" / "cli" / "main.py"
         ).read_text(encoding="utf-8")
-        body = source[source.index("async def _migrate_or_refuse") :]
-        # The helper itself is the one legitimate caller.
-        helper_end = body.index("\ndef _refuse_if_server_running")
+
+    async def test_every_cli_migration_goes_through_the_guard(self):
+        """Thirteen copies of a guard is thirteen chances to forget the
+        thirteenth, so the rule is that the CLI never calls `run_migrations`
+        directly - `_open_cli_db` is the one legitimate caller."""
+        source = self._cli_source()
+        body = source[source.index("async def _open_cli_db") :]
+        helper_end = body.index("\ndef _server_is_running")
         after_helper = body[helper_end:]
 
         assert "await run_migrations(" not in after_helper, (
             "a CLI command migrates directly again - it can change the schema "
             "under a running backend"
+        )
+
+    async def test_the_guard_refuses_before_it_opens_anything(self):
+        """The ORDER is the fix (review #648, #623).
+
+        The refusal used to be raised while the caller already held an open
+        aiosqlite connection, and a CLI that raises while holding one never
+        exits: the sqlite3 handle lives on a NON-DAEMON worker thread parked on a
+        queue nobody will feed again, and CPython joins it at interpreter exit.
+        `hp token create` on a running install printed 'the backend is running'
+        and then hung for ever, leaving a process `docker compose exec` could not
+        signal away.
+
+        `tests/test_cli_never_hangs.py` proves the behaviour on a real process;
+        this holds the shape, so a later refactor cannot reintroduce the ordering
+        while the journey test happens to be skipped or slow.
+        """
+        source = self._cli_source()
+        start = source.index("async def _open_cli_db")
+        helper = source[start : source.index("\ndef _server_is_running", start)]
+
+        refuse_at = helper.index("_refuse_if_server_running(")
+        connect_at = helper.index("Database(")
+        assert refuse_at < connect_at, (
+            "_open_cli_db opens the database before it decides whether to refuse; "
+            "a refusal then hangs the process at interpreter exit (#623)"
+        )
+        assert "await database.close()" in helper, (
+            "_open_cli_db does not close what it opened when the migration fails"
         )

@@ -1,4 +1,16 @@
-from homepilot.executor.skip_if import _ResponseProxy, make_response_proxy, safe_eval_skip_if
+import pytest
+
+from homepilot.executor.skip_if import (
+    SkipIfUndecided,
+    _ResponseProxy,
+    make_response_proxy,
+    safe_eval_skip_if,
+)
+
+# Every refusal below asserted `is False`. False is the branch that RUNS the
+# mutating step, so an expression the evaluator would not run was silently
+# upgraded to "yes, apply it" - in the one guard whose job is to stop that
+# (#642, review #648). The refusals are unchanged; what they answer is not.
 
 
 class TestSafeEvalAllowedExpressions:
@@ -46,54 +58,68 @@ class TestSafeEvalAllowedExpressions:
         assert safe_eval_skip_if("False", None, {}) is False
 
     def test_any_generator_known_issue(self):
-        assert safe_eval_skip_if("any(x > 0 for x in [1, 2, 3])", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("any(x > 0 for x in [1, 2, 3])", None, {})
 
     def test_all_generator_known_issue(self):
-        assert safe_eval_skip_if("all(x > 0 for x in [1, 2, 3])", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("all(x > 0 for x in [1, 2, 3])", None, {})
 
 
 class TestDunderAttributeBlocked:
     def test_class_dunder_blocked(self):
         r = type("R", (), {"status": 200})()
-        assert safe_eval_skip_if("response.__class__", r, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response.__class__", r, {})
 
     def test_dict_dunder_blocked(self):
         r = type("R", (), {"status": 200})()
-        assert safe_eval_skip_if("response.__dict__", r, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response.__dict__", r, {})
 
     def test_private_attr_blocked(self):
         r = type("R", (), {"_secret": "hidden"})()
-        assert safe_eval_skip_if("response._secret == 'hidden'", r, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response._secret == 'hidden'", r, {})
 
     def test_subclasses_chain_blocked(self):
         r = type("R", (), {})()
-        assert safe_eval_skip_if("response.__class__.__bases__", r, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response.__class__.__bases__", r, {})
 
 
 class TestSafeEvalBlockedCalls:
     def test_import_blocked(self):
-        assert safe_eval_skip_if("__import__('os')", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("__import__('os')", None, {})
 
     def test_eval_blocked(self):
-        assert safe_eval_skip_if("eval('1')", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("eval('1')", None, {})
 
     def test_exec_blocked(self):
-        assert safe_eval_skip_if("exec('pass')", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("exec('pass')", None, {})
 
     def test_arbitrary_function_call_blocked(self):
-        assert safe_eval_skip_if("print('hi')", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("print('hi')", None, {})
 
     def test_os_system_blocked(self):
-        assert safe_eval_skip_if("os.system('ls')", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("os.system('ls')", None, {})
 
     def test_os_module_access(self):
-        assert safe_eval_skip_if("os", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("os", None, {})
 
     def test_unknown_name_blocked(self):
-        assert safe_eval_skip_if("unknown_var == 1", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("unknown_var == 1", None, {})
 
     def test_complex_expression_blocked(self):
-        assert safe_eval_skip_if("[x for x in range(10)]", None, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("[x for x in range(10)]", None, {})
 
 
 class TestComparisonOps:
@@ -179,11 +205,13 @@ class TestResponseProxy:
                 return {}
 
         proxy = make_response_proxy(FakeResp())
-        assert safe_eval_skip_if("response.request", proxy, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response.request", proxy, {})
 
     def test_proxy_prevents_private_attr_access(self):
         proxy = _ResponseProxy(200, {}, None)
-        assert safe_eval_skip_if("response._private", proxy, {}) is False
+        with pytest.raises(SkipIfUndecided):
+            safe_eval_skip_if("response._private", proxy, {})
 
     def test_proxy_status_code_eval(self):
         proxy = _ResponseProxy(200, {}, None)

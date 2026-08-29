@@ -9,15 +9,26 @@ import yaml
 
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
 from homepilot.executor.jinja_utils import (
+    InterpolationError,
     _eval_skip_if,
     _interpolate,
     _interpolate_obj,
+    interpolation_context,
 )
+from homepilot.executor.skip_if import SkipIfUndecided, make_pve_response_proxy
 
 logger = logging.getLogger(__name__)
 
 _SPEC_FENCE = "proxmox-api-spec"
 _ROLLBACK_FENCE = "proxmox-api-rollback"
+
+# A precheck answers when the API tells us something ABOUT THE RESOURCE. 2xx and
+# 4xx do that ("here it is" / "there is no such thing"). A 5xx or a transport
+# failure tells us about the API, not about the resource, so it settles nothing -
+# and "I could not tell whether this was already applied" must never become
+# "apply it" (#642 A4). Proved live on dev 3.6.14: a precheck that answered HTTP
+# 500 fell straight through to its step, and the log did not even mention it.
+_PRECHECK_ANSWERS_BELOW = 500
 
 # A clone or a destroy of a large disk is minutes of real work, so the wait has
 # to outlast it; the poll matches ProvisionService so one cluster sees one
@@ -95,60 +106,103 @@ async def execute(
             "failure_reason": "missing spec",
         }
 
-    context: dict[str, Any] = {
-        "target": target,
-        "artifact": {
-            "id": frontmatter.get("id", ""),
-            "intent": frontmatter.get("intent", ""),
-        },
-    }
+    context = interpolation_context(target, frontmatter)
 
     if target.get("kind") == "cluster":
         pve_node = await _pick_cluster_node(proxmox)
         if pve_node:
-            context["target"] = dict(target)
             context["target"]["node"] = pve_node
 
     log_lines: list[str] = []
     start = time.monotonic()
-    applied_steps: list[dict[str, Any]] = []
+    # Steps that did NOT do what they were asked. `on_error: continue` means
+    # "keep going", never "pretend it worked": an artifact that reports `applied`
+    # over a step that failed or that was refused by an undecided precheck is the
+    # lie this review exists to remove (#642 B5).
+    unfinished: list[str] = []
 
     for step in steps:
         step_id = step.get("id", "unknown")
         step_log = f"[{step_id}]"
+        on_error = step.get("on_error", "halt")
 
-        path = _interpolate(step.get("path", ""), context)
-        method = step.get("method", "GET").upper()
-        do_body = step.get("body")
-        if do_body is not None:
-            do_body = _interpolate_obj(do_body, context)
+        try:
+            path = _interpolate(step.get("path", ""), context)
+            method = step.get("method", "GET").upper()
+            do_body = step.get("body")
+            if do_body is not None:
+                do_body = _interpolate_obj(do_body, context)
+        except InterpolationError as exc:
+            step_log += f" -> REFUSED: {exc}"
+            log_lines.append(step_log)
+            elapsed = time.monotonic() - start
+            log_lines.append(f"duration={elapsed:.1f}s")
+            return {
+                "success": False,
+                "execution_log": "\n".join(log_lines),
+                "failure_reason": f"step {step_id} could not be interpolated: {exc}",
+            }
 
         precheck = step.get("precheck")
         if precheck and not rollback:
-            pre_method = precheck.get("method", "GET").upper()
-            pre_path = _interpolate(precheck.get("path", ""), context)
+            try:
+                pre_method = precheck.get("method", "GET").upper()
+                pre_path = _interpolate(precheck.get("path", ""), context)
+            except InterpolationError as exc:
+                step_log += f" -> REFUSED: precheck path {exc}"
+                log_lines.append(step_log)
+                elapsed = time.monotonic() - start
+                log_lines.append(f"duration={elapsed:.1f}s")
+                return {
+                    "success": False,
+                    "execution_log": "\n".join(log_lines),
+                    "failure_reason": f"precheck for {step_id} could not be interpolated: {exc}",
+                }
             skip_if_expr = precheck.get("skip_if")
 
             step_log += f" precheck {pre_method} {pre_path}"
+            undecided: str | None = None
+            proxy: Any = None
             try:
                 resp = await proxmox.call(pre_method, pre_path)
-                if skip_if_expr and _eval_skip_if(skip_if_expr, resp, context.get("target", {})):
-                    step_log += " -> SKIPPED (precheck)"
-                    log_lines.append(step_log)
-                    continue
+                proxy = make_pve_response_proxy(200, resp)
             except ProxmoxError as e:
-                if pre_method == "GET" and e.status_code == 0:
-                    step_log += f" -> precheck unreachable: {e}"
-                    log_lines.append(step_log)
-                    on_error = step.get("on_error", "halt")
-                    if on_error == "halt":
-                        elapsed = time.monotonic() - start
-                        log_lines.append(f"duration={elapsed:.1f}s")
-                        return {
-                            "success": False,
-                            "execution_log": "\n".join(log_lines),
-                            "failure_reason": f"precheck unreachable for {step_id}",
-                        }
+                if e.status_code and e.status_code < _PRECHECK_ANSWERS_BELOW:
+                    # A 4xx IS an answer about the resource; let the expression
+                    # decide on it (`status_code == 200` correctly says "no").
+                    proxy = make_pve_response_proxy(e.status_code, {"data": None})
+                    step_log += f" -> HTTP {e.status_code}"
+                else:
+                    undecided = f"precheck did not answer ({e})"
+
+            if undecided is None and skip_if_expr:
+                try:
+                    if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
+                        step_log += " -> SKIPPED (precheck)"
+                        log_lines.append(step_log)
+                        continue
+                except SkipIfUndecided as exc:
+                    undecided = str(exc)
+
+            if undecided is not None:
+                # The whole point of a precheck is to stand between the plan and
+                # the change. One that did not answer does not get to wave the
+                # change through.
+                step_log += f" -> NOT RUN: {undecided}"
+                log_lines.append(step_log)
+                unfinished.append(step_id)
+                if on_error == "halt":
+                    elapsed = time.monotonic() - start
+                    log_lines.append(f"duration={elapsed:.1f}s")
+                    return {
+                        "success": False,
+                        "execution_log": "\n".join(log_lines),
+                        "failure_reason": (
+                            f"step {step_id} was not run: its precheck could not be "
+                            f"decided ({undecided})"
+                        ),
+                    }
+                continue
 
         try:
             if method in ("POST", "PUT", "DELETE", "PATCH"):
@@ -167,10 +221,8 @@ async def execute(
             waited = await _await_pve_task(proxmox, context, resp, task_timeout_s, poll_interval)
             if waited:
                 step_log += waited
-            applied_steps.append({"step": step_id, "status": "ok"})
         except ProxmoxError as e:
             step_log += f" {method} {path} -> ERROR {e.status_code}: {e.body[:200]}"
-            on_error = step.get("on_error", "halt")
             if on_error == "halt":
                 elapsed = time.monotonic() - start
                 log_lines.append(step_log)
@@ -180,13 +232,21 @@ async def execute(
                     "execution_log": "\n".join(log_lines),
                     "failure_reason": f"step {step_id} failed: {e}",
                 }
-            else:
-                applied_steps.append({"step": step_id, "status": "error", "error": str(e)})
+            unfinished.append(step_id)
 
         log_lines.append(step_log)
 
     elapsed = time.monotonic() - start
     log_lines.append(f"duration={elapsed:.1f}s")
+    if unfinished:
+        return {
+            "success": False,
+            "execution_log": "\n".join(log_lines),
+            "failure_reason": (
+                "these steps did not complete (on_error: continue kept the "
+                "sequence going, it did not make them succeed): " + ", ".join(unfinished)
+            ),
+        }
     return {"success": True, "execution_log": "\n".join(log_lines)}
 
 

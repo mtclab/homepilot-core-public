@@ -17,6 +17,7 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from homepilot.app_state import create_app_state
 from homepilot.config import get_settings
 
+from ..auth.scopes import API_SCOPE_TO_MCP_TIER, SCOPE_WRITE
 from ..portal.repository import InviteRepository
 from .tools.agent_tools import (
     TOOL_DEFINITIONS as AGENT_TOOL_DEFS,
@@ -588,6 +589,24 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
 }
 
 
+# tier -> the API scope an operator would have MINTED to get it. A refusal that
+# names only the tier sends the operator looking for a word the console never
+# shows them: Settings -> Tokens offers read_only / write / admin, while the tool
+# ladder is read_only / full / admin, and `full` as an API SCOPE is the legacy
+# alias for the superuser scope (#579, #614). Naming both ends the confusion at
+# the one moment it matters.
+_TIER_TO_API_SCOPE = {tier: scope for scope, tier in API_SCOPE_TO_MCP_TIER.items()}
+
+
+def _describe_tier(tier: str | None) -> str:
+    if not tier:
+        return "unauthenticated"
+    api_scope = _TIER_TO_API_SCOPE.get(tier)
+    if api_scope == SCOPE_WRITE:
+        api_scope = "read,write"
+    return f"the {tier} tier" + (f" (API scope '{api_scope}')" if api_scope else "")
+
+
 async def _handle_tool(
     name: str, arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> list[TextContent] | dict[str, Any]:
@@ -597,9 +616,15 @@ async def _handle_tool(
     # than read_only. Admin is checked first so a `full` token is refused an admin
     # tool with the precise reason, not the generic write-scope one.
     if name in _ADMIN_TOOLS and mcp_scope != "admin":
-        raise ValueError(f"Tool '{name}' requires admin scope — '{mcp_scope}' token denied")
+        raise ValueError(
+            f"Tool '{name}' needs the admin tier; this token is {_describe_tier(mcp_scope)}. "
+            "Mint an admin-scope token in Settings -> Tokens."
+        )
     if name in _MUTATING_TOOLS and mcp_scope == "read_only":
-        raise ValueError(f"Tool '{name}' requires write scope — read-only token denied")
+        raise ValueError(
+            f"Tool '{name}' needs the full tier (API scope 'read,write'); this token is "
+            "read_only. Mint one with a wider scope in Settings -> Tokens."
+        )
 
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
@@ -644,9 +669,26 @@ async def _on_call_tool(_ctx: Any, params: Any) -> CallToolResult:
     ctx = await _server_context.snapshot()
     ctx["_mcp_token_scope"] = _mcp_token_scope_var.get()
     ctx["_mcp_caller_id"] = _mcp_caller_id_var.get()
+    # Attribute the fleet-root audit trail to the MCP caller. #381 persisted that
+    # trail "with caller attribution", but only the admin-authed REST endpoints
+    # ever set the contextvar, so every exec/read/write issued over MCP - the
+    # interface this product is built around - was recorded as "unknown". The
+    # trail could not answer "who ran this on my host".
+    from homepilot.agent_hub.audit import set_audit_caller
+
+    set_audit_caller(_mcp_caller_id_var.get() or None)
+    from homepilot.adapters.agent import AgentAdapterError
+    from homepilot.agent_hub.server import AgentCommandError
+
     try:
         result = await _handle_tool(name, arguments, ctx)
-    except ValueError as exc:
+    except (ValueError, AgentAdapterError, AgentCommandError) as exc:
+        # These are DOMAIN answers, not crashes: "no agent connected for web01",
+        # "path not in allowed read prefixes", "file is 30395000 bytes; the agent
+        # hub accepts at most 524288 per reply". Letting them fall through to the
+        # transport's generic handler turned every one into "Internal server
+        # error" - the product knew exactly what had happened and told the
+        # operator nothing.
         return CallToolResult(content=[TextContent(type="text", text=str(exc))], is_error=True)
     if isinstance(result, dict):
         return CallToolResult(

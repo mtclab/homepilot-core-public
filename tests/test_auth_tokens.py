@@ -19,6 +19,7 @@ from homepilot.auth.tokens import (
     generate_api_token,
     normalize_scope,
     scope_allows,
+    validate_scope,
 )
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
@@ -50,6 +51,49 @@ class TestNormalizeScope:
 
     def test_comma_separated(self):
         assert normalize_scope("read,write") == ["read", "write"]
+
+
+class TestValidateScopeAtTheMint:
+    """A mint refuses a scope the instance cannot honour (review #648).
+
+    `POST /auth/tokens` and `hp token create` stored the scope string verbatim,
+    whatever it was, and answered 201 with a real token. A typo therefore minted
+    a credential that AUTHENTICATES and is refused by every scoped route - and
+    the operator found out at first use, from a 403 quoting their own typo back
+    at them, rather than at the mint.
+
+    TEETH: delete the validate_scope call in admin_create_token and
+    test_the_endpoint_refuses_an_unusable_scope fails with a 201.
+    """
+
+    @pytest.mark.parametrize(
+        "scope", ["read_only", "read", "read,write", "admin", "all", "full", "*", " read , write "]
+    )
+    def test_every_spelling_the_product_documents_is_accepted(self, scope):
+        assert validate_scope(scope)
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            "banana",
+            "Read",  # capitals: normalize_scope is case-sensitive
+            "read write",  # a space instead of a comma - the whole thing is one atom
+            "readonly",  # the shorthand is read_only
+            "read,wrote",
+            "",
+            "   ",
+            None,
+        ],
+    )
+    def test_a_scope_nothing_can_honour_is_refused(self, scope):
+        with pytest.raises(ValueError):
+            validate_scope(scope)
+
+    def test_reading_stays_permissive_so_stored_rows_keep_working(self):
+        """Validation is a MINT-time rule only. Rows written before it exist,
+        and tightening the read path would revoke them by accident."""
+        assert normalize_scope("banana") == ["banana"]
+        assert scope_allows("banana", "read") is False
 
 
 class TestScopeAllows:
@@ -268,7 +312,7 @@ class TestMCPHttpScopeMiddleware:
         async def _test():
             _mcp_token_scope_var.set("read_only")
             try:
-                with pytest.raises(ValueError, match="write scope"):
+                with pytest.raises(ValueError, match="needs the full tier"):
                     await _handle_tool(
                         "propose_artifact",
                         {"spec": {"id": "test", "kind": "shell-script", "intent": "test"}},

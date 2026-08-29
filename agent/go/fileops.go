@@ -37,6 +37,37 @@ var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+/environ$`)
 // privateKeyBaseRe matches base names that look like private keys.
 var privateKeyBaseRe = regexp.MustCompile(`^(id_rsa|id_ed25519|id_ecdsa|id_dsa)$`)
 
+// agentSecretBases are the agent's OWN credential files. The agent must never
+// hand back the material that lets something else become an agent.
+//
+// `agent.token` (the durable per-agent credential) was already refused, but
+// only when HP_AGENT_TOKEN_FILE named it - and `agent.env` was not refused at
+// all. That file is what scripts/install-agent.sh writes, and it carries
+// HP_AGENT_AUTH_TOKEN: the SHARED FLEET ENROLMENT TOKEN, plus the hub's address
+// and certificate pin. The hub refuses to serve that token over MCP at all
+// (GET /agents/token and the installer one-liner are both excluded by name:
+// "a credential that provisions machines must not appear in an MCP transcript")
+// - and then read_file_on_guest, a READ-tier tool, read it straight off the
+// host instead. Found live on dev, review #648.
+//
+// Matched by base name under the agent's configuration directory rather than by
+// denying that directory outright: /etc/homepilot is also a granted WRITE
+// prefix, so artifacts legitimately put files there and must stay readable.
+var agentSecretBases = map[string]bool{
+	"agent.env":   true,
+	"agent.token": true,
+}
+
+// agentConfigDir is where the installer keeps the agent's identity and
+// credentials. Overridable for tests and for a constrained deployment that
+// moved them, the same way the prefixes are.
+func agentConfigDir() string {
+	if v := strings.TrimSpace(os.Getenv("HP_AGENT_CONFIG_DIR")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "/etc/homepilot"
+}
+
 func splitPrefixes(v string) []string {
 	parts := strings.Split(v, ":")
 	out := make([]string, 0, len(parts))
@@ -121,6 +152,12 @@ func isDenied(resolved string) (bool, string) {
 			return true, "access to agent token file forbidden"
 		}
 	}
+	// The agent's own credential files, wherever HP_AGENT_TOKEN_FILE points (or
+	// does not point at all - a bootstrap-enrolled agent has no token file yet,
+	// and agent.env holds the shared token regardless).
+	if filepath.Dir(resolved) == agentConfigDir() && agentSecretBases[base] {
+		return true, "access to the agent's own credentials forbidden: " + resolved
+	}
 	if procEnvironRe.MatchString(resolved) {
 		return true, "access to process environ forbidden: " + resolved
 	}
@@ -147,6 +184,17 @@ func readFile(path string) (string, error) {
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("not a file: %s", path)
+	}
+	// Refuse BEFORE reading, on the stat: a reply this size cannot cross the hub
+	// protocol, and on a replay-protected connection the hub answers an oversize
+	// frame by closing the socket - so reading it would cost the host its agent
+	// connection AND still return nothing. Refusing here also keeps the agent
+	// from allocating a multi-gigabyte log file into memory as root.
+	if info.Size() > maxPayloadBytes {
+		return "", fmt.Errorf(
+			"file is %d bytes; the agent hub accepts at most %d per reply. "+
+				"Filter it on the host (tail/grep) or copy it out of band: %s",
+			info.Size(), maxPayloadBytes, path)
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {

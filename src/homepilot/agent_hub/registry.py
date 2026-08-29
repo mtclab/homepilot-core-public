@@ -206,9 +206,16 @@ class AgentRegistry:
             # a newer agent with the same hostname may have replaced it.
             if self._hostname_index.get(agent.hostname) == agent_id:
                 self._hostname_index.pop(agent.hostname, None)
+            # Hand the caller the REASON, not just the fact. "agent X
+            # disconnected" is what an operator saw when the hub hung up on an
+            # oversize reply; it names neither what happened nor what to do,
+            # and it reads as the host's fault when it was the hub's decision.
+            detail = f"agent {agent_id} disconnected"
+            if reason:
+                detail = f"{detail}: {reason}"
             for fut in agent._result_futures.values():
                 if not fut.done():
-                    fut.set_exception(ConnectionError(f"agent {agent_id} disconnected"))
+                    fut.set_exception(ConnectionError(detail))
             logger.info("unregistered agent %s", agent_id)
             if self._repo is not None:
                 self._persist(self._repo.mark_agent_disconnected(agent_id, reason))

@@ -277,7 +277,11 @@ The tier ladder mirrors the API scope ladder read < write < admin:
 - `full` (default) — reads plus the standard mutators (`add_host`, `apply_artifact`, `revoke_artifact`, …), but NOT admin tools.
 - `admin` — everything above plus the admin tools that mirror API `require_scope("admin")` routes (`open_enrolment_window`, `revoke_agent`, `forget_agent`, `migrate_agents_tls`, `exec_on_host`, `write_file_on_host`, `delete_kb_doc`, `create_alert_rule`, guest management incl. `provision_guest`, `rejoin_tailnet` and `create_guest_template`, `delete_auth_token`, the operator-settings tools, …).
 
-Each tool's tier equals the API scope of the route it mirrors; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces that equality so a lesser MCP token can never do what the API reserves for a greater one. `create_guest_template` is the one tool with no route to mirror - it is MCP-only for now - so it is placed by hand at the admin tier, next to the `provision_guest` it feeds.
+Each tool that mirrors a management route sits at exactly that route's API scope; `tests/test_mcp_read_parity.py::TestMcpTierMatchesApiScope` enforces the equality, so a lesser MCP token can never do what the API reserves for a greater one.
+
+Seven tools mirror no route and therefore have no scope to be compared against; their tiers are placed by hand. Each is declared, with its tier and its reason, in `ROUTELESS_TOOLS` in the same test file, and `TestEveryToolIsTierGoverned` fails on any tool that is neither mapped nor declared — so a new tool cannot slip past the tier gate by simply not appearing in a map. `create_guest_template` (admin, MCP-only) is the deliberate one; `get_artifact_status`, `check_artifact_drift`, `proxmox_api_read` and `http_call_read` are narrow reads with no management twin.
+
+**The two that are not settled**: `read_file_on_guest` and `exec_on_guest_readonly` run at the `read_only` tier, while every API route that reads a file from — or executes on — a managed host (`POST /agents/host/read-file`, `POST /agents/host/exec`, `GET /agents/test/adapter`) is `require_scope("admin")`. These tools are guarded in their own way (a read prefix allowlist plus a secret denylist; an allowlist of read-only commands), but they are the only place in the product where an MCP tier is deliberately **weaker** than the API scope for the same capability. A `read`-scope token therefore reads `/etc`, `/home`, `/var/log` and `/opt` on any managed host as root — which is enough to lift whatever credentials that host keeps in a config file. Under review (#648, tranche 2); until it is decided, treat a `read`-scope token as trusted with every managed host's on-disk configuration.
 
 ---
 
@@ -356,14 +360,27 @@ Three tiers:
 
 | Tier | Commands | Requirement |
 |------|----------|-------------|
-| Safe | `ls`, `cat`, `ps`, `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl status`, `journalctl`, `dpkg -l` | Always allowed |
-| Privileged | `docker pull/compose/run/stop/rm/restart`, `systemctl start/stop/restart/enable/disable/daemon-reload`, `mkdir`, `chmod`, `cp`, `mv`, `bash /opt/homepilot/*.sh` | Requires `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit |
+| Safe | `ls`, `cat`, `ps`, `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl status/is-active/is-enabled/daemon-reload`, `journalctl`, `dpkg -l`, `docker ps/images/inspect/logs/stats/version/info` | Always allowed |
+| Privileged | `docker pull/compose/run/stop/rm/restart`, `systemctl start/stop/restart/enable/disable`, `mkdir`, `chmod`, `cp`, `mv`, `bash /opt/homepilot/*.sh` | Requires `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit |
 | Package management | `apt`/`apt-get install/update/upgrade` | Additionally requires `HP_AGENT_ALLOW_PACKAGE_INSTALL=true` (the unit must drop `ProtectSystem`) |
 
 `sudo` is not allowlisted in any tier: a privileged agent is already root, and an
 unprivileged one runs under `NoNewPrivileges=yes`, where sudo cannot escalate.
 
-Blocked commands return `exit_code=-1` with stderr `"command blocked: ..."`.
+Blocked commands return `exit_code=-1` with stderr `"command blocked: ..."`. The
+allowlist is enforced by the AGENT, on every exec, whichever surface asked — the
+admin-tier `exec_on_host` skips the hub-side read-only filter, not the agent's
+allowlist. There is no unrestricted host exec.
+
+### Reply size
+
+One protocol frame carries at most 1 MiB, so a reply has a payload budget
+(`maxPayloadBytes`, 512 KiB; stdout and stderr get half each). The agent refuses
+a file read above the budget on the `stat`, and truncates command output with a
+notice that states how much there was. This is a hard requirement rather than a
+nicety: the hub will not parse a frame it cannot MAC-verify, so on a
+replay-protected connection an oversize reply CLOSES the connection — the agent
+must never produce one.
 
 ### File access
 
@@ -422,27 +439,31 @@ machinery. See `/monitoring/*` in the README for the API.
 
 ### Audit logging
 
-All agent operations (exec, read_file, write_file) are logged to an in-memory rotating deque (max 1000 entries) and Python logging. Queryable via `GET /agents/audit` (admin scope).
+All agent operations (exec, read_file, write_file), plus enrolment attempts,
+rejections and revocations, are logged with the caller that asked for them. The
+in-memory rotating deque (max 1000 entries) is the fast view; each entry is also
+mirrored to the `agent_audit` table, so the trail survives a restart (#381).
+Queryable via `GET /agents/audit` (admin scope).
 
 ### Agent binary packaging
 
-The `hp-agent` daemon is distributed as a **standalone binary**, built with PyInstaller. This eliminates the need for Python on managed hosts — deployment is just `scp` + `chmod +x`:
+`hp-agent` is a Go program built as a single **static** binary
+(`CGO_ENABLED=0`, stdlib only, ~4.5 MB, amd64 + arm64). There is no Python on a
+managed host and no PyInstaller step; the original `agent/hp_agent/` package was
+removed.
 
 ```bash
-# Build the binary
-cd agent/
-pip install pyinstaller
-pyinstaller --onefile --name hp-agent hp_agent/main.py
-# Output: dist/hp-agent
-
-# Deploy to managed host
-scp dist/hp-agent target:/usr/local/bin/
-ssh target 'chmod +x /usr/local/bin/hp-agent'
+cd agent/go
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o hp-agent-linux-amd64 .
 ```
 
-The binary bundles Python 3.10+ stdlib and all dependencies (asyncio, ssl, json, subprocess). No virtualenv or pip install needed on the target host. Systemd unit file (`hp-agent.service`) calls `/usr/local/bin/hp-agent` directly.
-
-Source code also available for `pip install` into a venv during development: `pip install -e agent/`.
+The image carries the built binaries and `install-agent.sh` under
+`/app/agent-dist`, and the control plane serves them at
+`GET /agents/dist/install-agent.sh` and `GET /agents/dist/hp-agent-linux-<arch>`
+with an `x-hp-sha256` header the installer verifies (#464). A guest therefore
+enrols without reaching GitHub, and the agent it installs matches the hub that
+will manage it. See `agent/go/README.md` for the environment variables and the
+privileged-unit rules.
 
 ### AgentAdapter (the only host transport)
 

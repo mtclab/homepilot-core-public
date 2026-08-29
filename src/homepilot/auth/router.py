@@ -19,7 +19,13 @@ from .deps import (
     require_scope,
     require_token,
 )
-from .tokens import PREFIX_LENGTH, generate_api_token, normalize_scope, validate_token
+from .tokens import (
+    PREFIX_LENGTH,
+    generate_api_token,
+    normalize_scope,
+    validate_scope,
+    validate_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +358,13 @@ async def admin_create_token(
     # Rate limiting stays AHEAD of authorization so a brute-force attempt on
     # either credential is counted, not just a well-formed one.
     await _authorize_mint(request, authorization, hp_token, hp_csrf, db)
+
+    # Refuse a scope this instance cannot honour rather than storing it and
+    # answering 201 with a credential that is silently good for nothing.
+    try:
+        validate_scope(body.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
     full_token, prefix, token_hash = generate_api_token()
     existing_users = await db.db.fetchall("SELECT id FROM users LIMIT 1")

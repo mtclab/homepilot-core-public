@@ -229,7 +229,7 @@ class TestApiTokenJourneys:
 
             refused = await session.call_tool(_ADMIN_TOOL, {"prefix": other[:16]})
             assert refused.get("isError") is True, refused
-            assert "admin scope" in json.dumps(refused)
+            assert "admin tier" in json.dumps(refused)
             # Refused means REFUSED: the token it targeted is still there.
             assert await repo.get_token_by_prefix(other[:16]) is not None
 

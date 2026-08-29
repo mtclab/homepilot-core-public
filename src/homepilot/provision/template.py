@@ -435,11 +435,26 @@ class GuestTemplateService:
         if proxmox is None:  # pragma: no cover - the caller checked
             raise RuntimeError("Proxmox not configured")
         config = await proxmox.get_storage(storage)
-        content = [c.strip() for c in str(config.get("content") or "").split(",") if c.strip()]
+        raw = config.get("content")
+        # `set_storage_content` REPLACES the list; PVE takes no delta. So the
+        # existing types have to be read back first, and "I did not read them"
+        # and "there are none" are opposite facts with the same empty shape
+        # (#642 A3). Treating the second as the first sends `content=import`
+        # ALONE and un-declares `images`, `iso`, `backup` on a storage other
+        # people's guests are sitting on - while the record still says
+        # `storage_import_content_added: true`, as if it had added one type.
+        if raw is None or not str(raw).strip():
+            raise RuntimeError(
+                f"storage '{storage}' did not report its content types, so adding 'import' "
+                "would REPLACE the list with 'import' alone and un-declare whatever it "
+                "already holds. Add the 'import' content type to that storage by hand, or "
+                "point template creation at a storage that already has it."
+            )
+        content = [c.strip() for c in str(raw).split(",") if c.strip()]
         if "import" in content:
             return False
         await proxmox.set_storage_content(storage, ",".join([*content, "import"]))
-        logger.info("Added 'import' content type to storage %s", storage)
+        logger.info("Added 'import' content type to storage %s (kept %s)", storage, content)
         return True
 
     async def _wait(self, upid: str | None, node: str, timeout_s: float) -> None:

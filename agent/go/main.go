@@ -9,6 +9,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -88,21 +89,52 @@ func (a *Agent) sendOn(gen uint64, m msg) error {
 func (a *Agent) sendLocked(m msg) error {
 	// On a replay-protected connection, stamp a monotonic seq + MAC under the
 	// write lock so the on-wire order matches the assigned sequence.
+	//
+	// A frame that fails to ENCODE must give its sequence number back. The hub
+	// verifies sequences fail-closed, so a consumed-but-unsent seq would make
+	// every subsequent frame look like a replay and cost the agent the
+	// connection - turning "this answer is too big" into "this host is gone".
 	if a.replayOn {
 		a.sendSeq++
 		m["seq"] = a.sendSeq
 		mac, err := computeMAC(a.replayKey, m)
 		if err != nil {
+			a.sendSeq--
 			return err
 		}
 		m["mac"] = mac
 	}
 	b, err := encodeMessage(m)
 	if err != nil {
+		if a.replayOn {
+			a.sendSeq--
+		}
 		return err
 	}
 	_, err = a.conn.Write(b)
 	return err
+}
+
+// sendResult writes a command_result, degrading to a compact error frame when
+// the result itself will not fit on the wire.
+//
+// The per-payload budgets (maxPayloadBytes, execStreamBudget) are what normally
+// keep a reply sendable; this is the backstop behind them. It matters because
+// an unsendable frame is not a local error: the hub refuses to parse a body it
+// cannot MAC-verify, so an oversize reply CLOSES the connection, and the caller
+// that asked the question gets neither an answer nor a reason.
+func (a *Agent) sendResult(m msg, forAction, reqID string) {
+	err := a.send(m)
+	if err == nil || !errors.Is(err, errFrameTooLarge) {
+		return
+	}
+	log.Printf("refusing to send an oversize %s result for %s: %v", forAction, reqID, err)
+	_ = a.send(msg{
+		"action": "command_result", "for_action": forAction, "request_id": reqID,
+		"error": fmt.Sprintf(
+			"the %s result is too large to return over the agent hub protocol (%v)",
+			forAction, err),
+	})
 }
 
 // verifyInbound checks a frame's seq + MAC on a replay-protected connection and
@@ -423,10 +455,10 @@ func (a *Agent) handleExec(m msg, reqID string) {
 		timeout = int(t)
 	}
 	code, stdout, stderr := a.exec.Exec(command, timeout)
-	_ = a.send(msg{
+	a.sendResult(msg{
 		"action": "command_result", "for_action": "exec", "exit_code": code,
 		"stdout": stdout, "stderr": stderr, "request_id": reqID,
-	})
+	}, "exec", reqID)
 }
 
 func (a *Agent) handleReadFile(m msg, reqID string) {
@@ -436,8 +468,8 @@ func (a *Agent) handleReadFile(m msg, reqID string) {
 			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	_ = a.send(msg{"action": "command_result", "for_action": "read_file",
-		"content": content, "request_id": reqID})
+	a.sendResult(msg{"action": "command_result", "for_action": "read_file",
+		"content": content, "request_id": reqID}, "read_file", reqID)
 }
 
 func (a *Agent) handleWriteFile(m msg, reqID string) {

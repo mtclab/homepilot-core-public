@@ -177,7 +177,7 @@ class TestScope:
         context, _db = ctx
         token = _mcp_token_scope_var.set("full")
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _handle_tool("query_guests", {}, {**context, "_mcp_token_scope": "full"})
             # Same harness, admin token: reaches the handler and returns a dict.
             out = await _handle_tool("query_guests", {}, {**context, "_mcp_token_scope": "admin"})

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from ..metrics.repository import MAX_METRIC_NAME_LEN, METRIC_NAME_RE
-from .audit import ActionType
+from .audit import ActionType, ResultType
 from .enrolment_window import is_open as enrolment_window_is_open
 from .registry import AgentRegistry
 from .replay import (
@@ -217,6 +217,24 @@ def parse_metric_sample(item: Any, now: float) -> tuple[str, int, float] | None:
     if clock < now - MAX_SAMPLE_AGE_SECONDS or clock > now + MAX_SAMPLE_SKEW_SECONDS:
         return None
     return metric, clock, value
+
+
+# The marker the agent puts in stderr when its allowlist refused a command
+# (agent/go/exec.go). A refusal is not an error frame - it comes back as a normal
+# result with exit_code -1 - which is why the audit trail recorded every blocked
+# command as `result: success`. An operator asking the trail "what was refused on
+# my hosts?" got nothing, and the ResultType has had a "blocked" value all along.
+_BLOCKED_STDERR_PREFIX = "command blocked:"
+
+
+def _audit_result_kind(error: Any, result: dict[str, Any]) -> ResultType:
+    """success / blocked / error, from what the agent actually reported."""
+    if error is not None:
+        return "error"
+    stderr = result.get("stderr")
+    if isinstance(stderr, str) and stderr.lstrip().startswith(_BLOCKED_STDERR_PREFIX):
+        return "blocked"
+    return "success"
 
 
 class AgentCommandError(Exception):
@@ -1172,7 +1190,7 @@ class AgentHubServer:
             agent_id=agent_id,
             action=action,  # type: ignore[arg-type]
             command_or_path=command_or_path,
-            result="error" if error is not None else "success",
+            result=_audit_result_kind(error, result),
             exit_code=result.get("exit_code"),
             hostname=agent.hostname if agent else None,
         )

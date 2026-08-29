@@ -93,6 +93,45 @@ class ClaimRepository:
         )
         await self.db.conn.commit()
 
+    async def latch_claimed_externally(self, label: str) -> bool:
+        """Close the claim path for an instance that got its admin credential
+        another way, and return whether this call is what closed it.
+
+        `is_claimed()` answers True as soon as ANY admin-capable token exists,
+        which is right - but it was the ONLY thing keeping the claim shut on an
+        instance bootstrapped by `hp init`, by an install predating the claim, or
+        by a token minted in the console: those never take the latch, so
+        `claimed_at` stays NULL for ever.
+
+        Deleting that last admin token therefore REOPENED the claim path. The
+        operator sees a token they rotated away; the instance quietly becomes
+        claimable again, and on a private network it is claimable with no code at
+        all - handing a fresh superuser token to whoever asks first. That is the
+        opposite of the direction this is supposed to fail in, and it is a
+        plausible accident: revoke-then-mint is how people rotate credentials.
+
+        Taking the latch once makes "this instance has issued an admin
+        credential" a fact about its history rather than about its current token
+        list. Recovery for an instance that really has lost every admin token is
+        `hp init` or the admin secret, exactly as `has_admin_credential` says.
+
+        The INSERT covers an install old enough to have no claim row at all; the
+        conditional UPDATE is the same latch `claim()` uses, so a real claim
+        happening concurrently still wins exactly once.
+        """
+        await self.db.execute(
+            "INSERT OR IGNORE INTO instance_claim "
+            "(id, code_prefix, code_hash, created_at) VALUES (?, '', '', ?)",
+            (_ROW_ID, _now()),
+        )
+        cursor = await self.db.execute(
+            "UPDATE instance_claim SET claimed_at = ?, claimed_label = ? "
+            "WHERE id = ? AND claimed_at IS NULL",
+            (_now(), label, _ROW_ID),
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount == 1
+
     async def record_minted_token(self, prefix: str) -> None:
         await self.db.execute(
             "UPDATE instance_claim SET minted_token_prefix = ? WHERE id = ?",

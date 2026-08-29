@@ -455,9 +455,67 @@ class TestExistingInstalls:
         with caplog.at_level(logging.DEBUG, logger="homepilot.claim.startup"):
             assert await boot(instance) is None
 
-        assert caplog.text == ""
+        # Nothing that could BE a code reaches the log, and none is written.
+        assert "hpc_" not in caplog.text
         assert not claim_code_path(instance.data_dir).exists()
-        assert await instance.app.state.claim_repo.get() is None
+
+    async def test_an_admin_credential_seen_at_boot_latches_the_claim_shut(self, instance: Any):
+        """Review #648: revoking the last admin token used to REOPEN the claim.
+
+        `is_claimed()` answers True as soon as any admin-capable token exists,
+        and on an instance bootstrapped by `hp init` (or by a token minted in the
+        console, or on an install predating the claim) that was the ONLY thing
+        holding the claim shut - `claimed_at` stayed NULL for ever. Delete that
+        token, which is the ordinary first half of a rotation, and the instance
+        became claimable again; on a private network, claimable with NO CODE,
+        handing a fresh superuser token to whoever asked first.
+
+        TEETH: remove the `latch_claimed_externally` call from
+        `ensure_claim_code` and this fails - the status flips back to unclaimed
+        and the codeless POST mints a token.
+        """
+        await install_admin_token(instance.db)
+        await boot(instance)
+
+        claims = instance.app.state.claim_repo
+        row = await claims.get()
+        assert row is not None and row["claimed_at"] is not None, (
+            "boot saw an admin credential and did not latch the claim shut"
+        )
+
+        # The operator rotates: revoke first, mint second. Between the two the
+        # instance holds no admin token at all.
+        await instance.db.execute("DELETE FROM api_tokens")
+        await instance.db.conn.commit()
+        assert await token_count(instance.db) == 0
+
+        async with client_for(instance.app) as client:
+            assert (await client.get("/claim/status")).json() == {"state": "claimed"}
+            reopened = await client.post("/claim", json={"label": "attacker"})
+            assert reopened.status_code == 410, (
+                "the claim path reopened when the last admin token was revoked - "
+                f"a local caller just minted {reopened.json()}"
+            )
+        assert await token_count(instance.db) == 0
+
+    async def test_a_stale_claim_code_file_is_removed_once_the_instance_is_claimed(
+        self, instance: Any
+    ):
+        """The code file is documented as "deleted the moment the claim
+        succeeds", and POST /claim does delete it - but an instance claimed by
+        any OTHER route never ran that cleanup, so the plaintext code sat in the
+        data directory for the life of the instance. Found on dev at 3.6.14,
+        where `.claim_code` was still present two days after the instance was
+        in use."""
+        await boot(instance)
+        assert claim_code_path(instance.data_dir).exists()
+
+        await install_admin_token(instance.db)
+        await boot(instance)
+
+        assert not claim_code_path(instance.data_dir).exists(), (
+            "the plaintext claim code outlived the claim"
+        )
 
     async def test_an_instance_with_an_admin_token_reports_claimed(self, instance: Any):
         await install_admin_token(instance.db)

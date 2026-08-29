@@ -120,7 +120,7 @@ YAML. Keys are stable; do not rename without a version bump.
 | `tags` | list[str] | Free-form, e.g. `["security", "auth"]` |
 | `rollback` | bool | `true` if a rollback section exists in the body |
 | `replay_safe` | bool | Defaults to `true`. `false` per **D3** means the artifact cannot be replayed *at all*; to redo the operation, revoke and produce a fresh artifact. Agent must explain in the body why an artifact is not replay-safe. |
-| `requires_snapshot` | bool | Defaults to `true` for `mutating: true` against VM/LXC targets, `false` otherwise. Override only when snapshotting is impossible or dangerous (e.g. snapshotting the running PVE node itself). |
+| `requires_snapshot` | bool | Defaults to `true` for `mutating: true` against VM/LXC targets, `false` otherwise. Override only when snapshotting is impossible or dangerous (e.g. snapshotting the running PVE node itself). Setting it `true` on any other `target.kind` is **refused at propose**: only a vm or an lxc can be snapshotted, so the claim could not be honoured, and an ignored `requires_snapshot: true` reads on the review screen as a rollback point that does not exist. A required snapshot the executor cannot address (no vmid, no node) aborts the apply rather than being skipped. |
 
 ### 3.1 `target` object
 
@@ -383,12 +383,14 @@ For `target.kind: cluster` artifacts (datacenter-level config), the executor pic
    a. Interpolate `path` using `target` fields.
    b. If `precheck` present:
       - GET the precheck path.
-      - Evaluate `skip_if` expression with a sanitised `response` proxy and `target` in scope. Allowed attributes: `response.status_code` (int), `response.headers` (dict, auth/cookie keys excluded), `response.json` (pre-parsed body dict/list/None — use subscript access). Function calls and private/dunder attributes are blocked.
+      - Evaluate `skip_if` expression with a sanitised `response` proxy and `target` in scope. Allowed attributes: `response.status_code` (int), `response.headers` (dict, auth/cookie keys excluded), `response.json` (pre-parsed body dict/list/None — use subscript access). Function calls and private/dunder attributes are blocked. For `proxmox-api-sequence`, subscripting `response` directly reaches PVE's raw `{"data": …}` envelope as well; this is a compatibility alias for artifacts written before the documented binding worked, and new artifacts should use `response.json[…]`.
       - If true: log "skipped" and continue to next step.
+      - **An undecided precheck does not authorise the step.** The precheck ANSWERS when the API says something about the resource: any status below 500. A 5xx, a transport failure, or an expression the evaluator cannot decide (a name that is not bound, a refused construct, a syntax error) settles nothing — the step is NOT run, the reason is logged, and the artifact ends `failed`. "I could not tell whether this was already applied" is not "apply it".
    c. Else (or precheck didn't skip): send `method path` with `body` JSON-encoded.
    d. Capture status, headers (filtered), body.
    e. If status >= 400 and `on_error: halt`: stop. Mark `failed`.
-4. Append `## Execution log` with each step's outcome (skipped / ok / error) and timing.
+   f. If status >= 400 and `on_error: continue`: log the error and go on to the next step. The sequence continues; the ARTIFACT does not become `applied` — it ends `failed`, naming every step that did not complete. `continue` governs the sequence, not the verdict.
+4. Append `## Execution log` with each step's outcome (skipped / not-run / ok / error) and timing.
 
 **Idempotence:** `via-precheck` is the default and required for mutating steps. `declared-natural` allowed only for steps that are demonstrably state-replacing (e.g. `PUT /access/domains/authentik` with full state).
 
@@ -823,7 +825,7 @@ When the agent calls `propose_artifact(spec)`, HomePilot validates before writin
 3. **ID format:** matches `YYYY-MM-DD-[a-z0-9-]{1,60}(-[a-f0-9]{6})?`.
 4. **ID uniqueness:** doesn't already exist in repo.
 5. **Body parses:** Markdown body parses; for kinds with structured spec blocks, the spec block parses as YAML/bash.
-6. **Jinja2 interpolation safety (per D2):** all `{{ ... }}` expressions in the spec body resolve against the allowed context (`target.*`, `vault.<name>` non-secret fields, `now`, `artifact.id`, `artifact.intent`); references to other names are rejected. No `{% %}` control blocks.
+6. **Jinja2 interpolation safety (per D2):** all `{{ ... }}` expressions in the spec body resolve against the allowed context (`target.*`, `vault.<name>` non-secret fields, `now`, `artifact.id`, `artifact.intent`); references to other names are rejected. No `{% %}` control blocks. The body is rendered against **this artifact's own `target`**, and against the same context the executor uses at apply time, so `{{ target.nodee }}` is caught here rather than blanked at apply — and so a `cluster` artifact naming `{{ target.node }}` fails validation, which is what §11.7 asks for. Every `precheck.skip_if` in the body is checked against the evaluator's rules at the same moment; a `skip_if` the evaluator would refuse now means the step does not run, so it is caught while the artifact is still a draft.
 7. **Per-kind requirements:**
    - `ansible-playbook`: `## Spec` block present and parses as a YAML list of plays.
    - `proxmox-api-sequence`: `steps:` present, every step has required fields, every mutating step has a `precheck` unless `idempotence: declared-natural`. For `target.kind: cluster` artifacts: paths must NOT contain `{{ target.node }}` (the executor picks the node).

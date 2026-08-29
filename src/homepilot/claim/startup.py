@@ -121,7 +121,9 @@ async def ensure_claim_code(
     """Make sure an unclaimed instance has a claim code, and show it.
 
     Returns the plaintext code while the instance is claimable, or None when it
-    is already claimed - in which case NOTHING is generated, logged or written.
+    is already claimed - in which case nothing is generated and nothing is
+    logged. A claimed instance does have one side effect: the claim is LATCHED
+    and the operator-facing copy of the code is removed. See below.
 
     Restart safety: an unclaimed instance keeps the code it already has. The
     stored hash is only replaced when the operator-facing copy has gone missing,
@@ -129,10 +131,29 @@ async def ensure_claim_code(
     scrollback silently.
     """
     if await has_admin_credential(claims.db):
+        # An instance whose first admin credential came from `hp init`, from the
+        # console, or from an install predating the claim never took the latch,
+        # so `claimed_at` stayed NULL and only the presence of that token kept
+        # the claim shut. Revoking it - the ordinary first half of a rotation -
+        # reopened the claim path, and on a private network it reopens WITHOUT a
+        # code. Latch it here, on the boot that observes the credential.
+        if await claims.latch_claimed_externally("pre-claim admin credential"):
+            logger.info(
+                "Claim path closed permanently: this instance already holds an admin "
+                "credential (it was not claimed through the browser flow)."
+            )
+        # And drop the operator-facing copy of the code, which POST /claim
+        # removes on its own path but which otherwise sits in the data directory
+        # for the life of the instance.
+        clear_claim_code(data_dir)
         return None
 
     row = await claims.get()
     if row is not None and row["claimed_at"] is not None:
+        # Already latched. POST /claim removes the file on its own path; this
+        # covers a claim whose cleanup could not run (a read-only data dir at
+        # the time, a restore from a backup taken before the claim).
+        clear_claim_code(data_dir)
         return None
 
     if row is not None:

@@ -648,6 +648,22 @@ beside it.
 `unknown` is the default, on purpose: a path that forgets to say reads as "not
 established" rather than as a clean bill of health.
 
+Three paths were still greener than what they had established, and are not now:
+a **composite** counted an `unknown` sub-artifact as in spec, so a composite of
+ansible artifacts - none of which are checkable at all - reported green;
+**host-provision** had no `unknown` at all, so a config file the agent could not
+read (permission, a file over the hub's frame budget, a denied path) was reported
+as *drifted*, which is the verdict that sends an operator to re-apply; and a
+verifier that **raised** wrote no row, so the artifact silently kept the colour of
+its last successful check. A failed check now answers `unknown` with the reason.
+
+The same "unreadable is not absent" rule governs what an apply does. A
+host-provision whose config file could not be read used to record `existed:
+false`, overwrite the file as a first write, and then report *"created by this
+artifact"* on revoke - so the prior bytes were gone with nothing recording that
+they had ever been there. The capture now distinguishes absent from unread, and a
+revoke names what it never established rather than implying the file is new.
+
 **Ansible drift checking is not implemented and now says so.** The verifier
 called `executor.ssh.exec(...)` on an attribute that went with the jump server,
 so it raised on every run into a handler that returned "no drift" - every applied
@@ -680,6 +696,50 @@ that no-op'd, or that failed used to be indistinguishable from one that worked.
 The journal now records `outcome: reversed` or `outcome: relabelled` with the
 reason, and the task result carries the same. A composite whose sub-artifacts
 were only relabelled reports a failed rollback rather than a clean success.
+
+## A precheck that did not answer is not permission to act
+
+`idempotence: via-precheck` is the promise that re-applying a reviewed artifact
+is safe: each mutating step carries a read, and the step is skipped when the read
+says the target is already in the desired state. The guard failed OPEN in three
+ways at once, and all three ran together on a `proxmox-api-sequence`:
+
+- the binding ARTIFACT_SPEC documents did not exist. §5.2 and D2 define
+  `response.status_code` and `response.json`; the executor bound Proxmox's raw
+  `{"data": …}` envelope, which has neither. `skip_if: "response.status_code ==
+  200"` - the spec's own worked example - therefore evaluated to `False` on every
+  run, and `False` is the branch that mutates;
+- a precheck whose call FAILED fell through to the step. On dev, a precheck
+  answering HTTP 500 was followed straight into its own `DELETE`, and the
+  execution log did not mention the failure at all;
+- an expression the evaluator could not run - a wrong binding, a refused
+  construct, a syntax error - was answered `False` rather than raised.
+
+Now: the documented names are bound (subscripting `response` still reaches the
+envelope, so artifacts already in the store mean what they meant); a 2xx or 4xx
+is an answer and the expression decides on it; a 5xx, a transport failure, or an
+expression that cannot be decided means **the step does not run**, with the
+reason in the log. `on_error: continue` keeps the sequence going and no longer
+makes the artifact `applied` over a step that failed - it reports `failed` and
+names the steps.
+
+The same rule reaches interpolation: an undefined `{{ … }}` used to render as the
+empty string, so a missing vmid sent the call to `/nodes/pve/lxc//status/current`,
+and a template error sent `{{ … }}` to the API verbatim. Both are refusals now,
+and the propose-time validator renders each body against the SAME context the
+executor uses - which is also what made D2's canonical `{{ target.node }}`
+proposable again. It had been refused outright, because the validator faked
+`target` as a string.
+
+## Approving a composite approves its steps
+
+ARTIFACT_SPEC §5.4 and §7 both say so; nothing did it, so every composite failed
+its own apply with *"status is proposed, expected approved"* unless an operator
+approved each sub-artifact by hand. `composite` is the mechanism D1 names for
+multi-target work, so this was the fan-out not working at all. The cascade is
+atomic per §7 - if any step cannot be approved, nothing is written and the
+composite stays `proposed` - it recurses through composites-of-composites, and it
+writes one audit row per sub-artifact.
 
 ## One apply engine
 

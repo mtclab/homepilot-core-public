@@ -300,7 +300,11 @@ steps:
 """
     executor = _make_executor()
     result = await composite_execute(fm, body, mock_lifecycle, executor)
-    assert "missing artifact reference" in result["execution_log"]
+    assert "names no artifact" in result["execution_log"]
+    # It asserted only the LOG LINE, so the composite came back `success: True`
+    # having run nothing at all and the artifact reached `applied` (#642 B9,
+    # review #648). A step that named nothing did nothing.
+    assert result["success"] is False
 
 
 async def test_on_error_continue_sets_failed_flag(mock_lifecycle, make_frontmatter):

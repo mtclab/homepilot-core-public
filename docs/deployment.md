@@ -447,7 +447,14 @@ never touched and the template's own NIC is cloned exactly as before.
 
 ## 3. Create the First API Token
 
-`hp token create` works while the backend is running — it uses the HTTP API internally and falls back to direct DB access only when the backend is stopped.
+`hp token create` mints through the HTTP API when the backend is running, and
+falls back to a direct database write only when the backend is stopped.
+
+**It needs an admin credential of this box's own to use the API**: `HP_ADMIN_TOKEN`,
+or the `api-token` file that `hp init` and the browser claim write into the data
+directory. An instance whose first admin token came from the console has neither,
+and against a *running* backend the command will refuse and say so — mint from
+**Settings → Tokens** in that case, or export `HP_ADMIN_TOKEN` first.
 
 ```bash
 docker compose exec backend hp token create
@@ -1085,7 +1092,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.14` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.15` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1180,7 +1187,7 @@ If the restore was wrong, everything it replaced is under
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | 401 on all API calls | Token not set or expired | Run `hp token create` again; use the new token |
-| 403 on write operations | Token scope is `read_only` | Create a token with `--scope read,write` or `--scope '*'` |
+| 403 on write operations | Token scope is `read_only` | Create a token with `--scope read,write`. Not `--scope '*'`/`all` — that is the superuser scope, and it also hands out token and secret management |
 | Inventory shows 0 hosts | Proxmox not configured or refresh not run | Set `HP_PROXMOX_HOST` + token; run `hp inventory refresh` |
 | Vault errors on start | Passphrase not set | Auto-generated in v2.2+; for manual setup, set `HP_VAULT_PASSPHRASE` or `HP_VAULT_PASSPHRASE_FILE` |
 | Agent not connecting | Hub disabled or token mismatch | Check `HP_AGENT_HUB_ENABLED` is not set to `false`, and re-copy the one-liner from **Agents** (the token regenerates only if the data dir was wiped) |

@@ -168,7 +168,11 @@ class TestTheJourney:
 
         lifecycle, store, repo, _executor, _cluster = world
         bad = BODY.replace("subnet_cidr: 198.51.100.0/24", "subnet_cidr: not-a-subnet")
-        with pytest.raises(LifecycleError):
+        # The refusal now reaches the caller as a ValueError carrying the
+        # message, which is how every other refusal on this transport behaves;
+        # a raw LifecycleError escaping was #635 - "Internal server error", with
+        # the reason only in a log the MCP caller cannot read.
+        with pytest.raises(ValueError, match="subnet_cidr must be an IPv4 CIDR"):
             await _handle_tool(
                 "propose_artifact",
                 {"spec": json.dumps(_spec("2026-08-26-guest-network-mcpbad", bad))},

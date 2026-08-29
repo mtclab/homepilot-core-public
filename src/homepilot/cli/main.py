@@ -113,18 +113,49 @@ def _pve_host(settings: Any) -> str:
     return host or "(not configured)"
 
 
-async def _migrate_or_refuse(database: Any, what: str) -> None:
-    """Run migrations from the CLI, unless a backend holds this data directory.
+async def _open_cli_db(what: str, db_path: Path | None = None) -> Any:
+    """Open the control-plane database for a CLI command, migrating it first.
 
-    `hp init`, `hp token create|revoke`, `hp agent revoke`, `hp kb reindex` and
-    `hp import` each migrate the same file a running server is using, so a CLI
-    could change the schema under it (#431). One helper rather than a guard per
-    call site: five copies is five chances to forget the fifth.
+    Two rules live here, and both are about a command that must NOT proceed.
+
+    **The refusal is decided BEFORE anything is opened.** `hp init`,
+    `hp token create|revoke`, `hp invite *`, `hp inventory *`, `hp webhook *`,
+    `hp agent revoke|remove`, `hp kb reindex` and `hp import` all migrate the
+    same file a running server is using, so a CLI could change the schema under
+    it (#431). The refusal used to be raised while the caller already held an
+    open aiosqlite connection - and a CLI that raises while holding one NEVER
+    EXITS: aiosqlite runs the real sqlite3 handle on a NON-DAEMON worker thread
+    parked on a queue nobody will feed again, and CPython joins every non-daemon
+    thread at interpreter exit. The command printed its refusal and then hung
+    forever. `docker compose exec` does not forward the caller's signals either,
+    so giving up left an orphaned python process in the container that only a
+    SIGKILL from inside it cleared (#623; reproduced on dev at 3.6.14 with
+    `hp token create`, which `docs/deployment.md` calls the way to mint a token).
+
+    **A failure during the migration closes what it opened**, for the same
+    reason: an abandoned handle is a process that will not exit.
+
+    Callers still own the returned connection and must close it in a `finally`.
     """
+    from homepilot.db.connection import Database
     from homepilot.db.migrations import run_migrations
 
     _refuse_if_server_running(_get_settings(), what)
-    await run_migrations(database)
+    database = Database(str(db_path if db_path is not None else _db_path()))
+    await database.connect()
+    try:
+        await run_migrations(database)
+    except BaseException:
+        await database.close()
+        raise
+    return database
+
+
+def _server_is_running(settings: Any) -> bool:
+    """Whether a backend holds this data directory (it takes the instance lock)."""
+    from homepilot.instance_lock import another_instance_is_running
+
+    return bool(another_instance_is_running(settings.data_dir))
 
 
 def _refuse_if_server_running(settings: Any, what: str) -> None:
@@ -135,9 +166,7 @@ def _refuse_if_server_running(settings: Any, what: str) -> None:
     out from under it. The backend takes an advisory lock for its lifetime; this
     asks whether anyone holds it.
     """
-    from homepilot.instance_lock import another_instance_is_running
-
-    if another_instance_is_running(settings.data_dir):
+    if _server_is_running(settings):
         err_console.print(
             f"[red]The HomePilot backend is running against {settings.data_dir}.[/red]"
         )
@@ -239,6 +268,12 @@ def init(
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     console.print("[bold]HomePilot Init[/bold]\n")
+
+    # Refuse a live install BEFORE the first byte is written. `hp init` rewrites
+    # .env, the master vault identity and the box's api-token, and it used to do
+    # all of that and only then discover that a backend holds the data directory
+    # (#431) - so a refused init had already replaced the operator's .env.
+    _refuse_if_server_running(_get_settings(), "hp init")
 
     # Re-run guard (#384): `hp init` generates a fresh vault passphrase and
     # rewrites .env — the ONLY place the old passphrase lives. Running it a
@@ -343,31 +378,29 @@ def init(
     os.chmod(str(token_path), 0o600)
 
     async def _register_token() -> None:
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
-        db_path = data_dir / "homepilot.db"
-        database = Database(str(db_path))
-        await database.connect()
-        await _migrate_or_refuse(database, "hp init")
-        repo = Repository(database)
-        user_id = await repo.create_user(display_name="admin", auth_source="api_token")
-        await repo.create_api_token(
-            user_id=str(user_id),
-            token_type="personal",
-            prefix=token_prefix,
-            hash=token_hash,
-            # "all" normalizes to "*" - the admin scope the browser claim hands
-            # its first credential. It used to be "read,write", which could not
-            # open Settings -> Tokens (admin) and, now that minting requires an
-            # admin, could not mint either: the box's only token was locked out
-            # of managing tokens.
-            scope="all",
-            label="admin",
-            expires_at=None,
-        )
-        await database.conn.commit()
-        await database.close()
+        database = await _open_cli_db("hp init", data_dir / "homepilot.db")
+        try:
+            repo = Repository(database)
+            user_id = await repo.create_user(display_name="admin", auth_source="api_token")
+            await repo.create_api_token(
+                user_id=str(user_id),
+                token_type="personal",
+                prefix=token_prefix,
+                hash=token_hash,
+                # "all" normalizes to "*" - the admin scope the browser claim
+                # hands its first credential. It used to be "read,write", which
+                # could not open Settings -> Tokens (admin) and, now that
+                # minting requires an admin, could not mint either: the box's
+                # only token was locked out of managing tokens.
+                scope="all",
+                label="admin",
+                expires_at=None,
+            )
+            await database.conn.commit()
+        finally:
+            await database.close()
 
         vault = VaultManager(data_dir, passphrase)
         await vault.ensure_master_identity()
@@ -1258,7 +1291,6 @@ def import_backup(
 ) -> None:
     """Restore a HomePilot data dir from a tarball. Backs up current state first."""
     from homepilot.db.backup import DatabaseLockedError, SnapshotError, ensure_not_locked
-    from homepilot.db.connection import Database
 
     if not path.exists():
         err_console.print(f"[red]File not found: {path}[/red]")
@@ -1363,10 +1395,8 @@ def import_backup(
     if db_path.exists():
 
         async def _migrate() -> int:
-            database = Database(str(db_path))
-            await database.connect()
+            database = await _open_cli_db("hp import", db_path)
             try:
-                await _migrate_or_refuse(database, "hp import")
                 row = await database.fetchone(
                     "SELECT value FROM settings WHERE key = 'schema_version'"
                 )
@@ -1543,7 +1573,6 @@ def kb_reindex(
         if via_api is not None:
             return via_api
 
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
         from homepilot.executor import kb_note
 
@@ -1553,10 +1582,8 @@ def kb_reindex(
         if not db_path.exists():
             return {"deleted": 0, "reindexed": 0, "errors": 0}
 
-        database = Database(str(db_path))
-        await database.connect()
+        database = await _open_cli_db("hp kb reindex", db_path)
         try:
-            await _migrate_or_refuse(database, "hp kb reindex")
             repo = Repository(database)
             store = _get_artifact_store()
 
@@ -1688,10 +1715,11 @@ async def _mint_token_via_api(
         detail = str(resp.json().get("detail", ""))
     except Exception:
         detail = resp.text
+    # `hp init` is deliberately not offered here either: on an instance that is
+    # already set up it refuses, and forcing it generates a fresh vault
+    # passphrase that orphans every stored secret.
     hint = (
-        " Pass an admin token in HP_ADMIN_TOKEN (the one the claim or "
-        "Settings -> Tokens gave you), or bootstrap the admin secret with "
-        "`hp init --non-interactive` (stores it in the vault)."
+        " Pass an admin token in HP_ADMIN_TOKEN (the one the claim or Settings -> Tokens gave you)."
     )
     return None, f"Backend refused token creation ({resp.status_code}): {detail}.{hint}"
 
@@ -1721,6 +1749,17 @@ def token_create(
     `hp agent` does its work. The old path survives for the one case that cannot
     be authenticated - an instance with no live token to authenticate WITH.
     """
+    # Refuse a scope the instance cannot honour BEFORE anything is minted: a
+    # typo used to produce a real token that authenticates and is refused by
+    # every scoped route, discovered at first use rather than here.
+    from homepilot.auth.tokens import validate_scope
+
+    try:
+        validate_scope(scope)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+
     if scope.strip() in ("all", "full", "*"):
         legacy = " ('full' is the legacy name for 'all')" if scope.strip() == "full" else ""
         typer.secho(
@@ -1736,7 +1775,6 @@ def token_create(
         nonlocal bootstrapped
         from aiosqlite import OperationalError
 
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
@@ -1744,15 +1782,38 @@ def token_create(
         token, err = await _mint_token_via_api(settings, label, scope)
         if token:
             return token
+        if err:
+            # The backend was REACHED and refused. Falling through to the
+            # direct-DB path would only produce a second, less relevant refusal
+            # (the schema guard) on top of the real one.
+            err_console.print(f"[red]{err}[/red]")
+            raise typer.Exit(1)
+
+        # "I could not ask" and "the backend said no" are different answers, and
+        # so is "there is nothing here to ask WITH". Reaching the direct-DB path
+        # on a LIVE install produced the schema-guard refusal ("stop the backend
+        # first"), which named neither the real obstacle nor the real fix: on an
+        # instance whose first admin token came from the console rather than from
+        # `hp init` or the browser claim, <data dir>/api-token does not exist and
+        # this box holds no credential to mint through. Say that.
+        if not _admin_headers(settings) and _server_is_running(settings):
+            err_console.print(
+                "[red]The backend is running, but this box holds no admin credential "
+                "to mint through it.[/red]"
+            )
+            err_console.print(
+                "[yellow]Set HP_ADMIN_TOKEN to an admin token (Settings -> Tokens "
+                "shows the ones you have), or mint it there directly. The direct-DB "
+                "bootstrap only runs with the backend stopped.[/yellow]"
+            )
+            raise typer.Exit(1)
 
         data_dir = Path(settings.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = data_dir / "homepilot.db"
+        database = await _open_cli_db("hp token create", db_path)
         try:
-            database = Database(str(db_path))
-            await database.connect()
-            await _migrate_or_refuse(database, "hp token create")
             repo = Repository(database)
 
             # THE RULE. An unauthenticated mint is allowed only while there is no
@@ -1761,12 +1822,9 @@ def token_create(
             # authenticated path above is decoration anyone can walk around.
             live = await repo.count_live_api_tokens()
             if live > 0:
-                await database.close()
                 err_console.print(
                     f"[red]Refusing to mint: {live} live token(s) exist - {_TOKEN_RULE}[/red]"
                 )
-                if err:
-                    err_console.print(f"[yellow]{err}[/yellow]")
                 raise typer.Exit(1)
 
             full_token, prefix, token_hash = generate_api_token()
@@ -1787,7 +1845,6 @@ def token_create(
                 expires_at=None,
             )
             await database.conn.commit()
-            await database.close()
             bootstrapped = True
         except OperationalError as exc:
             if "database is locked" in str(exc).lower():
@@ -1798,6 +1855,8 @@ def token_create(
                 )
                 raise typer.Exit(1) from exc
             raise
+        finally:
+            await database.close()
         return full_token
 
     token = asyncio.run(_create())
@@ -1823,9 +1882,16 @@ async def _admin_request(settings: Any, method: str, path: str) -> tuple[Any | N
 
     headers = _admin_headers(settings)
     if not headers:
+        # NOT "run `hp init`". On an instance that is already set up, `hp init`
+        # refuses (it would generate a fresh vault passphrase and orphan every
+        # stored secret), and with the backend running it now refuses earlier
+        # still. Pointing the operator at it was advice that could not be
+        # followed - and if forced, would have cost them the vault.
         return None, (
-            "No admin credential on this box: set HP_ADMIN_TOKEN to an admin "
-            "token, or run `hp init` to store an admin secret in the vault."
+            "No admin credential on this box: mint one in Settings -> Tokens "
+            "(scope 'admin') and export it as HP_ADMIN_TOKEN. `hp init` is the "
+            "bootstrap for a NEW instance, not a way to add a credential to "
+            "this one."
         )
     port = getattr(settings, "daemon_port", 8000)
     try:
@@ -1899,15 +1965,15 @@ async def _open_invite_repo() -> tuple[Database, InviteRepository]:
     talks to SQLite directly - WAL plus busy_timeout lets it write while the
     backend is running.
     """
-    from homepilot.db.connection import Database
     from homepilot.portal.repository import InviteRepository
 
     settings = _get_settings()
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    database = Database(str(data_dir / "homepilot.db"))
-    await database.connect()
-    await _migrate_or_refuse(database, "hp token revoke")
+    # The command name is the operator's own: it used to say "hp token revoke"
+    # here, so `hp invite create` refused with a message about a command the
+    # operator had not run.
+    database = await _open_cli_db("hp invite", data_dir / "homepilot.db")
     return database, InviteRepository(database)
 
 
@@ -2057,26 +2123,25 @@ def inventory_list(
     from homepilot.inventory.service import InventoryService
 
     async def _list() -> list[dict[str, Any]]:
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             return []
-        db = Database(str(db_path))
-        await db.connect()
-        await _migrate_or_refuse(db, "hp inventory list")
-        repo = Repository(db)
-        svc = InventoryService(repo=repo)
-        filt: dict[str, Any] = {}
-        if role:
-            filt["role"] = role
-        if status:
-            filt["status"] = status
-        hosts = await svc.query_inventory(filter=filt or None)
-        await db.close()
-        return hosts
+        db = await _open_cli_db("hp inventory list", db_path)
+        try:
+            repo = Repository(db)
+            svc = InventoryService(repo=repo)
+            filt: dict[str, Any] = {}
+            if role:
+                filt["role"] = role
+            if status:
+                filt["status"] = status
+            hosts: list[dict[str, Any]] = await svc.query_inventory(filter=filt or None)
+            return hosts
+        finally:
+            await db.close()
 
     hosts = asyncio.run(_list())
 
@@ -2113,20 +2178,19 @@ def inventory_show(
     """Show details for a specific host."""
 
     async def _show() -> dict[str, Any] | None:
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
         settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             return None
-        db = Database(str(db_path))
-        await db.connect()
-        await _migrate_or_refuse(db, "hp inventory show")
-        repo = Repository(db)
-        host = await repo.get_host_by_hostname(hostname)
-        await db.close()
-        return dict(host) if host else None
+        db = await _open_cli_db("hp inventory show", db_path)
+        try:
+            repo = Repository(db)
+            host = await repo.get_host_by_hostname(hostname)
+            return dict(host) if host else None
+        finally:
+            await db.close()
 
     host = asyncio.run(_show())
 
@@ -2180,37 +2244,36 @@ def inventory_refresh(
             raise typer.Exit(1)
 
         # Backend not running → refresh directly against the DB.
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
         from homepilot.inventory.service import InventoryService
 
         db_path = Path(settings.data_dir) / "homepilot.db"
-        db = Database(str(db_path))
-        await db.connect()
-        await _migrate_or_refuse(db, "hp inventory refresh")
-        repo = Repository(db)
+        db = await _open_cli_db("hp inventory refresh", db_path)
+        try:
+            repo = Repository(db)
 
-        proxmox = None
-        if settings.proxmox_host:
-            try:
-                from homepilot.adapters.proxmox import ProxmoxClient
+            proxmox = None
+            if settings.proxmox_host:
+                try:
+                    from homepilot.adapters.proxmox import ProxmoxClient
 
-                token = ""
-                import os as _os
+                    token = ""
+                    import os as _os
 
-                token = _os.environ.get("PVE_API_TOKEN", "")
-                if token:
-                    base_url = f"https://{settings.proxmox_host}:{settings.proxmox_port}"
-                    proxmox = ProxmoxClient(
-                        base_url=base_url, token=token, verify_ssl=settings.proxmox_verify_ssl
-                    )
-            except Exception as e:
-                err_console.print(f"[yellow]Proxmox adapter unavailable: {e}[/yellow]")
+                    token = _os.environ.get("PVE_API_TOKEN", "")
+                    if token:
+                        base_url = f"https://{settings.proxmox_host}:{settings.proxmox_port}"
+                        proxmox = ProxmoxClient(
+                            base_url=base_url, token=token, verify_ssl=settings.proxmox_verify_ssl
+                        )
+                except Exception as e:
+                    err_console.print(f"[yellow]Proxmox adapter unavailable: {e}[/yellow]")
 
-        svc = InventoryService(repo=repo, proxmox=proxmox, proxmox_host=settings.proxmox_host)
-        result = await svc.refresh_inventory(scope=scope or None)
-        await db.close()
-        return result
+            svc = InventoryService(repo=repo, proxmox=proxmox, proxmox_host=settings.proxmox_host)
+            result: dict[str, Any] = await svc.refresh_inventory(scope=scope or None)
+            return result
+        finally:
+            await db.close()
 
     result = asyncio.run(_refresh())
     console.print(
@@ -2313,16 +2376,26 @@ def vault_delete(
     console.print(f"[green]Secret '{name}' deleted[/green]")
 
 
-async def _get_repo_for_webhook() -> tuple[Any, Any]:
-    from homepilot.db.connection import Database
+@contextlib.asynccontextmanager
+async def _webhook_repo() -> Any:
+    """(database, Repository) for the webhook commands, always closed.
+
+    A context manager rather than a bare opener because three of the four
+    webhook commands raise `typer.Exit` on a not-found or an undelivered event -
+    and a CLI that exits while holding an open aiosqlite connection never exits
+    at all (see `_open_cli_db`). `hp webhook test <unknown id>` hung forever.
+    """
     from homepilot.db.repository import Repository
 
     settings = _get_settings()
     db_path = Path(settings.data_dir) / "homepilot.db"
-    db = Database(str(db_path))
-    await db.connect()
-    await _migrate_or_refuse(db, "hp vault delete")
-    return db, Repository(db)
+    # The command name is the operator's own: it used to say "hp vault delete"
+    # here, so every `hp webhook` refusal talked about the vault.
+    db = await _open_cli_db("hp webhook", db_path)
+    try:
+        yield db, Repository(db)
+    finally:
+        await db.close()
 
 
 @webhook_app.command("add")
@@ -2337,13 +2410,12 @@ def webhook_add(
     secret_val = secret or None
 
     async def _add() -> int:
-        db, repo = await _get_repo_for_webhook()
-        config_id: int = await repo.create_webhook_config(
-            url=url, event_types=event_list, secret=secret_val, max_retries=max_retries
-        )
-        await db.conn.commit()
-        await db.close()
-        return config_id
+        async with _webhook_repo() as (db, repo):
+            config_id: int = await repo.create_webhook_config(
+                url=url, event_types=event_list, secret=secret_val, max_retries=max_retries
+            )
+            await db.conn.commit()
+            return config_id
 
     config_id = asyncio.run(_add())
     console.print(f"[green]Webhook #{config_id} registered[/green] — {url} → {events}")
@@ -2356,10 +2428,9 @@ def webhook_list(
     """List all webhook configurations."""
 
     async def _list() -> list[dict[str, Any]]:
-        db, repo = await _get_repo_for_webhook()
-        configs: list[dict[str, Any]] = await repo.list_webhook_configs()
-        await db.close()
-        return configs
+        async with _webhook_repo() as (_db, repo):
+            configs: list[dict[str, Any]] = await repo.list_webhook_configs()
+            return configs
 
     configs = asyncio.run(_list())
 
@@ -2404,11 +2475,10 @@ def webhook_delete(
     """Delete a webhook configuration."""
 
     async def _delete() -> bool:
-        db, repo = await _get_repo_for_webhook()
-        deleted: bool = await repo.delete_webhook_config(id)
-        await db.conn.commit()
-        await db.close()
-        return deleted
+        async with _webhook_repo() as (db, repo):
+            deleted: bool = await repo.delete_webhook_config(id)
+            await db.conn.commit()
+            return deleted
 
     deleted = asyncio.run(_delete())
     if deleted:
@@ -2427,25 +2497,24 @@ def webhook_test(
     async def _test() -> None:
         from homepilot.events import deliver_with_retry
 
-        db, repo = await _get_repo_for_webhook()
-        config = await repo.get_webhook_config(id)
-        if not config:
-            err_console.print(f"[red]Webhook #{id} not found[/red]")
-            raise typer.Exit(1)
+        async with _webhook_repo() as (_db, repo):
+            config = await repo.get_webhook_config(id)
+            if not config:
+                err_console.print(f"[red]Webhook #{id} not found[/red]")
+                raise typer.Exit(1)
 
-        test_payload = {
-            "event": "webhook_test",
-            "message": f"Test event from webhook #{id}",
-            "timestamp": datetime.now(UTC).isoformat(),
-        }
-        console.print(f"[dim]Sending test event to {config['url']}...[/dim]")
-        delivered = await deliver_with_retry(
-            url=config["url"],
-            payload=test_payload,
-            secret=config.get("secret"),
-            max_retries=config.get("max_retries", 3),
-        )
-        await db.close()
+            test_payload = {
+                "event": "webhook_test",
+                "message": f"Test event from webhook #{id}",
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            console.print(f"[dim]Sending test event to {config['url']}...[/dim]")
+            delivered = await deliver_with_retry(
+                url=config["url"],
+                payload=test_payload,
+                secret=config.get("secret"),
+                max_retries=config.get("max_retries", 3),
+            )
         if not delivered:
             # This command exists to answer "does delivery work". Printing
             # success for an endpoint that never answered is the one thing it
@@ -2704,7 +2773,6 @@ def agent_revoke(
     """
 
     async def _revoke() -> bool:
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
         settings = get_settings()
@@ -2712,10 +2780,8 @@ def agent_revoke(
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
             raise typer.Exit(1)
-        db = Database(str(db_path))
-        await db.connect()
+        db = await _open_cli_db("hp agent revoke", db_path)
         try:
-            await _migrate_or_refuse(db, "hp agent revoke")
             repo = Repository(db)
             return await repo.revoke_agent_credential(agent_id)
         finally:
@@ -2749,7 +2815,6 @@ def agent_remove(
     """
 
     async def _remove() -> bool:
-        from homepilot.db.connection import Database
         from homepilot.db.repository import Repository
 
         settings = get_settings()
@@ -2757,10 +2822,8 @@ def agent_remove(
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
             raise typer.Exit(1)
-        db = Database(str(db_path))
-        await db.connect()
+        db = await _open_cli_db("hp agent remove", db_path)
         try:
-            await _migrate_or_refuse(db, "hp agent remove")
             repo = Repository(db)
             # Revoke FIRST: if the delete then fails, the credential is already
             # dead rather than the other way round.

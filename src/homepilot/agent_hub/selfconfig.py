@@ -128,18 +128,59 @@ def certificate_fingerprint(cert_path: Path) -> str:
     return hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
 
 
+class HubCertificateError(Exception):
+    """The hub's certificate material could not be READ, as opposed to being
+    absent or corrupt.
+
+    Regeneration re-pins the entire fleet: every agent verifies this hub by the
+    sha256 of the certificate it was handed at enrolment, so a new certificate
+    means every managed host refuses the handshake until it is re-enrolled by
+    hand. That is not an outcome to reach from a read that did not happen (#642),
+    so "I could not look" is raised rather than answered."""
+
+
+def _present(path: Path) -> bool:
+    """Whether ``path`` exists, distinguishing "no" from "could not tell".
+
+    ``Path.exists()`` swallows every OSError into ``False`` - an EACCES on the
+    parent directory, an EIO, a dead NFS mount all read as "the file is not
+    there", which here means "generate a new one"."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise HubCertificateError(
+            f"could not determine whether the hub certificate material at {path} exists "
+            f"({exc}). Refusing to generate a replacement: a new certificate re-pins "
+            "every enrolled agent. Fix the permissions or the volume and restart."
+        ) from exc
+    return True
+
+
 def _usable(cert_path: Path, key_path: Path) -> bool:
     """True when both files exist and the certificate is still within validity.
 
-    An unreadable or unparseable certificate counts as absent: regenerating is
-    the only way forward, and refusing to start would reintroduce exactly the
-    operator decision this module exists to remove."""
-    if not cert_path.exists() or not key_path.exists():
+    An *unparseable* certificate counts as absent - the bytes are there and they
+    are not a certificate, so regenerating is the only way forward. An
+    *unreadable* one does not: raising is the fail-safe direction, because the
+    alternative is to re-pin the whole fleet on the strength of an errno."""
+    if not _present(cert_path) or not _present(key_path):
         return False
     try:
-        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-    except (OSError, ValueError):
-        logger.warning("hub certificate at %s is unreadable - regenerating", cert_path)
+        raw = cert_path.read_bytes()
+    except OSError as exc:
+        raise HubCertificateError(
+            f"could not read the hub certificate at {cert_path} ({exc}). Refusing to "
+            "generate a replacement: a new certificate re-pins every enrolled agent, "
+            "which would strand the fleet. Fix the permissions or the volume and restart."
+        ) from exc
+    try:
+        cert = x509.load_pem_x509_certificate(raw)
+    except ValueError:
+        logger.warning(
+            "hub certificate at %s is not a parseable certificate - regenerating", cert_path
+        )
         return False
     now = _dt.datetime.now(_dt.UTC)
     if cert.not_valid_after_utc <= now:
