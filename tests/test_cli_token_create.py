@@ -315,7 +315,13 @@ class TestAuthenticatedMint:
                 result = runner.invoke(app, ["token", "create"])
             assert result.exit_code == 1, result.output
             assert not result.stdout.strip()
-            assert "Refusing to mint" in result.stderr
+            # The reason the operator is given is THEIR obstacle - the token they
+            # exported is not an admin - not the bootstrap rule about a path they
+            # were never on. The backend was reached and refused, so the CLI
+            # stops there rather than falling through to the direct-DB mint and
+            # reporting the schema guard instead (review #648).
+            assert "Insufficient scope" in result.stderr, result.stderr
+            assert "admin" in result.stderr
             assert len(_tokens(tmp_path)) == before
 
     def test_the_stored_box_token_is_credential_enough(self, tmp_path):

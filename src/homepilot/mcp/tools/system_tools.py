@@ -55,7 +55,23 @@ _ALLOWED_READ_PREFIXES = (
 
 # Secrets that are blocked regardless of prefix (some, like /etc/shadow, live
 # under an allowed prefix).
-_DENIED_READ_PATHS = ("/etc/shadow", "/etc/gshadow")
+#
+# The agent's own credential files are here because they are the one secret this
+# tool could be used to turn INTO another agent: /etc/homepilot/agent.env is what
+# scripts/install-agent.sh writes, and it carries HP_AGENT_AUTH_TOKEN - the
+# shared fleet enrolment token - plus the hub address and certificate pin. The
+# MCP surface refuses to serve that token through GET /agents/token or the
+# installer one-liner by name ("a credential that provisions machines must not
+# appear in an MCP transcript"); reading it back off a managed host is the same
+# disclosure by another route, and this tool sits at the READ tier. Found live on
+# dev, review #648. agent/go/fileops.go denies the same two files - that is the
+# real enforcement point; this is the control plane declining to ask.
+_DENIED_READ_PATHS = (
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/homepilot/agent.env",
+    "/etc/homepilot/agent.token",
+)
 _DENIED_READ_BASENAMES = ("id_rsa", "id_ed25519")
 _DENIED_READ_SUFFIXES = (".key", ".pem")
 

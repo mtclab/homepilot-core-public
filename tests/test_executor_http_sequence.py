@@ -202,7 +202,12 @@ steps:
         ),
     ):
         result = await http_sequence_execute(fm, body, {}, mock_vault)
-    assert result["success"] is True
+    # `continue` kept the sequence going and the step is logged, but a 404 is
+    # still a step that did not do what it was asked - so the artifact must not
+    # come out `applied` over it (#642 B5, review #648).
+    assert result["success"] is False
+    assert "fetch-missing" in result["failure_reason"]
+    assert "404" in result["execution_log"]
 
 
 async def test_missing_credential_halts(mock_vault, make_frontmatter):

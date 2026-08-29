@@ -54,11 +54,18 @@ def _agent(*, nginx_installed: bool, curl_installed: bool, active: bool, config_
     """A host in a known state, answering the same probes a real agent would."""
     agent = MagicMock()
 
+    # dpkg's REAL answer for a package that is not installed. The fake used to
+    # say "not found", which no dpkg has ever printed - and since the probe
+    # tested only `rc == 0`, any rc≠1 read as "absent" too. That conflation is
+    # #642 A6, and a harness that does not speak the host's words cannot catch
+    # it (review #648).
+    _dpkg_absent = "dpkg-query: package 'x' is not installed and no information is available"
+
     async def exec_readonly(host: str, command: str):
         if command == "dpkg -s nginx":
-            return (0, "install ok installed", "") if nginx_installed else (1, "", "not found")
+            return (0, "install ok installed", "") if nginx_installed else (1, "", _dpkg_absent)
         if command == "dpkg -s curl":
-            return (0, "install ok installed", "") if curl_installed else (1, "", "not found")
+            return (0, "install ok installed", "") if curl_installed else (1, "", _dpkg_absent)
         if command.startswith("systemctl is-active"):
             return (0, "active\n" if active else "inactive\n", "")
         return (1, "", "unexpected probe")
@@ -222,6 +229,27 @@ class TestThePlanCannotContradictDrift:
         planned = sorted(item["id"] for item in items if item["changes"])
         assert planned == sorted(drift["drifted_items"])
         assert bool(planned) == drift["drifted"]
+        assert drift["unknown_items"] == [], "this host answered every probe"
+
+    @pytest.mark.asyncio
+    async def test_an_item_the_host_never_answered_is_not_drift(self):
+        """The third view the pair needs (review #648): applying WOULD change an
+        unreadable file, so the plan says so - but nobody established that it is
+        out of spec, so drift must answer `unknown`, not red. Reporting it as
+        drift is what sends an operator to re-apply, and the apply overwrites a
+        file whose prior bytes were never read."""
+        spec = parse_host_provision_spec(SPEC_BODY)
+        agent = _agent(nginx_installed=True, curl_installed=True, active=True, config_matches=True)
+        agent.read_file = AsyncMock(side_effect=Exception("permission denied"))
+
+        items = await probe(agent, "web01", spec)
+        drift = await check_drift(agent, "web01", spec)
+
+        config = next(i for i in items if i["id"] == "config:/etc/nginx/nginx.conf")
+        assert config["changes"] is True, "the plan must still say a write would happen"
+        assert config["established"] is False
+        assert drift["drifted"] is False
+        assert drift["unknown_items"] == ["config:/etc/nginx/nginx.conf"]
 
 
 class TestItRefusesToGuess:

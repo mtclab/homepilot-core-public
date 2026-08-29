@@ -645,7 +645,7 @@ class TestTheMcpTool:
         service = self._service()
         token = _mcp_token_scope_var.set("full")
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _handle_tool(
                     "create_guest_template",
                     {"node": NODE, "template_vmid": VMID, "source_volid": STAGED_VOLID},

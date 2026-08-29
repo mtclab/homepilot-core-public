@@ -11,15 +11,35 @@ from typing import Any
 import httpx
 
 from homepilot.adapters.agent import is_pve_node
+from homepilot.adapters.proxmox import ProxmoxError
 from homepilot.artifacts.models import ArtifactKind, ArtifactStatus
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
+from homepilot.executor.jinja_utils import InterpolationError, interpolation_context
+from homepilot.executor.skip_if import SkipIfUndecided, make_pve_response_proxy
 
 logger = logging.getLogger(__name__)
 
 _ansible_semaphore = asyncio.Semaphore(3)
 
 _MAX_VERIFY_DEPTH = 10
+
+# Everything a read against a target can fail with. `ProxmoxError` was NOT in
+# this set, so a drift check on any sequence whose precheck path answered an
+# error status raised straight out of the verifier: the reconciler counted an
+# "error", wrote NO row - leaving the previous verdict standing as if it were
+# current - and over MCP the caller got "Internal server error". Seen live on
+# dev 3.6.14. A read that failed is an UNKNOWN, which is a verdict this module
+# already has a word for.
+_PROBE_FAILED = (
+    httpx.HTTPError,
+    httpx.TimeoutException,
+    ConnectionError,
+    OSError,
+    ProxmoxError,
+    SkipIfUndecided,
+    InterpolationError,
+)
 
 _HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$")
 
@@ -125,31 +145,47 @@ async def verify_artifact(
             details={"reason": "no_executor"},
         )
 
-    if kind == ArtifactKind.ANSIBLE_PLAYBOOK:
-        return await _verify_ansible(artifact_id, fm, body, executor)
-    elif kind == ArtifactKind.PROXMOX_API_SEQUENCE:
-        return await _verify_proxmox_api(artifact_id, fm, body, executor)
-    elif kind == ArtifactKind.HTTP_SEQUENCE:
-        return await _verify_http_sequence(artifact_id, fm, body, executor)
-    elif kind == ArtifactKind.COMPOSITE:
-        return await _verify_composite(artifact_id, fm, body, store, repo, executor, _depth)
-    elif kind == ArtifactKind.SHELL_SCRIPT:
+    try:
+        if kind == ArtifactKind.ANSIBLE_PLAYBOOK:
+            return await _verify_ansible(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.PROXMOX_API_SEQUENCE:
+            return await _verify_proxmox_api(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.HTTP_SEQUENCE:
+            return await _verify_http_sequence(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.COMPOSITE:
+            return await _verify_composite(artifact_id, fm, body, store, repo, executor, _depth)
+        elif kind == ArtifactKind.SHELL_SCRIPT:
+            return VerifyResult(
+                artifact_id=artifact_id,
+                drifted=False,
+                verification_log="shell-script: unverifiable",
+                details={"reason": "shell_script_unverifiable"},
+            )
+        elif kind == ArtifactKind.HOST_PROVISION:
+            return await _verify_host_provision(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.GUEST_NETWORK:
+            return await _verify_guest_network(artifact_id, fm, body, executor)
+        else:
+            return VerifyResult(
+                artifact_id=artifact_id,
+                drifted=False,
+                verification_log=f"unhandled kind: {kind.value}",
+                details={"reason": "unknown_kind"},
+            )
+    except (FileNotFoundError, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        # A verifier that RAISED left no verdict at all: the reconciler counted
+        # an error and wrote no row, so the artifact kept whatever colour its
+        # last successful check gave it, indefinitely and invisibly. UNKNOWN is
+        # the answer this module already has for "I could not establish it", and
+        # it is the one a failed check has earned (#425/#642).
+        logger.warning("verify raised for %s: %s", artifact_id, exc, exc_info=True)
         return VerifyResult(
             artifact_id=artifact_id,
-            drifted=False,
-            verification_log="shell-script: unverifiable",
-            details={"reason": "shell_script_unverifiable"},
-        )
-    elif kind == ArtifactKind.HOST_PROVISION:
-        return await _verify_host_provision(artifact_id, fm, body, executor)
-    elif kind == ArtifactKind.GUEST_NETWORK:
-        return await _verify_guest_network(artifact_id, fm, body, executor)
-    else:
-        return VerifyResult(
-            artifact_id=artifact_id,
-            drifted=False,
-            verification_log=f"unhandled kind: {kind.value}",
-            details={"reason": "unknown_kind"},
+            state=DriftState.UNKNOWN,
+            verification_log=f"the drift check itself failed: {exc}"[:2000],
+            details={"reason": "check_failed", "error": str(exc)[:500]},
         )
 
 
@@ -263,17 +299,14 @@ async def _verify_proxmox_api(
         )
 
     target: dict[str, Any] = fm.get("target", {})
-    context: dict[str, Any] = {
-        "target": target,
-        "artifact": {"id": fm.get("id", ""), "intent": fm.get("intent", "")},
-    }
+    context = interpolation_context(target, fm)
 
     if target.get("kind") == "cluster":
         from homepilot.executor.proxmox_api import _pick_cluster_node
 
         try:
             pve_node = await _pick_cluster_node(executor.proxmox)
-        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError):
+        except _PROBE_FAILED:
             pve_node = None
         if pve_node:
             context["target"] = dict(target)
@@ -294,7 +327,6 @@ async def _verify_proxmox_api(
 
         if precheck:
             pre_method = precheck.get("method", "GET").upper()
-            pre_path = _interpolate(precheck.get("path", ""), context)
             skip_if_expr = precheck.get("skip_if")
 
             if not skip_if_expr:
@@ -308,14 +340,18 @@ async def _verify_proxmox_api(
                 continue
 
             try:
+                pre_path = _interpolate(precheck.get("path", ""), context)
                 resp = await executor.proxmox.call(pre_method, pre_path)
-                if _eval_skip_if(skip_if_expr, resp, context.get("target", {})):
+                # The same binding the executor uses, so drift and apply cannot
+                # disagree about what a precheck means (#642).
+                proxy = make_pve_response_proxy(200, resp)
+                if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
                     skipped_steps.append(step_id)
                     continue
                 else:
                     drifted_steps.append(step_id)
                     continue
-            except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError):
+            except _PROBE_FAILED:
                 skipped_steps.append(step_id)
                 continue
         else:
@@ -386,10 +422,7 @@ async def _verify_http_sequence(
         )
 
     target: dict[str, Any] = fm.get("target", {})
-    context: dict[str, Any] = {
-        "target": target,
-        "artifact": {"id": fm.get("id", ""), "intent": fm.get("intent", "")},
-    }
+    context = interpolation_context(target, fm)
 
     client_cache: dict[str, httpx.AsyncClient] = {}
     drifted_steps: list[str] = []
@@ -404,10 +437,15 @@ async def _verify_http_sequence(
             if precheck:
                 pre_cred_name = precheck.get("name", cred_name)
                 pre_method = precheck.get("method", "GET").upper()
-                pre_path = _interpolate(precheck.get("path", ""), context)
                 skip_if_expr = precheck.get("skip_if")
 
                 if not skip_if_expr:
+                    skipped_steps.append(step_id)
+                    continue
+
+                try:
+                    pre_path = _interpolate(precheck.get("path", ""), context)
+                except InterpolationError:
                     skipped_steps.append(step_id)
                     continue
 
@@ -538,11 +576,20 @@ async def _verify_host_provision(
 
     result = await check_drift(executor.host_adapter, host, spec)
     drifted_items: list[str] = result["drifted_items"]
+    unknown_items: list[str] = result.get("unknown_items") or []
+    if result["drifted"]:
+        state = DriftState.DRIFTED
+    elif unknown_items:
+        # Nothing said it had drifted, but something never answered. "I looked
+        # and it matches" and "I could not look" are different answers (#425).
+        state = DriftState.UNKNOWN
+    else:
+        state = DriftState.IN_SPEC
     return VerifyResult(
         artifact_id=artifact_id,
-        state=DriftState.DRIFTED if result["drifted"] else DriftState.IN_SPEC,
+        state=state,
         verification_log=(result["log"] or "all items in desired state")[:2000],
-        details={"drifted_items": drifted_items},
+        details={"drifted_items": drifted_items, "unknown_items": unknown_items},
     )
 
 
@@ -658,6 +705,7 @@ async def _verify_composite(
 
     drifted_subs: list[str] = []
     skipped_subs: list[str] = []
+    unknown_subs: list[str] = []
 
     for step in steps:
         sub_id = step.get("artifact", "")
@@ -676,18 +724,36 @@ async def _verify_composite(
         except FileNotFoundError:
             skipped_subs.append(sub_id)
             continue
-        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError):
+        except _PROBE_FAILED:
             skipped_subs.append(sub_id)
             continue
 
-        if sub_result.drifted:
+        if sub_result.state is DriftState.DRIFTED:
             drifted_subs.append(sub_id)
+        elif sub_result.state is not DriftState.IN_SPEC:
+            unknown_subs.append(sub_id)
 
-    drifted = len(drifted_subs) > 0
-    verification_log = f"drifted_subs={drifted_subs}, skipped_subs={skipped_subs}"
+    verification_log = (
+        f"drifted_subs={drifted_subs}, unknown_subs={unknown_subs}, skipped_subs={skipped_subs}"
+    )
+    # Both sibling verifiers already refuse to call "nothing established" green
+    # (`_evaluated`, #425). This one tested `sub_result.drifted`, a BOOLEAN that
+    # is False for UNKNOWN as well as for IN_SPEC - so a composite of ansible
+    # sub-artifacts, every one of which reports "not checked", reported in spec.
+    # Confirmed live on dev 3.6.14: sub state `unknown`, composite `in_spec`.
+    if drifted_subs:
+        state = DriftState.DRIFTED
+    elif unknown_subs or skipped_subs:
+        state = DriftState.UNKNOWN
+    else:
+        state = DriftState.IN_SPEC
     return VerifyResult(
         artifact_id=artifact_id,
-        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
+        state=state,
         verification_log=verification_log[:2000],
-        details={"drifted_subs": drifted_subs, "skipped_subs": skipped_subs},
+        details={
+            "drifted_subs": drifted_subs,
+            "unknown_subs": unknown_subs,
+            "skipped_subs": skipped_subs,
+        },
     )

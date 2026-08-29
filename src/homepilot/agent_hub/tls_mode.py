@@ -43,6 +43,15 @@ _LEGACY_NOTICE = (
 )
 
 
+_UNREADABLE_NOTICE = (
+    "Could not read how many agents this install has enrolled, so the hub keeps "
+    "serving PLAINTEXT on %s for this boot and NOTHING has been recorded. TLS by "
+    "default is a decision taken once and kept, and taking it from a read that "
+    "did not happen would strand a plaintext fleet with no way back. Fix the "
+    "database read (or set HP_AGENT_HUB_TLS explicitly) and restart."
+)
+
+
 async def resolve_hub_tls_mode(repo: Any, *, tls_set_explicitly: bool, bind: str = "") -> str:
     """Return the TLS mode for this install, taking the decision once.
 
@@ -59,6 +68,17 @@ async def resolve_hub_tls_mode(repo: Any, *, tls_set_explicitly: bool, bind: str
         return str(stored["value"])
 
     enrolled = await _enrolled_agent_count(repo)
+    if enrolled is None:
+        # "I could not look" is not "there is no fleet" (#642). Taking the
+        # TLS-by-default decision here would PERSIST it forever off a read that
+        # never happened, and the install it strands is precisely the one this
+        # module exists to protect: a plaintext fleet whose only repair channel
+        # is the transport that just flipped. So this boot keeps the transport a
+        # pre-existing fleet would be speaking, nothing is written, and the next
+        # boot decides again once the count can be read.
+        logger.warning(_UNREADABLE_NOTICE, bind or "the hub port")
+        return MODE_LEGACY_PLAINTEXT
+
     mode = MODE_LEGACY_PLAINTEXT if enrolled else MODE_TLS
     await repo.set_setting(SETTING_KEY, mode)
 
@@ -69,16 +89,26 @@ async def resolve_hub_tls_mode(repo: Any, *, tls_set_explicitly: bool, bind: str
     return mode
 
 
-async def _enrolled_agent_count(repo: Any) -> int:
-    """How many agents this install has ever enrolled.
+async def _enrolled_agent_count(repo: Any) -> int | None:
+    """How many agents this install has ever enrolled, or ``None`` if unreadable.
 
     Counts ROWS, not live connections: an agent that is merely switched off at
     upgrade time is still part of the fleet and will dial back in expecting the
     transport it enrolled with.
+
+    ``None`` is the deliberate third answer. A failed or empty read used to come
+    back as ``0``, which reads as "new install" and is the single most damaging
+    wrong answer available here, so the two cases are kept apart.
     """
     try:
         row = await repo.db.fetchone("SELECT COUNT(*) c FROM agents")
-    except Exception:  # pragma: no cover - a missing table means nothing enrolled
-        logger.debug("Could not count enrolled agents; treating as a new install", exc_info=True)
-        return 0
-    return int(row["c"]) if row else 0
+    except Exception:
+        logger.warning("Could not count enrolled agents", exc_info=True)
+        return None
+    if not row:
+        return None
+    try:
+        return int(row["c"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Enrolled-agent count came back in an unusable shape: %r", row)
+        return None

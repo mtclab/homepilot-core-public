@@ -49,7 +49,14 @@ async def execute(
             on_error = step.get("on_error", "halt")
 
             if not sub_artifact_id:
-                log_lines.append(f"[{sid}] missing artifact reference, skipping")
+                # A step that names no artifact did nothing, and a composite made
+                # only of those used to report success having run NOTHING (#642
+                # B9). Propose-time validation refuses this shape, so it can only
+                # arrive through `hp artifacts edit` or a hand edit of the file -
+                # neither of which re-validates - which is exactly why the
+                # executor must not treat it as a step that went fine.
+                log_lines.append(f"[{sid}] names no artifact, so nothing was run")
+                failed = True
                 continue
 
             log_lines.append(f"[{sid}] applying sub-artifact {sub_artifact_id}")
@@ -150,4 +157,10 @@ async def execute(
             }
 
     success = not failed
-    return {"success": success, "execution_log": "\n".join(log_lines)}
+    if not success:
+        return {
+            "success": False,
+            "execution_log": "\n".join(log_lines),
+            "failure_reason": "one or more steps did not run or did not succeed",
+        }
+    return {"success": True, "execution_log": "\n".join(log_lines)}

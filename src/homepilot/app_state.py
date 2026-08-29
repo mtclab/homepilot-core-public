@@ -337,26 +337,44 @@ async def create_app_state(settings: Any | None = None) -> AppState:
 
         ssl_ctx = None
         hub_cert_fingerprint = ""
+        # Set when the hub's own TLS material cannot be READ. That is not a
+        # reason to mint a replacement (a new certificate re-pins every enrolled
+        # agent) and not a reason to kill the control plane either, so the hub
+        # goes dark carrying the sentence that says why - the same treatment the
+        # fail-closed transport check gets below.
+        hub_material_error = ""
         if _tls_wanted:
             import ssl as _ssl
 
-            from .agent_hub.selfconfig import certificate_fingerprint, ensure_hub_certificate
+            from .agent_hub.selfconfig import (
+                HubCertificateError,
+                certificate_fingerprint,
+                ensure_hub_certificate,
+            )
 
             cert_file = settings.agent_hub_tls_cert
             key_file = settings.agent_hub_tls_key
-            if not (cert_file and key_file):
-                # No operator-supplied material: generate once and reuse, so the
-                # fail-closed transport check passes on its own merits rather
-                # than being weakened or overridden (ADR-004 S3).
-                _cert_path, _key_path = ensure_hub_certificate(
-                    data_dir,
-                    extra_hosts=(settings.agent_hub_advertise_host, settings.agent_hub_host),
+            try:
+                if not (cert_file and key_file):
+                    # No operator-supplied material: generate once and reuse, so the
+                    # fail-closed transport check passes on its own merits rather
+                    # than being weakened or overridden (ADR-004 S3).
+                    _cert_path, _key_path = ensure_hub_certificate(
+                        data_dir,
+                        extra_hosts=(settings.agent_hub_advertise_host, settings.agent_hub_host),
+                    )
+                    cert_file, key_file = str(_cert_path), str(_key_path)
+            except HubCertificateError as exc:
+                hub_material_error = (
+                    f"The agent hub is disabled because its TLS material is unreadable: {exc}"
                 )
-                cert_file, key_file = str(_cert_path), str(_key_path)
             ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
-            ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-            hub_cert_fingerprint = certificate_fingerprint(Path(cert_file))
-            if settings.agent_hub_tls_ca:
+            if not hub_material_error:
+                ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                hub_cert_fingerprint = certificate_fingerprint(Path(cert_file))
+            if hub_material_error:
+                pass
+            elif settings.agent_hub_tls_ca:
                 # Mutual TLS: verify each connecting agent's client certificate
                 # against the configured CA.
                 ssl_ctx.load_verify_locations(settings.agent_hub_tls_ca)
@@ -398,6 +416,8 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         # one optional subsystem; it goes dark, says why, and everything else
         # keeps serving so the operator can read the reason and act on it.
         try:
+            if hub_material_error:
+                raise RuntimeError(hub_material_error)
             agent_hub.check_transport_security()
         except RuntimeError as exc:
             agent_hub_disabled_reason = str(exc)

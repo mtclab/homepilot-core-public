@@ -432,7 +432,7 @@ class TestReadOnlyScopeIsRefusedEveryMutator:
     ) -> None:
         token = _mcp_token_scope_var.set("read_only")
         try:
-            with pytest.raises(ValueError, match="requires write scope"):
+            with pytest.raises(ValueError, match="needs the full tier"):
                 await _handle_tool(name, arguments, {**ctx, "_mcp_token_scope": "read_only"})
         finally:
             _mcp_token_scope_var.reset(token)

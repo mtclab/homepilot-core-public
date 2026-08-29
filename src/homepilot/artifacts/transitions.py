@@ -11,6 +11,7 @@ from .models import (
     ArtifactStatus,
     LifecycleError,
     compute_body_hash,
+    extract_composite_steps,
     utcnow_iso,
 )
 from .validator import validate_transition
@@ -97,6 +98,13 @@ class ArtifactTransitionManager:
             if current_hash != fm.get("hash"):
                 raise LifecycleError(f"Hash mismatch for {id}: body was modified after propose")
 
+            # ARTIFACT_SPEC §7: "Cascade is atomic - if any sub-artifact fails to
+            # approve (e.g. it was edited and the hash is now stale), the whole
+            # cascade is rolled back and the composite stays `proposed`." So the
+            # subs are CHECKED before the composite is written, and nothing is
+            # written at all if one of them cannot go.
+            cascade = self._composite_cascade(id, fm, body)
+
             now = utcnow_iso()
             fm["status"] = ArtifactStatus.APPROVED.value
             fm["approved_by"] = {"user": user, "at": now}
@@ -107,9 +115,111 @@ class ArtifactTransitionManager:
 
             fm_yml = self.file_store.serialize_frontmatter(fm)
             self.file_store.write(id, fm_yml, body, "approve")
-        details = {"approved_by_role": role} if role else None
+        details: dict[str, Any] | None = {"approved_by_role": role} if role else None
+        if cascade:
+            details = dict(details or {})
+            details["cascaded_to"] = cascade
         await self._audit("approve", id, user, details)
         await self._sync_to_db(id, fm)
+        for sub_id in cascade:
+            await self._approve_cascaded(sub_id, user, reason, role, via=id)
+
+    def _composite_cascade(
+        self, composite_id: str, fm: dict[str, Any], body: str, visited: set[str] | None = None
+    ) -> list[str]:
+        """Every `proposed` sub-artifact this approval must carry with it.
+
+        ARTIFACT_SPEC says approving a composite approves its subs, in §5.4
+        ("approving a composite implicitly approves all referenced `proposed`
+        sub-artifacts that aren't already `approved`") and again in §7. Nothing
+        did it. The composite then failed at apply with "status is proposed,
+        expected approved" - so the ONE mechanism D1 names for multi-target work
+        could not be run without an operator approving every piece by hand.
+        Confirmed live on dev 3.6.14.
+
+        Raises LifecycleError if any sub cannot be approved, BEFORE anything is
+        written, which is what makes the cascade atomic.
+        """
+        if fm.get("kind") != ArtifactKind.COMPOSITE.value:
+            return []
+        if visited is None:
+            visited = set()
+        visited.add(composite_id)
+
+        try:
+            steps = extract_composite_steps(body)
+        except ValueError as exc:
+            raise LifecycleError(
+                f"composite {composite_id} has an unreadable spec, so approval cannot "
+                f"cascade to its steps: {exc}"
+            ) from None
+
+        out: list[str] = []
+        for step in steps:
+            sub_id = str(step.get("artifact") or "")
+            if not sub_id or sub_id in visited:
+                continue
+            visited.add(sub_id)
+            try:
+                sub_fm, sub_body = self.file_store.read(sub_id)
+            except FileNotFoundError:
+                raise LifecycleError(
+                    f"composite step '{step.get('id', '?')}' references {sub_id}, which does "
+                    "not exist; approving would approve a plan that cannot run"
+                ) from None
+            sub_status = ArtifactStatus(sub_fm.get("status", ""))
+            if sub_status is ArtifactStatus.APPROVED:
+                continue
+            if sub_status is not ArtifactStatus.PROPOSED:
+                raise LifecycleError(
+                    f"sub-artifact {sub_id} is {sub_status.value}; a composite can only be "
+                    "approved while every step it names is proposed or approved"
+                )
+            if compute_body_hash(sub_body) != sub_fm.get("hash"):
+                raise LifecycleError(
+                    f"sub-artifact {sub_id} was modified after propose (hash mismatch), so "
+                    "the composite cannot be approved over it"
+                )
+            out.append(sub_id)
+            # Composites of composites cascade too (§7). Cycles are refused at
+            # propose; `visited` makes that structural rather than assumed.
+            out.extend(self._composite_cascade(sub_id, sub_fm, sub_body, visited))
+        return out
+
+    async def _approve_cascaded(
+        self,
+        sub_id: str,
+        user: str,
+        reason: str | None,
+        role: str | None,
+        via: str,
+    ) -> None:
+        with self.file_store.file_lock(sub_id):
+            fm, body = self.file_store.read(sub_id)
+            if ArtifactStatus(fm["status"]) is not ArtifactStatus.PROPOSED:
+                return
+            fm["status"] = ArtifactStatus.APPROVED.value
+            fm["approved_by"] = {"user": user, "at": utcnow_iso()}
+            if role:
+                fm["approved_by"]["role"] = role
+            # The composite's reason is copied, per §7, with the composite named
+            # so the audit trail says WHY this artifact was approved without
+            # anyone opening it.
+            fm["approved_by"]["reason"] = (
+                f"{reason} (cascaded from composite {via})"
+                if reason
+                else f"cascaded from composite {via}"
+            )
+            fm_yml = self.file_store.serialize_frontmatter(fm)
+            self.file_store.write(sub_id, fm_yml, body, "approve")
+        # One audit row per sub-artifact, per §7.
+        await self._audit("approve", sub_id, user, {"cascaded_from": via})
+        await self._sync_to_db(sub_id, fm)
+        if self._db is not None:
+            try:
+                await self._db.clear_approval_code(sub_id)
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                _logger.exception("Clearing approval code failed for %s", sub_id)
 
     async def reject(
         self, id: str, user: str, reason: str | None = None, role: str | None = None

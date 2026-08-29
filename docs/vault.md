@@ -106,7 +106,23 @@ If neither env var nor vault has the secret, some keys are auto-generated:
 
 ## Deployment: Zero-Secrets .env
 
-A production `.env` contains **no HomePilot secrets**:
+A production `.env` holds **none of the secrets the vault protects** — no admin
+secret, no Proxmox token, no webhook key. What it may hold is the ONE key that
+opens the vault, and whether it does depends on how the instance was set up:
+
+| Install path | Where the vault passphrase lives |
+|---|---|
+| First-run claim / plain `docker compose up` | `{data_dir}/.vault_passphrase`, auto-generated at 0600. `.env` holds no secret at all. |
+| `hp init` | **`.env`, as `HP_VAULT_PASSPHRASE=…`**, written at 0600. This is what the command does today; the file below is the other shape. |
+| `HP_VAULT_PASSPHRASE_FILE` | Wherever the operator points it. Preferred for production. |
+
+Two other values are secrets in the environment rather than in the vault, because
+they are needed before the vault is open or by a process that has no vault:
+`HP_AGENT_HUB_AUTH_TOKEN` (the shared fleet enrolment token, auto-generated or
+read from the vault at startup) and `HP_PORTAL_PROXY_SECRET`. "Zero-secrets"
+describes the four vault-held credentials below, not the whole environment.
+
+The example is the auto-generated shape:
 
 ```env
 # Non-secret configuration only

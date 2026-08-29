@@ -105,3 +105,74 @@ func TestWriteAtomicRespectsMode(t *testing.T) {
 		t.Fatalf("file must not be group/world accessible, got mode %o", info.Mode().Perm())
 	}
 }
+
+// The agent must never hand back its OWN credentials (review #648).
+//
+// /etc/homepilot/agent.env is what scripts/install-agent.sh writes. It carries
+// HP_AGENT_AUTH_TOKEN - the SHARED FLEET ENROLMENT TOKEN - plus the hub's
+// address and its certificate pin. The control plane refuses to serve that
+// token over MCP by name (GET /agents/token and the installer one-liner are
+// both excluded: "a credential that provisions machines must not appear in an
+// MCP transcript"); read_file_on_guest, a READ-tier tool, read it straight off
+// the host instead. Verified live on dev at 3.6.14.
+//
+// The previous guard covered only the file HP_AGENT_TOKEN_FILE names - the
+// DURABLE per-agent credential - and missed the shared one sitting next to it.
+//
+// TEETH: remove the agentSecretBases branch from isDenied and both files below
+// come back as content instead of an error.
+func TestReadDeniesTheAgentsOwnCredentialFiles(t *testing.T) {
+	dir := realTempDir(t)
+	conf := filepath.Join(dir, "homepilot")
+	if err := os.MkdirAll(conf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HP_AGENT_CONFIG_DIR", conf)
+	// The config dir is inside a temp tree, so make it readable at all -
+	// otherwise the allowlist would refuse it and the test would pass vacuously.
+	t.Setenv("HP_AGENT_READ_PREFIXES", dir)
+	// Deliberately NO HP_AGENT_TOKEN_FILE: a bootstrap-enrolled agent has none
+	// yet, and agent.env holds the shared token either way.
+	t.Setenv("HP_AGENT_TOKEN_FILE", "")
+
+	for _, name := range []string{"agent.env", "agent.token"} {
+		path := filepath.Join(conf, name)
+		secret := []byte("HP_AGENT_AUTH_TOKEN=fleet-enrolment-secret\n")
+		if err := os.WriteFile(path, secret, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := readFile(path)
+		if err == nil {
+			t.Fatalf("%s was served to the caller: %q", name, out)
+		}
+		if !strings.Contains(err.Error(), "forbidden") {
+			t.Fatalf("%s was refused for the wrong reason (want a denylist rejection): %v", name, err)
+		}
+	}
+}
+
+// Guard the guard: the denial is by NAME inside the agent's configuration
+// directory, not a ban on the directory. /etc/homepilot is a granted WRITE
+// prefix, so artifacts legitimately put files there and those must stay
+// readable - a blanket ban would look like a stronger fix and break the product.
+func TestTheAgentConfigDirIsNotDeniedWholesale(t *testing.T) {
+	dir := realTempDir(t)
+	conf := filepath.Join(dir, "homepilot")
+	if err := os.MkdirAll(conf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HP_AGENT_CONFIG_DIR", conf)
+	t.Setenv("HP_AGENT_READ_PREFIXES", dir)
+
+	path := filepath.Join(conf, "some-artifact.conf")
+	if err := os.WriteFile(path, []byte("listen = 8080\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readFile(path)
+	if err != nil {
+		t.Fatalf("an ordinary file in the agent config dir was refused: %v", err)
+	}
+	if !strings.Contains(got, "listen = 8080") {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}

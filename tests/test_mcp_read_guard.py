@@ -56,6 +56,31 @@ class TestReadSecretDenylist:
         with pytest.raises(ValueError, match="denied"):
             _check_guest_read_path("/proc/1/environ")
 
+    def test_the_agents_own_credential_files_are_denied(self):
+        """Review #648, found live on dev at 3.6.14.
+
+        `/etc/homepilot/agent.env` is what scripts/install-agent.sh writes, and
+        it carries HP_AGENT_AUTH_TOKEN - the SHARED FLEET ENROLMENT TOKEN - plus
+        the hub's address and certificate pin. The MCP surface refuses to serve
+        that token by name (GET /agents/token and the installer one-liner are
+        both in EXCLUDED_GET_ROUTES: "a credential that provisions machines must
+        not appear in an MCP transcript") - and then read_file_on_guest, which
+        sits at the READ tier, read it straight off a managed host instead.
+        `/etc/` is an allowed prefix and nothing on the denylist matched it.
+
+        TEETH: remove either path from _DENIED_READ_PATHS and this fails.
+        """
+        with pytest.raises(ValueError, match="denied"):
+            _check_guest_read_path("/etc/homepilot/agent.env")
+        with pytest.raises(ValueError, match="denied"):
+            _check_guest_read_path("/etc/homepilot/agent.token")
+
+    def test_ordinary_files_in_the_agent_config_dir_still_read(self):
+        """Guard the guard: /etc/homepilot is a granted WRITE prefix, so
+        artifacts put files there. Denying the whole directory would look like a
+        stronger fix and would break reading back what HomePilot itself wrote."""
+        _check_guest_read_path("/etc/homepilot/some-artifact.conf")
+
 
 class TestHandlerEnforcesGuard:
     """The handler must reject a denied path BEFORE reaching the agent adapter."""

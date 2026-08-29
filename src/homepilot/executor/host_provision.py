@@ -173,8 +173,7 @@ async def capture_pre_state(
     captured: list[dict[str, Any]] = []
 
     for name in spec.packages:
-        rc, stdout, _ = await agent.exec_readonly(host, f"dpkg -s {name}")
-        installed = rc == 0 and "install ok installed" in stdout
+        installed = await _package_installed(agent, host, name)
         captured.append({"kind": "package", "name": name, "was_installed": installed})
 
     for svc in spec.services:
@@ -201,16 +200,52 @@ async def capture_pre_state(
             entry["existed"] = True
             rc, mode_out, _ = await agent.exec_readonly(host, f"stat -c %a {cfg.path}")
             entry["prior_mode"] = mode_out.strip() if rc == 0 else None
-        except Exception:
-            # Unreadable and absent are indistinguishable through this adapter,
-            # and they demand opposite inverses (restore vs delete), so neither
-            # is assumed.
-            entry["existed"] = False
+        except Exception as exc:
+            # This docstring has always promised "unknown" here, and the code
+            # wrote `existed: False` - the one value that means the opposite.
+            # The apply then overwrote the file as a FIRST write and the revoke
+            # said "created by this artifact", so the bytes that were there went
+            # away with nothing recording that they had ever existed. The agent's
+            # read fails for plenty of reasons that are not absence: permission,
+            # a file over the hub's frame budget, a denied path.
             entry["prior_content"] = None
             entry["prior_mode"] = None
+            if _read_says_absent(exc):
+                entry["existed"] = False
+            else:
+                entry["existed"] = None
+                entry["read_error"] = str(exc)[:300]
         captured.append(entry)
 
     return captured
+
+
+# The agent answers a genuinely missing file with this exact phrase
+# (agent/go/fileops.go). Everything else it can raise - "permission denied",
+# "path not in allowed read prefixes", "file is N bytes; the agent hub accepts at
+# most ..." - is a failure to look, not a finding that there is nothing there.
+_ABSENT_MARKERS = ("file not found",)
+
+
+def _read_says_absent(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _ABSENT_MARKERS)
+
+
+async def _package_installed(agent: AgentAdapter, host: str, name: str) -> bool | None:
+    """True / False / None-for-unknown, from one `dpkg -s`.
+
+    `dpkg -s` exits 1 for "not installed" and also for its own errors, so
+    `rc == 0 and "install ok installed" in stdout` quietly turned every kind of
+    failure into "absent" - and absent is the answer that makes the plan install
+    something (#642 A6).
+    """
+    rc, stdout, stderr = await agent.exec_readonly(host, f"dpkg -s {name}")
+    if rc == 0:
+        return "install ok installed" in stdout
+    if "not installed" in (stdout + stderr).lower():
+        return False
+    return None
 
 
 async def _rollback(
@@ -278,6 +313,14 @@ async def _rollback(
                 mode = str(item.get("prior_mode") or "0644")
                 await agent.write_config(host, name, str(item["prior_content"]), mode)
                 log_lines.append(f"config {name}: restored {len(item['prior_content'])} bytes")
+            elif item.get("existed") is None:
+                # NOT "created by this artifact". Whatever was there was
+                # overwritten and never read, so the honest answer names that
+                # rather than implying the file is new.
+                reason = item.get("read_error") or "the prior content was never read"
+                not_reversible.append(
+                    f"config {name} (its prior content was never established: {reason})"
+                )
             else:
                 not_reversible.append(f"config {name} (created by this artifact)")
 
@@ -305,24 +348,33 @@ async def probe(
     saying "in spec" while the plan promises changes would be the same defect
     wearing a different hat.
 
-    Each item is ``{kind, name, desired, observed, changes, id}`` where ``changes``
-    means applying the spec would alter this item. ``observed`` is what the host
-    reports, in the host's own words, so a plan can show an operator the before
-    and after rather than a boolean.
+    Each item is ``{kind, name, desired, observed, changes, established, id}``.
+    ``changes`` means applying the spec would alter this item; ``established``
+    says whether the host actually ANSWERED. The two are not the same, and
+    conflating them is #642 A6: an unreadable file, a service whose state could
+    not be read and a package whose query failed all read as "not in the desired
+    state", so a plan promised to install, restart and overwrite on a host that
+    was fine and drift painted it red. ``observed`` is what the host reports, in
+    the host's own words, so a plan can show an operator the before and after
+    rather than a boolean.
     """
     items: list[dict[str, Any]] = []
 
     for name in spec.packages:
-        rc, stdout, _ = await agent.exec_readonly(host, f"dpkg -s {name}")
-        installed = rc == 0 and "install ok installed" in stdout
+        installed = await _package_installed(agent, host, name)
         items.append(
             {
                 "kind": "package",
                 "id": f"package:{name}",
                 "name": name,
                 "desired": "installed",
-                "observed": "installed" if installed else "absent",
-                "changes": not installed,
+                "observed": (
+                    "could not be read"
+                    if installed is None
+                    else ("installed" if installed else "absent")
+                ),
+                "changes": installed is not True,
+                "established": installed is not None,
                 "log": f"package {name}: installed={installed}",
             }
         )
@@ -347,22 +399,31 @@ async def probe(
                 "id": f"service:{svc.name}",
                 "name": svc.name,
                 "desired": state,
-                "observed": observed or "unknown",
+                "observed": observed or "could not be read",
                 "changes": not ok,
+                # systemctl always names a state it could determine ("active",
+                # "inactive", "unknown", "failed"). An EMPTY answer means the
+                # command did not run, not that the unit is stopped.
+                "established": bool(observed),
                 "log": log,
             }
         )
 
     for cfg in spec.config_files:
+        established = True
         try:
             on_host = await agent.read_file(host, cfg.path)
             matches = on_host == cfg.content
             # "absent" and "different" are different problems to an operator:
             # one is a first write, the other overwrites bytes already there.
             observed = "matches" if matches else "differs"
-        except Exception:
+        except Exception as exc:
             matches = False
-            observed = "absent or unreadable"
+            if _read_says_absent(exc):
+                observed = "absent"
+            else:
+                observed = f"could not be read: {str(exc)[:120]}"
+                established = False
         items.append(
             {
                 "kind": "config",
@@ -371,7 +432,8 @@ async def probe(
                 "desired": f"{len(cfg.content)} bytes, mode {cfg.mode}",
                 "observed": observed,
                 "changes": not matches,
-                "log": f"config {cfg.path}: matches={matches}",
+                "established": established,
+                "log": f"config {cfg.path}: {observed}",
             }
         )
 
@@ -386,13 +448,19 @@ async def check_drift(
     """Read-only drift probe for a host-provision spec. Mutates NOTHING.
 
     A view over :func:`probe`: an item is drifted when applying the spec would
-    change it. Returns ``{"drifted": bool, "drifted_items": [...], "log": str}``.
+    change it, and UNESTABLISHED when the host never answered. Returns
+    ``{"drifted": bool, "drifted_items": [...], "unknown_items": [...],
+    "log": str}`` - the third key is what stops "I could not read this file"
+    being filed as "this file has drifted", and what lets the verifier answer
+    UNKNOWN instead of a colour it did not earn (#425, #642 A6).
     """
     items = await probe(agent, host, spec)
-    drifted_items = [item["id"] for item in items if item["changes"]]
+    drifted_items = [item["id"] for item in items if item["changes"] and item.get("established")]
+    unknown_items = [item["id"] for item in items if not item.get("established")]
     return {
         "drifted": len(drifted_items) > 0,
         "drifted_items": drifted_items,
+        "unknown_items": unknown_items,
         "log": "\n".join(str(item["log"]) for item in items),
     }
 

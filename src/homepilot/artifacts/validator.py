@@ -201,6 +201,23 @@ def validate_propose_spec(spec: dict[str, Any], store: ArtifactStore) -> tuple[d
             )
         fm["rollback"] = derived
 
+    # `requires_snapshot` is a REQUEST the executor can only honour against a VM
+    # or an LXC - there is no such thing as a snapshot of a `cluster` or a
+    # `service`. Setting it true anywhere else used to be dropped in silence, so
+    # the review screen said `requires_snapshot: true` over an apply that had no
+    # rollback point at all (#642 A7). Refuse the claim at propose, the same way
+    # an unhonourable `rollback: true` is refused above.
+    if kind != ArtifactKind.KB_NOTE and spec.get("requires_snapshot") is True:
+        from homepilot.executor.orchestrator import SNAPSHOTTABLE_TARGET_KINDS
+
+        t_kind = (target_data or {}).get("kind", "")
+        if t_kind not in SNAPSHOTTABLE_TARGET_KINDS:
+            raise LifecycleError(
+                f"requires_snapshot: true cannot be honoured for target.kind '{t_kind}' - "
+                "only vm and lxc targets can be snapshotted, so this artifact would apply "
+                "with no rollback point. Drop the claim, or target the guest."
+            )
+
     # A credential written out in full, in a body about to be committed to a git
     # repository designed to be pushed (#505). Refused at propose because that is
     # the last moment before it is in history, and history is a one-way door.

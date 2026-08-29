@@ -9,6 +9,18 @@ Allowed skip_if context (per ARTIFACT_SPEC.md §5.2/§5.3 and D2):
   response.headers      — dict of response headers (auth/cookie headers excluded)
   response.json         — pre-parsed JSON body (dict/list/None); walk with subscripts
   target                — artifact target dict; use subscript access: target["host"]
+
+An expression that CANNOT BE DECIDED against the response is not the same answer
+as "do not skip" (#642). Every failure used to collapse into ``False``, and
+``False`` is the branch that RUNS the mutating step - so a precheck whose binding
+was wrong, or whose expression referred to a name that is not there, silently
+became permission to act. Those cases now raise :class:`SkipIfUndecided`, and the
+executors refuse to run the step behind an undecided guard.
+
+A missing dict KEY is different and still answers ``None``: "the response has no
+``count`` field" is a fact about the target's state, which is exactly what a
+precheck is for. A missing ATTRIBUTE is a fact about the BINDING being wrong, and
+no artifact should mutate on the strength of one.
 """
 
 from __future__ import annotations
@@ -67,6 +79,38 @@ class _ResponseProxy:
         self.json = json_body
 
 
+class _PveResponseProxy(_ResponseProxy):
+    """The Proxmox flavour of the same view, and the envelope it wraps.
+
+    ``ProxmoxClient.call`` hands back the parsed ``{"data": ...}`` envelope and
+    nothing else, so ``proxmox-api-sequence`` used to bind that raw dict as
+    ``response``. ARTIFACT_SPEC §5.2 and D2 define the binding as
+    ``response.status_code`` / ``response.json``, and a dict has neither: every
+    precheck written to the spec evaluated to False and the mutating step ran.
+    Proved live on dev 3.6.14 - the spec's own worked example never skipped.
+
+    So the documented names are bound properly here. Subscripting ``response``
+    still reaches the envelope, because artifacts already in the store were
+    written against the shape the executor really had (``response["data"]["…"]``)
+    and silently changing what an APPLIED artifact's precheck means would be its
+    own dishonesty.
+    """
+
+    __slots__ = ("envelope",)
+
+    def __init__(self, status_code: int, envelope: Any) -> None:
+        super().__init__(status_code, {}, envelope)
+        self.envelope = envelope
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.envelope[key]
+
+
+def make_pve_response_proxy(status_code: int, envelope: Any) -> _PveResponseProxy:
+    """Bind a Proxmox API answer under the names ARTIFACT_SPEC D2 documents."""
+    return _PveResponseProxy(status_code, envelope)
+
+
 def make_response_proxy(response: Any) -> _ResponseProxy:
     """Wrap an httpx.Response (or similar) in a sanitised _ResponseProxy."""
     if isinstance(response, _ResponseProxy):
@@ -98,6 +142,15 @@ def make_response_proxy(response: Any) -> _ResponseProxy:
 
 class UnsafeExpressionError(Exception):
     pass
+
+
+class SkipIfUndecided(Exception):  # noqa: N818 - it is not an error, it is an answer
+    """The precheck expression could not be decided against this response.
+
+    Raised instead of answering ``False``, because ``False`` means "the target is
+    NOT in the desired state, run the mutating step" - and an undecided guard
+    must never say that (#642).
+    """
 
 
 def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
@@ -136,7 +189,12 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
         try:
             return getattr(value, node.attr)
         except AttributeError:
-            return None
+            # NOT None. A name that is not bound on this response is a broken
+            # precheck, and answering None here made it compare False, which is
+            # the branch that mutates.
+            raise SkipIfUndecided(
+                f"the precheck response has no '{node.attr}'; this expression could not be decided"
+            ) from None
 
     if isinstance(node, ast.BoolOp):
         op_func = _ALLOWED_BOOL_OPS.get(type(node.op))
@@ -191,16 +249,71 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
     raise UnsafeExpressionError(f"node type not allowed: {type(node).__name__}")
 
 
-def safe_eval_skip_if(expression: str, response: Any, target: dict[str, Any]) -> bool:
+_STATIC_ALLOWED_NAMES = frozenset({"response", "target", "True", "False", "None"})
+
+
+def validate_skip_if_expression(expression: str) -> list[str]:
+    """Would :func:`safe_eval_skip_if` be able to run this at all?
+
+    Checked at PROPOSE, so a `skip_if` the evaluator will refuse is caught while
+    it is still a draft rather than at apply - where it now means the step does
+    not run. The old propose-time check validated `frontmatter["skip_if"]`, a key
+    ARTIFACT_SPEC does not define, under an allowlist that forbade attribute
+    access and did not bind `response` - so it could only ever have refused the
+    spec's own documented form, and it never looked at the prechecks in the body
+    where every real `skip_if` lives.
+
+    Mirrors ``_eval_node``'s refusals; ``tests/test_precheck_truth.py`` gates the
+    two against each other.
+    """
+    errors: list[str] = []
     try:
         tree = ast.parse(expression, mode="eval")
-        context: dict[str, Any] = {
-            "response": response,
-            "target": target,
-        }
+    except SyntaxError as exc:
+        return [f"skip_if syntax error: {exc}"]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            errors.append("skip_if: imports are not allowed")
+        elif isinstance(node, ast.Call):
+            errors.append("skip_if: function calls are not allowed")
+        elif isinstance(node, ast.Lambda):
+            errors.append("skip_if: lambda expressions are not allowed")
+        elif isinstance(node, ast.comprehension):
+            errors.append("skip_if: comprehensions are not allowed")
+        elif isinstance(node, ast.NamedExpr):
+            errors.append("skip_if: the walrus operator is not allowed")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                errors.append(f"skip_if: private attribute access '{node.attr}' is not allowed")
+        elif isinstance(node, ast.Name) and node.id not in _STATIC_ALLOWED_NAMES:
+            errors.append(
+                f"skip_if: '{node.id}' is not bound; the context is "
+                "response.status_code / response.headers / response.json and target"
+            )
+    return errors
+
+
+def safe_eval_skip_if(expression: str, response: Any, target: dict[str, Any]) -> bool:
+    """Decide a precheck expression, or raise :class:`SkipIfUndecided`.
+
+    Every failure used to become ``False``. ``False`` runs the mutating step, so
+    a syntax error, a refused construct, or a wrong binding was silently upgraded
+    to "yes, apply it" - in the one guard whose entire job is to stop that (#642).
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise SkipIfUndecided(f"skip_if is not a valid expression: {exc}") from None
+    context: dict[str, Any] = {
+        "response": response,
+        "target": target,
+    }
+    try:
         result = _eval_node(tree, context)
-        return bool(result)
-    except UnsafeExpressionError:
-        return False
-    except (ValueError, TypeError, AttributeError, KeyError):
-        return False
+    except SkipIfUndecided:
+        raise
+    except UnsafeExpressionError as exc:
+        raise SkipIfUndecided(f"skip_if was refused by the evaluator: {exc}") from None
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise SkipIfUndecided(f"skip_if could not be evaluated: {exc}") from None
+    return bool(result)

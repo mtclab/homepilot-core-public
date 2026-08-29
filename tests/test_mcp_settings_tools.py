@@ -313,7 +313,7 @@ class TestScope:
     ) -> None:
         token = _mcp_token_scope_var.set(scope)
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _call(tool, arguments, {**ctx, "_mcp_token_scope": scope})
         finally:
             _mcp_token_scope_var.reset(token)

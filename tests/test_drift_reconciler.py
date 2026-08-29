@@ -523,7 +523,13 @@ class TestVerifyComposite:
             "    precheck:\n"
             "      method: GET\n"
             "      path: /test\n"
-            '      skip_if: "response.json.ok == true"\n'
+            # Was `response.json.ok == true`: `true` is not a Python name and
+            # `.ok` is attribute access on a dict, so the expression could not be
+            # evaluated at all - and "could not be evaluated" used to come back as
+            # `False`, which reads as DRIFTED. The test passed for the wrong
+            # reason, on the exact conflation review #648 removes. Written as a
+            # working expression, it still proves what it meant to.
+            "      skip_if: 'response.json[\"ok\"]'\n"
             "```\n"
         )
 

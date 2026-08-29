@@ -509,3 +509,34 @@ class TestTokenAdminEndpoints:
             f"/auth/tokens/{prefix}", headers={"x-hp-admin-secret": "test-admin-secret"}
         )
         assert resp2.status_code == 404
+
+    def test_the_endpoint_refuses_an_unusable_scope(self, secret_app):
+        """Review #648: the mint stored whatever string it was given and
+        answered 201. A typo produced a real credential that authenticates and
+        is refused by every scoped route - discovered at first use, not here.
+
+        TEETH: remove the validate_scope call from admin_create_token and this
+        returns 201 with a token.
+        """
+        client, _ = secret_app
+        resp = client.post(
+            "/auth/tokens",
+            headers={"x-hp-admin-secret": "test-admin-secret"},
+            json={"label": "typo", "scope": "read write"},
+        )
+        assert resp.status_code == 400, (
+            f"minted a token for a scope nothing honours: {resp.status_code} {resp.text}"
+        )
+        assert "token" not in resp.json()
+        assert "read" in resp.json()["detail"]
+
+    def test_a_real_scope_still_mints(self, secret_app):
+        """Guard the guard: the check must not be refusing everything."""
+        client, _ = secret_app
+        resp = client.post(
+            "/auth/tokens",
+            headers={"x-hp-admin-secret": "test-admin-secret"},
+            json={"label": "ci", "scope": "read,write"},
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["token"].startswith("hp_")

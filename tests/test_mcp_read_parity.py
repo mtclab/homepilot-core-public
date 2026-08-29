@@ -587,6 +587,126 @@ def _tier_mismatches(tier_fn: Any, exemptions: set[str]) -> list[str]:
     return out
 
 
+# ── The other direction: no tool may sit OUTSIDE the gate ────────────────────
+# TestMcpTierMatchesApiScope walks the two parity maps, so it only ever judges a
+# tool that appears in one of them. A tool in NEITHER map has no route to be
+# compared against and its hand-placed tier is checked by nothing at all - which
+# is how six of them came to sit at read_only unnoticed while ARCHITECTURE.md
+# said `create_guest_template` was "the one tool with no route to mirror".
+#
+# So every tool must be either mapped or declared here, with the tier it is
+# hand-placed at and why no route governs it. A new tool that is neither fails
+# TestEveryToolIsTierGoverned rather than quietly escaping the gate.
+ROUTELESS_TOOLS: dict[str, str] = {
+    "create_guest_template": (
+        "admin - MCP-only for now. Builds the cloud-init template provision_guest "
+        "clones; there is no API route, so it is placed next to the admin-tier "
+        "provision_guest it feeds."
+    ),
+    "get_artifact_status": (
+        "read_only - reports an artifact's lifecycle state from the store. "
+        "GET /artifacts/{id} (API read, mapped to get_artifact) carries the same "
+        "status field; this tool is the narrow read of it."
+    ),
+    "check_artifact_drift": (
+        "read_only - the single-artifact drift probe. GET /artifacts/drift (API "
+        "read) answers the FLEET question and is mapped to get_fleet_drift; this "
+        "is the same read scoped to one artifact."
+    ),
+    "proxmox_api_read": (
+        "read_only - a GET-only, path-allowlisted passthrough to the Proxmox API "
+        "with the vault-resolved token. No management route mirrors it: it reads "
+        "the hypervisor, not HomePilot."
+    ),
+    "http_call_read": (
+        "read_only - a GET-only, SSRF-guarded call to a vault-registered service "
+        "with that service's stored credential. No management route mirrors it: "
+        "it reads an adopted third-party service, not HomePilot."
+    ),
+    # The two below are the ones this declaration exists to make visible. Their
+    # nearest API routes are ADMIN, so they are the only tools in the product
+    # whose MCP tier is deliberately WEAKER than the API scope for the same
+    # capability. Left as-is pending an owner decision (review #648, tranche 2)
+    # - the point of listing them is that the next reader sees it.
+    "read_file_on_guest": (
+        "read_only - reads a file off a managed host through the agent, under a "
+        "prefix allowlist plus a secret denylist. The API's equivalents, POST "
+        "/agents/host/read-file and POST /agents/{id}/read-file, are require_scope"
+        "('admin') and are excluded from the mutation map rather than mapped, so "
+        "this tool's tier has never been compared against them. It is WEAKER "
+        "than the API scope for the same adapter call."
+    ),
+    "exec_on_guest_readonly": (
+        "read_only - runs a command from AgentAdapter's read-only allowlist on a "
+        "managed host. The API has no read-scoped route that executes anything: "
+        "POST /agents/host/exec and GET /agents/test/adapter are both "
+        "require_scope('admin'). WEAKER than any API scope for executing on a "
+        "host."
+    ),
+}
+
+
+class TestEveryToolIsTierGoverned:
+    """Every MCP tool is judged by the tier gate, or is a declared exception.
+
+    Without this, TestMcpTierMatchesApiScope can be perfectly toothed and still
+    say nothing about a tool nobody put in a map.
+    """
+
+    async def test_every_tool_is_mapped_or_declared_routeless(self) -> None:
+        mapped = set(ROUTE_TO_TOOL.values()) | set(MUTATION_ROUTE_TO_TOOL.values())
+        ungoverned = sorted(set(_TOOL_HANDLERS) - mapped - set(ROUTELESS_TOOLS))
+        assert not ungoverned, (
+            "MCP tool(s) that no route governs and no declaration explains: "
+            f"{ungoverned}. Map the tool to the route it mirrors so the tier gate "
+            "judges it, or add it to ROUTELESS_TOOLS naming its hand-placed tier "
+            "and why no route applies."
+        )
+
+    async def test_no_routeless_declaration_is_stale(self) -> None:
+        """A declaration for a tool that IS mapped weakens nothing today but
+        hides the day it stops being true, so it must be removed instead."""
+        mapped = set(ROUTE_TO_TOOL.values()) | set(MUTATION_ROUTE_TO_TOOL.values())
+        stale = sorted(set(ROUTELESS_TOOLS) & mapped)
+        assert not stale, (
+            f"ROUTELESS_TOOLS names tool(s) a parity map already covers: {stale} - "
+            "the tier gate judges them, so remove the declaration."
+        )
+
+    async def test_every_routeless_declaration_names_a_real_tool(self) -> None:
+        unknown = sorted(set(ROUTELESS_TOOLS) - set(_TOOL_HANDLERS))
+        assert not unknown, f"ROUTELESS_TOOLS names tool(s) the server does not serve: {unknown}"
+
+    async def test_every_tool_sits_in_exactly_one_tier(self) -> None:
+        """_handle_tool refuses on membership of _ADMIN_TOOLS and _MUTATING_TOOLS
+        only, so a tool in NO tier set is callable by every tier including
+        read_only - a fail-OPEN default. A tool in two sets is a tier the code
+        and the reader disagree about."""
+        wrong: list[str] = []
+        for tool in sorted(_TOOL_HANDLERS):
+            tiers = [
+                name
+                for name, members in (
+                    ("admin", _ADMIN_TOOLS),
+                    ("full", _MUTATING_TOOLS),
+                    ("read_only", _READ_ONLY_TOOLS),
+                )
+                if tool in members
+            ]
+            if len(tiers) != 1:
+                wrong.append(f"{tool}: {tiers or 'no tier at all - callable by read_only'}")
+        assert not wrong, "tool(s) not in exactly one tier set:\n" + "\n".join(wrong)
+
+    async def test_the_gate_has_teeth(self) -> None:
+        """A new tool that is in neither map and undeclared must be caught."""
+        mapped = set(ROUTE_TO_TOOL.values()) | set(MUTATION_ROUTE_TO_TOOL.values())
+        pretend_handlers = {*_TOOL_HANDLERS, "delete_the_whole_estate"}
+        ungoverned = set(pretend_handlers) - mapped - set(ROUTELESS_TOOLS)
+        assert "delete_the_whole_estate" in ungoverned, (
+            "the completeness check did not notice a tool outside both maps"
+        )
+
+
 class TestMcpTierMatchesApiScope:
     """No MCP tool may sit at a tier weaker OR stronger than its route's API
     scope. This is the gate that makes the tiers trustworthy."""
@@ -1142,7 +1262,7 @@ class TestReadOnlyScopeCanCallEveryReadTool:
         """Guard the guard: the same harness must REFUSE a mutating tool."""
         token = _mcp_token_scope_var.set("read_only")
         try:
-            with pytest.raises(ValueError, match="requires write scope"):
+            with pytest.raises(ValueError, match="needs the full tier"):
                 await _handle_tool(
                     "record_fact",
                     {"target": "x", "kind": "note", "content": "y"},

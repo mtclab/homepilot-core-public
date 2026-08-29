@@ -14,6 +14,7 @@ Proxmox settings save has its `getattr` guard. These four were still real:
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -25,6 +26,23 @@ from homepilot.artifacts.store import ArtifactStore
 from homepilot.cli.main import app
 
 runner = CliRunner()
+
+
+def _fake_webhook_repo(repo: object):
+    """Stand in for `_webhook_repo`, the async context manager the webhook
+    commands open the database through.
+
+    It became a context manager in review #648: three of the four commands raise
+    `typer.Exit` on a not-found or an undelivered event, and a CLI that exits
+    while holding an open aiosqlite connection never exits at all - its
+    non-daemon worker thread is one CPython will join for ever.
+    """
+
+    @contextlib.asynccontextmanager
+    async def _cm():
+        yield AsyncMock(), repo
+
+    return _cm
 
 
 class TestTakingALockDoesNotCreateTheArtifact:
@@ -107,13 +125,8 @@ class TestTheWebhookCliDoesNotLeakOrLie:
         always omitted the secret."""
         configs = [{"id": 1, "url": "https://example.test/hook", "secret": "super-secret-hmac-key"}]
         with patch(
-            "homepilot.cli.main._get_repo_for_webhook",
-            AsyncMock(
-                return_value=(
-                    AsyncMock(),
-                    AsyncMock(list_webhook_configs=AsyncMock(return_value=configs)),
-                )
-            ),
+            "homepilot.cli.main._webhook_repo",
+            _fake_webhook_repo(AsyncMock(list_webhook_configs=AsyncMock(return_value=configs))),
         ):
             result = runner.invoke(app, ["webhook", "list", "--output", "json"])
 
@@ -127,13 +140,8 @@ class TestTheWebhookCliDoesNotLeakOrLie:
         config = {"id": 1, "url": "https://example.test/hook", "secret": None, "max_retries": 0}
         with (
             patch(
-                "homepilot.cli.main._get_repo_for_webhook",
-                AsyncMock(
-                    return_value=(
-                        AsyncMock(),
-                        AsyncMock(get_webhook_config=AsyncMock(return_value=config)),
-                    )
-                ),
+                "homepilot.cli.main._webhook_repo",
+                _fake_webhook_repo(AsyncMock(get_webhook_config=AsyncMock(return_value=config))),
             ),
             patch("homepilot.events.deliver_with_retry", AsyncMock(return_value=False)),
         ):
@@ -146,13 +154,8 @@ class TestTheWebhookCliDoesNotLeakOrLie:
         config = {"id": 1, "url": "https://example.test/hook", "secret": None, "max_retries": 0}
         with (
             patch(
-                "homepilot.cli.main._get_repo_for_webhook",
-                AsyncMock(
-                    return_value=(
-                        AsyncMock(),
-                        AsyncMock(get_webhook_config=AsyncMock(return_value=config)),
-                    )
-                ),
+                "homepilot.cli.main._webhook_repo",
+                _fake_webhook_repo(AsyncMock(get_webhook_config=AsyncMock(return_value=config))),
             ),
             patch("homepilot.events.deliver_with_retry", AsyncMock(return_value=True)),
         ):

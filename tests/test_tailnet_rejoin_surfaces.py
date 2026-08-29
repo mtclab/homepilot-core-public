@@ -169,7 +169,7 @@ class TestOnlyAdminMayRejoin:
         assert "rejoin_tailnet" in _ADMIN_TOOLS
 
     async def test_a_full_scope_mcp_token_is_refused(self, service: MagicMock) -> None:
-        with pytest.raises(ValueError, match="admin scope"):
+        with pytest.raises(ValueError, match="admin tier"):
             await _handle_tool(
                 "rejoin_tailnet",
                 {"vmid": 105, "auth_key": KEY},

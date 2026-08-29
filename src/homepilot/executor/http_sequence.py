@@ -10,16 +10,23 @@ import httpx
 import yaml
 
 from homepilot.executor.jinja_utils import (
+    InterpolationError,
     _eval_skip_if,
     _interpolate,
     _interpolate_obj,
+    interpolation_context,
 )
-from homepilot.executor.skip_if import make_response_proxy
+from homepilot.executor.skip_if import SkipIfUndecided, make_response_proxy
 
 logger = logging.getLogger(__name__)
 
 _SPEC_FENCE = "http-spec"
 _ROLLBACK_FENCE = "http-rollback"
+
+# See proxmox_api: 2xx/4xx answer about the resource, 5xx and transport failures
+# answer about the service. Only the first kind is permission to skip - or not to
+# skip - a mutating step (#642 A4).
+_PRECHECK_ANSWERS_BELOW = 500
 
 
 def _extract_steps(body: str, tag: str) -> list[dict[str, Any]] | None:
@@ -65,90 +72,114 @@ async def execute(
             "failure_reason": "missing spec",
         }
 
-    context: dict[str, Any] = {
-        "target": target,
-        "artifact": {
-            "id": frontmatter.get("id", ""),
-            "intent": frontmatter.get("intent", ""),
-        },
-    }
+    context = interpolation_context(target, frontmatter)
 
     client_cache: dict[str, httpx.AsyncClient] = {}
 
     log_lines: list[str] = []
     start = time.monotonic()
+    # `on_error: continue` keeps the sequence going; it does not make a step that
+    # failed, or one that was refused by an undecided precheck, into a success
+    # (#642 B5).
+    unfinished: list[str] = []
 
     try:
         for step in steps:
             step_id = step.get("id", "unknown")
             step_log = f"[{step_id}]"
+            on_error = step.get("on_error", "halt")
 
             cred_name = step.get("name", "")
             precheck = step.get("precheck")
             if precheck and not rollback:
                 pre_cred_name = precheck.get("name", cred_name)
                 pre_method = precheck.get("method", "GET").upper()
-                pre_path = _interpolate(precheck.get("path", ""), context)
+                try:
+                    pre_path = _interpolate(precheck.get("path", ""), context)
+                except InterpolationError as exc:
+                    step_log += f" -> REFUSED: precheck path {exc}"
+                    log_lines.append(step_log)
+                    return {
+                        "success": False,
+                        "execution_log": "\n".join(log_lines),
+                        "failure_reason": f"precheck for {step_id}: {exc}",
+                    }
                 skip_if_expr = precheck.get("skip_if")
 
+                undecided: str | None = None
+                pre_cred: dict[str, Any] = {}
                 try:
                     pre_cred = await _resolve_credential(pre_cred_name, vault)
                 except ExecutorError as e:
-                    step_log += f" credential '{pre_cred_name}' not found"
+                    undecided = f"precheck credential '{pre_cred_name}' not found ({e})"
+
+                if undecided is None:
+                    base_url = pre_cred.get("base_url", "").rstrip("/")
+                    headers = pre_cred.get("headers", {})
+                    verify_tls = pre_cred.get("verify_tls", True)
+
+                    client_key = f"{base_url}:{pre_cred_name}"
+                    if client_key not in client_cache:
+                        client_cache[client_key] = httpx.AsyncClient(
+                            base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
+                        )
+                    pre_client = client_cache[client_key]
+
+                    step_log += f" precheck {pre_method} {pre_path}"
+                    try:
+                        resp = await pre_client.request(method=pre_method, url=pre_path)
+                        if resp.status_code >= _PRECHECK_ANSWERS_BELOW:
+                            undecided = (
+                                f"precheck answered HTTP {resp.status_code}, which says "
+                                "nothing about the resource"
+                            )
+                        elif skip_if_expr:
+                            proxy = make_response_proxy(resp)
+                            if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
+                                step_log += " -> SKIPPED (precheck)"
+                                log_lines.append(step_log)
+                                continue
+                    except SkipIfUndecided as e:
+                        undecided = str(e)
+                    except httpx.HTTPError as e:
+                        undecided = f"precheck did not answer ({e})"
+
+                if undecided is not None:
+                    step_log += f" -> NOT RUN: {undecided}"
                     log_lines.append(step_log)
-                    on_error = step.get("on_error", "halt")
+                    unfinished.append(step_id)
                     if on_error == "halt":
                         return {
                             "success": False,
                             "execution_log": "\n".join(log_lines),
-                            "failure_reason": str(e),
+                            "failure_reason": (
+                                f"step {step_id} was not run: its precheck could not be "
+                                f"decided ({undecided})"
+                            ),
                         }
                     continue
 
-                base_url = pre_cred.get("base_url", "").rstrip("/")
-                headers = pre_cred.get("headers", {})
-                verify_tls = pre_cred.get("verify_tls", True)
-
-                client_key = f"{base_url}:{pre_cred_name}"
-                if client_key not in client_cache:
-                    client_cache[client_key] = httpx.AsyncClient(
-                        base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
-                    )
-                pre_client = client_cache[client_key]
-
-                step_log += f" precheck {pre_method} {pre_path}"
-                try:
-                    resp = await pre_client.request(method=pre_method, url=pre_path)
-                    proxy = make_response_proxy(resp)
-                    if skip_if_expr and _eval_skip_if(
-                        skip_if_expr, proxy, context.get("target", {})
-                    ):
-                        step_log += " -> SKIPPED (precheck)"
-                        log_lines.append(step_log)
-                        continue
-                except httpx.HTTPError as e:
-                    step_log += f" -> precheck error: {e}"
-                    on_error = step.get("on_error", "halt")
-                    if on_error == "halt":
-                        log_lines.append(step_log)
-                        return {
-                            "success": False,
-                            "execution_log": "\n".join(log_lines),
-                            "failure_reason": str(e),
-                        }
-
             method = step.get("method", "GET").upper()
-            path = _interpolate(step.get("path", ""), context)
-            do_body = step.get("body")
-            if do_body is not None:
-                do_body = _interpolate_obj(do_body, context)
+            try:
+                path = _interpolate(step.get("path", ""), context)
+                do_body = step.get("body")
+                if do_body is not None:
+                    do_body = _interpolate_obj(do_body, context)
+            except InterpolationError as exc:
+                step_log += f" -> REFUSED: {exc}"
+                log_lines.append(step_log)
+                return {
+                    "success": False,
+                    "execution_log": "\n".join(log_lines),
+                    "failure_reason": f"step {step_id} could not be interpolated: {exc}",
+                }
 
             try:
                 cred = await _resolve_credential(cred_name, vault)
             except ExecutorError as e:
                 step_log += f" credential '{cred_name}' not found"
                 log_lines.append(step_log)
-                on_error = step.get("on_error", "halt")
+                unfinished.append(step_id)
                 if on_error == "halt":
                     return {
                         "success": False,
@@ -175,7 +206,6 @@ async def execute(
                 resp = await client.request(method=method, url=path, **kwargs)
                 step_log += f" {method} {path} -> {resp.status_code}"
                 if resp.status_code >= 400:
-                    on_error = step.get("on_error", "halt")
                     if on_error == "halt":
                         log_lines.append(step_log)
                         return {
@@ -183,9 +213,9 @@ async def execute(
                             "execution_log": "\n".join(log_lines),
                             "failure_reason": f"step {step_id}: HTTP {resp.status_code}",
                         }
+                    unfinished.append(step_id)
             except httpx.HTTPError as e:
                 step_log += f" {method} {path} -> ERROR: {e}"
-                on_error = step.get("on_error", "halt")
                 if on_error == "halt":
                     log_lines.append(step_log)
                     return {
@@ -193,6 +223,7 @@ async def execute(
                         "execution_log": "\n".join(log_lines),
                         "failure_reason": str(e),
                     }
+                unfinished.append(step_id)
 
             log_lines.append(step_log)
 
@@ -208,4 +239,13 @@ async def execute(
 
     elapsed = time.monotonic() - start
     log_lines.append(f"duration={elapsed:.1f}s")
+    if unfinished:
+        return {
+            "success": False,
+            "execution_log": "\n".join(log_lines),
+            "failure_reason": (
+                "these steps did not complete (on_error: continue kept the "
+                "sequence going, it did not make them succeed): " + ", ".join(unfinished)
+            ),
+        }
     return {"success": True, "execution_log": "\n".join(log_lines)}

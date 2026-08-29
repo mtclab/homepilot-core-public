@@ -279,7 +279,7 @@ class TestTheMcpTool:
         ctx["_mcp_token_scope"] = "full"
         with pytest.raises(ValueError) as exc:
             await _handle_tool("query_guest_network", {}, ctx)
-        assert "admin scope" in str(exc.value)
+        assert "admin tier" in str(exc.value)
 
     async def test_the_tool_and_the_route_answer_the_same(self, api, state) -> None:
         client, app = api

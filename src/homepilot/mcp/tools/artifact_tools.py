@@ -90,7 +90,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "check_artifact_drift",
         "description": (
             "Check whether an applied artifact has drifted from its desired state. "
-            "Returns drift status, verification log, and details. "
+            "Answers `state`: in_spec, drifted, or unknown - `unknown` means the "
+            "check could not establish anything (no spec, no host, a read that "
+            "failed), which is NOT the same as in spec. `drifted` is the boolean "
+            "view and is false for both of the other two. "
             "Always performs a fresh check (not cached)."
         ),
         "inputSchema": {
@@ -108,10 +111,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "artifact_id": {"type": "string"},
                 "drifted": {"type": "boolean"},
+                "state": {"type": "string"},
                 "verification_log": {"type": "string"},
                 "details": {"type": "object"},
             },
-            "required": ["artifact_id", "drifted"],
+            "required": ["artifact_id", "drifted", "state"],
         },
     },
     {
@@ -528,8 +532,19 @@ async def handle_propose_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     if not spec.get("produced_by"):
         spec["produced_by"] = {"session": "mcp", "agent": "mcp-tool", "user": "mcp"}
 
+    from homepilot.artifacts.lifecycle import ConflictError, LifecycleError
+
     lifecycle = ctx["lifecycle"]
-    artifact_id = await lifecycle.propose(spec)
+    try:
+        artifact_id = await lifecycle.propose(spec)
+    except (LifecycleError, ConflictError) as exc:
+        # A LifecycleError NAMES what is wrong and how to fix it ("intent must be
+        # 1-200 chars"). Letting it escape turned that into a bare "Internal
+        # server error" over MCP, where the caller cannot read the log either -
+        # so a one-line correction became a log-diving exercise for someone who
+        # has no log (#635). Every other refusal on this transport says what it
+        # refused and why; this one now does too.
+        raise ValueError(str(exc)) from None
     fm, _ = await asyncio.to_thread(ctx["store"].read, artifact_id)
     msg = (
         f"Artifact {artifact_id} created with status: "
@@ -557,11 +572,21 @@ async def handle_check_artifact_drift(
     except FileNotFoundError:
         raise ValueError(f"Artifact not found: {artifact_id}") from None
     except Exception:  # MCP tool error handler, converts to RuntimeError for client
+        # Stays deliberately opaque: an arbitrary exception's text can carry
+        # internal paths and secrets, and this transport is where an untrusted
+        # caller reads it (gated by test_drift_api_mcp's no-leak assertion). The
+        # REASON now reaches the caller by the right door instead - the verifier
+        # answers UNKNOWN with an explanation rather than raising, so this path
+        # is the last resort rather than the ordinary one.
         logger.exception("Drift check failed for %s", artifact_id)
         raise RuntimeError("Drift check failed") from None
     return {
         "artifact_id": result.artifact_id,
         "drifted": result.drifted,
+        # The tri-state, not just the boolean: `drifted: false` alone cannot tell
+        # "checked and in spec" from "could not be checked" (#425), and this
+        # transport is where an agent decides what to do next.
+        "state": result.state.value,
         "verification_log": result.verification_log,
         "details": result.details,
     }

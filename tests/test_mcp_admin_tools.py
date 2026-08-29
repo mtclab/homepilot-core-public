@@ -494,7 +494,7 @@ class TestProvisionGuest:
         service = self._service()
         token = _mcp_token_scope_var.set("full")
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _handle_tool(
                     "provision_guest",
                     {"name": "web01", "node": "pve1", "template_vmid": 9000},
@@ -611,7 +611,7 @@ class TestScopeLadder:
     ) -> None:
         token = _mcp_token_scope_var.set("full")
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _handle_tool(name, arguments, {**ctx, "_mcp_token_scope": "full"})
         finally:
             _mcp_token_scope_var.reset(token)
@@ -622,7 +622,7 @@ class TestScopeLadder:
     ) -> None:
         token = _mcp_token_scope_var.set("read_only")
         try:
-            with pytest.raises(ValueError, match="requires admin scope"):
+            with pytest.raises(ValueError, match="needs the admin tier"):
                 await _handle_tool(name, arguments, {**ctx, "_mcp_token_scope": "read_only"})
         finally:
             _mcp_token_scope_var.reset(token)
