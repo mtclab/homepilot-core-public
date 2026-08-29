@@ -143,7 +143,24 @@ def proxmox() -> AsyncMock:
     px = AsyncMock(spec=ProxmoxClient)
     px.get_vm_current = AsyncMock(return_value={"data": {"status": "running"}})
     px.agent_ping = AsyncMock(return_value=True)
+    _wire_agent_run(px)
     return px
+
+
+def _wire_agent_run(px: Any) -> None:
+    """Give a mocked client the REAL exec-and-wait loop.
+
+    `agent_run` is the thing under test in half this file - a token that must
+    not reach an argv, a non-zero exit that must be terminal, a command that
+    never exits. Stubbing it would delete those assertions; binding the real
+    implementation over the fake's exec/exec_status keeps them.
+    """
+    from homepilot.adapters.proxmox import ProxmoxClient
+
+    async def run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        return await ProxmoxClient.agent_run(px, *args, **kwargs)
+
+    px.agent_run = run
 
 
 @pytest.fixture

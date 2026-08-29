@@ -96,6 +96,35 @@ class TestAGuestSeesOnlyTheirWorld:
         items = res.json()["items"]
         assert [h["hostname"] for h in items] == ["alice-web"]
 
+    async def test_a_destroyed_machine_is_shown_as_gone_not_online(self, stack):
+        """#613 - the guest page must never show a machine that is not there.
+
+        WHAT THIS FORBIDS: passing the last-seen status through. The row keeps
+        whatever it was when the hypervisor stopped reporting it, so a
+        destroyed machine went on telling its owner it was "online" - on the
+        one page that is their only window onto whether it still exists.
+        """
+        app, _pve, _ids = stack
+        repo = app.state.repo
+        await repo.db.execute(
+            "UPDATE hosts SET status = 'online', pve_status = 'running' WHERE hostname = ?",
+            ("alice-web",),
+        )
+        await repo.db.conn.commit()
+
+        async with client_for(app) as client:
+            before = await client.get("/guest/vms", headers=cert_headers(cn=ALICE))
+        assert before.json()["items"][0]["status"] == "online"
+
+        await repo.mark_hosts_absent(seen_ids=set(), sources=("hp_created",))
+
+        async with client_for(app) as client:
+            res = await client.get("/guest/vms", headers=cert_headers(cn=ALICE))
+
+        item = res.json()["items"][0]
+        assert item["status"] == "gone", "a destroyed machine still reads as online to its owner"
+        assert item["gone_since"], "the guest is not told WHEN it went"
+
     async def test_the_view_leaks_no_topology(self, stack):
         """No node, no template, no proxmox id, no tags: operator vocabulary
         stays out of guest pages."""

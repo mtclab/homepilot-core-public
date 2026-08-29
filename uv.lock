@@ -1068,7 +1068,7 @@ wheels = [
 
 [[package]]
 name = "homepilot"
-version = "3.6.11"
+version = "3.6.12"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

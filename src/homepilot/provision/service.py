@@ -22,6 +22,15 @@ from .models import ProvisionRequest
 
 logger = logging.getLogger(__name__)
 
+# Tailscale's own installer: the only thing that knows how to add their
+# repository across distributions, and what their docs tell you to run. It
+# needs the guest to reach the internet, which a fenced guest still does.
+# `set -e` so a failed download cannot look like a successful install.
+_TAILSCALE_INSTALL_SCRIPT = (
+    "set -e; export DEBIAN_FRONTEND=noninteractive; "
+    "curl -fsSL https://tailscale.com/install.sh | sh"
+)
+
 # What inventory refresh writes for a qemu guest. A provisioned VM MUST use the
 # same host_type + proxmox_id, because refresh_inventory matches existing rows by
 # proxmox_id alone: any other convention would leave the reconciler creating a
@@ -52,6 +61,9 @@ class ProvisionService:
         ip_wait_s: float = 60.0,
         ip_interval: float = 3.0,
         defaults_source: Any = None,
+        tailscale_install: bool = True,
+        tailscale_timeout_s: float = 120.0,
+        tailscale_install_timeout_s: float = 300.0,
     ):
         self.proxmox = proxmox
         # Where the provisioning defaults are read from at RUN time (#553 C3):
@@ -70,6 +82,14 @@ class ProvisionService:
         self.task_timeout_s = task_timeout_s
         self.ip_wait_s = ip_wait_s
         self.ip_interval = ip_interval
+        # Whether a guest with no tailscale gets it installed before the join.
+        # Off is for an image that ships its own (or an air-gapped guest, where
+        # the vendor installer cannot reach the internet anyway).
+        self.tailscale_install = tailscale_install
+        self.tailscale_timeout_s = tailscale_timeout_s
+        # The vendor installer adds a repo and pulls packages: minutes, not
+        # seconds, on a cold cloud image.
+        self.tailscale_install_timeout_s = tailscale_install_timeout_s
         self._running_tasks: set[asyncio.Task[Any]] = set()
         # task_id → in-flight asyncio.Task, so cancel() can reach the coroutine
         # that is actually talking to Proxmox (#452). Without it, a cancel only
@@ -622,6 +642,19 @@ class ProvisionService:
         proxmox = self.proxmox
         if proxmox is None:
             return "failed"
+
+        # NOTHING PUT TAILSCALE IN THE GUEST. The join ran `tailscale up`
+        # against a stock cloud image that has never heard of it, so the first
+        # real guest recorded tailnet "failed" and no amount of retrying could
+        # have helped (#628). Install it if it is missing, unless the operator
+        # has turned that off for an image that ships its own.
+        # Read at USE time, like every other provisioning default, so the
+        # setting can be flipped without a restart and mean it.
+        defaults = await provisioning_defaults(self.defaults_source)
+        install_allowed = self.tailscale_install and defaults.tailscale_install
+        if not await self._ensure_tailscale(request, vmid, install_allowed):
+            return "failed"
+
         # The key never goes on the command line. Tailscale's own guidance is to
         # pass it through the environment for exactly this reason: an argv is
         # readable in the guest's process list and is echoed back inside PVE task
@@ -638,16 +671,72 @@ class ProvisionService:
             logger.warning("Could not stage the tailnet key for vmid %s (key redacted)", vmid)
             return "failed"
         try:
-            await proxmox.agent_exec(request.node, vmid, ["sh", "-c", script])
+            # WAIT for it. agent_exec answers with a pid, so returning "joined"
+            # on the call alone reported a join that had not happened yet and
+            # might never (#628) - a `tailscale up` that exits 1 on a bad key
+            # looked identical to success.
+            rc, _out, _err = await proxmox.agent_run(
+                request.node, vmid, script, timeout_s=self.tailscale_timeout_s
+            )
         except Exception:
-            # Never log the exception body: a PVE error echoes the command back.
+            # Never log the exception body: a PVE error echoes the command back,
+            # and the command is built around the key file.
             logger.warning("Tailnet join failed for vmid %s (key redacted)", vmid)
             # Best effort: the shell deletes the file itself, but if the exec
             # never ran the key would otherwise stay on the guest's disk.
             with contextlib.suppress(Exception):
                 await proxmox.agent_exec(request.node, vmid, ["rm", "-f", key_path])
             return "failed"
+        if rc != 0:
+            # Same reason: the stderr of this command can quote the key back.
+            logger.warning("Tailnet join for vmid %s exited %s (output withheld)", vmid, rc)
+            with contextlib.suppress(Exception):
+                await proxmox.agent_exec(request.node, vmid, ["rm", "-f", key_path])
+            return "failed"
         return "joined"
+
+    async def _ensure_tailscale(
+        self, request: ProvisionRequest, vmid: int, install_allowed: bool
+    ) -> bool:
+        """Is tailscale in the guest? Install it if not. True when it is there.
+
+        The installer is the vendor's own, which is the only thing that knows
+        how to add their repo across distributions. It needs the guest to reach
+        the internet - a fenced guest may leave the LAN alone but still routes
+        out - and it is skipped entirely when the operator has said the image
+        provides tailscale itself.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:
+            return False
+        try:
+            rc, _out, _err = await proxmox.agent_run(
+                request.node, vmid, "command -v tailscale", timeout_s=self.tailscale_timeout_s
+            )
+        except Exception:
+            logger.warning("Could not ask vmid %s whether tailscale is installed", vmid)
+            return False
+        if rc == 0:
+            return True
+        if not install_allowed:
+            logger.warning(
+                "vmid %s has no tailscale and installing it is disabled; join cannot succeed", vmid
+            )
+            return False
+        try:
+            rc, _out, err = await proxmox.agent_run(
+                request.node,
+                vmid,
+                _TAILSCALE_INSTALL_SCRIPT,
+                timeout_s=self.tailscale_install_timeout_s,
+            )
+        except Exception as exc:
+            logger.warning("Installing tailscale in vmid %s failed: %s", vmid, exc)
+            return False
+        if rc != 0:
+            logger.warning("Installing tailscale in vmid %s exited %s: %s", vmid, rc, err[:200])
+            return False
+        return True
 
     async def _discover_ip(self, node: str, vmid: int) -> str | None:
         proxmox = self.proxmox

@@ -80,10 +80,17 @@ def _guest_view(host: dict[str, Any]) -> dict[str, Any]:
     No node, no template, no proxmox id, no tags, no import state: those are
     operator vocabulary, and the guest pages must not leak topology.
     """
+    # A machine the hypervisor no longer reports is GONE, whatever the last
+    # status we happened to record was. Passing the stale value through showed
+    # a guest their destroyed machine as "online" (#613) - the one thing the
+    # page must never do, because it is the guest's only window onto whether
+    # their machine still exists.
+    status = "gone" if host.get("absent_since") else host.get("status")
     return {
         "id": host["id"],
         "hostname": host["hostname"],
-        "status": host.get("status"),
+        "status": status,
+        "gone_since": host.get("absent_since"),
         "ip_address": host.get("ip_address"),
         "cpu_cores": host.get("cpu_cores"),
         "memory_mb": host.get("memory_mb"),
