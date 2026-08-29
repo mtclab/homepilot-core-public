@@ -28,6 +28,7 @@ direction would be a cycle. Consumption of the resolved defaults lives in
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -369,6 +370,72 @@ async def probe_ipconfig(value: Any, ctx: ProbeContext) -> ProbeResult:
     return ProbeResult(True, f"Checked locally: {text} is a valid ipconfig0. No cluster call.")
 
 
+async def probe_ip_mode(value: Any, ctx: ProbeContext) -> ProbeResult:
+    """Is 'dhcp' a thing this cluster can actually do (#630)?
+
+    A local shape check would be nearly free and nearly useless: the whole
+    incident behind this setting is that an operator can say "dhcp" on a node
+    where no DHCP server exists, and find out when a friend's guest boots with
+    a link-local address. So the mode that DEPENDS on something is checked
+    against the thing it depends on - the SDN zone's own dnsmasq - and the mode
+    that depends on nothing is confirmed locally.
+    """
+    mode = str(value or "").strip().lower() or "static"
+    if mode not in ("static", "dhcp"):
+        return ProbeResult(False, f"{mode!r} is not a mode: expected 'static' or 'dhcp'")
+    if mode == "static":
+        return ProbeResult(
+            True,
+            "Checked locally: HomePilot allocates the guest's address from the guest "
+            "subnet itself, so nothing on the wire has to answer. No cluster call.",
+        )
+    try:
+        rows = _rows(await _read(ctx, "/cluster/sdn/zones"))
+    except _NotConfiguredError:
+        return _NO_CLUSTER
+    except Exception as exc:
+        return _unreachable(exc)
+    serving = [
+        str(row.get("zone", ""))
+        for row in rows
+        if str(row.get("dhcp", "")).strip() and str(row.get("zone", ""))
+    ]
+    if serving:
+        return ProbeResult(
+            True,
+            f"DHCP is configured on SDN zone(s): {', '.join(sorted(serving))}. The guest "
+            "still gets nothing unless dnsmasq is installed on the node that serves it.",
+        )
+    return ProbeResult(
+        False,
+        "no SDN zone on this cluster runs a DHCP server, so a guest told ip=dhcp "
+        "would boot with no address at all - which is the failure this setting "
+        "exists to end. Leave provision_ip_mode on 'static'.",
+    )
+
+
+async def probe_nameserver(value: Any, ctx: ProbeContext) -> ProbeResult:
+    """Syntax only, and it says so. There is no cluster question: the resolver
+    is written into the guest's cloud-init and it is the GUEST that finds out
+    whether it answers. The shape is what can honestly be checked here."""
+    text = str(value or "").strip()
+    if not text:
+        return ProbeResult(
+            True,
+            "No nameserver: a statically-addressed guest gets no resolver of its own, "
+            "which on a subnet with no DHCP means no name resolution at all.",
+        )
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError as exc:
+        return ProbeResult(False, f"{text!r} is not an IP address: {exc}")
+    if not isinstance(addr, ipaddress.IPv4Address):
+        return ProbeResult(False, f"{text!r} is IPv6; the guest subnet is IPv4")
+    return ProbeResult(
+        True, f"Checked locally: {addr} is a valid resolver address. No cluster call."
+    )
+
+
 async def _network_entries(ctx: ProbeContext) -> tuple[list[dict[str, Any]], ProbeResult | None]:
     try:
         # type=any_bridge, because a plain /network listing omits SDN vnet
@@ -527,6 +594,8 @@ PROBES: dict[str, ProbeFn] = {
     "provision_default_bridge": probe_bridge,
     "provision_default_vlan_tag": probe_vlan_tag,
     "provision_default_ipconfig": probe_ipconfig,
+    "provision_ip_mode": probe_ip_mode,
+    "provision_default_nameserver": probe_nameserver,
     "guest_network_zone": _shape_probe(_check_zone),
     "guest_network_vnet": _shape_probe(_check_vnet),
     "guest_network_subnet": _shape_probe(_check_subnet),

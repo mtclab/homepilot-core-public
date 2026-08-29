@@ -85,6 +85,7 @@ def portal_app(portal_db, portal_proxmox):
     # The portal's per-CN redemption limiter is module state; a test must never
     # inherit another test's attempts.
     portal_router_module._redeem_attempts.clear()
+    portal_router_module._rejoin_attempts.clear()
 
     application = FastAPI()
     application.include_router(portal_router, prefix="/invite")
@@ -101,9 +102,18 @@ def portal_app(portal_db, portal_proxmox):
         task_timeout_s=5.0,
         ip_wait_s=2.0,
         ip_interval=0.05,
+        # The guest agent answers immediately in these journeys, so the wait is
+        # only ever one ping; bounded small so a fake that stops answering fails
+        # the test instead of timing it out.
+        agent_wait_s=1.0,
+        agent_interval=0.05,
+        cloud_init_wait_s=2.0,
+        tailscale_timeout_s=5.0,
+        tailscale_install_timeout_s=5.0,
     )
     yield application
     portal_router_module._redeem_attempts.clear()
+    portal_router_module._rejoin_attempts.clear()
 
 
 # ── The real hp-agent binary ─────────────────────────────────────────────────

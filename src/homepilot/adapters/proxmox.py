@@ -344,6 +344,19 @@ class ProxmoxClient:
             body["sshkeys"] = quote(str(body["sshkeys"]), safe="")
         return await self.call("POST", f"/nodes/{node}/qemu/{vmid}/config", body=body)
 
+    async def get_vm_config(self, node: str, vmid: int, guest_type: str = "qemu") -> dict[str, Any]:
+        """One guest's configuration as PVE stores it (#630).
+
+        `guest_type` because an LXC container's config lives in a different
+        collection and states its address on the NIC line rather than on a
+        cloud-init one - and a container on the guest wire holds an address
+        just as firmly as a VM does.
+        """
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/config")
+        data = result.get("data", result)
+        return data if isinstance(data, dict) else {}
+
     async def resize_disk(self, node: str, vmid: int, disk: str, size: str) -> dict[str, Any]:
         return await self.call(
             "PUT",
@@ -393,9 +406,7 @@ class ProxmoxClient:
         except ProxmoxError:
             return False
 
-    async def agent_exec(
-        self, node: str, vmid: int, command: list[str], capture_output: bool = False
-    ) -> dict[str, Any]:
+    async def agent_exec(self, node: str, vmid: int, command: list[str]) -> dict[str, Any]:
         """Run one command inside a guest through qemu-guest-agent.
 
         PVE takes the argv as repeated `command` parameters; a single string
@@ -404,16 +415,28 @@ class ProxmoxClient:
         that is fatal.
 
         Returns the guest agent's PID, NOT a result: exec is asynchronous, so a
-        caller that needs the outcome must poll `agent_exec_status`.
-        `capture_output` is what makes that outcome carry stdout/stderr.
+        caller that needs the outcome must poll `agent_exec_status`, which does
+        carry the guest's stdout and stderr.
+
+        `command` IS THE ONLY PARAMETER. 3.6.12 also sent `capture-output: 1`,
+        reasoning that output had to be asked for - and PVE refused every call
+        with `400 property is not defined in schema and the schema does not
+        allow additional properties`, because its exec endpoint declares
+        `additionalProperties => 0` and has never taken that argument. PVE sets
+        `capture-output` on the guest-agent command ITSELF, so exec-status
+        carries out-data/err-data either way.
+
+        That one invented parameter is the whole of #628's live failure: it made
+        `agent_run` - the wait-and-check-the-exit-status loop that the tailnet
+        join was rewritten around - fail on its FIRST call against every real
+        guest, which the operator saw as "Could not ask vmid 101 whether
+        tailscale is installed". It shipped because every fake in the suite
+        answered exec with a pid no matter what was sent.
         """
-        body: dict[str, Any] = {"command": command}
-        if capture_output:
-            body["capture-output"] = 1
         return await self.call(
             "POST",
             f"/nodes/{node}/qemu/{vmid}/agent/exec",
-            body=body,
+            body={"command": command},
         )
 
     async def agent_exec_status(self, node: str, vmid: int, pid: int) -> dict[str, Any]:
@@ -475,7 +498,7 @@ class ProxmoxClient:
         Raises ProxmoxError if the agent refuses the command, RuntimeError if it
         accepts it without a pid, and TimeoutError if it never exits.
         """
-        started = await self.agent_exec(node, vmid, ["sh", "-c", script], capture_output=True)
+        started = await self.agent_exec(node, vmid, ["sh", "-c", script])
         # Reached on the CLASS, not through self: these two are fixed rules for
         # reading a PVE answer, not behaviour a subclass or a test double should
         # be able to replace out from under the wait loop.

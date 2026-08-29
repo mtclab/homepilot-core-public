@@ -189,6 +189,73 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        # Admin tier, mirroring POST /guests/{vmid}/tailnet-join, which is
+        # require_scope("admin") - it runs a command inside somebody's machine.
+        #
+        # Why the key IS allowed on this surface when a minted invite token is
+        # not (see this module's docstring): provision_guest already takes a
+        # tailscale_auth_key, so the assistant is already a channel for one, and
+        # a retry that could not be reached from the same place as the original
+        # attempt would send the operator hunting for a different surface at the
+        # exact moment something has gone wrong. What is forbidden is MINTING a
+        # secret into a transcript; carrying one the caller already holds, once,
+        # to the machine it is for, is what this whole path does.
+        "name": "rejoin_tailnet",
+        "description": (
+            "Retry the tailnet join on a guest that ALREADY EXISTS, with a fresh auth "
+            "key - no re-provisioning, nothing on the guest is rebuilt. The usual "
+            "reason a join failed is an expired or already-used key, which only a new "
+            "key fixes. STARTS AN ASYNC task and returns its task_id with status "
+            "'pending'; poll get_task_result: its 'result' carries 'tailnet' - 'joined', "
+            "'failed' (the guest was asked and said no) or 'unknown' (nothing could be "
+            "established, so a fresh key will not help) - and 'tailnet_detail', the "
+            "reason in plain words. "
+            "Installs tailscale in the guest first if it has none (unless "
+            "provision_tailscale_install is off). node and tailnet_hostname come from "
+            "the guest's inventory row when not given. The key is used once and is never "
+            "stored, audited or logged. Admin only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "vmid": {"type": "integer", "description": "VMID of the existing guest"},
+                "auth_key": {
+                    "type": "string",
+                    "description": (
+                        "A FRESH tskey-... auth key. Used once in-memory and never "
+                        "persisted or logged"
+                    ),
+                },
+                "node": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Proxmox node the guest is on; omit to take it from the "
+                        "guest's inventory row, then provision_default_node"
+                    ),
+                },
+                "tailnet_hostname": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "The name the machine takes ON THE TAILNET; omit to use the "
+                        "guest's inventory hostname. Not called `host`/`hostname`, "
+                        "because which machine this addresses is `vmid` (#608)"
+                    ),
+                },
+            },
+            "required": ["vmid", "auth_key"],
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "status": {"type": "string"},
+                "vmid": {"type": "integer"},
+                "node": {"type": "string"},
+            },
+            "required": ["task_id", "status", "vmid", "node"],
+        },
+    },
+    {
         # Admin tier, like provision_guest: this WRITES to the cluster (it can
         # add a content type to a storage and it creates a VM), and the template
         # it builds is what every later provision clones.
@@ -448,6 +515,56 @@ async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any])
     except ProvisionConflictError as exc:
         raise ValueError(str(exc)) from exc
     return {"task_id": task_id, "status": "pending"}
+
+
+async def handle_rejoin_tailnet(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    """Retry a tailnet join through the SAME ProvisionService the route uses (#628).
+
+    The node/hostname fallback chain is `resolve_join_target`, which the HTTP
+    route calls too: one implementation, so the two transports cannot answer
+    differently about the same guest.
+    """
+    from pydantic import ValidationError
+
+    from ...provision.models import TailnetJoinRequest
+    from ...provision.service import (
+        TailnetJoinConflictError,
+        TailnetJoinTargetError,
+        resolve_join_target,
+    )
+
+    service = ctx.get("provision_service")
+    if service is None or getattr(service, "proxmox", None) is None:
+        raise ValueError("Proxmox not configured")
+    vmid = arguments.get("vmid")
+    if not isinstance(vmid, int) or isinstance(vmid, bool) or vmid <= 0:
+        raise ValueError("vmid must be a positive integer naming an existing guest")
+    try:
+        body = TailnetJoinRequest(
+            auth_key=str(arguments.get("auth_key") or ""),
+            node=arguments.get("node"),
+            tailnet_hostname=arguments.get("tailnet_hostname"),
+        )
+    except ValidationError as exc:
+        # The message names the FIELD, never the value: a validation error that
+        # echoed the auth key back would put it in the transcript.
+        raise ValueError(f"Invalid tailnet-join request: {exc.errors()[0]['msg']}") from exc
+
+    try:
+        node, hostname = await resolve_join_target(
+            service, vmid, node=body.node, hostname=body.tailnet_hostname
+        )
+    except TailnetJoinTargetError as exc:
+        raise ValueError(str(exc)) from exc
+
+    actor = str(ctx.get("_mcp_caller_id") or "mcp")
+    try:
+        task_id = await service.start_tailnet_join(
+            node=node, vmid=vmid, hostname=hostname, key=body.auth_key, actor=actor
+        )
+    except TailnetJoinConflictError as exc:
+        raise ValueError(str(exc)) from exc
+    return {"task_id": task_id, "status": "pending", "vmid": vmid, "node": node}
 
 
 async def handle_create_guest_template(

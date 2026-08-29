@@ -23,17 +23,43 @@ every five seconds; it takes a couple of minutes.</p>
     <dt>VM id</dt><dd>{{ result.vmid }}</dd>
     <dt>Address</dt><dd>{{ result.ip or "not reported yet" }}</dd>
     <dt>Username</dt><dd>{{ username }}</dd>
-    {% if result.tailnet %}
-    <dt>Tailnet</dt><dd>{{ "joined" if result.tailnet == "joined" else "join failed - run tailscale up yourself" }}</dd>
+    {% if tailnet %}
+    {# Three answers, not two. "not joined" means the machine was asked and said
+       no - usually a used or expired key, which a fresh one fixes. "not
+       established" means nothing could be found out at all, and a fresh key
+       will not help (#642). #}
+    <dt>Tailnet</dt>
+    <dd>{% if rejoin_running %}joining now{% elif tailnet == "joined" %}joined{% elif tailnet == "unknown" %}not established{% else %}not joined{% endif %}</dd>
     {% endif %}
   </dl>
 </div>
+{% if tailnet and tailnet != "joined" and not rejoin_running %}
+<p class="notice">{{ tailnet_detail or "The tailnet join did not succeed, and no reason was recorded." }}</p>
+{% endif %}
 {% if result.ip %}
 <h2>Connect</h2>
 <pre class="connect">ssh {{ username }}@{{ result.ip }}</pre>
 {% else %}
 <p class="notice">No address has been reported yet. Refresh in a minute; if it stays empty, ask
 the operator.</p>
+{% endif %}
+
+{% if join_error %}
+<p class="notice">{{ join_error }}</p>
+{% endif %}
+{% if can_rejoin and tailnet != "joined" and not rejoin_running %}
+<h2>Try the tailnet again</h2>
+<p class="lede">The commonest reason a join fails is a key that has already been used or has
+expired. Mint a fresh one in your own tailscale admin console and paste it here: the machine
+is not rebuilt, and the key is used once and never stored.</p>
+<form method="post" action="{{ join_url }}">
+  <div class="field">
+    <label for="tailscale_auth_key">Fresh tailscale auth key</label>
+    <p class="hint">Your own key, from your own tailnet.</p>
+    <input type="text" id="tailscale_auth_key" name="tailscale_auth_key" value="" required>
+  </div>
+  <button type="submit">Join the tailnet</button>
+</form>
 {% endif %}
 
 {% else %}

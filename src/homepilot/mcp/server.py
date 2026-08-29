@@ -67,6 +67,7 @@ from .tools.guest_tools import (
     handle_delete_guest_quota,
     handle_provision_guest,
     handle_query_guests,
+    handle_rejoin_tailnet,
     handle_revoke_guest_invite,
     handle_set_guest_quota,
 )
@@ -221,6 +222,10 @@ _ADMIN_TOOLS = frozenset(
         # Guest provisioning (owner decision 2026-08-25): POST /guests/provision is
         # API admin; it clones a Proxmox template into a running guest.
         "provision_guest",
+        # Retrying that guest's tailnet join with a fresh key (#628). POST
+        # /guests/{vmid}/tailnet-join is API admin for the same reason
+        # provision is: it runs a command inside somebody's machine.
+        "rejoin_tailnet",
         # Building that template (#594). MCP-only for now - there is no HTTP
         # route to mirror - and it sits with the provisioning tools it feeds: it
         # writes to the cluster (a VM, and possibly a storage content type).
@@ -514,6 +519,7 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "delete_guest_quota": handle_delete_guest_quota,
     "revoke_guest_invite": handle_revoke_guest_invite,
     "provision_guest": handle_provision_guest,
+    "rejoin_tailnet": handle_rejoin_tailnet,
     "create_guest_template": handle_create_guest_template,
     # Read parity with the management API, wave 1. Every one is read-only and
     # calls the same repo/service its management route calls.

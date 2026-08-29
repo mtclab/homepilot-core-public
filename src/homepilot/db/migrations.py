@@ -871,6 +871,58 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             "storage",
         ),
     ],
+    30: [
+        # The tailnet re-join a redeemer can start for themselves (#628).
+        #
+        # First the tasks CHECK constraint, which must admit the 'tailnet_join'
+        # action. Artifactless like 'provision' and 'create_guest_template' - it
+        # runs one command inside one existing guest and authors nothing - so it
+        # relies on the same NULL artifact_id to stay out of the artifact-scoped
+        # dedup/active-task queries.
+        #
+        # Same rebuild dance as migrations 14, 15, 18 and 28 (a CHECK constraint
+        # is not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
+        # recreate the indexes AFTER the drop, because the old indexes ride the
+        # rename and only vanish with the old table.
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT, "
+            "action TEXT NOT NULL "
+            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+            "'create_guest_template', 'tailnet_join')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        #
+        # Its own column rather than reusing resulting_task_id: that one holds
+        # the PROVISION, whose result is what the status page renders (the name,
+        # the VM id, the address, the login). Overwriting it with a re-join task
+        # would blank the machine's own details from the page that exists to
+        # show them.
+        #
+        # NULL means "no re-join has ever been started from this invite", which
+        # is every invite that existed before the column did.
+        (
+            "ALTER TABLE invites ADD COLUMN rejoin_task_id TEXT",
+            "invites",
+            "rejoin_task_id",
+        ),
+    ],
 }
 
 

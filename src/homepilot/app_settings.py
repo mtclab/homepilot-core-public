@@ -22,6 +22,7 @@ labels the rest "restart required" and means it.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
@@ -136,6 +137,43 @@ def _parse_ipconfig(raw: Any) -> str:
             "ip=<address>/<prefix> optionally followed by ,gw=<address>"
         )
     return value
+
+
+# What may decide a guest's address (#630). Two words, and nothing else: a
+# typo'd mode that fell through to "whatever isn't static" would silently put
+# an install back on the DHCP server it does not run.
+IP_MODES = ("static", "dhcp")
+
+
+def _parse_ip_mode(raw: Any) -> str:
+    value = _parse_str(raw).lower()
+    if value == "":
+        # An emptied field is not "no opinion" here: something has to decide the
+        # address. The code default is the honest answer.
+        return "static"
+    if value not in IP_MODES:
+        raise SettingError(f"expected one of {', '.join(IP_MODES)}, got {value!r}")
+    return value
+
+
+def _parse_ipv4(raw: Any) -> str:
+    """A bare IPv4 address, or the empty string.
+
+    Checked here rather than only at use time: this value is written into a
+    guest's cloud-init as its resolver, and a typo becomes a guest that has an
+    address, a route, and no name resolution - the hardest of the three to
+    diagnose from inside.
+    """
+    value = _parse_str(raw)
+    if value == "":
+        return ""
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise SettingError(f"expected an IPv4 address, got {value!r}: {exc}") from exc
+    if not isinstance(addr, ipaddress.IPv4Address):
+        raise SettingError(f"expected an IPv4 address; {value!r} is IPv6")
+    return str(addr)
 
 
 # A PVE storage id, as PVE itself accepts it (#618). The same shape
@@ -396,6 +434,32 @@ REGISTRY: dict[str, SettingSpec] = {
             hot_reloadable=True,
             parse=_parse_ipconfig,
             probe=_cluster_probe("provision_default_ipconfig"),
+        ),
+        SettingSpec(
+            key="provision_ip_mode",
+            type_="str",
+            description=(
+                "Who decides a guest's address. 'static' (the default) has HomePilot "
+                "allocate a free address from the guest subnet at provision time and "
+                "write it into cloud-init; 'dhcp' writes ip=dhcp and leaves the answer "
+                "to a DHCP server on the wire. A PVE SDN zone only serves DHCP through "
+                "dnsmasq, so an install whose node lacks that package must stay static."
+            ),
+            hot_reloadable=True,
+            parse=_parse_ip_mode,
+            probe=_cluster_probe("provision_ip_mode"),
+        ),
+        SettingSpec(
+            key="provision_default_nameserver",
+            type_="str",
+            description=(
+                "Resolver written into a statically-addressed guest's cloud-init. "
+                "Empty leaves the guest with no nameserver of its own, which on a "
+                "subnet with no DHCP means no name resolution at all."
+            ),
+            hot_reloadable=True,
+            parse=_parse_ipv4,
+            probe=_cluster_probe("provision_default_nameserver"),
         ),
         # ── The guest network (#553) ─────────────────────────────────────────
         # What the guest subnet IS. Together these are the desired state a

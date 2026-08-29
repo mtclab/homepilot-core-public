@@ -31,7 +31,7 @@ export const EXTRA_GROUPS: Array<{ id: string; title: string; note: string; keys
 	{
 		id: 'provisioning',
 		title: 'Provisioning defaults',
-		note: 'What guest provisioning uses when a request does not say it itself, so an invite carries a person and a size rather than the cluster\u2019s topology. Each value is checked against the live cluster before it is saved; Test asks without saving. A bridge is per-node, so set the node first - and setting a bridge is what makes provisioning write net0 at all.',
+		note: 'What guest provisioning uses when a request does not say it itself, so an invite carries a person and a size rather than the cluster\u2019s topology. Each value is checked against the live cluster before it is saved; Test asks without saving. A bridge is per-node, so set the node first - and setting a bridge is what makes provisioning write net0 at all. Address mode \u201cstatic\u201d has HomePilot allocate the guest\u2019s address from the guest subnet itself, which is what an install whose node runs no DHCP server needs.',
 		keys: [
 			'provision_default_node',
 			'provision_default_template_vmid',
@@ -40,6 +40,8 @@ export const EXTRA_GROUPS: Array<{ id: string; title: string; note: string; keys
 			'provision_default_bridge',
 			'provision_default_vlan_tag',
 			'provision_default_ipconfig',
+			'provision_ip_mode',
+			'provision_default_nameserver',
 		],
 	},
 ];
@@ -60,6 +62,8 @@ const FIELD_LABELS: Record<string, string> = {
 	provision_default_bridge: 'Bridge',
 	provision_default_vlan_tag: 'VLAN tag (0 = untagged)',
 	provision_default_ipconfig: 'ipconfig0',
+	provision_ip_mode: 'Address mode (static | dhcp)',
+	provision_default_nameserver: 'Nameserver for static addresses',
 	guest_network_zone: 'SDN zone',
 	guest_network_vnet: 'Vnet (the bridge guests get)',
 	guest_network_subnet: 'Subnet (CIDR)',

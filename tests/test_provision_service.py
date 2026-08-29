@@ -119,10 +119,17 @@ class TestHappyPath:
             "name": "web-01",
             "node": "pve1",
             "ip": "10.0.0.42",
+            # How the guest was addressed, in the guest's own words (#630).
+            # This instance describes no guest network, so nothing was
+            # allocated and ip=dhcp is what the guest was actually built with.
+            "ipconfig0": "ip=dhcp",
             "host_id": result["host_id"],
             "ciuser": "friend",
             # No tailscale key was requested, so no tailnet join was attempted.
             "tailnet": None,
+            # WHY, when there is a why. A bare "failed" with no reason is what
+            # the first live run left the operator with (#628).
+            "tailnet_detail": None,
             # The guest network fence (#553), stated even when there is none:
             # "this guest is not fenced" is a fact about the machine an operator
             # must be able to read, and an absent key would leave it ambiguous.
@@ -180,28 +187,69 @@ class TestHappyPath:
         assert rows[0]["user_id"] == "tester"
 
 
-def _guest(proxmox: AsyncMock, *, has_tailscale: bool = True, rc: int = 0) -> list[str]:
-    """A guest that answers agent_run, recording the scripts it was asked to run.
+def _wire_agent_run(px: Any) -> None:
+    """Give a mocked client the REAL exec-and-wait loop.
 
-    `agent_run` is the real exec-and-WAIT: the join used to report success off
-    the pid alone, so a `tailscale up` that exited non-zero looked identical to
-    one that worked (#628). Driving the outcome through rc is what lets these
-    tests tell those apart.
+    A copy of the one in tests/test_agent_enroll.py, deliberately - the rule it
+    encodes is the same and each gate should stand on its own: STUBBING
+    `agent_run` deletes the assertions that ARE that loop (a pid is not a
+    result, a non-zero exit is terminal, a command that never exits times out).
+    Binding the real implementation over the fake's exec/exec-status keeps them.
+
+    This file's fake used to stub `agent_run` outright, which is one of the two
+    reasons a fully green suite never saw any of #628.
+    """
+    from homepilot.adapters.proxmox import ProxmoxClient
+
+    async def run(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        return await ProxmoxClient.agent_run(px, *args, **kwargs)
+
+    px.agent_run = run
+
+
+def _guest(
+    proxmox: AsyncMock, *, has_tailscale: bool = True, rc: int = 0, agent: bool = True
+) -> list[str]:
+    """A guest at the exec/exec-status boundary, with the real wait loop above it.
+
+    `agent_ping` is set EXPLICITLY, and that is not decoration: `AsyncMock(spec=
+    ProxmoxClient)` answers any un-stubbed coroutine with a truthy mock, so a
+    fake that stays silent about the ping silently says "the agent is up" - the
+    other reason the suite was green through #628. A test that wants a guest
+    with no agent has to say so.
+
+    Script SEMANTICS are not tested here; tests/test_tailnet_join.py runs these
+    same scripts through a real /bin/sh. This fake only decides what each script
+    exits with, so the provision run's own branches can be driven.
     """
     scripts: list[str] = []
     state = {"installed": has_tailscale}
+    exits: dict[int, int] = {}
 
-    async def run(node, vmid, script, **kwargs):
-        scripts.append(script)
+    def _outcome(script: str) -> int:
         if script.startswith("command -v tailscale"):
-            return (0 if state["installed"] else 1, "", "")
+            return 0 if state["installed"] else 1
         if "install.sh" in script:
             state["installed"] = True
-            return (0, "", "")
-        return (rc, "", "")
+            return 0
+        if script.startswith("command -v cloud-init") or script.startswith("rm -f"):
+            return 0
+        return rc
 
-    proxmox.agent_run = AsyncMock(side_effect=run)
-    proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
+    async def agent_exec(node, vmid, command):
+        script = command[-1]
+        scripts.append(script)
+        pid = len(scripts)
+        exits[pid] = _outcome(script)
+        return {"data": {"pid": pid}}
+
+    async def agent_exec_status(node, vmid, pid):
+        return {"data": {"exited": 1, "exitcode": exits[pid], "out-data": "", "err-data": ""}}
+
+    proxmox.agent_ping = AsyncMock(return_value=agent)
+    proxmox.agent_exec = AsyncMock(side_effect=agent_exec)
+    proxmox.agent_exec_status = AsyncMock(side_effect=agent_exec_status)
+    _wire_agent_run(proxmox)
     proxmox.agent_write_file = AsyncMock(return_value={"data": {}})
     return scripts
 
@@ -237,20 +285,53 @@ class TestTailnetJoin:
         # reach the task record.
         assert key not in str(task)
 
-    async def test_a_join_that_fails_does_not_fail_the_provision(
+    async def test_a_join_that_cannot_run_does_not_fail_the_provision(
         self, service: ProvisionService, proxmox: AsyncMock
     ):
-        proxmox.agent_run = AsyncMock(
+        """The guest EXISTS by the time the join runs; the join must not undo it.
+
+        And the outcome is `unknown`, not `failed`: a guest agent that refused
+        the command told us nothing about the machine's tailnet, and #642 is the
+        rule that a read which did not happen is not a verdict. It matters to
+        the person holding the key - `failed` means "get a fresh one", `unknown`
+        means "a fresh one will not help".
+        """
+        proxmox.agent_ping = AsyncMock(return_value=True)
+        proxmox.agent_exec = AsyncMock(
             side_effect=ProxmoxError("POST", "/agent/exec", 500, "no guest agent")
         )
-        proxmox.agent_exec = AsyncMock(return_value={"data": {"pid": 1}})
+        _wire_agent_run(proxmox)
 
         task = await _run_to_completion(
             service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
         )
 
         assert task["status"] == "succeeded", task["error"]
-        assert json.loads(task["result_json"])["tailnet"] == "failed"
+        result = json.loads(task["result_json"])
+        assert result["tailnet"] == "unknown"
+        assert result["tailnet_detail"], "an outcome with no reason is what #628 was"
+
+    async def test_a_guest_whose_agent_never_answers_is_told_so(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#628's live failure: the join fired at a guest that could not answer yet.
+
+        WHAT THIS FORBIDS: reporting a tailnet verdict off a refused exec. The
+        provision must wait for the agent, and when it never comes must say
+        THAT, not "your join failed".
+        """
+        service.agent_wait_s = 0.05
+        service.agent_interval = 0.01
+        scripts = _guest(proxmox, agent=False)
+
+        task = await _run_to_completion(
+            service, _request(tailscale_auth_key="tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk")
+        )
+
+        result = json.loads(task["result_json"])
+        assert result["tailnet"] == "unknown"
+        assert "qemu-guest-agent" in result["tailnet_detail"]
+        assert scripts == [], "commands were sent to a guest that never answered"
 
     async def test_a_guest_without_tailscale_gets_it_installed_first(
         self, service: ProvisionService, proxmox: AsyncMock
@@ -639,6 +720,50 @@ class TestCancelReachesProxmox:
 
         waited = [c.args[1] for c in proxmox.wait_for_task.await_args_list if len(c.args) > 1]
         assert "UPID:pve1:destroy:" in waited, "the destroy task was never waited on"
+
+    async def test_an_unfenced_guest_is_not_called_destroyed_until_it_is(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#642/#626 - the one destroy claim that must not be made off acceptance.
+
+        WHAT THIS FORBIDS: reporting "the half-made guest was destroyed" on the
+        UPID `delete_vm` returns. That sentence is the assurance an UNFENCED
+        guest is off the guest wire - the one place being wrong means a machine
+        nobody has walled off is still running, while the operator has been told
+        it is gone. The sibling path was fixed in #626; this one was missed.
+        """
+        waited: list[str] = []
+
+        async def delete_vm(node, vmid):
+            return "UPID:pve1:destroy-unfenced:"
+
+        async def wait_for_task(node, upid, **kwargs):
+            waited.append(upid)
+            return {"status": "stopped", "exitstatus": "OK"}
+
+        proxmox.delete_vm = AsyncMock(side_effect=delete_vm)
+        proxmox.wait_for_task = AsyncMock(side_effect=wait_for_task)
+
+        said = await service._destroy_unfenced(_request(), 105)
+
+        assert "destroyed" in said
+        assert "UPID:pve1:destroy-unfenced:" in waited, (
+            "an unfenced guest was reported destroyed without waiting for the destroy"
+        )
+
+    async def test_a_destroy_that_fails_asynchronously_is_not_reported_as_gone(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """The honest arm: the wait must be able to CHANGE the answer."""
+        proxmox.delete_vm = AsyncMock(return_value="UPID:pve1:destroy-unfenced:")
+        proxmox.wait_for_task = AsyncMock(
+            side_effect=ProxmoxError("GET", "/tasks", 0, "exitstatus 'destroy failed'")
+        )
+
+        said = await service._destroy_unfenced(_request(), 105)
+
+        assert "could NOT be destroyed" in said
+        assert "may still" in said
 
     async def test_cancel_writes_an_audit_row_and_releases_the_name(
         self, service: ProvisionService, proxmox: AsyncMock, db: Database

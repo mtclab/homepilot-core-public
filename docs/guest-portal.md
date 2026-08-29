@@ -98,6 +98,31 @@ would hand out the router's address, a vnet name longer than PVE's 8-character
 field. PVE accepts all three happily, and the first anybody hears of them is a
 guest with no network.
 
+### Who gives the guest its address (#630)
+
+**HomePilot does, by default.** `provision_ip_mode` ships as `static`: at
+provision time a free address is allocated out of the guest subnet and written
+into the guest's cloud-init as
+`ipconfig0=ip=<addr>/<prefix>,gw=<gateway>`, together with
+`nameserver=<provision_default_nameserver>`.
+
+The DHCP range above is therefore optional equipment, not the mechanism. It has
+to be: a `simple` SDN zone serves DHCP through **dnsmasq**, and on a node
+without that package installed the zone exists, the settings look right, and a
+guest booting on the vnet gets a link-local address and no explanation. That is
+exactly how the first real guest came up. Set `provision_ip_mode` to `dhcp`
+only on an install where something on the wire genuinely answers.
+
+Free addresses are found by scanning the cluster's own guest configs for NICs
+on the vnet - no allocation table, so a destroyed guest's address is free again
+immediately. The lowest free address at or above the tenth host wins; `.1`-`.9`
+are left for infrastructure. An address named on the invite or the request wins
+over the allocator, and an exhausted subnet fails the provision before anything
+is cloned.
+
+The friend sees their address on the portal immediately, without the guest
+agent having to answer: HomePilot chose the address, so it can record it.
+
 ### The change ships as an artifact
 
 Describing the network does not build it. `GET /admin/guest-network` (and the
