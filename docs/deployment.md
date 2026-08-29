@@ -176,8 +176,9 @@ the vault, and cannot be read or written through it.
 
 `HP_PROVISION_DEFAULT_NODE`, `HP_PROVISION_DEFAULT_TEMPLATE_VMID`,
 `HP_PROVISION_DEFAULT_POOL`, `HP_PROVISION_DEFAULT_STORAGE`,
-`HP_PROVISION_DEFAULT_BRIDGE`, `HP_PROVISION_DEFAULT_VLAN_TAG` and
-`HP_PROVISION_DEFAULT_IPCONFIG` are the same kind of setting, on their own
+`HP_PROVISION_DEFAULT_BRIDGE`, `HP_PROVISION_DEFAULT_VLAN_TAG`,
+`HP_PROVISION_DEFAULT_IPCONFIG`, `HP_PROVISION_IP_MODE` and
+`HP_PROVISION_DEFAULT_NAMESERVER` are the same kind of setting, on their own
 **Provisioning defaults** card, and they are what lets an invite stop carrying
 raw infra details: mint an invite without a node or a template and it takes
 both from here, frozen into the invite at mint time. `POST /guests/provision`
@@ -193,10 +194,27 @@ guest recorded `tailnet: failed` and no retry would have helped.
 
 `HP_PROVISION_TAILSCALE_INSTALL` (default `1`) fixes that: when a key is
 supplied and the guest has no `tailscale`, the vendor's own installer is run
-first. It needs the guest to reach the internet - a fenced guest still routes
-out, it is only the LAN it may not touch - and it is skipped entirely when no
-key was given, so a provision without a tailnet request runs no guest commands
-at all.
+first. It is skipped entirely when no key was given, so a provision without a
+tailnet request runs no guest commands at all.
+
+**It needs the guest to reach the internet, and a fenced guest may not.** Docs
+here used to assert that a fenced guest "still routes out, it is only the LAN it
+may not touch". That is a claim about a particular network, not a property of
+the fence, and on the dev cluster it is false: a fenced guest resolves names
+through the subnet's own dnsmasq and then cannot open a connection at all -
+
+```
+tailnet: failed
+tailnet_detail: The guest could not download the tailscale installer. Name
+  resolution was not shown to be the problem, so the route out is the thing to
+  look at. The guest said: curl: (7) Failed to connect to tailscale.com port 443
+  after 5087 ms: Could not connect to server
+```
+
+Whether a fenced guest can reach the tailscale control plane is a property of
+YOUR guest network - the SDN zone's SNAT, the vnet's forward rules, and whatever
+sits upstream of the node. If it cannot, no tailnet join can work there, with or
+without the installer, and the join now says which of the two things it was.
 
 Set it to `0` for an image that ships tailscale itself, or an air-gapped guest
 where the installer could not reach the internet anyway. The join is then
@@ -206,6 +224,75 @@ The join is waited for and its exit status checked. PVE's guest-agent exec is
 fire-and-forget - it answers with a pid, not a result - so a `tailscale up`
 that exits non-zero on an expired or already-used key used to be recorded as a
 successful join.
+
+##### What the outcome means
+
+The provision task result carries `tailnet` and `tailnet_detail`. There are
+**three** outcomes, not two, and they are different pieces of advice:
+
+| `tailnet` | What was established | What to do |
+| --- | --- | --- |
+| `null` | No key was supplied; nothing ran inside the guest. | Nothing. |
+| `joined` | `tailscale up` ran in the guest and exited 0. | Nothing. |
+| `failed` | Something was READ that settles it: `tailscale up` exited non-zero (a used or expired key, a refused device), the installer ran and failed, or the guest has no tailscale and installing it is switched off. | Read `tailnet_detail`. A fresh key fixes the key cases. |
+| `unknown` | NOTHING was established: the guest agent never answered, PVE refused the exec, or the install or join ran out of time and may still be finishing. | Read `tailnet_detail`. A fresh key will **not** help. |
+
+`unknown` exists for the reason `DriftState.UNKNOWN` exists (#425, #642): "I
+looked and it says no" and "I could not look" are different answers, and
+collapsing them sends the redeemer after a fresh key on a machine whose problem
+is a missing guest agent.
+
+`tailnet_detail` is the reason in plain words, with every auth key scrubbed out
+of it - both the one we sent (by value) and anything else shaped like a
+`tskey-`. It is what the status page shows the redeemer.
+
+##### What the guest actually needs
+
+* **qemu-guest-agent, running, with `guest-exec` allowed.** It is the whole
+  channel: the join runs commands inside the guest through it. HomePilot waits
+  for it to answer (`agent_ping`, bounded) before sending anything, because a
+  guest that has booted enough to report an IP has not necessarily started its
+  agent. Some builds of qemu-guest-agent ship with `guest-exec` blocked; that
+  refusal is reported as `unknown` with the reason, not as a failed join.
+* **One of `curl`, `wget` or `python3`,** to fetch the vendor installer. A cloud
+  image ships the fetcher its distribution chose, and the images that ship
+  qemu-guest-agent are not the same set as the images that ship curl - so
+  whichever of the three is present is used, and a guest with none of them is
+  told so by name.
+* **A route out and a resolver.** These are reported separately: the installer
+  probes the name lookup itself when a download fails, so "no DNS" and "no route"
+  do not arrive as the same message. If `getent` is missing the DNS verdict is
+  not given at all, because it was not established.
+
+The installer is fetched to a file, checked non-empty, run, and then the binary
+is looked for. `curl ... | sh` was the 3.6.12 form and **cannot fail**: a
+pipeline's exit status is its LAST command's, so a download that 404s feeds `sh`
+an empty script and `sh` exits 0. `set -e` never sees it. That is how a guest
+with no tailscale went on to run `tailscale up` and report a bare `failed`.
+
+##### Retrying a join with a fresh key
+
+A failed join is no longer terminal. The commonest cause - a key that has
+expired or has already been used - is fixed by a new key, and the original
+provision cannot be given one.
+
+* **The guest portal** (`/invite/{token}/status`) shows the reason and a form.
+  This is the primary surface: the redeemer is the person who can mint another
+  key. It reaches only the machine that invite built - the vmid and node come
+  from the invite's own provision result, never from the posted body.
+* **`POST /guests/{vmid}/tailnet-join`** (admin) with `{"auth_key": "tskey-..."}`,
+  optionally `node` and `tailnet_hostname`. Returns a `task_id`; the task's
+  result carries `tailnet` and `tailnet_detail`.
+* **The `rejoin_tailnet` MCP tool** (admin), the same thing over MCP.
+
+There is deliberately **no CLI command**. An `--auth-key tskey-...` flag puts the
+key in an argv and in the operator's shell history, which is the one property
+this code path exists to protect: the key is written to `/run/hp-tailscale.key`
+(tmpfs) through the guest-agent file-write call and deleted by the same shell
+that reads it, so it never reaches a process list or a PVE task error.
+
+Only one join runs against a guest at a time. Two would overwrite each other's
+staged key file, so the second is refused (409) rather than served.
 
 #### Where the disks land (#618)
 
@@ -227,6 +314,50 @@ Provisioning always makes a **full** clone, and #618 does not change that: PVE
 honours a target storage only on a full clone, and a linked clone would bind
 the guest to its template forever - it could never leave the template's
 storage, and the template could no longer be deleted or moved.
+
+#### Who gives the guest its address (#630)
+
+`HP_PROVISION_IP_MODE` decides, and it defaults to **`static`**: HomePilot
+allocates the guest's address out of the guest subnet itself and writes it into
+cloud-init. `dhcp` restores the older behaviour - `ipconfig0=ip=dhcp` and
+something on the wire has to answer.
+
+Static is the default because of what happened the first time a real guest
+booted onto the SDN guest network: PVE's simple zone serves DHCP through
+**dnsmasq**, the node did not have dnsmasq installed, and installing it is a
+node mutation an operator is entitled to refuse. The guest came up with a
+link-local address and nothing reported a problem - the clone succeeded, the
+fence was written, the VM started. A product that can address its own guests
+does not need a server it cannot install.
+
+Allocation happens when ALL of these hold, and does nothing otherwise:
+
+* the resolved `ipconfig0` is `ip=dhcp` - an explicit address on the request,
+  on the invite, or in `HP_PROVISION_DEFAULT_IPCONFIG` is respected unchanged;
+* `HP_PROVISION_IP_MODE` is `static`;
+* the guest is going onto the guest network's own vnet (that is,
+  `HP_PROVISION_DEFAULT_BRIDGE` equals `HP_GUEST_NETWORK_VNET`) - the same
+  condition that decides the per-VM fence, so a VM on `vmbr0` is never handed
+  a guest-subnet address.
+
+What it writes: `ipconfig0=ip=<addr>/<prefix>,gw=<guest network gateway>` plus
+`nameserver=` from `HP_PROVISION_DEFAULT_NAMESERVER` (default `1.1.1.1`) -
+nothing hands out a resolver on a subnet with no DHCP either.
+
+Which address: the **lowest free** one at or above the tenth host address;
+`.1`-`.9` are left for infrastructure. "Free" is decided by a LIVE SCAN of the
+cluster - every guest config with a NIC on the guest vnet, VM and container
+alike - minus the network, broadcast and gateway addresses. There is no
+allocation table on purpose: a destroyed guest frees its address the moment it
+is gone, an address typed into the PVE UI by hand is respected, and nothing can
+drift from what the cluster actually says. A scan that cannot complete refuses
+the provision rather than risk handing out an address twice.
+
+An invite that froze `ip=dhcp` in its caps is allocated at REDEMPTION, not at
+mint: two outstanding invites must not be able to claim the same address.
+
+A subnet with no free address fails the provision **before the clone**, so a
+failed allocation never leaves an orphaned guest on the node.
 
 #### Building the template itself (#594)
 
@@ -954,7 +1085,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.13` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.14` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -974,6 +1105,8 @@ If the restore was wrong, everything it replaced is under
 | `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
 | `HP_PROVISION_TAILSCALE_INSTALL` | `1` | Install tailscale in a guest that has none before joining it to the requester's tailnet. `0` for an image that ships tailscale itself, or a guest with no route out - the join is then reported failed rather than attempted |
+| `HP_PROVISION_IP_MODE` | `static` | Who decides a guest's address: `static` allocates a free one from the guest subnet at provision time; `dhcp` writes `ip=dhcp` and leaves it to a DHCP server on the wire |
+| `HP_PROVISION_DEFAULT_NAMESERVER` | `1.1.1.1` | Resolver written into a statically-addressed guest's cloud-init. Empty leaves the guest with no resolver |
 | `HP_GUEST_NETWORK_ZONE` | `guest` | SDN zone the guest network lives in (1-8 characters, PVE's own limit) |
 | `HP_GUEST_NETWORK_VNET` | `innkeep` | Vnet guests attach to. Point `HP_PROVISION_DEFAULT_BRIDGE` at this name to put provisioned guests on it |
 | `HP_GUEST_NETWORK_SUBNET` | — | The guest subnet in CIDR form, e.g. `198.51.100.0/24`. Empty means this instance describes no guest network |

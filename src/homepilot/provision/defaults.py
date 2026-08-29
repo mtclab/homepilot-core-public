@@ -36,6 +36,8 @@ KEYS = (
     "provision_default_vlan_tag",
     "provision_default_ipconfig",
     "provision_tailscale_install",
+    "provision_ip_mode",
+    "provision_default_nameserver",
 )
 
 
@@ -58,6 +60,16 @@ class ProvisioningDefaults:
     # Defaults to True so a fresh install can actually honour a key it is given
     # - nothing installed it before, which is why no join could ever work.
     tailscale_install: bool = True
+    # Who decides a guest's address (#630). "static" is the code default, and
+    # the empty string a resolver-less process reads back is treated as it
+    # rather than as "dhcp": an install that cannot read its settings must not
+    # fall back to depending on a DHCP server it may not have.
+    ip_mode: str = "static"
+    nameserver: str = ""
+
+    @property
+    def allocates_addresses(self) -> bool:
+        return (self.ip_mode or "static").strip().lower() != "dhcp"
 
     @property
     def net0(self) -> str | None:
@@ -117,6 +129,8 @@ async def provisioning_defaults(source: Any = None) -> ProvisioningDefaults:
             if values.get("provision_tailscale_install") is None
             else int(values["provision_tailscale_install"])
         ),
+        ip_mode=str(values["provision_ip_mode"] or "static"),
+        nameserver=str(values["provision_default_nameserver"] or ""),
     )
 
 

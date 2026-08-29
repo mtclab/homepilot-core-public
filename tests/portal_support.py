@@ -55,6 +55,15 @@ class FakePVE:
     def __init__(self) -> None:
         self.seen: list[tuple[str, str]] = []
         self.bodies: dict[str, Any] = {}
+        # The guest's side of a tailnet join, which the journey gates drive both
+        # ways (#628): a first attempt whose key is refused, then a retry with a
+        # fresh one that works. Keyed by pid, because exec-status is a SEPARATE
+        # call that knows nothing but the pid - which is the whole reason
+        # `agent_run` exists and the whole reason the 3.6.12 join was wrong.
+        self.scripts: dict[int, str] = {}
+        self.next_pid = 4242
+        self.tailscale_up_rc = 0
+        self.tailscale_up_err = ""
 
     def handle(self, request: Request) -> Response:
         path = request.url.path.removeprefix("/api2/json")
@@ -74,8 +83,61 @@ class FakePVE:
             return Response(200, json={"data": None})
         if path == "/nodes/pve1/qemu/105/status/start":
             return Response(200, json={"data": START_UPID})
+        # The guest-agent surface, ALL of it (#628). This fake used to answer
+        # /agent/exec with a pid and nothing else, so `agent_run` raised on the
+        # exec-status poll and every tailnet join in these journeys came out
+        # "failed" - which the tests then asserted as if it were the shipped
+        # behaviour. A fake that cannot succeed proves nothing about success.
+        if path == "/nodes/pve1/qemu/105/agent/ping":
+            return Response(200, json={"data": {}})
+        if path == "/nodes/pve1/qemu/105/agent/file-write":
+            return Response(200, json={"data": {}})
         if path == "/nodes/pve1/qemu/105/agent/exec":
-            return Response(200, json={"data": {"pid": 4242}})
+            # PVE declares `additionalProperties => 0` on this endpoint and
+            # refuses a body carrying anything it does not name. A fake that
+            # shrugs at an extra parameter is how 3.6.12 shipped an
+            # `agent_exec` sending `capture-output: 1`, which PVE rejected on
+            # EVERY call - the whole of #628's live failure (see
+            # tests/test_proxmox_provision_adapter.py for the dedicated gate).
+            extra = sorted(set(self.bodies.get(path) or {}) - {"command"})
+            if extra:
+                return Response(
+                    400,
+                    json={
+                        "data": None,
+                        "message": "Parameter verification failed.\n",
+                        "errors": {
+                            name: (
+                                "property is not defined in schema and the schema "
+                                "does not allow additional properties"
+                            )
+                            for name in extra
+                        },
+                    },
+                )
+            self.next_pid += 1
+            command = (self.bodies.get(path) or {}).get("command") or []
+            self.scripts[self.next_pid] = command[-1] if command else ""
+            return Response(200, json={"data": {"pid": self.next_pid}})
+        if path == "/nodes/pve1/qemu/105/agent/exec-status":
+            pid = int(request.url.params.get("pid", 0))
+            script = self.scripts.get(pid, "")
+            # A guest that already has tailscale: the probe finds it, so nothing
+            # is installed and the only command with an interesting outcome is
+            # the join itself.
+            if "tailscale up" in script and self.tailscale_up_rc:
+                return Response(
+                    200,
+                    json={
+                        "data": {
+                            "exited": 1,
+                            "exitcode": self.tailscale_up_rc,
+                            "out-data": "",
+                            "err-data": self.tailscale_up_err,
+                        }
+                    },
+                )
+            return Response(200, json={"data": {"exited": 1, "exitcode": 0, "out-data": ""}})
         if path == "/nodes/pve1/qemu/105/agent/network-get-interfaces":
             return Response(
                 200,

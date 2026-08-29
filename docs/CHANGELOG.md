@@ -1,5 +1,179 @@
 # Changelog
 
+## 3.6.14 - 2026-08-29
+
+### A confined guest agent is not a broken network
+
+Running the join against a real Fedora guest showed the last of it. On any
+SELinux-enforcing distribution (Fedora, RHEL, Rocky, Alma, CentOS) the
+qemu-guest-agent runs as the confined domain `virt_qemu_ga_t`, which may not
+open http or https. From the installer's side that is indistinguishable from a
+dead route: `curl` simply cannot connect.
+
+So the guest was told to check the route out - and the route out was fine. From
+that same guest, TCP to `1.1.1.1:53` connects and `:443` returns EPERM before a
+packet leaves. Sending an operator to fix a working network is the most
+expensive way to be wrong, so the installer now asks `id -Z` first and names the
+confinement, with the remedy that actually applies: put tailscale in the image,
+or install it in the guest yourself.
+
+
+### The tailnet join, run against a real guest (#628)
+
+3.6.12 shipped an install-then-join that had never been run against a guest. A
+live run on dev proves it fails on the first one it meets, 28 seconds in,
+logging one line: `Could not ask vmid 101 whether tailscale is installed`. The
+task recorded `"tailnet": "failed"` and nothing else - no reason, for the
+operator or for the friend holding the machine.
+
+**`curl ... | sh` cannot fail.** A pipeline's exit status is its LAST command's,
+so a download that 404s, is refused by DNS or is cut off feeds `sh` an empty
+script and `sh` exits 0. The comment above it claimed `set -e` covered that; it
+did not. The installer is now fetched to a file, checked non-empty, run, and
+then the binary is looked for - because an installer exiting 0 is not evidence
+that anything was installed either (#642, one layer down).
+
+**The join fired before the guest could answer.** The machine had booted and an
+IP had come back, but qemu-guest-agent need not have started accepting commands
+yet. The join now waits for a ping, bounded - and when the agent never answers,
+says so instead of blaming the key. (This was NOT what the live run turned out
+to be failing on; see the `agent_exec` section below for that.)
+
+**curl is not a given.** A cloud image ships the fetcher its distribution chose,
+and the images that ship qemu-guest-agent are not the same set as the images
+that ship curl. Whichever of curl / wget / python3 is present is used; a guest
+with none of them is told so by name.
+
+**A failure now says why**, in the requester's own words, with every auth key
+scrubbed out of it - the one we sent, by value, and anything else shaped like a
+`tskey-`. "Your key was already used" is actionable. "failed" cost a rebuilt
+guest to diagnose.
+
+**"I could not look" is not "it said no" (#642).** `tailnet` has a third value,
+`unknown`, on the paths that established nothing: the agent never answered, PVE
+refused the exec, the install or the join ran out of time. It is not pedantry -
+`failed` tells the redeemer to mint a fresh key, and on these paths a fresh key
+cannot help.
+
+**The staged key is shredded through a call whose result is read.** The cleanup
+fired `rm` through `agent_exec`, which answers with a pid: the same "acceptance
+is not completion" mistake the join itself was built on, and what it leaves
+behind is somebody's auth key on a disk.
+
+Also: only one join runs against a guest at a time (two would overwrite each
+other's staged key file, so the second is refused), and the whole join is
+contained - nothing it raises can turn a built machine into a failed provision.
+
+How far the live evidence actually goes is set out in "What the live run proved,
+and what it did not" below. It stops short of the installer running.
+
+### `agent_exec` sent PVE a parameter that does not exist (#628)
+
+The live root cause, found by running the 3.6.12 code on dev and reading the
+reason the new failure text carries:
+
+```
+"tailnet": "unknown",
+"tailnet_detail": "The guest agent answered a ping but would not run a command:
+ POST nodes/pve/qemu/102/agent/exec -> 400: {\"errors\":{\"capture-output\":
+ \"property is not defined in schema and the schema does not allow additional
+ properties\"}}"
+```
+
+3.6.12 added `agent_run` - exec, then poll exec-status until it exits - so that
+a `tailscale up` which failed could not be reported as a join. It sent
+`capture-output: 1` with the exec, reasoning that output had to be asked for.
+PVE's exec endpoint declares `additionalProperties => 0` and has never taken
+that parameter, so it refused **every** call. PVE sets `capture-output` on the
+guest-agent command itself, so exec-status carries out-data/err-data anyway.
+
+So the fix that was supposed to make the join honest could not run at all, and
+the operator saw one line: *"Could not ask vmid 101 whether tailscale is
+installed"*. Nothing had been run inside a guest by this code path, ever.
+
+The fakes are why: every one of them answered exec with a pid whatever was
+sent. They now enforce PVE's own parameter list and refuse an extra exactly as
+PVE does, in the dedicated adapter gate and in the portal journey's transport.
+
+### What the live run proved, and what it did not
+
+Run on dev against a real Fedora 44 guest, through the product's own surfaces.
+
+**Proved.** The guest agent is waited for and answers; `agent_exec` +
+`exec-status` complete; the wait loop reads a real exit status; that status
+reaches the caller; and the reason text names the stage that failed and quotes
+the guest. A fresh provision, end to end, 39 seconds:
+
+```
+tailnet: failed
+tailnet_detail: The guest could not download the tailscale installer. Name
+  resolution was not shown to be the problem, so the route out is the thing to
+  look at. The guest said: curl: (7) Failed to connect to tailscale.com port 443
+  after 5087 ms: Could not connect to server
+```
+
+and the same through `POST /guests/{vmid}/tailnet-join` on an existing guest,
+which is the re-join surface working end to end.
+
+**NOT proved, and it matters.** The vendor installer never ran, `tailscale up`
+never ran, and the Tailscale control plane was never reached - because on the
+dev guest network a FENCED GUEST HAS NO ROUTE OUT. It gets an address and
+resolves names through the subnet's own dnsmasq, and then cannot open a
+connection. So on that network no tailnet join can succeed at all, installer or
+no installer, and the remaining work for #628 is the guest network, not this
+code path. The docs asserted the opposite ("a fenced guest still routes out, it
+is only the LAN it may not touch"); that claim is removed.
+
+**Also not proved: that a guest appears on a tailnet.** No tailscale auth key
+exists in this estate, so every live run used a deliberately invalid one. The
+registration itself is untested.
+
+### Retrying a join with a fresh key (#628)
+
+A failed join used to be terminal: the status page told the redeemer to run
+`tailscale up` themselves on a machine they had only just been handed, and
+nothing in the product would try again. The commonest cause - a key that has
+expired or has already been used - is fixed by a FRESH key, which is exactly
+what the original provision cannot be given.
+
+The redeemer's own **guest portal** status page now shows the reason and offers
+a form for a new key; it can only ever reach the machine that invite built,
+because the vmid and node come from the invite's own provision result and never
+from the posted body. Operators get `POST /guests/{vmid}/tailnet-join` and the
+`rejoin_tailnet` MCP tool, both admin, both driven by the same resolution as
+each other.
+
+There is deliberately **no CLI command**: an `--auth-key tskey-...` flag would put
+the key in an argv and in shell history, which is the one property this code
+path exists to protect. A standing gate forbids one.
+
+### The tool that reports outcomes could not report these (#628)
+
+`get_task_result` declared `artifact_id: string` while every provision,
+tailnet-join and template-build task carries NULL, so an MCP client validating
+structured content refused the whole answer: *"Structured content does not match
+the tool's output schema: data/artifact_id must be string"*. Reproduced live on
+dev against a real provision task. The field is nullable now, and the task's own
+`result` comes back with it - reading a provision used to answer with four empty
+strings and nothing about the machine it built.
+
+### A 422 no longer hands back what it rejected
+
+FastAPI's default validation handler echoes the rejected value under `input`.
+This API takes a `tailscale_auth_key` in a request body, so a key that failed
+the shape check came straight back out to its caller and into whatever logs the
+round trip touched. `loc`, `msg` and `type` are kept; the value is not.
+
+### Two fakes that were why a green suite saw none of it
+
+`tests/test_provision_service.py` stubbed `agent_run` outright, deleting the
+exec-and-wait loop that is half of what was wrong, and left `agent_ping`
+un-stubbed - which on an `AsyncMock(spec=...)` answers truthy, silently asserting
+that every guest's agent was up. The guest in the new gates is a real `/bin/sh`
+with a PATH of fake binaries the test composes, running the ACTUAL scripts: the
+`curl ... | sh` defect fails a test in one line, which is the only way that class
+of bug is ever caught.
+
 ## 3.6.13 - 2026-08-29
 
 ### An unread is not a fact (#642)
@@ -143,6 +317,43 @@ a guest that may already be running, which PVE refuses - so a cancelled provisio
 recorded "cleanup failed" and left a live VM on the node. Cancel now shares the
 stop-then-destroy the post-failure cleanup already had, and waits for the destroy
 task, so "deleted" means gone.
+### HomePilot gives a guest its address itself (#630)
+
+Prod's SDN guest network has no DHCP server. A `simple` zone serves DHCP
+through **dnsmasq**, the node does not have dnsmasq installed, and installing it
+is a node mutation the operator refuses - rightly. Provisioning wrote
+`ipconfig0=ip=dhcp` regardless, so the first real guest booted with a
+link-local address while everything reported success: the clone finished, the
+fence was written, the VM started, the task said "succeeded".
+
+Provisioning no longer depends on a server this product does not run. A new
+**`provision_ip_mode`** setting (Settings -> Provisioning defaults,
+`HP_PROVISION_IP_MODE`) defaults to **`static`**: when the resolved `ipconfig0`
+is `ip=dhcp` and the guest is going onto the guest network's own vnet,
+HomePilot allocates a free address out of the guest subnet and writes
+`ip=<addr>/<prefix>,gw=<gateway>` into cloud-init, with a resolver from the new
+**`provision_default_nameserver`** (default `1.1.1.1`) - nothing hands one of
+those out on a subnet with no DHCP either. `provision_ip_mode=dhcp` restores
+the previous behaviour exactly.
+
+Which address is free is decided by a **live scan of the cluster's own guest
+configs** - every VM and container with a NIC on the vnet - never by a table.
+So a destroyed guest's address is free the moment the guest is gone, and an
+address an operator typed into the PVE UI is respected. The lowest free host
+address at or above the tenth wins; `.1`-`.9` stay with infrastructure. A scan
+that cannot complete refuses rather than risk issuing an address twice, and an
+exhausted subnet fails the provision **before the clone**, so a refusal never
+strands a half-made guest on the node.
+
+An operator-written static address still wins, from the request, from the
+`provision_guest` tool or from `provision_default_ipconfig`. An invite that
+froze `ip=dhcp` in its caps is allocated at redemption rather than at mint, so
+two outstanding invites cannot claim one address.
+
+The allocated address goes onto the guest record and into the provision result
+(which now also states the `ipconfig0` the guest was built with), so the friend
+sees their address on the portal immediately - a bare cloud image may never run
+the guest agent this used to wait for.
 
 ## 3.6.9 - 2026-08-28
 
@@ -885,7 +1096,7 @@ configuration exited the process outright.
   Phase B provisioning was undeliverable on a stock install.
 - **P0: every successful apply reported failure to the operator (#467).** The
   executor and the task runner each performed the same transition, so a correct
-  apply ended with `Invalid transition: applied → applied` and a `failed` task.
+  apply ended with `Invalid transition: applied -> applied` and a `failed` task.
 - **P0: an upgrade either stranded the fleet or refused to boot (#468).**
 - **The dashboard overstated connected agents (#469).** It counted a persisted
   column that survives an unclean disconnect, while `/agents/` read the live
@@ -950,7 +1161,7 @@ Manage imported hosts, end to end — plus deployment robustness.
   ansible needs a full shell that breaks containment). A new **`host-provision`
   artifact kind** describes a host's desired state declaratively (packages
   installed, services in a state, config files written) and applies it through
-  the propose → approve → apply lifecycle, with read-only drift detection. Paired
+  the propose -> approve -> apply lifecycle, with read-only drift detection. Paired
   with Phase A (introspect-on-adopt, in 2.6.0), HomePilot can now observe and
   provision an imported host without reverse-engineering it.
 
@@ -1081,7 +1292,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
   (accepts `host` or `host:port`) controls the address the enrollment endpoints
   and UI install command hand to agents. Set it to the HomePilot host's IP when
   HomePilot sits behind a reverse proxy so agents dial the raw hub port instead
-  of the proxy. Resolution order: this setting → non-wildcard bind host →
+  of the proxy. Resolution order: this setting -> non-wildcard bind host ->
   request hostname.
 
 ## v2.3.8 (2026-06-12)
@@ -1157,7 +1368,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 - **Inventory status on refresh (#318)**: a guest that is shut down now surfaces
   as `offline` after an inventory refresh, instead of staying `unknown`. Derived
   `status` was previously computed only during enrichment; the refresh path now
-  derives it (`stopped → offline`, `running + ip → online`) for nodes and guests,
+  derives it (`stopped -> offline`, `running + ip -> online`) for nodes and guests,
   on both create and update. `Repository.create_host` gains a `status` argument
   (was hard-coded to `unknown`).
 - **Proxmox settings endpoints + client close**: restored the admin Proxmox
@@ -1196,7 +1407,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 ### Features
 
-- **Dual PVE tokens (read + write)**: Separate low-privilege read token and higher-privilege write token for Proxmox operations. Read operations use `pve-token` from vault; mutations (POST/PUT/DELETE) use `pve-write-token` if configured, otherwise fall back to read token. Configurable in web UI (Settings → Proxmox) or via vault.
+- **Dual PVE tokens (read + write)**: Separate low-privilege read token and higher-privilege write token for Proxmox operations. Read operations use `pve-token` from vault; mutations (POST/PUT/DELETE) use `pve-write-token` if configured, otherwise fall back to read token. Configurable in web UI (Settings -> Proxmox) or via vault.
 - **Token scope display**: Settings UI shows the scope of the current API token (e.g., `read,write` or `read_only`) after login, with warnings for insufficient scope and link to create a new token.
 - **Proxmox Settings UI**: Configure Proxmox host, port, and both API tokens from the web UI (`/ui/settings`). Connection status and Test Connection button.
 - **Agents page**: Web UI at `/ui/agents` showing connected agent status.
@@ -1233,7 +1444,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 ### Security
 
-- **vitest 2.1.9→4.1.7**: Dev dependency bump in `/web/` (PR #287).
+- **vitest 2.1.9->4.1.7**: Dev dependency bump in `/web/` (PR #287).
 - **esbuild 0.25.12**: Fixed esbuild dev server CVE (medium, absorbed via transitive dep).
 - **vite 6.4.2**: Fixed CVE-2026-39365 path traversal (medium, absorbed via transitive dep).
 - **Deferred**: CVE-2024-47764 cookie (low, SvelteKit transitive dep, no safe fix).
@@ -1243,7 +1454,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 ### Features
 
 - **Auto-generate vault passphrase**: When neither `HP_VAULT_PASSPHRASE` nor `HP_VAULT_PASSPHRASE_FILE` is set, the system generates a 256-bit passphrase using `secrets.token_urlsafe(32)` and persists it to `{data_dir}/.vault_passphrase` (mode `0o600`). On subsequent starts, the persisted passphrase is loaded automatically. This enables zero-secrets deployment where `.env` contains no HomePilot secrets.
-- **`_try_vault_secret` multi-key extraction**: The configuration resolver now attempts multiple keys when extracting secrets from the vault: `value` → `secret` → `key` → `token` → first value. This accommodates different vault secret formats (e.g., `pve-token` stored as `{"token": "..."}` vs `secret-key` stored as `{"value": "..."}`).
+- **`_try_vault_secret` multi-key extraction**: The configuration resolver now attempts multiple keys when extracting secrets from the vault: `value` -> `secret` -> `key` -> `token` -> first value. This accommodates different vault secret formats (e.g., `pve-token` stored as `{"token": "..."}` vs `secret-key` stored as `{"value": "..."}`).
 - **Zero-secrets deployment verified**: Production dev server (homepilot.example.com:8000) now runs with zero HomePilot secrets in `.env`. All 5 secrets are stored in the encrypted vault and resolved at runtime.
 
 ### Bug Fixes

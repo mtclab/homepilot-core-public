@@ -34,6 +34,7 @@ from homepilot.mcp.server import _TOOL_DEFINITIONS, _TOOL_HANDLERS
 from homepilot.mcp.tools.artifact_tools import handle_get_artifact, handle_get_task_result
 from homepilot.mcp.tools.system_tools import handle_check_host_reachable
 from homepilot.tasks.repository import TaskRepository
+from tests.mcp_schema import assert_matches_output_schema
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,6 +53,18 @@ systemctl restart nginx
 
 def _tool(name: str) -> dict:
     return next(t for t in _TOOL_DEFINITIONS if t["name"] == name)
+
+
+def _assert_matches_output_schema(name: str, result: dict) -> None:
+    """The answer must satisfy the schema the tool advertises for it.
+
+    An MCP client validates structured content against outputSchema and refuses
+    the whole answer when it does not match, so a schema the handler cannot
+    satisfy is not a documentation problem - it is the tool not working (#628).
+    """
+    schema = _tool(name).get("outputSchema")
+    assert schema, f"{name} advertises no outputSchema"
+    assert_matches_output_schema(schema, result)
 
 
 @pytest.fixture
@@ -147,6 +160,63 @@ class TestTheAgentCanLearnTheOutcome:
     async def test_asking_for_nothing_is_an_error(self, ctx):
         with pytest.raises(ValueError, match="task_id or artifact_id"):
             await handle_get_task_result({}, ctx)
+
+    @pytest.mark.parametrize(
+        "action", ["provision", "tailnet_join", "create_guest_template", "install_agent"]
+    )
+    async def test_an_artifactless_task_answers_within_its_own_output_schema(self, ctx, action):
+        """#628 - the only tool that reports an outcome could not report these.
+
+        WHAT THIS FORBIDS: a declared output schema the handler cannot satisfy.
+        `artifact_id` was typed `string` while every artifactless task carries
+        NULL, so an MCP client validating structured content refused the answer
+        outright: "Structured content does not match the tool's output schema:
+        data/artifact_id must be string". Reproduced live on dev against a real
+        provision task before it was fixed.
+
+        Teeth: put `"artifact_id": {"type": "string"}` back and every case here
+        fails.
+        """
+        task_repo = ctx["task_repo"]
+        task_id = await task_repo.create_task(None, action)
+        await task_repo.update_task_status(
+            task_id,
+            "succeeded",
+            result_json=json.dumps({"vmid": 105, "tailnet": "failed", "tailnet_detail": "why"}),
+        )
+
+        result = await handle_get_task_result({"task_id": task_id}, ctx)
+
+        _assert_matches_output_schema("get_task_result", result)
+        assert result["artifact_id"] is None
+        assert result["action"] == action
+
+    async def test_the_task_result_itself_comes_back_not_just_the_execution_log(self, ctx):
+        """A provision's outcome lives in `result_json`, not in `execution_log`.
+
+        WHAT THIS FORBIDS: answering a provision or a tailnet re-join with four
+        empty strings. `execution_log` is the artifact runner's own field and
+        nothing else writes it, so reading a provision through this tool used to
+        say nothing whatever about the machine it built - or about why a tailnet
+        join did not happen, which is the one thing the caller needs.
+        """
+        task_repo = ctx["task_repo"]
+        task_id = await task_repo.create_task(None, "tailnet_join")
+        await task_repo.update_task_status(
+            task_id,
+            "succeeded",
+            result_json=json.dumps(
+                {"vmid": 105, "tailnet": "failed", "tailnet_detail": "invalid key: already used"}
+            ),
+        )
+
+        result = await handle_get_task_result({"task_id": task_id}, ctx)
+
+        assert result["result"] == {
+            "vmid": 105,
+            "tailnet": "failed",
+            "tailnet_detail": "invalid key: already used",
+        }
 
 
 class TestTheAgentCanSeeTheWorkingProvisioningKind:

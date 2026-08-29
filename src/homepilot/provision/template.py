@@ -468,7 +468,18 @@ class GuestTemplateService:
         if proxmox is None:  # pragma: no cover - the caller checked create_issued
             return f"no Proxmox client to destroy with, vmid {vmid} may remain"
         try:
-            await proxmox.delete_vm(node, vmid)
+            # Waited on, like every other destroy: the returned UPID means the
+            # work was accepted, and "destroyed the half-made template" is a
+            # claim an operator acts on when they retry the build under the same
+            # vmid (#626/#642).
+            destroy_upid = await proxmox.delete_vm(node, vmid)
+            if destroy_upid:
+                await proxmox.wait_for_task(
+                    node,
+                    destroy_upid,
+                    timeout_s=self.task_timeout_s,
+                    poll_interval=self.poll_interval,
+                )
         except Exception as exc:
             logger.error("Could not destroy the half-made template %s on %s: %s", vmid, node, exc)
             return f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"

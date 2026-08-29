@@ -216,10 +216,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_task_result",
         "description": (
-            "The outcome of an apply/replay/revoke: status, error and the execution log "
-            "the runner kept. Pass a task_id, or an artifact_id to get its most recent "
-            "task. Without this an agent can propose work and never learn whether it "
-            "succeeded. Requires read scope."
+            "The outcome of ANY task this install ran - apply, replay, revoke, provision, "
+            "tailnet_join, guest-template build: status, error, the execution log the "
+            "runner kept, and `result`, the task's own recorded outcome (a provision's "
+            "vmid/ip/tailnet, a tailnet_join's tailnet/tailnet_detail). Pass a task_id, or "
+            "an artifact_id to get its most recent task. Without this an agent can start "
+            "work and never learn whether it succeeded. Requires read scope."
         ),
         "inputSchema": {
             "type": "object",
@@ -231,15 +233,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
             },
         },
+        # artifact_id is NULLABLE and must say so. A provision, a tailnet re-join
+        # and a guest-template build all carry no artifact, so the handler
+        # returned null against a schema that promised a string - and every one
+        # of those tasks came back over MCP as "Structured content does not match
+        # the tool's output schema: data/artifact_id must be string", which is
+        # to say the ONLY tool that reports an outcome could not report the
+        # outcome of the tools that most need one (#628).
         "outputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
-                "artifact_id": {"type": "string"},
+                "artifact_id": {"type": ["string", "null"]},
                 "action": {"type": "string"},
                 "status": {"type": "string"},
                 "error": {"type": ["string", "null"]},
                 "execution_log": {"type": "string"},
+                "result": {"type": ["object", "null"]},
             },
             "required": ["id", "status"],
         },
@@ -706,19 +716,32 @@ async def handle_get_task_result(arguments: dict[str, Any], ctx: dict[str, Any])
         raise ValueError(f"Task not found: {task_id or artifact_id}")
 
     execution_log = ""
+    result: dict[str, Any] | None = None
     raw = task.get("result_json")
     if raw:
         try:
-            execution_log = str(json.loads(raw).get("execution_log", ""))
+            parsed = json.loads(raw)
         except (ValueError, TypeError):
-            execution_log = ""
+            parsed = None
+        if isinstance(parsed, dict):
+            result = parsed
+            execution_log = str(parsed.get("execution_log", ""))
     return {
         "id": task.get("id", ""),
-        "artifact_id": task.get("artifact_id", ""),
+        # `.get(key, "")` returns the STORED None, not the default, because the
+        # key is present: every provision / tailnet_join / template build has a
+        # null artifact_id and every one of them broke this tool's own output
+        # schema. Nullable in the schema, nullable here (#628).
+        "artifact_id": task.get("artifact_id"),
         "action": task.get("action", ""),
         "status": task.get("status", ""),
         "error": task.get("error"),
         "execution_log": execution_log,
+        # The task's whole recorded outcome. `execution_log` is the artifact
+        # runner's field and only the artifact runner writes it, so reading a
+        # provision through this tool used to answer with four empty strings and
+        # nothing at all about the machine it built.
+        "result": result,
     }
 
 

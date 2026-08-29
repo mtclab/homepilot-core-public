@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     provision_default_bridge: str = ""
     provision_default_vlan_tag: int = 0
     provision_default_ipconfig: str = "ip=dhcp"
+    # Who decides a guest's address (#630). "static" - the default - means
+    # HomePilot allocates one from the guest subnet itself at provision time;
+    # "dhcp" means it writes ip=dhcp and something else on the wire has to
+    # answer. Static is the default because a PVE SDN zone only serves DHCP
+    # through dnsmasq, and a node without that package hands a guest nothing at
+    # all - which is exactly what happened to the first real guest.
+    provision_ip_mode: str = "static"
+    # The resolver a statically-addressed guest is given. Without a DHCP server
+    # there is nothing to hand out a nameserver either, so a guest with an
+    # address and no resolver is still a guest that cannot do anything.
+    provision_default_nameserver: str = "1.1.1.1"
 
     # The guest network (#553). Empty subnet/gateway means this instance
     # describes no guest network at all: nothing is surveyed and provisioning

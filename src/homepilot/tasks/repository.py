@@ -15,14 +15,24 @@ def _uuid4() -> str:
     return str(uuid.uuid4())
 
 
-VALID_ACTIONS = {"apply", "revoke", "replay", "provision", "install_agent", "create_guest_template"}
+VALID_ACTIONS = {
+    "apply",
+    "revoke",
+    "replay",
+    "provision",
+    "install_agent",
+    "create_guest_template",
+    # Retrying a guest tailnet join with a fresh key (#628). Its own action, not
+    # a second "provision": nothing is cloned, configured or recorded as a host.
+    "tailnet_join",
+}
 
 # Actions that create infrastructure rather than apply an artifact. They carry a
 # NULL artifact_id BY CONTRACT (both ways: artifactless actions must not name an
 # artifact, artifact actions must name one) so they can never be picked up by the
 # artifact-scoped dedup/active-task queries — a provision task must not block, or
 # be mistaken for, an apply/revoke on some artifact.
-ARTIFACTLESS_ACTIONS = {"provision", "install_agent", "create_guest_template"}
+ARTIFACTLESS_ACTIONS = {"provision", "install_agent", "create_guest_template", "tailnet_join"}
 
 
 def _validate_action(action: str, artifact_id: str | None) -> None:

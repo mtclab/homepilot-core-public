@@ -312,6 +312,9 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     # Guest provisioning (owner decision 2026-08-25): POST /guests/provision is API
     # admin; it clones a Proxmox template into a running guest.
     ("POST", "/guests/provision"): "provision_guest",
+    # #628: retrying the tailnet join on an existing guest. Same admin scope as
+    # provision - it runs a command inside somebody's machine.
+    ("POST", "/guests/{vmid}/tailnet-join"): "rejoin_tailnet",
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {

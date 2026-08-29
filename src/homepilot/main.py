@@ -17,6 +17,8 @@ import httpx
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.dependencies.models import Dependant
 from fastapi.dependencies.utils import get_dependant
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.routing import APIRoute
@@ -881,6 +883,29 @@ async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """A 422 that says WHICH field, never what was in it (#628).
+
+    FastAPI's default handler echoes the rejected value back under `input`, and
+    this API takes secrets in request bodies: a `tailscale_auth_key` that failed
+    the shape check came straight back out in the response, into the caller's
+    console and into whatever logs the round trip touched. The key is the one
+    thing this whole provisioning path is careful with - staged in tmpfs, kept
+    off every argv, scrubbed out of guest output - and the validator handed it
+    to anyone who mistyped it.
+
+    `loc`, `msg` and `type` are kept, which is everything a caller needs to fix
+    the call; every validator in this codebase names the FIELD in its message
+    rather than quoting the value.
+    """
+    errors = [
+        {key: value for key, value in error.items() if key not in ("input", "ctx", "url")}
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
 from .admin.router import router as admin_router  # noqa: E402
 from .agent_hub.router import router as agent_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
@@ -969,6 +994,11 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/invite/{token}"),
         ("POST", "/invite/{token}"),
         ("GET", "/invite/{token}/status"),
+        # The redeemer's tailnet retry (#628). Same trust model, and the same
+        # reason it is here: the CN is re-derived per request and the target
+        # guest comes from THIS invite's own provision result, never from the
+        # posted body - a redeemer has no say in which machine it reaches.
+        ("POST", "/invite/{token}/tailnet-join"),
         # Guest API (#442 G1): same mTLS trust model as the invite portal -
         # every route re-derives the CN through portal.trust and scopes every
         # query to hosts the CN owns. No API token exists on the guest side.

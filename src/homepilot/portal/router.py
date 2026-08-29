@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from ..common import SlidingWindowLimiter
 from ..config import get_settings
+from ..provision.models import validate_tailscale_auth_key
+from ..provision.service import TailnetJoinConflictError
 from .models import RedemptionIdentity, build_provision_request, caps_from_row
 from .repository import InviteRepository, invite_state
 from .templates import SECURITY_HEADERS, render
@@ -27,6 +29,14 @@ router = APIRouter()
 _REDEEM_LIMIT = 10
 _REDEEM_WINDOW_SECONDS = 300
 _redeem_attempts = SlidingWindowLimiter(limit=_REDEEM_LIMIT, window_seconds=_REDEEM_WINDOW_SECONDS)
+
+# Re-joins get their OWN bucket (#628). Sharing the redemption one would mean a
+# friend who retried a tailnet join five times could no longer redeem a second
+# invite, and a redemption storm would lock a machine's owner out of fixing its
+# tailnet - two unrelated actions taking each other's budget.
+_REJOIN_LIMIT = 5
+_REJOIN_WINDOW_SECONDS = 300
+_rejoin_attempts = SlidingWindowLimiter(limit=_REJOIN_LIMIT, window_seconds=_REJOIN_WINDOW_SECONDS)
 
 # Bound the body we will parse as a form. The portal takes four short fields; a
 # larger body is not a redemption.
@@ -161,9 +171,18 @@ def _machine_facts(task: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "name": parsed.get("name"),
         "vmid": parsed.get("vmid"),
+        # The node, so the re-join knows where the machine is without asking the
+        # inventory a second time. Never rendered: it is infrastructure, not the
+        # friend's business.
+        "node": parsed.get("node"),
         "ip": parsed.get("ip"),
         "ciuser": parsed.get("ciuser"),
         "tailnet": parsed.get("tailnet"),
+        # WHY the tailnet is not up, in the redeemer's own words. Before this
+        # the page said "join failed - run tailscale up yourself" to somebody
+        # who had just been handed a machine and had no idea which of six
+        # things had gone wrong (#628).
+        "tailnet_detail": parsed.get("tailnet_detail"),
         "host_id": parsed.get("host_id"),
     }
 
@@ -302,22 +321,43 @@ async def invite_redeem(request: Request, token: str) -> Any:
     )
 
 
-@router.get("/{token}/status", response_class=HTMLResponse)
-async def invite_status(request: Request, token: str) -> HTMLResponse:
-    try:
-        cn = _client_cn(request)
-        invites = _repo(request)
-    except PortalNotConfiguredError as exc:
-        return _unavailable(str(exc))
-    except PortalUntrustedError:
-        return _refused()
+def _rejoin_facts(task: dict[str, Any] | None) -> dict[str, Any]:
+    """What the LAST tailnet re-join established, if one was ever started (#628).
 
-    row = await invites.get_by_token(token)
-    # No open-state check here: this page exists precisely for an invite that
-    # has already been redeemed. The CN binding is still enforced.
-    if row is None or row["bound_cn"] != cn or row["redeemed_at"] is None:
-        return _not_usable()
+    Named fields only, like `_machine_facts` and for the same reason: a task row
+    carries operator-facing error text that is not the friend's business. The
+    outcome and its reason are.
+    """
+    if not task:
+        return {}
+    facts: dict[str, Any] = {"status": str(task.get("status") or "")}
+    raw = task.get("result_json")
+    if raw:
+        try:
+            parsed = json.loads(str(raw))
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            facts["tailnet"] = parsed.get("tailnet")
+            facts["tailnet_detail"] = parsed.get("tailnet_detail")
+    return facts
 
+
+async def _render_status(
+    request: Request,
+    invites: InviteRepository,
+    row: dict[str, Any],
+    token: str,
+    *,
+    join_error: str | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    """The redeemer's own page: what their machine is, and what its tailnet is doing.
+
+    Shared by GET /{token}/status and by every failing branch of the re-join
+    POST, so a rejected key comes back on the page it was typed on rather than
+    on a dead end the friend has to navigate away from.
+    """
     task_repo = getattr(request.app.state, "task_repo", None)
     task = None
     if task_repo is not None and row["resulting_task_id"]:
@@ -338,10 +378,184 @@ async def invite_status(request: Request, token: str) -> HTMLResponse:
     else:
         state = "running"
 
+    # A re-join, if one was ever started from this page. Its answer WINS over
+    # the provision's: it is the newer reading of the same question, and the
+    # whole point of the retry is that the first answer is no longer current.
+    rejoin: dict[str, Any] = {}
+    if task_repo is not None and row["rejoin_task_id"]:
+        rejoin = _rejoin_facts(await task_repo.get_task(str(row["rejoin_task_id"])))
+    tailnet = facts.get("tailnet")
+    tailnet_detail = facts.get("tailnet_detail")
+    rejoin_running = bool(rejoin) and rejoin.get("status") in ("pending", "running")
+    if rejoin and not rejoin_running and rejoin.get("tailnet") is not None:
+        tailnet = rejoin.get("tailnet")
+        tailnet_detail = rejoin.get("tailnet_detail")
+    elif rejoin and not rejoin_running and rejoin.get("status") == "failed":
+        # A re-join task that failed outright established nothing, and must not
+        # leave the older verdict standing as if it had (#642).
+        tailnet = "unknown"
+        tailnet_detail = "The retry could not be run. Ask the operator to look at it."
+
     return render(
         "status.html",
+        status_code=status_code,
         state=state,
-        finished=state != "running",
-        result={k: facts.get(k) for k in ("name", "vmid", "ip", "tailnet")},
+        # The page stops refreshing when the machine is settled AND no re-join
+        # is in flight - otherwise it would sit on "joining" forever.
+        finished=state != "running" and not rejoin_running,
+        result={k: facts.get(k) for k in ("name", "vmid", "ip")},
+        tailnet=tailnet,
+        tailnet_detail=tailnet_detail,
+        rejoin_running=rejoin_running,
+        # The form posts back to the invite's own path, exactly like the
+        # redemption form does - the token is already in the address bar, and
+        # building the URL here keeps it out of the template's hands.
+        join_url=f"/invite/{token}/tailnet-join",
+        # Only a machine that exists can be re-joined, and only when a key was
+        # part of the deal in the first place: an invite whose redeemer never
+        # gave one gets no form, because there would be nothing to retry.
+        can_rejoin=state == "ok" and facts.get("vmid") is not None and tailnet is not None,
+        join_error=join_error,
         username=facts.get("ciuser") or "",
+    )
+
+
+@router.get("/{token}/status", response_class=HTMLResponse)
+async def invite_status(request: Request, token: str) -> HTMLResponse:
+    try:
+        cn = _client_cn(request)
+        invites = _repo(request)
+    except PortalNotConfiguredError as exc:
+        return _unavailable(str(exc))
+    except PortalUntrustedError:
+        return _refused()
+
+    row = await invites.get_by_token(token)
+    # No open-state check here: this page exists precisely for an invite that
+    # has already been redeemed. The CN binding is still enforced.
+    if row is None or row["bound_cn"] != cn or row["redeemed_at"] is None:
+        return _not_usable()
+
+    return await _render_status(request, invites, row, token)
+
+
+@router.post("/{token}/tailnet-join", response_class=HTMLResponse)
+async def invite_rejoin_tailnet(request: Request, token: str) -> Any:
+    """Retry the tailnet join on the machine this invite built, with a FRESH key.
+
+    The redeemer's surface, and the primary one: they are the person holding the
+    key, and the commonest reason a join failed - an expired or already-used key
+    - can only be fixed by somebody who can mint another. Before this, the
+    status page told them to go and run `tailscale up` themselves on a machine
+    they had just been handed and could not necessarily reach.
+
+    Deliberately NOT a CLI command: an `--auth-key tskey-...` flag puts the key
+    in an argv and in the operator's shell history, which is the one property
+    this entire code path exists to protect.
+
+    The key is read from the form, handed to ProvisionService, and forgotten. It
+    is not stored on the invite, in the task row, in the audit row or in a log
+    line - exactly like the one the redemption form takes.
+    """
+    try:
+        cn = _client_cn(request)
+        invites = _repo(request)
+    except PortalNotConfiguredError as exc:
+        return _unavailable(str(exc))
+    except PortalUntrustedError:
+        return _refused()
+
+    row = await invites.get_by_token(token)
+    if row is None or row["bound_cn"] != cn or row["redeemed_at"] is None:
+        return _not_usable()
+    if row["revoked_at"]:
+        # A revoked invite is an operator saying "this person is done here". The
+        # machine keeps running - revoking an invite has never destroyed one -
+        # but nothing new is started from it.
+        return _not_usable()
+
+    peer = request.client.host if request.client else "?"
+    if not _rejoin_attempts.allow(f"{peer}|{cn}"):
+        return _too_many()
+
+    fields = await _read_form(request)
+    try:
+        key = validate_tailscale_auth_key(fields.get("tailscale_auth_key", ""))
+    except ValueError as exc:
+        # str(exc) is the validator's own message and names the FIELD, never the
+        # value: an error that quoted the key back would put it in the friend's
+        # browser history and in the server log.
+        return await _render_status(
+            request, invites, row, token, join_error=str(exc), status_code=400
+        )
+
+    service = getattr(request.app.state, "provision_service", None)
+    if service is None or getattr(service, "proxmox", None) is None:
+        return await _render_status(
+            request,
+            invites,
+            row,
+            token,
+            join_error="The lab's hypervisor connection is not available. Try again later.",
+            status_code=503,
+        )
+
+    task_repo = getattr(request.app.state, "task_repo", None)
+    task = None
+    if task_repo is not None and row["resulting_task_id"]:
+        task = await task_repo.get_task(str(row["resulting_task_id"]))
+    facts = _machine_facts(task)
+    vmid = facts.get("vmid")
+    node = facts.get("node")
+    if not isinstance(vmid, int) or not node:
+        # The machine this invite built is the ONLY one this form can reach, and
+        # it is named by the invite's own provision result - never by anything
+        # the browser posted. A redeemer cannot aim this at a guest that is not
+        # theirs, because they have no say in the target at all.
+        return await _render_status(
+            request,
+            invites,
+            row,
+            token,
+            join_error=(
+                "This invite has no finished machine to join yet. Wait for the build "
+                "to finish, then try again."
+            ),
+            status_code=409,
+        )
+
+    try:
+        task_id = await service.start_tailnet_join(
+            node=str(node),
+            vmid=vmid,
+            hostname=str(facts.get("name") or ""),
+            key=key,
+            actor=f"invite:{row['token_prefix']}",
+        )
+    except TailnetJoinConflictError:
+        return await _render_status(
+            request,
+            invites,
+            row,
+            token,
+            join_error=(
+                "A tailnet join is already running for this machine. Wait for it to "
+                "finish before sending another key."
+            ),
+            status_code=409,
+        )
+    except Exception as exc:
+        logger.warning("Invite %s could not start a tailnet re-join: %s", row["token_prefix"], exc)
+        return await _render_status(
+            request,
+            invites,
+            row,
+            token,
+            join_error="The retry did not start. Please try again.",
+            status_code=503,
+        )
+
+    await invites.record_rejoin_task(str(row["id"]), task_id)
+    return RedirectResponse(
+        url=f"/invite/{token}/status", status_code=303, headers=dict(SECURITY_HEADERS)
     )

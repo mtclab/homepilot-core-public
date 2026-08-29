@@ -197,6 +197,36 @@ the guest and PVE echoes the command back inside task errors, which is why
 [tailscale's own guidance](https://tailscale.com/kb/1595/secure-auth-key-cli) is
 to pass the key through the environment. A test asserts the key never reaches an
 argv.
-The template therefore needs `qemu-guest-agent` and `tailscale` installed. The
-join is best-effort: if it fails, the machine is still built and the status page
-says the join did not work.
+
+The template needs `qemu-guest-agent` installed, running, and allowed to run
+commands - it is the whole channel. `tailscale` itself is installed for the guest
+when it has none, unless `HP_PROVISION_TAILSCALE_INSTALL=0`; see
+[deployment.md](deployment.md#joining-the-requesters-tailnet-628) for what the
+guest needs and what each outcome means.
+
+The join is best-effort: if it does not work, the machine is still built and the
+status page says so - with the reason, in the redeemer's own words.
+
+### If the join did not work: retry it from the status page
+
+A refused key used to be the end of the road. The status page said "join failed -
+run `tailscale up` yourself" to somebody who had just been handed a machine they
+could not necessarily reach yet, and nothing in the product would try again. The
+commonest cause is a key that has expired or has already been used, and only the
+redeemer can mint another one.
+
+So `/invite/{token}/status` now shows what happened and, when the machine is up
+and its tailnet is not, offers a form for a **fresh** key. Posting it starts a
+`tailnet_join` task against that machine and the page reports the outcome; the
+machine is not rebuilt and nothing about the invite's caps changes.
+
+The form can only ever reach the machine THIS invite built: the vmid and node are
+read from the invite's own provision result, so nothing the browser posts chooses
+a target. It is bound to the same client certificate as the rest of the portal,
+refused on a revoked invite, and rate-limited on its own budget - a retry storm
+cannot lock the friend out of redeeming another invite, and vice versa.
+
+The same retry is available to an operator as `POST /guests/{vmid}/tailnet-join`
+and as the `rejoin_tailnet` MCP tool, both admin. There is deliberately no CLI
+command: an `--auth-key tskey-...` flag would put the key in an argv and in shell
+history, which is precisely what the tmpfs staging above exists to avoid.

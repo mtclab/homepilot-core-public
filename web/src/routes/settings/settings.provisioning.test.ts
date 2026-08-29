@@ -71,6 +71,8 @@ const OVERRIDES = [
 	setting('provision_default_bridge', { value: 'vmbr0', source: 'db' }),
 	setting('provision_default_vlan_tag', { value: 0, type: 'int' }),
 	setting('provision_default_ipconfig', { value: 'ip=dhcp' }),
+	setting('provision_ip_mode', { value: 'static' }),
+	setting('provision_default_nameserver', { value: '1.1.1.1' }),
 ];
 
 function field(key: string): HTMLElement {
@@ -101,8 +103,11 @@ describe('Subsystems tab: provisioning defaults, checked against the cluster', (
 		const card = bridge.closest('.card');
 		expect(card).toBeTruthy();
 		expect(card!.textContent).toContain('Provisioning defaults');
-		// Every one of the seven, on the one card - a default reachable only
-		// through an env var is the state C3 exists to end.
+		// Every one of them, on the one card - a default reachable only
+		// through an env var is the state C3 exists to end, and the address
+		// mode (#630) is exactly the kind of decision that must not hide in a
+		// .env file: it is what stands between a friend and a guest with no
+		// address at all.
 		for (const key of [
 			'provision_default_node',
 			'provision_default_template_vmid',
@@ -111,6 +116,8 @@ describe('Subsystems tab: provisioning defaults, checked against the cluster', (
 			'provision_default_bridge',
 			'provision_default_vlan_tag',
 			'provision_default_ipconfig',
+			'provision_ip_mode',
+			'provision_default_nameserver',
 		]) {
 			expect(card!.contains(field(key))).toBe(true);
 		}

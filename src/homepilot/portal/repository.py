@@ -14,7 +14,7 @@ from .tokens import PREFIX_LENGTH, generate_invite_token, validate_token
 _LIST_COLUMNS = (
     "id, token_prefix, bound_cn, template_vmid, node, pool, storage, cores, memory_mb, "
     "disk_gb, disk, ipconfig0, expires_at, created_by, created_at, redeemed_at, "
-    "redeemed_cn, resulting_host_id, resulting_task_id, revoked_at"
+    "redeemed_cn, resulting_host_id, resulting_task_id, rejoin_task_id, revoked_at"
 )
 
 
@@ -175,6 +175,18 @@ class InviteRepository:
     async def record_task(self, invite_id: str, task_id: str) -> None:
         await self.db.execute(
             "UPDATE invites SET resulting_task_id = ? WHERE id = ?", (task_id, invite_id)
+        )
+        await self.db.conn.commit()
+
+    async def record_rejoin_task(self, invite_id: str, task_id: str) -> None:
+        """Remember the tailnet re-join this invite last started (#628).
+
+        Kept apart from resulting_task_id, which holds the PROVISION: the status
+        page renders the machine's own details out of that task's result, and a
+        re-join task carries none of them.
+        """
+        await self.db.execute(
+            "UPDATE invites SET rejoin_task_id = ? WHERE id = ?", (task_id, invite_id)
         )
         await self.db.conn.commit()
 

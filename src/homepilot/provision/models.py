@@ -200,6 +200,50 @@ class ProvisionRequestIn(ProvisionRequest):
         return ProvisionRequest(**payload)
 
 
+class TailnetJoinRequest(BaseModel):
+    """Retry the tailnet join against a guest that ALREADY EXISTS (#628).
+
+    A failed join used to be terminal: the redeemer was told to run `tailscale
+    up` themselves and there was nothing in the product that would try again.
+    The commonest cause - an expired or already-used key - is fixed by a FRESH
+    key, so a new one is the ONE required field; everything else about the
+    guest HomePilot already knows.
+
+    `node` and `tailnet_hostname` are overrides, not requirements: the guest's
+    own inventory row supplies both, and naming them is for the case where the
+    row is missing or stale.
+
+    It is `tailnet_hostname`, not `hostname`: #608 reserved `host`/`hostname`
+    across this surface for "which machine am I addressing", and here that is
+    `vmid`. This field is the name the machine takes ON THE TAILNET, which is a
+    different thing - and the MCP host-parameter gate rightly refused the tool
+    while it was called `hostname`.
+    """
+
+    auth_key: str
+    node: str | None = None
+    tailnet_hostname: str | None = None
+
+    @field_validator("auth_key")
+    @classmethod
+    def _check_key(cls, v: str) -> str:
+        return validate_tailscale_auth_key(v)
+
+    @field_validator("node")
+    @classmethod
+    def _check_node(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return v.strip()
+
+    @field_validator("tailnet_hostname")
+    @classmethod
+    def _check_tailnet_hostname(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        return _validate_name(v.strip(), "tailnet_hostname")
+
+
 # ── Guest-template creation (#594) ───────────────────────────────────────────
 
 # A volume id as PVE prints it: '<storage>:<content>/<filename>'. The staged

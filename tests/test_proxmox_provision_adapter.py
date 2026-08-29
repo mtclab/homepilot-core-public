@@ -388,3 +388,153 @@ class TestSnapshotGuestType:
 
         assert qemu.called
         assert not lxc.called
+
+
+# ── The guest-agent surface, against a PVE that refuses what it does not declare
+
+
+# PVE's guest-agent endpoints declare `additionalProperties => 0`, so a body
+# carrying ANYTHING the schema does not name is refused outright with 400. This
+# is the parameter list PVE 9 actually accepts, and the fake below enforces it
+# the same way PVE does - which is the whole point: a fake that shrugs at an
+# invented parameter is how one shipped (#628).
+_PVE_AGENT_PARAMS: dict[str, set[str]] = {
+    "exec": {"command"},
+    "exec-status": {"pid"},
+    "file-write": {"file", "content", "encode"},
+    "ping": set(),
+}
+
+
+def _pve_agent_route(endpoint: str, handler):
+    """Wrap a handler in PVE's own parameter check for that endpoint."""
+    allowed = _PVE_AGENT_PARAMS[endpoint]
+
+    def respond(request):
+        sent = set()
+        if request.content:
+            sent |= set(json.loads(request.content))
+        sent |= set(request.url.params)
+        extra = sorted(sent - allowed)
+        if extra:
+            return Response(
+                400,
+                json={
+                    "data": None,
+                    "message": "Parameter verification failed.\n",
+                    "errors": {
+                        name: (
+                            "property is not defined in schema and the schema "
+                            "does not allow additional properties"
+                        )
+                        for name in extra
+                    },
+                },
+            )
+        return handler(request)
+
+    return respond
+
+
+class TestTheGuestAgentSurfaceSendsOnlyWhatPveDeclares:
+    """#628 - the live failure, at the layer it actually happened on.
+
+    3.6.12 added `agent_run` (exec, then poll exec-status until it exits) so a
+    `tailscale up` that failed could not be reported as a join. It sent
+    `capture-output: 1` with the exec, reasoning that output had to be asked
+    for. PVE's exec endpoint declares `additionalProperties => 0` and has never
+    taken that parameter, so it refused EVERY call:
+
+        400 {"errors":{"capture-output":"property is not defined in schema and
+        the schema does not allow additional properties"}}
+
+    Which the operator saw, on the first real guest, as one line: "Could not ask
+    vmid 101 whether tailscale is installed". The fix that was supposed to make
+    the join honest could not run at all.
+
+    WHAT THIS FORBIDS: sending PVE a parameter it does not declare. The fake
+    refuses extras exactly as PVE does, so an invented one fails here instead of
+    on somebody's machine. Teeth: put `capture-output` back into `agent_exec`
+    and every test in this class fails.
+    """
+
+    async def test_exec_sends_the_command_and_nothing_else(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(f"{API}/nodes/pve1/qemu/105/agent/exec")
+            route.side_effect = _pve_agent_route(
+                "exec", lambda request: Response(200, json={"data": {"pid": 4242}})
+            )
+
+            result = await client.agent_exec("pve1", 105, ["sh", "-c", "echo hi"])
+
+        assert result["data"]["pid"] == 4242
+        assert json.loads(route.calls[0].request.content) == {"command": ["sh", "-c", "echo hi"]}
+
+    async def test_agent_run_completes_against_that_pve(self, client: ProxmoxClient):
+        """The goal, not the call: a script runs and its exit status comes back.
+
+        PVE sets `capture-output` on the guest-agent command itself, so
+        exec-status carries out-data/err-data without being asked - which is why
+        dropping the parameter loses nothing.
+        """
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{API}/nodes/pve1/qemu/105/agent/exec").side_effect = _pve_agent_route(
+                "exec", lambda request: Response(200, json={"data": {"pid": 7}})
+            )
+            mock.get(f"{API}/nodes/pve1/qemu/105/agent/exec-status").side_effect = _pve_agent_route(
+                "exec-status",
+                lambda request: Response(
+                    200,
+                    json={
+                        "data": {
+                            "exited": 1,
+                            "exitcode": 1,
+                            "out-data": "",
+                            "err-data": "invalid key: already used",
+                        }
+                    },
+                ),
+            )
+
+            rc, out, err = await client.agent_run("pve1", 105, "tailscale up", poll_interval=0.01)
+
+        assert rc == 1
+        assert err == "invalid key: already used"
+        assert out == ""
+
+    async def test_a_file_write_sends_only_the_file_and_its_content(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(f"{API}/nodes/pve1/qemu/105/agent/file-write")
+            route.side_effect = _pve_agent_route(
+                "file-write", lambda request: Response(200, json={"data": {}})
+            )
+
+            await client.agent_write_file("pve1", 105, "/run/hp-tailscale.key", "tskey-x")
+
+        body = json.loads(route.calls[0].request.content)
+        assert body == {"file": "/run/hp-tailscale.key", "content": "tskey-x"}
+
+    async def test_a_ping_that_pve_refuses_is_false_not_an_exception(self, client: ProxmoxClient):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{API}/nodes/pve1/qemu/105/agent/ping").mock(
+                return_value=Response(500, json={"data": None, "message": "no guest agent"})
+            )
+
+            assert await client.agent_ping("pve1", 105) is False
+
+    async def test_the_fake_refuses_an_invented_parameter(self, client: ProxmoxClient):
+        """Guard the guard: a permissive fake would pass every test above."""
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{API}/nodes/pve1/qemu/105/agent/exec").side_effect = _pve_agent_route(
+                "exec", lambda request: Response(200, json={"data": {"pid": 1}})
+            )
+
+            with pytest.raises(ProxmoxError) as excinfo:
+                await client.call(
+                    "POST",
+                    "/nodes/pve1/qemu/105/agent/exec",
+                    body={"command": ["true"], "capture-output": 1},
+                )
+
+        assert "capture-output" in str(excinfo.value)
+        assert "does not allow additional properties" in str(excinfo.value)
