@@ -339,8 +339,10 @@ class TestHealthStructuredResponse:
         client = TestClient(app)
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -361,8 +363,10 @@ class TestHealthStructuredResponse:
         client = TestClient(app)
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
         mock_settings.cors_origins = "http://localhost:5173"
@@ -382,8 +386,10 @@ class TestHealthStructuredResponse:
         client = TestClient(app)
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(side_effect=Exception("connection lost"))
+        mock_db.fetchall = AsyncMock(side_effect=Exception("connection lost"))
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 

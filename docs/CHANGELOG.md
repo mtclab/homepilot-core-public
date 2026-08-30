@@ -1,5 +1,54 @@
 # Changelog
 
+## 3.6.16 - 2026-08-30
+
+Tranche 4 of the platform review (#648): backup, restore and data durability -
+the capability that had already failed twice this week without anyone noticing.
+
+### A full backup that could not restore the host, while saying it could
+
+`hp export --include-secrets` printed, in red, that the archive was restorable.
+On the deployment our own `docs/deployment.md` describes - compose, a data dir,
+an `env_file` beside the compose file - the vault passphrase lives OUTSIDE the
+data dir, and the secret paths were entirely data-dir relative. So the archive
+carried the vault and not its key.
+
+Restored onto a rebuilt host: `Failed to decrypt identity (wrong passphrase?)`,
+the container exits, every secret unrecoverable - and no way back in, because
+minting a token needs the admin secret, which is in the vault that will not
+open. The trigger is following our own documentation.
+
+### The remedy we printed destroyed the database
+
+`run_migrations` refuses a database newer than the build and names
+`backups/pre-migration-vN.db`. That file is WAL-mode, so copying it over
+`homepilot.db` beside a stale `-wal` replays one database's journal into
+another: `database disk image is malformed`, and now both copies are gone.
+
+That is not hypothetical - it is the 2026-08-29 incident, reproduced by
+following the sentence the product prints. There is now `hp db restore`, which
+moves the sidecars aside and verifies the result, and `hp db check`.
+
+### `database: ok` over a corrupt database
+
+`/health` proved a connection opens (`SELECT 1`), not that the file is readable.
+During the same incident it reported `ok` while `list_tasks` was 500ing on a
+malformed image. It now reads a real row, and a reconciler runs `quick_check` on
+its own connection - the app's page cache hides corruption from the connection
+that has it open. A corrupt database now answers `{"status":"down",
+"database":"corrupt"}` with a 503. `vault: ok` was likewise derived from a glob
+of `*.age` files; it now opens the vault.
+
+### Also
+
+`.env.example` shipped in 3.6.14 and 3.6.15 with unresolved merge conflict
+markers - the file step 1 of every install copies, and one `docker compose`
+would refuse outright. Every parity gate passed over it: they assert that names
+are documented and not inert, and not one asserted the file PARSES. Now gated.
+
+The artifacts remote reported an off-box copy it had never made, and the README
+promised a compaction that cannot happen at `auto_vacuum=0`.
+
 ## 3.6.15 - 2026-08-29
 
 The first three tranches of the platform review (#648). Everything here was

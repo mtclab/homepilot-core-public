@@ -159,6 +159,14 @@ class Settings(BaseSettings):
     # Artifacts are never pruned - they are the record of intent, not history.
     retention_days: int = 90
     retention_interval_seconds: int = 21600
+    # How often `PRAGMA quick_check` is run against the database FILE, on its own
+    # read-only connection (#648 tranche 4). The backend's own connection cannot
+    # answer this: its page cache serves rows out of memory long after the file
+    # underneath has been damaged - verified on a dev instance whose file was
+    # `database disk image is malformed` while every endpoint returned 200. On
+    # 2026-08-29 an OOM kill corrupted a database mid-write and nothing said so
+    # until data was gone. 0 turns the check off.
+    db_integrity_interval_seconds: int = 21600
     # Host management is the product, so the hub is on unless an operator turned
     # it off (ADR-004 S3). Everything it needs that an operator would otherwise
     # have to decide - the shared token below, the TLS certificate - generates

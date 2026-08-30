@@ -187,6 +187,7 @@ class TestOffIsNotBroken:
     async def test_locked_vault_is_unreachable_not_off(self):
         vault = MagicMock()
         vault.list_secrets = AsyncMock(side_effect=RuntimeError("locked"))
+        vault.ensure_master_identity = AsyncMock(side_effect=RuntimeError("locked"))
         entry = _by_name(await selfcheck_report(_stock_state(vault=vault), _stock_settings()))[
             "vault"
         ]
@@ -199,6 +200,7 @@ class TestOffIsNotBroken:
         proxmox.test_connection = AsyncMock(return_value=True)
         vault = MagicMock()
         vault.list_secrets = AsyncMock(return_value=[])
+        vault.ensure_master_identity = AsyncMock(return_value="age1x")
         settings = _stock_settings(proxmox_host="pve.example.com")
 
         entries = _by_name(
@@ -386,6 +388,7 @@ class TestNoSecretsInTheReport:
         proxmox.test_connection = AsyncMock(return_value=True)
         vault = MagicMock()
         vault.list_secrets = AsyncMock(return_value=[])
+        vault.ensure_master_identity = AsyncMock(return_value="age1x")
         hub = MagicMock()
         hub.is_listening.return_value = True
 
@@ -505,6 +508,7 @@ class TestBuildSubsystems:
         )
         vault = MagicMock()
         vault.list_secrets = AsyncMock(return_value=[])
+        vault.ensure_master_identity = AsyncMock(return_value="age1x")
         subsystems = build_subsystems(_stock_state(vault=vault), configured)
         for sub in subsystems:
             assert sub.off.strip(), f"{sub.name} has no 'off' consequence"

@@ -57,11 +57,23 @@ def snapshot_database(db_path: Path, dest_path: Path) -> None:
 
 
 def read_schema_version(db_path: Path) -> int:
-    """Return the recorded schema_version, or 0 for an unmigrated/absent table."""
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    """Return the recorded schema_version, or 0 for an unreadable/unmigrated file.
+
+    `sqlite3.DatabaseError`, not `OperationalError`. The narrower catch was fine
+    until something asked this question about a CORRUPT database - which is
+    precisely when it gets asked, because `hp db restore` reads the version of
+    the file it is about to replace. Found by running the new command against a
+    genuinely malformed dev database: the restore died on
+    `DatabaseError: database disk image is malformed` before it could restore
+    anything, i.e. it failed exactly in the case it exists for.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0
     try:
         row = conn.execute("SELECT value FROM settings WHERE key = 'schema_version'").fetchone()
-    except sqlite3.OperationalError:
+    except sqlite3.DatabaseError:
         return 0
     finally:
         conn.close()
@@ -100,3 +112,53 @@ def ensure_not_locked(db_path: Path) -> None:
         raise
     finally:
         conn.close()
+
+
+def wal_sidecars(db_path: Path) -> tuple[Path, Path]:
+    """The `-wal`/`-shm` files SQLite keeps beside `db_path`."""
+    return (
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    )
+
+
+def remove_wal_sidecars(db_path: Path) -> list[Path]:
+    """Delete any `-wal`/`-shm` left beside `db_path`. Returns what was removed.
+
+    THE reason a restore corrupts a database. A WAL file is not bound to the
+    database it was written from: SQLite replays any `-wal` whose frames
+    checksum, onto whatever main file is sitting next to it. So dropping a
+    backup over `homepilot.db` while the previous database's journal is still
+    there hands SQLite a journal for a file that no longer exists, and the
+    result is `database disk image is malformed` - reproduced on 3.6.15 with the
+    product's own `backups/pre-migration-v29.db`.
+
+    Every path that replaces the database file goes through here.
+    """
+    removed: list[Path] = []
+    for sidecar in wal_sidecars(db_path):
+        if sidecar.exists():
+            sidecar.unlink()
+            removed.append(sidecar)
+    return removed
+
+
+def integrity_problems(db_path: Path, limit: int = 5) -> list[str]:
+    """Rows `PRAGMA quick_check` complains about; empty means the file is sound.
+
+    Used to fail closed BEFORE a backup is installed over a live database: a
+    restore that puts a corrupt file in place destroys both copies at once.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return [f"could not open {db_path}: {exc}"]
+    try:
+        rows = conn.execute(f"PRAGMA quick_check({int(limit)})").fetchall()
+    except sqlite3.DatabaseError as exc:
+        # A malformed header does not answer the pragma, it raises.
+        return [str(exc)]
+    finally:
+        conn.close()
+    problems = [str(row[0]) for row in rows if str(row[0]).lower() != "ok"]
+    return problems

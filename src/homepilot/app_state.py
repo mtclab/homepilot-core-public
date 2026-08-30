@@ -86,13 +86,44 @@ async def create_app_state(settings: Any | None = None) -> AppState:
 
     vault: Any = None
     if settings.vault_passphrase:
-        from .vault import VaultManager
+        from .vault import VaultError, VaultManager
 
         vault_dir = Path(settings.vault_dir) if settings.vault_dir else data_dir / "vault"
         vault_dir.mkdir(parents=True, exist_ok=True)
         vault = VaultManager(data_dir, settings.vault_passphrase)
-        await vault.ensure_master_identity()
-        logger.info("Vault unlocked")
+        try:
+            await vault.ensure_master_identity()
+        except VaultError as exc:
+            # A vault that will not open must NOT take the instance down. This
+            # call was unguarded, so a data dir whose passphrase no longer
+            # matches its identity killed the lifespan outright: "Application
+            # startup failed. Exiting.", exit 3, and under
+            # `restart: unless-stopped` a crash loop - with a 60-line traceback
+            # as the only diagnosis. That is precisely the outcome /health was
+            # changed to prevent ("a vault that needs unlocking ... marked the
+            # container unhealthy over something no restart can repair"); the
+            # lifespan was the surface that had not learned it.
+            #
+            # It is also the ordinary result of restoring a backup without the
+            # source host's passphrase, which `hp export --include-secrets` did
+            # not include until 3.6.16 - so the first thing an operator met
+            # after a restore was a container that would not start.
+            #
+            # The vault object stays on the state, LOCKED: /health then reports
+            # `vault: locked` and /admin/selfcheck says what that costs, which
+            # an operator can read from a running box.
+            logger.error(
+                "VAULT LOCKED: %s. The passphrase in force does not open "
+                "%s/vault/identities/master.protected, so NO stored secret can be read "
+                "(pve-token, admin-secret, webhook secrets). Set HP_VAULT_PASSPHRASE or "
+                "HP_VAULT_PASSPHRASE_FILE to the passphrase from the host that wrote "
+                "this vault. Starting anyway with the vault locked - see "
+                "/admin/selfcheck.",
+                exc,
+                data_dir,
+            )
+        else:
+            logger.info("Vault unlocked")
     else:
         logger.warning("Vault passphrase not set — secrets unavailable until configured")
 

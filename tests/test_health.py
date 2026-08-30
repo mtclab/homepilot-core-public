@@ -57,6 +57,7 @@ class TestTheAgentHubVerdictIsAskedOfTheHub:
     def _state(client, *, listening: bool, enabled: bool = True):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         settings = MagicMock(agent_hub_enabled=enabled, cors_origins="http://localhost:5173")
         settings.proxmox_host = ""
         _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=settings)
@@ -101,6 +102,7 @@ class TestProxmoxIsJudgedFromTheResolvedAddress:
     def _no_client(client, *, resolved_host: str):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         settings.proxmox_host = ""  # the ENV half says nothing
         _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=settings)
@@ -126,8 +128,10 @@ class TestHealthEndpoint:
     def test_all_ok(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -143,8 +147,10 @@ class TestHealthEndpoint:
     def test_db_error_yields_down(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(side_effect=Exception("connection lost"))
+        mock_db.fetchall = AsyncMock(side_effect=Exception("connection lost"))
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -158,10 +164,12 @@ class TestHealthEndpoint:
     def test_proxmox_unreachable_returns_false(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_proxmox = MagicMock()
         mock_proxmox.test_connection = AsyncMock(return_value=False)
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = "pve.example.com"
 
@@ -179,10 +187,12 @@ class TestHealthEndpoint:
     def test_proxmox_unreachable_raises(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_proxmox = MagicMock()
         mock_proxmox.test_connection = AsyncMock(side_effect=Exception("timeout"))
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = "pve.example.com"
 
@@ -200,10 +210,12 @@ class TestHealthEndpoint:
     def test_proxmox_ok(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_proxmox = MagicMock()
         mock_proxmox.test_connection = AsyncMock(return_value=True)
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = "pve.example.com"
 
@@ -220,8 +232,10 @@ class TestHealthEndpoint:
 
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(side_effect=VaultError("locked"))
+        mock_vault.ensure_master_identity = AsyncMock(side_effect=VaultError("locked"))
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -237,6 +251,7 @@ class TestHealthEndpoint:
     def test_vault_not_configured(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -269,8 +284,10 @@ class TestHealthEndpoint:
     def test_proxmox_not_configured(self, client):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -284,8 +301,10 @@ class TestHealthEndpoint:
 
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(side_effect=VaultError("locked"))
+        mock_vault.ensure_master_identity = AsyncMock(side_effect=VaultError("locked"))
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -306,8 +325,10 @@ class TestHealthEndpoint:
 
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(side_effect=VaultError("locked"))
+        mock_vault.ensure_master_identity = AsyncMock(side_effect=VaultError("locked"))
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
 
@@ -408,8 +429,10 @@ class TestLivenessMeansServing:
 
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(side_effect=VaultError("locked"))
+        mock_vault.ensure_master_identity = AsyncMock(side_effect=VaultError("locked"))
         mock_settings = MagicMock(
             agent_hub_enabled=checks.get("hub_enabled", False),
             cors_origins="http://localhost:5173",
@@ -441,6 +464,7 @@ class TestLivenessMeansServing:
         or this change would have traded a false alarm for a missing one."""
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(side_effect=Exception("connection lost"))
+        mock_db.fetchall = AsyncMock(side_effect=Exception("connection lost"))
         mock_settings = MagicMock(agent_hub_enabled=False, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
         _setup_state(client, db=mock_db, proxmox=None, vault=None, settings=mock_settings)
@@ -474,8 +498,10 @@ class TestInformationalFieldsAreNotStatuses:
     def _hub_up(self, client, connected: str):
         mock_db = MagicMock()
         mock_db.execute = AsyncMock(return_value=None)
+        mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
         mock_vault = MagicMock()
         mock_vault.list_secrets = AsyncMock(return_value=[])
+        mock_vault.ensure_master_identity = AsyncMock(return_value="age1x")
         mock_settings = MagicMock(agent_hub_enabled=True, cors_origins="http://localhost:5173")
         mock_settings.proxmox_host = ""
         registry = MagicMock()

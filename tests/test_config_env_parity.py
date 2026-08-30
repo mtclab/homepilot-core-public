@@ -166,6 +166,34 @@ def _extract_image_tag_default(compose_path: Path) -> str | None:
     return None
 
 
+def test_env_example_is_a_usable_env_file() -> None:
+    """`.env.example` is copied to `.env` by step 1 of every install.
+
+    3.6.15 shipped it with UNRESOLVED MERGE CONFLICT MARKERS in it (`<<<<<<<
+    HEAD` around the provisioning defaults, from #630). Every gate here passed:
+    they all look for `NAME=` lines, and a conflict marker is not one. So the
+    file the deployment guide tells an operator to copy - and the restore recipe
+    depends on - was not a valid env file at all, for as long as nobody looked.
+
+    Every non-blank, non-comment line must be a `KEY=value` assignment.
+    """
+    if not _ENV_EXAMPLE.exists():
+        raise AssertionError(f".env.example not found at {_ENV_EXAMPLE}")
+
+    bad: list[str] = []
+    for number, raw in enumerate(_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", line):
+            bad.append(f"{number}: {raw}")
+
+    assert not bad, (
+        ".env.example has lines that are neither comments nor KEY=value "
+        "assignments, so copying it produces a broken .env:\n" + "\n".join(bad)
+    )
+
+
 def test_every_settings_field_is_documented_in_env_example() -> None:
     """Every resolved env name from Settings appears in .env.example."""
     if not _ENV_EXAMPLE.exists():

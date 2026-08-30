@@ -15,6 +15,7 @@ def _make_admin_app() -> FastAPI:
     app.include_router(admin_router, prefix="/admin")
     mock_db = MagicMock()
     mock_db.execute = AsyncMock(return_value=None)
+    mock_db.fetchall = AsyncMock(return_value=[{"key": "schema_version", "value": "1"}])
     app.state.db = mock_db
     app.state.repo = MagicMock()
     app.state.settings = MagicMock(proxmox_host="", proxmox_port=8006, proxmox_verify_ssl=True)

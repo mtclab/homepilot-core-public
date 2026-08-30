@@ -47,6 +47,20 @@ STATE_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
+class ProbeVerdict:
+    """A probe's own answer when `reachable / not reachable` is too coarse.
+
+    Added for the artifacts remote, where three outcomes are genuinely
+    different: pushed recently, never pushed at all, and pushed once a long time
+    ago. Folding the last two into "ok" is how "there is an off-box copy" got
+    asserted about instances that had never made one.
+    """
+
+    state: str
+    consequence: str
+
+
+@dataclass(frozen=True)
 class Subsystem:
     """One optional subsystem and everything needed to report on it honestly.
 
@@ -61,7 +75,7 @@ class Subsystem:
     off: str
     ok: str
     broken: str
-    probe: Callable[[], Awaitable[bool]] | None = None
+    probe: Callable[[], Awaitable[bool | ProbeVerdict]] | None = None
 
 
 async def _tcp_reachable(host: str, port: int) -> bool:
@@ -117,6 +131,28 @@ def agent_hub_listening(hub: Any) -> bool:
     on. Both surfaces now ask the hub itself.
     """
     return hub is not None and bool(hub.is_listening())
+
+
+async def vault_unlocked(vault: Any) -> bool:
+    """Whether the vault can actually be OPENED, not merely listed.
+
+    The same lesson as `agent_hub_listening`, in the subsystem where it costs
+    the most. Both surfaces probed with `list_secrets()`, which is
+    `glob("*.age")` - a directory listing that cannot fail while the directory
+    is readable. So "The vault is unlocked" was established by the presence of
+    filenames, and a vault whose passphrase does not match its identity - the
+    state a restore without the passphrase leaves behind - would have reported
+    `ok` with every secret in it unreadable.
+
+    `ensure_master_identity()` unwraps `master.protected` with the passphrase in
+    force. It caches after the first success, so this costs one AES-GCM open per
+    process and nothing thereafter.
+    """
+    try:
+        await vault.ensure_master_identity()
+    except Exception:
+        return False
+    return True
 
 
 def _embeddings_subsystem(settings: Any) -> Subsystem:
@@ -260,11 +296,7 @@ def _vault_subsystem(state: Any) -> Subsystem:
     vault: Any = getattr(state, "vault", None)
 
     async def probe() -> bool:
-        try:
-            await vault.list_secrets()
-        except Exception:
-            return False
-        return True
+        return await vault_unlocked(vault)
 
     return Subsystem(
         name="vault",
@@ -277,8 +309,12 @@ def _vault_subsystem(state: Any) -> Subsystem:
         ),
         ok="The vault is unlocked; secrets are stored encrypted in the data directory.",
         broken=(
-            "The vault is present but locked, so stored secrets cannot be read. "
-            "Anything depending on them - the Proxmox token above all - will fail."
+            "The vault is present but its identity cannot be unwrapped with the "
+            "passphrase in force, so NO stored secret can be read. Anything depending "
+            "on them - the Proxmox token above all - will fail. This is what a restore "
+            "without the source host's passphrase leaves behind: set "
+            "HP_VAULT_PASSPHRASE (or HP_VAULT_PASSPHRASE_FILE) to the passphrase that "
+            "wrote vault/identities/master.protected."
         ),
         probe=probe if vault is not None else None,
     )
@@ -315,22 +351,84 @@ def _mcp_subsystem(state: Any) -> Subsystem:
     )
 
 
+def _age_seconds(timestamp: str) -> float | None:
+    """Seconds since `timestamp`, or None if it is not one we wrote.
+
+    `repository.now()` writes `%Y-%m-%dT%H:%M:%SZ`. An unparseable value means
+    the caller must not claim an age rather than guessing one.
+    """
+    import datetime
+
+    try:
+        parsed = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.UTC
+        )
+    except (TypeError, ValueError):
+        return None
+    return (datetime.datetime.now(datetime.UTC) - parsed).total_seconds()
+
+
+def _humanise(seconds: float) -> str:
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
 def _artifacts_remote_subsystem(state: Any, settings: Any) -> Subsystem:
     remote = (getattr(settings, "artifacts_remote", "") or "").strip()
     target = redact_endpoint(remote)
 
+    interval = float(getattr(settings, "artifacts_push_interval_seconds", 3600) or 3600)
+    # A push may legitimately be one cycle late (the reconciler waits 90s after
+    # boot, and a cycle can be skipped by a slow git). Three of them is not
+    # lateness, it is a mirror that stopped.
+    stale_after = interval * 3
+
     # The scheduled push (#442 follow-up) records its outcome in the settings
     # table; report THAT, not a promise. A probe reading our own database is
-    # bounded and honest - it verifies "the last push worked", which is the
-    # only thing "mirrored" can truthfully mean.
-    async def _last_push_succeeded() -> bool:
+    # bounded and honest - but it has to read the WHOLE record. The previous
+    # version read only `archive_last_push_ok` and answered "ok" when the row
+    # was ABSENT, so an instance that had never pushed anything - and one whose
+    # push loop had been dead for a month, with `archive_last_push_at` sitting
+    # unread beside it - both reported "the most recent push succeeded". The
+    # off-box copy is the thing an operator loses their artifacts without; its
+    # check may not round up.
+    async def _push_verdict() -> bool | ProbeVerdict:
         repo = getattr(state, "repo", None)
         if repo is None:
             return False
-        row = await repo.get_setting("archive_last_push_ok")
-        # No row yet = the first push has not run; treat as ok-so-far rather
-        # than alarming a fresh configure, the schedule will write the truth.
-        return row is None or row.get("value") == "1"
+        ok_row = await repo.get_setting("archive_last_push_ok")
+        at_row = await repo.get_setting("archive_last_push_at")
+        last_at = (at_row or {}).get("value") or ""
+        # A recorded failure is a failure whether or not a timestamp came with
+        # it: the fault outranks the bookkeeping.
+        if ok_row is not None and ok_row.get("value") != "1":
+            return False
+        if ok_row is None or not last_at:
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"No push to {target} has completed yet, so there is still no off-box "
+                "copy. The first one runs about 90s after boot; if this persists, read "
+                "the journal for `archive_push`.",
+            )
+        age = _age_seconds(last_at)
+        if age is not None and age > stale_after:
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"The last SUCCESSFUL push to {target} was {_humanise(age)} ago, more "
+                f"than three push intervals ({interval:g}s). Nothing has failed - the "
+                "push has stopped running, so the off-box copy is that old. Check the "
+                "backend is up and the `archive_push` reconciler is scheduled.",
+            )
+        when = f"{_humanise(age)} ago" if age is not None else f"at {last_at}"
+        return ProbeVerdict(
+            STATE_OK,
+            f"Artifacts are pushed to {target} on a schedule; the last push succeeded {when}.",
+        )
 
     return Subsystem(
         name="artifacts_remote",
@@ -341,16 +439,13 @@ def _artifacts_remote_subsystem(state: Any, settings: Any) -> Subsystem:
             "Artifacts live only in this instance's data directory; there is no "
             "off-box copy if the volume is lost."
         ),
-        ok=(
-            f"Artifacts are pushed to {target} on a schedule; the most recent "
-            "push succeeded (or the first one has not run yet)."
-        ),
+        ok=f"Artifacts are pushed to {target} on a schedule and the last push succeeded.",
         broken=(
             f"The last scheduled push to {target} FAILED - the off-box copy is "
             "stale. The error is recorded in the journal and the settings table "
             "(archive_last_push_error)."
         ),
-        probe=_last_push_succeeded,
+        probe=_push_verdict,
     )
 
 
@@ -411,6 +506,11 @@ async def _evaluate(subsystem: Subsystem, timeout: float) -> dict[str, Any]:
             f"Checking {subsystem.label} failed unexpectedly. Its state is unverified - "
             "treat it as unproven, not as working."
         )
+        return entry
+
+    if isinstance(reachable, ProbeVerdict):
+        entry["state"] = reachable.state
+        entry["consequence"] = reachable.consequence
         return entry
 
     entry["state"] = STATE_OK if reachable else STATE_UNREACHABLE

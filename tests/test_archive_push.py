@@ -115,12 +115,24 @@ class TestTheSelfCheckStopsPromising:
         )
         assert "FAILED" in sub.broken
 
-    async def test_first_run_is_calm_not_alarming(self, repo):
+    async def test_first_run_is_unproven_not_ok(self, repo):
+        """A push that has never run is not "the most recent push succeeded".
+
+        This used to answer `True` - "(or the first one has not run yet)" - so
+        an instance with no off-box copy at all read as green, indefinitely if
+        the reconciler never ran. Unproven is its own state, and the report has
+        one (#648 tranche 4).
+        """
         from types import SimpleNamespace
 
-        from homepilot.selfcheck import _artifacts_remote_subsystem
+        from homepilot.selfcheck import STATE_UNKNOWN, ProbeVerdict, _artifacts_remote_subsystem
 
         state = SimpleNamespace(repo=repo)
         settings = SimpleNamespace(artifacts_remote="git@example.com:me/archive.git")
         sub = _artifacts_remote_subsystem(state, settings)
-        assert await sub.probe() is True, "a freshly configured remote alarms before any push ran"
+        verdict = await sub.probe()
+        assert isinstance(verdict, ProbeVerdict)
+        assert verdict.state == STATE_UNKNOWN
+        assert "no off-box copy" in verdict.consequence
+        # And it does not alarm either: `unknown` is not `unreachable`.
+        assert verdict.state != "unreachable"
