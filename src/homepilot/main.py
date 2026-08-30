@@ -241,6 +241,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.sse_bus = state.sse_bus
     app.state.metrics_repo = state.metrics_repo
 
+    # A fresh install must WATCH something, not merely store samples (ADR-004
+    # corollary 2). Seeded once, marker-guarded, and never resurrected after an
+    # operator deletes it - see metrics/defaults.py for why these two and why
+    # they are floors.
+    from .metrics.defaults import seed_default_alert_rules
+
+    await seed_default_alert_rules(state.repo, state.metrics_repo)
+
     if state.agent_hub is not None:
         app.state.agent_hub = state.agent_hub
         app.state.agent_registry = state.agent_registry

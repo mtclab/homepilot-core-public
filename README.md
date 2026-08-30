@@ -346,9 +346,20 @@ exposition endpoint and these routes are authenticated.
 
 A rule fires only when its condition holds for the whole `for_seconds` span, so a
 single spike never pages anyone, and it emits `alert_firing` / `alert_resolved`
-through the existing SSE + webhook event machinery. Rules are managed from the
-**Agents** page (Alert Rules), which is also where each host's sparklines and
-recent-metrics panel live.
+through the existing SSE + webhook event machinery. `host_filter` is a glob
+(`*`, `web-*`, or one hostname) and `metric` must be one the agent actually
+reports (`cpu.count`, `disk.total_gb`, `disk.free_gb`, `memory.total_gb`,
+`memory.free_gb`, `load.1m`, `load.5m`, `load.15m`) — anything else is accepted
+and never matches, so each rule reports `hosts_matched` from its last
+evaluation. A fresh install is seeded with two rules (disk under 1 GB free,
+available memory under 200 MB, both for ten minutes on every host); delete them
+if you want your own and they will not come back.
+
+**Alerts reach whatever the events webhook points at, and nothing else.** There
+is no mail and no pager, and no alert history: `alert_state` holds the current
+state only, so a fire that resolves overnight leaves no record unless a webhook
+received it. Rules are managed from **Settings → Monitoring**; each host's
+sparklines and recent-metrics panel live on the host page.
 
 ### Agent CLI commands
 

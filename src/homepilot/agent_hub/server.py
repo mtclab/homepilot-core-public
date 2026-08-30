@@ -795,6 +795,38 @@ class AgentHubServer:
             agent_id = handshake.get("agent_id", str(uuid.uuid4()))
             system_info = handshake.get("system_info", {})
 
+            # A nameless agent cannot be monitored and cannot be fenced, so it
+            # does not get in (#648 tranche 5). The hostname is the primary key
+            # of the metrics table and the join key of every alert rule: an agent
+            # that registers with "" is enrolled, connected and green, and every
+            # metrics frame it sends is dropped on the floor while the hub acks
+            # it as accepted. The enrolment fence reads the same field, so an
+            # unnamed agent also skipped `agent_hostname_known` entirely. The Go
+            # agent takes its name from os.Hostname() and ignores the error, so
+            # "" is reachable rather than theoretical.
+            if not isinstance(hostname, str) or not hostname.strip():
+                await self._record_rejection(
+                    reason=(
+                        "register rejected: the agent reported no hostname, and a host "
+                        "with no name cannot be monitored or fenced"
+                    ),
+                    peer_host=peer_host,
+                    agent_id=str(agent_id),
+                    hostname=None,
+                )
+                writer.write(
+                    _encode(
+                        {
+                            "error": "register rejected: no hostname reported",
+                            "request_id": handshake.get("request_id", ""),
+                        }
+                    )
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
             # Replay protection is enabled for a connection ONLY when the agent
             # asked for it (register carried "replay": 1) AND it authenticated
             # with its per-agent token (the shared secret used as the MAC key).
@@ -1050,6 +1082,23 @@ class AgentHubServer:
             )
 
         metrics_repo = getattr(self.registry, "metrics_repo", None)
+        if rows and (metrics_repo is None or not hostname):
+            # Nothing was stored, so nothing may be reported as accepted. The
+            # ack is what frees the agent's buffer: telling it we took samples
+            # we dropped is how a batch disappears for good with no hole anyone
+            # can see. Counted as rejected instead, which is a number the agent
+            # already logs (#648 tranche 5).
+            logger.error(
+                "metrics frame from %s discarded: %s. %d sample(s) lost; "
+                "reported back to the agent as rejected, not accepted",
+                agent_id,
+                "no metrics storage is wired up"
+                if metrics_repo is None
+                else "the agent registered without a hostname, and a sample has "
+                "nowhere to be filed without one",
+                len(rows),
+            )
+            return 0, rejected + len(rows)
         if metrics_repo is not None and rows and hostname:
             await metrics_repo.insert_samples(hostname, agent_id, rows)
 

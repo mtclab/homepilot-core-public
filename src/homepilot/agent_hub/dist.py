@@ -15,8 +15,15 @@ consequences, both against ADR-004:
 
 HomePilot has both artifacts in its own image, so it serves them. The guest
 fetches from the control plane it is being enrolled into - no internet, and the
-agent version always matches the hub that manages it, which kills a class of
-version skew too.
+agent an install ENROLS matches the hub that enrolled it.
+
+That is enrolment only, and this file used to claim more: "the agent version
+always matches the hub that manages it, which kills a class of version skew". It
+does not. Nothing upgrades an already-enrolled agent, and nothing reports the
+gap - dev ran a v3.6.6 agent against a 3.6.15 hub for weeks with every surface
+green, so a fix that lived in the binary shipped and changed nothing on any
+managed host. `system_info.agent_version` is recorded on every register and is
+in the fleet list; comparing it to the hub is #648's tranche-1 follow-up.
 
 The checksum is computed from the bytes on disk at request time rather than
 baked at build: there is then no way for a recorded hash and a served file to

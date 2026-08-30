@@ -923,6 +923,31 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             "rejoin_task_id",
         ),
     ],
+    31: [
+        # What a rule is ACTUALLY watching (#648 tranche 5).
+        #
+        # A rule whose host_filter matches no host, or whose metric no agent in
+        # the fleet reports, was accepted, listed and shown enabled while being
+        # skipped on every cycle. Nothing anywhere distinguished it from a rule
+        # standing guard over the whole fleet - so "no alerts" read as "all
+        # well" when it meant "nothing is being looked at".
+        #
+        # Two columns written by the evaluator on every pass: when it last
+        # looked, and how many hosts the rule matched when it did. NULL/0 for
+        # every rule that existed before this migration, which is honest - we
+        # do not know what they matched until the evaluator next runs, and it
+        # runs a minute after boot.
+        (
+            "ALTER TABLE alert_rules ADD COLUMN last_eval_at TEXT",
+            "alert_rules",
+            "last_eval_at",
+        ),
+        (
+            "ALTER TABLE alert_rules ADD COLUMN hosts_matched INTEGER",
+            "alert_rules",
+            "hosts_matched",
+        ),
+    ],
 }
 
 

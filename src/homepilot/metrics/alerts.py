@@ -4,6 +4,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from fnmatch import fnmatchcase
 from typing import Any
 
 from ..events import emit_event
@@ -101,9 +102,23 @@ class AlertEvaluator(Reconciler):
         fired = 0
         resolved = 0
         evaluated = 0
+        watching_nothing = 0
         rules = await self._metrics.list_rules(enabled_only=True)
         for rule in rules:
-            for hostname in await self._hosts_for(rule):
+            hosts = await self._hosts_for(rule)
+            # Recorded every cycle, zero included: a rule that matches no host
+            # is enabled, listed and guarding nothing, and this is the only
+            # place that knows it (#648 tranche 5).
+            await self._metrics.record_rule_coverage(str(rule["id"]), len(hosts))
+            if not hosts:
+                watching_nothing += 1
+                logger.info(
+                    "alert rule %r (%s on %r) matched no reporting host this cycle",
+                    rule["name"],
+                    rule["metric"],
+                    str(rule["host_filter"] or "*"),
+                )
+            for hostname in hosts:
                 evaluated += 1
                 transition = await self._evaluate(rule, hostname)
                 if transition == "firing":
@@ -118,22 +133,34 @@ class AlertEvaluator(Reconciler):
                 "evaluated": evaluated,
                 "fired": fired,
                 "resolved": resolved,
+                # Surfaced next to the others because a run of "rules: 4,
+                # evaluated: 0" is the state an operator most needs to see and
+                # the one the old details line was silent about.
+                "watching_nothing": watching_nothing,
             },
         )
 
     async def _hosts_for(self, rule: dict[str, Any]) -> list[str]:
         """Hosts this rule applies to.
 
-        A ``*`` filter means every host that has recently reported the metric; an
-        exact hostname means that host only. Hosts that never reported the metric
-        are not evaluated at all - "no data" is not a breach."""
+        ``host_filter`` is a GLOB, which is what the API docs, the MCP tool
+        description and the console's own placeholder have always said it was -
+        it simply was not one. It was compared with ``==``, so ``web-*`` matched
+        no host, the rule was skipped on every cycle, and nothing anywhere said
+        so; only ``*`` and an exact hostname ever worked (#648 tranche 5).
+        ``fnmatchcase`` subsumes both: ``*`` matches every host and a bare
+        hostname has no wildcards, so it still matches only itself.
+
+        Hosts that never reported the metric are not evaluated at all - "no
+        data" is not a breach. That is deliberate, and it is also why a rule can
+        match nothing; the caller records the count either way."""
         window = int(rule["for_seconds"]) + SAMPLE_FRESHNESS_SECONDS
         since = int(self._now() - window)
         reporting = await self._metrics.hosts_reporting(str(rule["metric"]), since)
         host_filter = str(rule["host_filter"] or "*")
         if host_filter == "*":
             return reporting
-        return [h for h in reporting if h == host_filter]
+        return [h for h in reporting if fnmatchcase(h, host_filter)]
 
     async def _evaluate(self, rule: dict[str, Any], hostname: str) -> str | None:
         now = self._now()

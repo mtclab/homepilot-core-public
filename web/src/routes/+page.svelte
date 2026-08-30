@@ -236,6 +236,29 @@
 			),
 		);
 
+		// The state an empty alert list cannot distinguish itself from. `0 firing`
+		// on an install with no rules is not good news, it is the absence of news,
+		// and it sat on the first screen reading green (#642, #648 tranche 5).
+		if (summary.metrics.rules_enabled === 0) {
+			out.push({
+				key: 'alerts:none',
+				severity: 'warning',
+				label: 'not watched',
+				text: 'No alert rule is enabled, so nothing raises an alert however bad it gets',
+				href: `${base}/settings#monitoring`,
+				meta: '',
+			});
+		} else if (summary.metrics.rules_watching_nothing > 0) {
+			out.push({
+				key: 'alerts:inert',
+				severity: 'warning',
+				label: 'not watched',
+				text: `${plural(summary.metrics.rules_watching_nothing, 'alert rule matches', 'alert rules match')} no host - check the metric name and the host filter`,
+				href: `${base}/settings#monitoring`,
+				meta: '',
+			});
+		}
+
 		// Firing alerts, one line per alert - the host page is where the chart is.
 		out.push(
 			...capped(
@@ -553,6 +576,8 @@
 
 			<p class="prose-note text-xs">
 				Each host's page carries its charts. Metrics kept for {d.metrics.retention_days} days.
+				{d.metrics.rules_enabled}
+				{d.metrics.rules_enabled === 1 ? 'alert rule' : 'alert rules'} enabled.
 			</p>
 		</section>
 

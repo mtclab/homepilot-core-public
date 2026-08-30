@@ -205,17 +205,27 @@ def _events_webhook_subsystem(settings: Any) -> Subsystem:
         label="the events webhook",
         configured=bool(url),
         target=target,
+        # The wording used to name only "artifact and task events", which stopped
+        # being the whole truth when ADR-004 S5 routed alert_firing and
+        # alert_resolved down this same channel. On a default install a FIRING
+        # ALERT reaches a log line and a browser that happens to be open, and
+        # nothing else - and, unlike artifacts and tasks, an alert leaves no
+        # durable record to look at afterwards. That is the consequence this
+        # line exists to state (#642, #648 tranche 5).
         off=(
-            "Artifact and task events are not forwarded anywhere because no events "
-            "webhook is configured. Events are still recorded and shown in the UI."
+            "Nothing is forwarded anywhere because no events webhook is configured. "
+            "That includes ALERTS: a firing alert reaches the log and an open browser "
+            "and nowhere else, and it leaves no record once it resolves. Artifact and "
+            "task events are still recorded and shown in the UI."
         ),
         ok=(
-            f"Events are posted to {target}, which is accepting connections. "
-            "Whether the receiving workflow handles them is only proven by a real event."
+            f"Events, including firing and resolved alerts, are posted to {target}, "
+            "which is accepting connections. Whether the receiving workflow handles "
+            "them is only proven by a real event."
         ),
         broken=(
             f"Events are dropped: the webhook configured at {target} is not accepting "
-            "connections. Every artifact and task notification is lost."
+            "connections. Every artifact, task and ALERT notification is lost."
         ),
         probe=probe if url else None,
     )

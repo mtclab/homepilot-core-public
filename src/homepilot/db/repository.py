@@ -1014,7 +1014,21 @@ class Repository:
         resolves, which is how a "forgotten" machine keeps showing up in service
         listings and coverage counts. One commit, so a partial delete cannot
         leave that state.
+
+        Its ALERT STATE goes with it (#648 tranche 5). A latched ``firing_since``
+        for a host that is gone can never clear on its own: the evaluator only
+        looks at hosts that reported in the last few minutes, so a forgotten host
+        is never evaluated again and the alert stands forever - counted on the
+        Overview, named in the attention list, pointing at a machine no longer in
+        inventory, and clearable only by deleting the rule (which stops watching
+        every other host too). Keyed by hostname, because that is what an alert
+        is about; the metric SAMPLES are left to retention, which is the thing
+        that owns the time series' lifetime.
         """
+        row = await self.db.fetchone("SELECT hostname FROM hosts WHERE id = ?", (host_id,))
+        hostname = str(row["hostname"]) if row and row["hostname"] else ""
+        if hostname:
+            await self.db.execute("DELETE FROM alert_state WHERE hostname = ?", (hostname,))
         await self.db.execute("DELETE FROM services WHERE host_id = ?", (host_id,))
         # The as-found observation note is keyed `introspect:<host_id>` in its
         # SOURCE (its target is the hostname), so that is what identifies it -

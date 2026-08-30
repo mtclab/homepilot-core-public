@@ -163,6 +163,57 @@ one-liner remains for hosts without a guest agent.
   `HP_ZABBIX_URL`, the dashboard deep-links, the agent's Zabbix sender, and the
   hand-imported template.
 
+#### S5 review note, 2026-08-30 (#648 tranche 5)
+
+Annotated rather than rewritten, per the precedent set for ADR-001: what the ADR
+decided stands as it was written; this is what a review found when it measured
+the claims against the shipped product.
+
+**"Rollups are deliberately NOT built up front - measure a week of real data
+first, then decide."** That week has now happened. Dev carried 25,960 samples
+from one agent over 55.2 hours at the shipped 60s cadence - 11,287 rows a day
+per host against a theoretical 11,520, so ~2% is lost to restarts. Two numbers
+come out of it, and they point in opposite directions:
+
+* **Storage is not the problem.** The metrics table plus `idx_metrics_ts` cost
+  **128.9 bytes per row** on dev's real database - about 6.3 MB per host per
+  week, ~520 MB for fifty hosts at the 7-day default. Comfortable. (Note the
+  gate in `test_metrics_retention.py` measures 77.7 B/row on synthetic data
+  with a 5-character hostname; the primary key repeats the hostname and metric
+  name in every row and `idx_metrics_ts` repeats the whole key again, so real
+  hostnames cost meaningfully more than the seeded figure. The gate's ceiling
+  still holds; its documented projection is optimistic.)
+* **Reading it back is.** The series API caps one response at 2000 points, which
+  at a 60s cadence is 33 hours. Asked live for the 7-day window it keeps, dev
+  returned **34.5 hours - 21% of it** - with `truncated: true`. So the product
+  retains five times more history than any single query can return, and the
+  remaining 80% is reachable only by paging windows the UI does not page.
+
+The rollup decision therefore has an answer, and it is not the one the ADR
+anticipated: rollups are not needed to bound the TABLE, they are needed to make
+the retained window READABLE. A cheaper alternative exists - an opt-in
+server-side downsample on the series endpoint, honestly labelled as averaged -
+and would not require a second storage tier. Either way the current shape
+(7 days kept, 33 hours legible) is the thing to fix.
+
+**"Nothing installs, imports or configures; monitoring is part of the
+product."** True of collection from the first release. Not true of ALERTING
+until this tranche: a fresh install had zero alert rules, so the Overview's
+`firing_alerts: 0` meant "nothing is being looked at" while reading as "all
+well"; the metric name on a rule was checked against nothing and the MCP tool
+schema's own example named a metric no agent emits; `host_filter` was
+documented as a glob everywhere and compared with `==`. Corollary 2 - pick a
+safe default and proceed - now applies to alerting too.
+
+**One thing S5 gave up without saying so.** The "what is knowingly given up"
+list names SNMP/IPMI and Zabbix's template library and escalation. It does not
+name `nodata`. There is no way to express "alert me when a host stops
+reporting": a rule only fires on a threshold, and a host that goes quiet drops
+out of evaluation entirely. The console shows `agent offline` as a warning, so
+it is not invisible - but nothing is emitted, so nothing can reach a webhook.
+For a monitoring system replacing Zabbix, that is a real omission and it should
+be an explicit decision rather than an implicit one.
+
 ### S6 - Honest defaults
 
 Optional services work or are off. A startup self-check reports what is

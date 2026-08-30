@@ -45,7 +45,7 @@ function summary(done: string[], complete = false) {
 		artifacts: {},
 		tasks: {},
 		agents: { known: 0, connected: 0 },
-		metrics: { firing_alerts: 0, retention_days: 7 },
+		metrics: { firing_alerts: 0, retention_days: 7, rules_enabled: 1, rules_watching_nothing: 0 },
 	};
 }
 

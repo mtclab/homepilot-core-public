@@ -22,6 +22,22 @@ MAX_SERIES_POINTS = 2000
 METRIC_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$")
 MAX_METRIC_NAME_LEN = 64
 
+# Exactly what a shipped hp-agent emits, in the order agent/go/metrics.go
+# builds them. This is the metric vocabulary of the whole product: a rule on
+# anything else can never fire, and every surface that offers an EXAMPLE metric
+# must take it from here. `agent/go/metrics.go` is the source of truth and
+# tests/test_metrics_vocabulary.py fails if the two drift.
+AGENT_METRICS: tuple[str, ...] = (
+    "cpu.count",
+    "disk.total_gb",
+    "disk.free_gb",
+    "memory.total_gb",
+    "memory.free_gb",
+    "load.1m",
+    "load.5m",
+    "load.15m",
+)
+
 VALID_COMPARISONS = ("gt", "gte", "lt", "lte")
 
 # Comparison name -> SQL operator. A fixed table, never interpolated from caller
@@ -318,6 +334,35 @@ class MetricsRepository:
     async def set_rule_enabled(self, rule_id: str, enabled: bool) -> bool:
         """Thin wrapper over update_rule for the enable/silence-only path."""
         return await self.update_rule(rule_id, enabled=enabled) is not None
+
+    async def record_rule_coverage(self, rule_id: str, hosts_matched: int) -> None:
+        """Stamp what the last evaluation of this rule actually looked at.
+
+        Written every cycle, including - especially - when the answer is zero.
+        A rule matching no host is the failure mode this exists to surface: it
+        is enabled, it is listed, and it is guarding nothing, and before these
+        columns the product had no way to say so. Not routed through
+        ``update_rule``: this is bookkeeping about a rule, not a change to it,
+        and it must not move ``updated_at``."""
+        await self.db.execute(
+            "UPDATE alert_rules SET last_eval_at = ?, hosts_matched = ? WHERE id = ?",
+            (_now(), int(hosts_matched), rule_id),
+        )
+        await self.db.conn.commit()
+
+    async def clear_alert_state_for_host(self, hostname: str) -> int:
+        """Drop every alert-state row for one host; returns how many went.
+
+        For a host being forgotten. Its state rows would otherwise outlive it
+        AND never be revisited - the evaluator only ever looks at hosts that
+        reported recently, so a host that is gone is never evaluated again and a
+        latched ``firing_since`` stays latched forever. The Overview counts it,
+        the attention list names a machine that is no longer in inventory, and
+        the only way to clear it is to delete the rule (which stops watching
+        every other host too)."""
+        cursor = await self.db.execute("DELETE FROM alert_state WHERE hostname = ?", (hostname,))
+        await self.db.conn.commit()
+        return int(cursor.rowcount or 0)
 
     # ── Alert state ──────────────────────────────────────────────────────────
     async def get_alert_state(self, rule_id: str, hostname: str) -> dict[str, Any] | None:

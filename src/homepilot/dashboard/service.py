@@ -162,6 +162,20 @@ async def build_summary(repo: Any) -> dict[str, Any]:
                     "SELECT COUNT(*) c FROM alert_state WHERE firing_since IS NOT NULL"
                 )
             )["c"],
+            # firing_alerts on its own is the #642 shape: on an install with no
+            # rules it is 0, and 0 reads as "everything is well" when it means
+            # "nothing is being looked at". These two say which it is - how many
+            # rules are enabled, and how many of those matched no host on their
+            # last pass. Both come off alert_rules, one row per rule.
+            "rules_enabled": (
+                await db.fetchone("SELECT COUNT(*) c FROM alert_rules WHERE enabled = 1")
+            )["c"],
+            "rules_watching_nothing": (
+                await db.fetchone(
+                    "SELECT COUNT(*) c FROM alert_rules "
+                    "WHERE enabled = 1 AND COALESCE(hosts_matched, 0) = 0"
+                )
+            )["c"],
             # Resolved, not read off boot Settings: the number the overview
             # states is the horizon actually in force (#553 C2).
             "retention_days": await effective("metrics_retention_days", get_settings()),

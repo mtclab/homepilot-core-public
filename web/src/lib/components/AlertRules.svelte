@@ -126,7 +126,8 @@
 		never raises one. Firing and recovery both go out as events; firing alerts
 		show on the Overview and on the affected host. There is no mail and no
 		pager: to get an alert off this box, point the events webhook at something
-		(Settings → Subsystems).
+		(Settings → Subsystems). Until you do, a firing alert reaches the log and
+		this console and nowhere else, and it leaves no record once it resolves.
 	</p>
 	<!-- One line instead of six ragged notes under six narrow inputs: the row
 	     already reads left to right, so saying so explains every field at once
@@ -137,7 +138,11 @@
 		<em>host</em> - where <span class="font-mono">*</span> means every host, and
 		a name is what you will see when it fires. <em>Edit</em> retunes an existing
 		rule's comparison, threshold and duration in place - no need to delete and
-		recreate it.
+		recreate it. <em>Host</em> is a glob: <span class="font-mono">*</span> is
+		every host, <span class="font-mono">web-*</span> every host whose name
+		starts that way, and a bare name is one machine. The Hosts column says how
+		many the rule matched when it was last evaluated - if that is zero, it is
+		enabled and watching nothing.
 	</p>
 
 	<div class="flex flex-wrap items-end gap-2">
@@ -231,7 +236,23 @@
 								for {Math.round(r.for_seconds / 60)} min
 							</td>
 						{/if}
-						<td class="text-muted font-mono">{r.host_filter}</td>
+						<!-- The filter AND what it actually matched. A rule whose glob
+						     matches no host, or whose metric no agent reports, is enabled
+						     and listed and guarding nothing; before this column it looked
+						     identical to one watching the whole fleet (#648 tranche 5). -->
+						<td class="text-muted font-mono">
+							{r.host_filter}
+							{#if r.last_eval_at === null}
+								<span class="font-sans text-muted" data-rule-coverage>not evaluated yet</span>
+							{:else if (r.hosts_matched ?? 0) === 0}
+								<span class="font-sans text-warn" data-rule-coverage>watching no host</span>
+							{:else}
+								<span class="font-sans text-muted" data-rule-coverage>
+									watching {r.hosts_matched}
+									{r.hosts_matched === 1 ? 'host' : 'hosts'}
+								</span>
+							{/if}
+						</td>
 						<td>
 							{#if r.enabled}
 								<span class="text-ok">enabled</span>
