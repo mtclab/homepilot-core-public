@@ -165,6 +165,7 @@ class TestCallEmbedServiceProtocol:
 
         fake_embedding = [0.1] * 1024
         mock_resp = MagicMock()
+        mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "object": "list",
             "data": [{"object": "embedding", "embedding": fake_embedding}],
@@ -191,6 +192,7 @@ class TestCallEmbedServiceProtocol:
 
         fake_embedding = [0.2] * 768
         mock_resp = MagicMock()
+        mock_resp.status_code = 200
         mock_resp.json.return_value = {"embedding": fake_embedding}
 
         with patch("homepilot.kb.service.httpx.AsyncClient") as mock_client_cls:

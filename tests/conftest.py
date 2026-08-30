@@ -289,6 +289,10 @@ def mock_repo():
 
     r = AsyncMock()
     r.create_doc_metadata = AsyncMock(return_value=1)
+    # (doc_id, text_changed) - the kb-note executor upserts by source so the row
+    # id survives a reindex; see Repository.upsert_doc_metadata.
+    r.upsert_doc_metadata = AsyncMock(return_value=(1, True))
+    r.has_embedding = AsyncMock(return_value=False)
     r.log_audit = AsyncMock()
     r.db = AsyncMock()
     r.db.conn = AsyncMock()

@@ -177,6 +177,26 @@ class ArtifactLifecycle:
                 exc_info=True,
             )
 
+        # A kb-note is `applied` the moment it is proposed and the executor
+        # never runs, so nothing put it in the knowledge base. `propose_artifact`
+        # answered `status: "applied"` for a note that `get_kb_doc` could not
+        # find and `search_kb` did not return - the exact defect #388 fixed for
+        # the `record_fact` tool and left standing on every other propose path,
+        # including the one `hp policy init` uses (#648 tranche 6).
+        if fm.get("kind") == "kb-note":
+            kb_service = getattr(self, "_kb_service", None)
+            if kb_service is not None:
+                try:
+                    outcome = await kb_service.index_note(id_str)
+                    if not outcome.get("indexed"):
+                        logger.warning(
+                            "kb-note %s is applied but NOT searchable: %s",
+                            id_str,
+                            outcome.get("reason"),
+                        )
+                except Exception:  # indexing must never fail the propose itself
+                    logger.warning("Indexing kb-note %s failed", id_str, exc_info=True)
+
         return id_str
 
     async def approve(self, id: str, user: str, reason: str | None = None) -> None:

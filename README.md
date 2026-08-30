@@ -605,12 +605,53 @@ their order and their scores; keyword hits fill in behind them. Ingest embeds as
 it writes, and `reindex` sweeps everything still missing an embedding rather than
 re-walking artifact notes alone.
 
+**A note is in the KB when the call that wrote it returns.** A `kb-note` is
+`applied` on propose and the executor never runs, so `propose_artifact`,
+`POST /kb` and `hp policy init` all answered "applied" for notes that
+`search_kb` could not find - until some unrelated KB write happened to trigger a
+rebuild. Every propose path indexes now, and the write surfaces return
+`indexed`.
+
+**A rebuild does not delete anything to build it.** `reindex` upserts each
+applied note by source and removes only the documents whose artifact is no
+longer applied. The old shape deleted every artifact-backed row up front, which
+(a) reassigned every doc id, so the id `list_kb` handed out meant a different
+document afterwards, (b) lost any note whose artifact could not be read while
+reporting `errors: 0`, and (c) — because the background rebuild ran with
+embeddings switched off — destroyed the entire vector index on any restart with
+an unindexed note in it. Failures are counted, named, and the status says
+`completed_with_errors`.
+
+**Search says how it found what it found.** `search_mode` is `vector`,
+`keyword`, `vector+keyword` or `no_matches`, per call and per result. Keyword
+mode - the default, since no embedding URL is set out of the box - matches every
+TERM of the query rather than the query as one substring; before, `nginx
+business hours` found nothing in a note that says exactly that. Vector hits
+below the midpoint distance are dropped: a nearest-neighbour query always
+returns k rows, and "the five nearest documents" is not the same claim as "five
+matches".
+
+**Deleting a document deletes its embedding.** `doc_metadata.id` is a reusable
+row id, so a stranded vector was inherited by the next document to take that id
+and returned, at full score, as the answer to questions about a note the
+operator had deleted. Migration 32 clears the ones already stranded. Editing a
+document re-embeds it, so it stops answering for text it no longer contains.
+
 ## Reviewing
 
 The approval screen shows the plan (what changes on the host), the artifact body,
-and the **policies** the operator recorded for that host - `kind: "policy"` KB
-entries for the target - so approving is an informed decision rather than reading
-YAML the AI wrote. A KB that is down never blocks the plan.
+and the **policies** the operator recorded for that host - so approving is an
+informed decision rather than reading YAML the AI wrote. A KB that is down never
+blocks the plan.
+
+Those policies are selected by what they are ABOUT: `kind: "policy"` entries
+whose target is this host, plus the global ones (no target, or `global`), each
+tagged `applies_via`. It used to be a free-text search for the hostname, which
+was wrong in both directions - it showed a policy whose own text read "this rule
+is about dev-ct-db only" beside a change to a different machine, and it could
+never show a global policy at all, which is every one of the nineteen
+`hp policy init` writes. With embeddings on it showed the five nearest policies
+for any host whatsoever.
 
 The queue supports **bulk approve/reject** with an inline two-step confirm, the
 same pattern as every other destructive action here (Approve used to raise a

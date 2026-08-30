@@ -18,8 +18,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_kb",
         "description": (
-            "Search the knowledge base using vector + keyword search. "
-            "Returns matching notes, policies, and decisions."
+            "Search the knowledge base for notes, policies and decisions. Vector "
+            "search runs only when an embedding service is configured AND the "
+            "documents are embedded; otherwise this matches words. The answer "
+            "says which happened: `search_mode` is vector, keyword, vector+keyword "
+            "or no_matches, and every result carries the mode that found it, so a "
+            "word match is never read as a semantic one. Use "
+            "get_kb_embedding_status to see whether vector search is available at "
+            "all."
         ),
         "inputSchema": {
             "type": "object",
@@ -40,8 +46,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "results": {"type": "array", "items": {"type": "object"}},
                 "total": {"type": "integer"},
+                "search_mode": {"type": "string"},
+                "vector_hits": {"type": "integer"},
+                "keyword_hits": {"type": "integer"},
             },
-            "required": ["results", "total"],
+            "required": ["results", "total", "search_mode"],
         },
     },
     {
@@ -233,9 +242,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "reindex_kb",
         "description": (
-            "Rebuild the knowledge-base search index over every stored document. Pass "
-            "no_embeddings=true to rebuild only the keyword index and skip recomputing "
-            "vector embeddings. Returns counts of what was reindexed. Admin only."
+            "Bring the knowledge-base index in line with the applied kb-note "
+            "artifacts: each is upserted by source (row ids are stable), documents "
+            "whose artifact is no longer applied are removed, and anything missing "
+            "an embedding gets one. Pass no_embeddings=true to skip embeddings "
+            "entirely, or force_embeddings=true to drop every stored vector and "
+            "recompute - the step to run after changing the embedding model, since "
+            "an unchanged document otherwise keeps the old model's vector. Returns "
+            "reindexed / removed / errors, and status `completed_with_errors` when "
+            "anything failed. Admin only."
         ),
         "inputSchema": {
             "type": "object",
@@ -244,9 +259,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Skip recomputing vector embeddings (keyword index only)",
                 },
+                "force_embeddings": {
+                    "type": "boolean",
+                    "description": "Drop every stored vector and recompute (after a model change)",
+                },
             },
         },
-        "outputSchema": {"type": "object", "properties": {"status": {"type": "string"}}},
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "reindexed": {"type": "integer"},
+                "removed": {"type": "integer"},
+                "errors": {"type": "integer"},
+            },
+            "required": ["status"],
+        },
     },
     {
         "name": "get_kb_embedding_status",
@@ -330,10 +358,15 @@ async def handle_get_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -> d
 
 
 async def handle_search_kb(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    from homepilot.kb.service import summarise_search_mode
+
     query = arguments["query"]
     kind = arguments.get("kind")
     results = await ctx["kb_service"].search(query, kind=kind, limit=20)
-    return {"results": results, "total": len(results)}
+    # The same summary GET /kb/search returns, from the same function: an agent
+    # asked to act on a KB answer needs to know whether it is a semantic match
+    # or a word match, and nothing here ever said.
+    return {"results": results, "total": len(results), **summarise_search_mode(results)}
 
 
 def _mcp_caller_id() -> str:
@@ -379,14 +412,27 @@ async def handle_record_fact(arguments: dict[str, Any], ctx: dict[str, Any]) -> 
     # path never reindexed - so an agent recorded a fact, was told
     # `{"status": "applied"}`, and an immediate `search_kb` found nothing until
     # the process restarted. "Recorded" that cannot be read back is not recorded.
+    #
+    # `lifecycle.propose` indexes every kb-note now, so this only CONFIRMS it -
+    # and reports the answer either way. The old code called
+    # `reindex_if_needed`, which rebuilt the whole index with embeddings
+    # switched off and destroyed every vector in it (#648 tranche 6).
+    indexed = False
     kb_service = ctx.get("kb_service")
     if kb_service is not None:
         try:
-            await kb_service.reindex_if_needed(reason="record_fact")
+            outcome = await kb_service.index_note(artifact_id)
+            indexed = bool(outcome.get("indexed"))
+            if not indexed:
+                logger.warning(
+                    "recorded fact %s is applied but NOT searchable: %s",
+                    artifact_id,
+                    outcome.get("reason"),
+                )
         except Exception:
             logger.warning("could not index the recorded fact %s", artifact_id, exc_info=True)
 
-    return {"id": artifact_id, "status": "applied", "kind": kind}
+    return {"id": artifact_id, "status": "applied", "kind": kind, "indexed": indexed}
 
 
 # ── Mutators (wave 2). Call the SAME repo/service the KB management routes call. ──
@@ -422,6 +468,13 @@ async def handle_update_kb_doc(arguments: dict[str, Any], ctx: dict[str, Any]) -
     result: dict[str, Any] | None = await repo.update_doc_metadata(doc_id, **updates)
     if result is None:
         raise ValueError(f"KB entry not found: {doc_id}")
+    # Re-embed, or the document keeps answering for the text it used to hold and
+    # stops answering for the text it now has - the same path GET /kb/{id}'s PUT
+    # takes (#648 tranche 6).
+    if "content" in updates or "title" in updates:
+        kb_service = ctx.get("kb_service")
+        if kb_service is not None:
+            result = {**result, "reembedded": await kb_service.reembed_doc(doc_id)}
     return result
 
 
@@ -473,8 +526,9 @@ async def handle_ingest_kb(arguments: dict[str, Any], ctx: dict[str, Any]) -> di
 
 async def handle_reindex_kb(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     no_embeddings = bool(arguments.get("no_embeddings", False))
+    force_embeddings = bool(arguments.get("force_embeddings", False))
     result: dict[str, Any] = await _kb_service(ctx).reindex(
-        no_embeddings=no_embeddings, reason="manual"
+        no_embeddings=no_embeddings, reason="manual", force_embeddings=force_embeddings
     )
     return result
 

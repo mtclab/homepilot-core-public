@@ -225,7 +225,7 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `get_environment_doc` | no | read | Fused doc for a target: inventory + KB + artifact history |
 | `query_artifacts` | no | read | Find artifacts by status, kind, target, or date |
 | `get_artifact_status` | no | read | Detailed status of one artifact: id, kind, status, intent, target, last_updated |
-| `search_kb` | no | read | Vector + keyword search over KB notes/policies/decisions |
+| `search_kb` | no | read | Search KB notes/policies/decisions; answers with the `search_mode` that ran (vector / keyword / vector+keyword / no_matches) |
 | `proxmox_api_read` | no | read | GET-only Proxmox REST call; allowlisted paths only |
 | `http_call_read` | no | read | GET-only call to an adopted service; vault-resolved creds |
 | `read_file_on_guest` | no | read | File read from a guest via the agent hub |

@@ -375,6 +375,20 @@ async def handle_get_environment_doc(
                 f"{a.get('status', '?')}"
             )
 
+    # Name every source that could NOT be read. An empty section used to mean
+    # both "nothing recorded" and "the read failed", and this document is the
+    # AI's picture of the estate - a silent hole in it becomes a confident
+    # answer one step later (#642, #648 tranche 6).
+    unread = [
+        (name, str(state.get("error") or "unknown"))
+        for name, state in (doc.get("sources") or {}).items()
+        if not state.get("read")
+    ]
+    if unread:
+        lines.append("\nNOT READ (this document is incomplete):")
+        for name, why in unread:
+            lines.append(f"  {name}: {why}")
+
     if len(lines) == 1:
         lines.append(f"No data found for target '{target}'")
 
