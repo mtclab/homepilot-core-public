@@ -1,5 +1,35 @@
 # Changelog
 
+## 3.6.20 - 2026-08-30
+
+Four defects that DRIVING 3.6.19 found and the green suite did not. Three are
+one root shape: **a rule that reads two different state objects, so two
+surfaces give two answers** - which is #631's shape, hit three more times.
+
+* **The self-check reported "No reconciler is registered, so nothing maintains
+  the estate on a timer" about an instance running seven of them.** Over MCP,
+  while `/admin/selfcheck` on the SAME process said they were all on time. The
+  lifespan set the scheduler on `app.state`; the MCP tool holds the `AppState`.
+* **A Proxmox settings reload left the `AppState` holding the client it had
+  just closed**, so every MCP-side report answered `connection_status: error`
+  with an empty token verdict while `/health` was correct.
+* **3.6.19's own write-token check broke the Proxmox self-check**: three
+  sequential round trips inside a 2-second probe budget turned `ok` into
+  `unknown` against a real cluster. A check that times out establishes nothing.
+  Both credentials are now probed concurrently, in one round trip.
+* The two subsystems added in 3.6.19 had no UI labels.
+
+`AppState` now declares `proxmox`, `mcp_app` and `reconciler_scheduler`, so a
+caller holding it cannot silently miss one.
+
+### Two of the tests written for 3.6.19 were vacuous
+
+Recorded because it is the same failure this review keeps finding elsewhere: a
+gate asserted the *string* `app.state.reconciler_scheduler = ...` appears in the
+lifespan and that `"reconciler_scheduler"` appears in the probe. Both were true,
+and neither established the two objects were the same one. **A source-string
+gate proves names match, never that objects do.**
+
 ## 3.6.19 - 2026-08-30
 
 The last three tranches of the platform review (#648), which finishes it:
