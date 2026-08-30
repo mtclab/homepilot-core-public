@@ -257,10 +257,18 @@ class InventoryService:
                 info: dict[str, Any] = {}
                 with _contextlib.suppress(ValueError, TypeError):
                     info = json.loads(agent["system_info"] or "{}")
+                # Decided HERE, not in the page: the same comparison feeds the
+                # self-check, and three hand-rolled copies of one rule is how
+                # #631 happened. `None` means the version could not be read,
+                # which is not the same as up to date (#648 tranche-1 follow-up).
+                from homepilot.agent_hub.version_skew import control_plane_version, is_behind
+
                 host_dict["agent"] = {
                     "agent_id": agent["agent_id"],
                     "connected": bool(agent["connected"]),
                     "version": info.get("agent_version"),
+                    "control_version": control_plane_version(),
+                    "behind": is_behind(info.get("agent_version"), control_plane_version()),
                     "arch": info.get("arch"),
                     "runtime": info.get("runtime"),
                     "first_seen": agent["first_seen"],
@@ -343,7 +351,18 @@ class InventoryService:
         return None
 
     async def refresh_inventory(self, scope: str | None = None) -> dict[str, Any]:
-        refreshed: dict[str, Any] = {"hosts": 0, "services": 0, "proxmox_host_ids": []}
+        # `complete` starts FALSE and is earned. Callers subtract this sweep's
+        # ids from what they already have to decide what is GONE, so a partial
+        # answer that looks like a whole one makes them declare live machines
+        # absent. Defaulting to False is the same fail-safe direction
+        # `VerifyResult.state` takes: a path that forgets to establish
+        # completeness reads as "not established" (#648 tranche 8).
+        refreshed: dict[str, Any] = {
+            "hosts": 0,
+            "services": 0,
+            "proxmox_host_ids": [],
+            "complete": False,
+        }
         # Did every listing this sweep depends on actually SUCCEED? The absent
         # sweep below deletes state on the strength of "I saw everything the
         # hypervisor reports", and that sentence is only true if nothing was
@@ -353,6 +372,11 @@ class InventoryService:
         listings_complete = True
 
         if self.proxmox is None:
+            # Nothing was asked, so nothing was established. Reported complete,
+            # this told the reconciler that Proxmox reports NO hosts - and every
+            # host in an agent-only install was written into the journal as
+            # absent, every cycle.
+            refreshed["error"] = "no Proxmox is configured, so no hypervisor was read"
             return refreshed
 
         try:
@@ -494,15 +518,25 @@ class InventoryService:
                     "Skipping the absent sweep: a guest listing failed, so the set of "
                     "guests actually seen is incomplete"
                 )
+            # A scoped sweep deliberately looks at one node, so it is complete
+            # for what it promised; a full one is complete only if every listing
+            # answered.
+            refreshed["complete"] = listings_complete
         except Exception as e:
+            # The sweep stopped part-way. `proxmox_host_ids` now holds whatever
+            # was reached before the failure, which is not "everything the
+            # hypervisor reports" - and it was returned looking exactly like a
+            # finished sweep, so the caller synced "successfully" and the
+            # reconciler wrote the rest of the fleet into the journal as absent.
             logger.warning("Failed to refresh proxmox inventory: %s", e)
+            refreshed["error"] = str(e)[:500]
 
         return refreshed
 
     async def enrich_inventory(
         self, host_ids: list[str] | None = None, scope: str | None = None
     ) -> dict[str, int]:
-        result = {"enriched": 0, "failed": 0, "skipped": 0}
+        result = {"enriched": 0, "failed": 0, "skipped": 0, "unchanged": 0}
         where_clauses: list[str] = []
         params: list[Any] = []
         if host_ids:
@@ -531,15 +565,23 @@ class InventoryService:
         for row in rows:
             host = dict(row)
             try:
-                await self._enrich_single_host(host)
-                result["enriched"] += 1
+                # "Enriched" used to mean "looked at": `status` was rewritten
+                # unconditionally, so `updates` was never empty and every host
+                # examined was counted as enriched. The reconciler then wrote
+                # `hosts_enriched: N` into the journal for a cycle that changed
+                # nothing (#648 tranche 8).
+                if await self._enrich_single_host(host):
+                    result["enriched"] += 1
+                else:
+                    result["unchanged"] += 1
             except Exception as exc:
                 logger.debug("Enrichment failed for %s: %s", host.get("id"), exc)
                 result["failed"] += 1
 
         return result
 
-    async def _enrich_single_host(self, host: dict[str, Any]) -> None:
+    async def _enrich_single_host(self, host: dict[str, Any]) -> bool:
+        """Enrich one host. Returns whether anything actually changed."""
         host_id = host["id"]
         pve_status = host.get("pve_status") or "unknown"
         role_source = host.get("role_source") or "inferred"
@@ -554,7 +596,7 @@ class InventoryService:
         # set by paths that did not stamp role_source="user" (#416).
         if role_source == "inferred":
             matched = _match_role(host.get("hostname", ""), host.get("description") or None)
-            if matched is not None:
+            if matched is not None and matched != host.get("role"):
                 updates["role"] = matched
                 updates["role_source"] = "inferred"
 
@@ -575,13 +617,15 @@ class InventoryService:
                 new_ip = await _guess_ip(host.get("hostname", ""))
                 if new_ip:
                     ip_source_val = "dns"
-            if new_ip:
+            if new_ip and (new_ip != current_ip or ip_source_val != ip_source):
                 updates["ip_address"] = new_ip
                 updates["ip_source"] = ip_source_val
 
-        # Status derivation
+        # Status derivation. Only when it MOVES: writing the same value back is
+        # not enrichment, and counting it as such is what made the number a lie.
         derived = derive_status(pve_status, updates.get("ip_address") or current_ip)
-        updates["status"] = derived
+        if derived != host.get("status"):
+            updates["status"] = derived
 
         if updates:
             # Through the one door: enrich used to re-derive `status` over
@@ -592,6 +636,9 @@ class InventoryService:
                 logger.debug(
                     "enrich left operator-set fields alone on %s: %s", host_id, ", ".join(skipped)
                 )
+            # Every field the operator has pinned means nothing moved.
+            return len(skipped) < len(updates)
+        return False
 
     async def introspect_and_record(self, host: dict[str, Any], adapter: Any) -> dict[str, Any]:
         """Run best-effort read-only introspection of an adopted host and record

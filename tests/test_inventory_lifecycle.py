@@ -214,10 +214,19 @@ class TestTheReconcilerSeesEveryHost:
                 await repo.create_host(hostname=f"h{n:03d}", host_type="qemu", role="guest")
 
             service = AsyncMock()
+            # A COMPLETE sweep that saw nothing: the hypervisor answered and
+            # reports no guests, which is what makes "the other 150 are gone" a
+            # sentence this reconciler has earned. (An incomplete sweep is a
+            # different case, gated in test_reconciler.py.)
             service.refresh_inventory = AsyncMock(
-                return_value={"hosts": 0, "services": 0, "proxmox_host_ids": []}
+                return_value={
+                    "hosts": 0,
+                    "services": 0,
+                    "complete": True,
+                    "proxmox_host_ids": [],
+                }
             )
-            service.enrich_inventory = AsyncMock(return_value={"enriched": 0})
+            service.enrich_inventory = AsyncMock(return_value={"enriched": 0, "unchanged": 0})
             reconciler = InventoryReconciler(inventory_service=service, repo=repo)
 
             result = await reconciler.run()

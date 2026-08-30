@@ -246,9 +246,19 @@ class TestAFailedListingNeverMarksAnythingAbsent:
 
 
 class TestRefreshInventory:
-    async def test_no_proxmox_returns_empty(self, svc):
+    async def test_no_proxmox_reports_an_unanswered_sweep_not_an_empty_one(self, svc):
+        """With no hypervisor there is nothing to read, so nothing is established.
+
+        Returned as a COMPLETE sweep naming zero hosts, this told the reconciler
+        that Proxmox reports no hosts at all - and every host in an agent-only
+        install was written into the journal as absent, on every cycle (#648
+        tranche 8).
+        """
         result = await svc.refresh_inventory()
-        assert result == {"hosts": 0, "services": 0, "proxmox_host_ids": []}
+        assert result["hosts"] == 0
+        assert result["proxmox_host_ids"] == []
+        assert result["complete"] is False
+        assert "no Proxmox is configured" in result["error"]
 
     async def test_refresh_creates_node(self, repo):
         mock_proxmox = AsyncMock()

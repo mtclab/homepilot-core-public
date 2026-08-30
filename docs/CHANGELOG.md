@@ -1,5 +1,67 @@
 # Changelog
 
+## 3.6.19 - 2026-08-30
+
+The last three tranches of the platform review (#648), which finishes it:
+the operator UI, inventory and the reconcilers, and the areas the review had
+exempted by assumption. One belief, found nine more times: **the product states
+conclusions it has not established.**
+
+### The operator UI reported a calm it had not established (tranche 7)
+
+Four screens, one cause - a read that did not come back, rendered as an answer.
+
+* Overview composed its "needs attention" zone from four side calls made with
+  `Promise.allSettled`. A rejection became an empty array and nothing else, so a
+  backend that could not answer produced the exact screen of an estate with
+  nothing wrong: **"Nothing needs you."** Each unread source is now its own line
+  with its own door, and the calm sentence cannot appear beside one.
+* The host page dropped every drift line when the drift read failed, so an
+  unreadable check rendered as a host in spec.
+* The change page polled the task it queued; a poll that threw stopped the timer
+  and said nothing, leaving the spinner claiming "in progress" and every action
+  disabled with nothing left running to correct either.
+* Settings told an operator "the token was rejected" when the session re-read
+  had simply not been answered - sending them to rotate a credential that was
+  never the problem.
+
+### Nothing could say whether the estate was being maintained (tranche 8)
+
+* **Eight reconcilers run the estate and no surface reported any of them.**
+  Every loop swallows its exceptions into a log line, so a loop crashing on
+  every cycle was indistinguishable from a healthy one - and the drift loop is
+  worse than indistinguishable: dead, it leaves the whole fleet on its last
+  green verdict, so stopping it makes the estate look better. The self-check now
+  reports them, naming per loop what stops happening.
+* **A hypervisor sweep that did not finish was returned as one that did**, so
+  the reconciler wrote "the whole fleet went absent" into the journal whenever
+  the node list failed - or simply whenever no Proxmox is configured, every
+  cycle, forever. The Sync button said "Synced: N hosts" either way.
+* `enriched` counted hosts *looked at*, not hosts changed.
+
+### The areas the review had exempted by assumption (tranche 9)
+
+* **No one ever compared the fleet's agent versions to the control plane.**
+  Enrolment serves the agent from the image, so a new agent matches the hub -
+  and nothing upgrades it and nothing reported the gap. A fix living in the Go
+  binary could ship, release and deploy without reaching a single managed host,
+  with every surface green. Reported now, per host and fleet-wide.
+* **The write token was never exercised** (#624). `connection_status: ok` only
+  ever meant the READ token answered; on prod that held until a friend's first
+  invite redemption 401ed in their face. Each credential is probed separately.
+* **An operator-side failure burned the friend's only link** (#625). An invite
+  now reopens when the build created nothing - and only when that is
+  established, which required the failure path to record its unwind
+  structurally (as the cancel path always had) and required distinguishing a
+  clone PVE REFUSED from one whose fate is unknown.
+
+### Tests that were defending defects
+
+Three found and rewritten across these tranches: one asserting an unreadable
+drift check must render "Nothing needs you"; one asserting a sweep that named no
+hosts must report success and mark the whole database absent; and one that was
+literally `assert hasattr(...) or True`.
+
 ## 3.6.18 - 2026-08-30
 
 Tranche 6 of the platform review (#648): the knowledge base and search.

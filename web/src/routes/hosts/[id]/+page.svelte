@@ -44,6 +44,10 @@
 	let activity: AuditEntry[] = [];
 	/** Artifact ids the drift checker currently says disagree with reality. */
 	let driftedIds: Set<string> = new Set();
+	// An unanswered drift read is not an answer of "none". Left as an empty set
+	// it silently dropped every drift line and this page read clean (#648
+	// tranche 7) - the same rule Overview's "In spec" card already keeps at P6.
+	let driftUnread = false;
 	let loading = true;
 	let loadError = '';
 	let hours = 1;
@@ -104,6 +108,7 @@
 			]);
 			doc = docRes.status === 'fulfilled' ? docRes.value : null;
 			activity = actRes.status === 'fulfilled' ? actRes.value.items : [];
+			driftUnread = driftRes.status === 'rejected';
 			driftedIds =
 				driftRes.status === 'fulfilled'
 					? new Set(driftRes.value.items.map((d) => d.artifact_id))
@@ -311,12 +316,32 @@
 				href: agentTabHref,
 			});
 		}
+		if (agent?.connected && agent.behind === true) {
+			// Nothing upgrades an enrolled agent, so a fix that lives in the Go
+			// binary can ship, release and deploy without ever reaching this
+			// machine - and every surface stayed green while it did (#648
+			// tranche-1 follow-up).
+			out.push({
+				severity: 'warning',
+				label: 'agent outdated',
+				text: `The agent here is ${agent.version ?? 'an unknown version'}, older than HomePilot ${agent.control_version ?? ''}. Fixes shipped in the agent have not reached this host.`,
+				href: agentTabHref,
+			});
+		}
 		if (agent?.last_error) {
 			out.push({
 				severity: 'warning',
 				label: 'refused',
 				text: agent.last_error,
 				href: agentTabHref,
+			});
+		}
+		if (driftUnread && (doc?.artifact_history?.length ?? 0) > 0) {
+			out.push({
+				severity: 'warning',
+				label: 'drift unread',
+				text: 'Could not read drift, so this page cannot say whether this host\u2019s changes still match their plan',
+				href: `${base}/changes/drift`,
 			});
 		}
 		for (const a of doc?.artifact_history ?? []) {

@@ -321,6 +321,23 @@ async def invite_redeem(request: Request, token: str) -> Any:
     )
 
 
+def _cleanup_verdict(task: dict[str, Any] | None) -> str:
+    """What a failed provision established about what it left behind.
+
+    "" when the task says nothing - which is the answer for a task written by an
+    older build, and is deliberately NOT treated as "nothing remains".
+    """
+    if not task or not task.get("result_json"):
+        return ""
+    try:
+        parsed = json.loads(str(task["result_json"]))
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("cleanup") or "")
+
+
 def _rejoin_facts(task: dict[str, Any] | None) -> dict[str, Any]:
     """What the LAST tailnet re-join established, if one was ever started (#628).
 
@@ -375,6 +392,42 @@ async def _render_status(
             await invites.record_host(str(row["id"]), str(facts["host_id"]))
     elif status_name in ("failed", "cancelled"):
         state = "bad"
+        # A build that failed WITHOUT creating a machine must not burn the
+        # friend's one link (#625). The first real redemption on prod died on a
+        # stale operator write token and left a blameless person needing a
+        # freshly minted invite. Only when nothing was built: a failure that
+        # left a VM behind is an operator's clean-up, not a link to hand back.
+        # ESTABLISHED, not assumed. The provision task now records its unwind
+        # structurally, so "nothing is left on the node" is something this can
+        # READ - `nothing_created` (the failure was before the clone) or
+        # `deleted` (the guest was taken back and the destroy was waited on). A
+        # cleanup that FAILED, or a task too old to say either way, leaves a
+        # machine that may still exist, and handing the link back then would
+        # give out a second machine past the quota.
+        cleanup = _cleanup_verdict(task)
+        nothing_built = (
+            cleanup in ("nothing_created", "deleted")
+            and facts.get("vmid") is None
+            and not row["resulting_host_id"]
+        )
+        if nothing_built and await invites.reopen_after_failed_build(
+            str(row["id"]), str(row["resulting_task_id"])
+        ):
+            logger.info(
+                "Invite %s reopened: the build failed before any machine existed",
+                row["token_prefix"],
+            )
+            return render(
+                "message.html",
+                status_code=status_code,
+                heading="The build failed - your link still works",
+                message=(
+                    "Something went wrong while your machine was being created, and "
+                    "nothing was built. Your invite link has been reopened, so open "
+                    "it again to retry. If it fails a second time, the operator needs "
+                    "to look at it."
+                ),
+            )
     else:
         state = "running"
 

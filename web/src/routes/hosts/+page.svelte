@@ -209,7 +209,20 @@
 		syncing = true;
 		try {
 			const res = await api.refreshInventory();
-			notify(`Synced: ${res.hosts} hosts, ${res.services} services`, 'ok');
+			// A sweep that did not see the whole hypervisor is not a small sync,
+			// it is an unfinished one - and reported green, its counts read as
+			// the estate rather than as the part of it that answered (#648
+			// tranche 8). Missing `complete` means an older backend that cannot
+			// say, which is not the same as saying yes.
+			if (res.complete === true) {
+				notify(`Synced: ${res.hosts} hosts, ${res.services} services`, 'ok');
+			} else {
+				notify(
+					`Sync did not finish: ${res.error ?? 'the hypervisor sweep was incomplete'}. ` +
+						`${res.hosts} hosts were read, so this is part of the estate, not all of it.`,
+					'err',
+				);
+			}
 			await enrich();
 		} catch (e) {
 			notify(String(e), 'err');
@@ -222,7 +235,13 @@
 		enriching = true;
 		try {
 			const res = await api.enrichInventory();
-			notify(`Enriched ${res.enriched}, failed ${res.failed}, skipped ${res.skipped}`, 'ok');
+			// `enriched` counts hosts that actually CHANGED, so an all-quiet pass
+			// reports zero rather than the row count.
+			const unchanged = res.unchanged === undefined ? '' : `, unchanged ${res.unchanged}`;
+			notify(
+				`Enriched ${res.enriched}, failed ${res.failed}, skipped ${res.skipped}${unchanged}`,
+				'ok',
+			);
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');

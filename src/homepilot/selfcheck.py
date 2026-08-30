@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from .agent_hub import version_skew
 from .common import redact_endpoint
 
 logger = logging.getLogger(__name__)
@@ -243,10 +244,40 @@ def _proxmox_subsystem(state: Any, settings: Any) -> Subsystem:
     client = getattr(state, "proxmox", None)
     target = redact_endpoint(host)
 
-    async def probe() -> bool:
+    async def probe() -> bool | ProbeVerdict:
         if client is None:
             return False
-        return bool(await client.test_connection())
+        if not bool(await client.test_connection()):
+            return False
+        # The read token answered. That is not the claim an operator needs:
+        # every clone, snapshot and delete goes through the WRITE token, and a
+        # stale one is invisible until a guest's first provision 401s in their
+        # face - which is exactly how it surfaced on prod (#624).
+        try:
+            tokens = await client.check_tokens()
+        except Exception:
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"The Proxmox API at {target} answered its read token, but the write "
+                "token could not be checked, so nothing is known about whether "
+                "provisioning would work.",
+            )
+        write = tokens.get("write", {})
+        if write.get("ok") is False:
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"The Proxmox API at {target} answers reads, but the WRITE token is "
+                f"refused ({write.get('detail') or 'no detail'}). Inventory works and "
+                "every mutation does not: provisioning, clones, snapshots and deletes "
+                "will fail at the moment they are attempted. Re-paste the write token "
+                "in Settings -> Proxmox.",
+            )
+        return ProbeVerdict(
+            STATE_OK,
+            f"The Proxmox API at {target} answered and both tokens authenticate; "
+            "inventory and provisioning are available. (Authentication only - "
+            "privileges are proven by the first real mutation.)",
+        )
 
     return Subsystem(
         name="proxmox",
@@ -459,6 +490,212 @@ def _artifacts_remote_subsystem(state: Any, settings: Any) -> Subsystem:
     )
 
 
+def _agent_versions_subsystem(state: Any, settings: Any) -> Subsystem:
+    """Is the fleet running the agent binary this control plane shipped?
+
+    Enrolment serves the agent out of this image, so a new agent matches the hub
+    that enrolled it - and then nothing upgrades it and, until now, nothing
+    reported the gap. Dev ran a v3.6.6 agent against a 3.6.15 hub for weeks with
+    every surface green: a fix that lived in the Go binary was written, gated,
+    released and deployed, and changed nothing at all on any managed host.
+    `agent_hub` reporting `ok` is not this claim - it says hosts CAN connect,
+    not that what connected is current. Named in `agent_hub/dist.py` as #648's
+    tranche-1 follow-up; this is it.
+    """
+    enabled = bool(getattr(settings, "agent_hub_enabled", False))
+    registry = getattr(state, "agent_registry", None)
+    control = version_skew.control_plane_version()
+
+    async def probe() -> bool | ProbeVerdict:
+        if registry is None or not hasattr(registry, "list_connected"):
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                "No agent registry is wired in, so the versions running on managed "
+                "hosts cannot be read at all.",
+            )
+        summary = version_skew.summarise(list(registry.list_connected()), control)
+        if summary["connected"] == 0:
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                "No agent is connected, so nothing can be said about what versions the "
+                "fleet is running.",
+            )
+        if summary["behind"]:
+            names = ", ".join(summary["behind"])
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"{len(summary['behind'])} of {summary['connected']} connected agents are "
+                f"OLDER than this control plane ({control}): {names}. Nothing upgrades an "
+                "enrolled agent, so any fix that lives in the agent binary - including a "
+                "security fix - has not reached those hosts however many releases ago it "
+                "shipped. Re-run the installer on each, or forget and re-enrol the agent.",
+            )
+        if summary["unknown"]:
+            names = ", ".join(summary["unknown"])
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"{len(summary['unknown'])} connected agent(s) report a version this build "
+                f"cannot compare with its own ({control}): {names}. Treat them as unproven "
+                "rather than current.",
+            )
+        return ProbeVerdict(
+            STATE_OK,
+            f"All {summary['connected']} connected agents are running {control}, the same "
+            "version as this control plane.",
+        )
+
+    return Subsystem(
+        name="agent_versions",
+        label="the agent versions in the fleet",
+        configured=enabled,
+        target="",
+        off=(
+            "No host runs an hp-agent, so there is no agent binary to be out of date - "
+            "and no host metrics or remote actions either."
+        ),
+        ok=f"Every connected agent is running {control}, the same version as this control plane.",
+        broken=(
+            "At least one managed host is running an agent binary older than this control "
+            "plane, so fixes shipped in the agent have not reached it."
+        ),
+        probe=probe if enabled else None,
+    )
+
+
+# What STOPS HAPPENING when one loop stops. "A reconciler is failing" tells an
+# operator nothing about what they have lost, and the whole point of this report
+# is the consequence in plain words. Keyed by the name each loop puts on its own
+# ReconcilerResult; an unlisted loop falls back to a generic line rather than
+# being left out of the verdict.
+_RECONCILER_CONSEQUENCE: dict[str, str] = {
+    "inventory": (
+        "the inventory has stopped following the hypervisor: a new guest is never "
+        "seen and a destroyed one keeps its row"
+    ),
+    "drift": (
+        "no applied artifact is re-checked, so every drift verdict on the fleet is "
+        "as old as the last cycle - and a fleet nothing checks stays green"
+    ),
+    "retention": "operational history is no longer pruned, so the database grows without bound",
+    "db_integrity": (
+        "nothing asks whether the database FILE is still sound, so /health cannot report corruption"
+    ),
+    "archive_push": "the artifact archive is no longer mirrored off-box",
+    "apply": "approved changes are no longer applied automatically",
+    "metrics_pruner": "old metrics are no longer pruned",
+    "alert_evaluator": (
+        "no alert rule is evaluated, so nothing raises an alert however bad it gets"
+    ),
+}
+
+# A loop may legitimately be one cycle late. Three is not lateness - the same
+# judgment the artifacts remote makes above, for the same reason.
+_STALE_INTERVALS = 3
+# Consecutive failed cycles before a loop counts as broken rather than unlucky.
+_FAILURE_STREAK = 3
+
+
+def _reconciler_consequence(name: str) -> str:
+    return _RECONCILER_CONSEQUENCE.get(name, f"whatever `{name}` maintains stops being maintained")
+
+
+def _reconcilers_subsystem(state: Any) -> Subsystem:
+    """Are the scheduled loops that maintain the estate actually running?
+
+    Nothing asked until #648 tranche 8. Every loop swallows its own exceptions
+    into a log line, so a crashed reconciler and a healthy one look identical
+    from every surface - and the drift loop looks BETTER dead, because a fleet
+    nothing re-checks keeps its last green verdict forever. This reports what
+    the scheduler has actually recorded, and it may not round up: a loop that
+    has never completed a cycle is `unknown`, not `ok`.
+    """
+
+    scheduler = getattr(state, "reconciler_scheduler", None)
+    registered: list[Any] = []
+    if scheduler is not None and hasattr(scheduler, "status"):
+        registered = list(scheduler.status())
+
+    async def probe() -> bool | ProbeVerdict:
+        statuses = registered
+        failing = [s for s in statuses if s.consecutive_failures >= _FAILURE_STREAK]
+        if failing:
+            worst = failing[0]
+            names = ", ".join(sorted(s.name for s in failing))
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"{len(failing)} reconciler(s) are failing every cycle ({names}). For "
+                f"`{worst.name}`: {_reconciler_consequence(worst.name)}. Last error: "
+                f"{worst.last_error or 'see the journal'}",
+            )
+
+        stale: list[Any] = []
+        never: list[Any] = []
+        for st in statuses:
+            interval = st.interval_seconds
+            budget = (interval or 0.0) * _STALE_INTERVALS + st.startup_delay
+            if st.runs == 0:
+                # Not yet due is not a fault: a loop with a 6h interval and a
+                # 120s delay has honestly not run yet a minute after boot.
+                age = _age_seconds(st.registered_at)
+                if age is not None and interval is not None and age > budget:
+                    never.append(st)
+                continue
+            age = _age_seconds(st.last_finished_at or st.registered_at)
+            if age is not None and interval is not None and age > budget:
+                stale.append(st)
+
+        if never:
+            names = ", ".join(sorted(s.name for s in never))
+            worst = never[0]
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"{len(never)} reconciler(s) have never completed a cycle although they "
+                f"are long overdue ({names}). For `{worst.name}`: "
+                f"{_reconciler_consequence(worst.name)}.",
+            )
+        if stale:
+            names = ", ".join(sorted(s.name for s in stale))
+            worst = stale[0]
+            age = _age_seconds(worst.last_finished_at or worst.registered_at)
+            when = _humanise(age) if age is not None else "a long time"
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"{len(stale)} reconciler(s) have stopped running ({names}). Nothing has "
+                f"FAILED - `{worst.name}` last finished {when} ago, more than three of its "
+                f"intervals, so {_reconciler_consequence(worst.name)}.",
+            )
+        ran = sum(1 for s in statuses if s.runs > 0)
+        return ProbeVerdict(
+            STATE_OK,
+            f"All {len(statuses)} scheduled reconcilers are on time ({ran} have completed "
+            "at least one cycle and none is failing).",
+        )
+
+    return Subsystem(
+        name="reconcilers",
+        label="the scheduled reconcilers",
+        # "Configured" here means a scheduler exists AND something is registered
+        # on it - which is what an operator is really asking. A process with no
+        # loops registered is not a healthy one with nothing to do; it is an
+        # estate nothing maintains, and that is the `off` arm below.
+        configured=bool(registered),
+        # These loops run in-process; there is no address to name, and a report
+        # that invents one implies something an operator could go and check.
+        target="",
+        off=(
+            "No reconciler is registered, so nothing maintains the estate on a timer: "
+            "the inventory never follows the hypervisor, no applied artifact is ever "
+            "re-checked for drift, and operational history is never pruned."
+        ),
+        ok="Every scheduled reconciler has run recently and none is failing.",
+        broken=(
+            "A scheduled reconciler has stopped. Whatever it maintains is no longer "
+            "being maintained, and no other surface would have said so."
+        ),
+        probe=probe,
+    )
+
+
 def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
     """The optional subsystems of a HomePilot instance, in report order.
 
@@ -474,6 +711,8 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _events_webhook_subsystem(settings),
         _mcp_subsystem(state),
         _artifacts_remote_subsystem(state, settings),
+        _reconcilers_subsystem(state),
+        _agent_versions_subsystem(state, settings),
     ]
 
 
