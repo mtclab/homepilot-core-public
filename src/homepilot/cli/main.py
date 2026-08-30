@@ -1813,6 +1813,44 @@ def db_check() -> None:
     console.print(f"[dim]Schema version {read_schema_version(db_path)}[/dim]")
 
 
+async def _index_proposed_notes(artifact_ids: list[str]) -> tuple[int, list[str]]:
+    """Put freshly proposed kb-notes into the knowledge base, from the CLI.
+
+    The CLI's lifecycle has no KB service attached, so a note proposed here was
+    written to disk and to the artifacts table and left OUT of `doc_metadata`
+    until a running backend happened to rebuild. This closes that gap for the
+    one command whose entire purpose is to seed the KB.
+    """
+    if not artifact_ids:
+        return 0, []
+    from homepilot.db.repository import Repository
+    from homepilot.executor import kb_note
+
+    settings = _get_settings()
+    db_path = Path(settings.data_dir) / "homepilot.db"
+    if not db_path.exists():
+        return 0, [f"no database at {db_path}"]
+    store = _get_artifact_store()
+    database = await _open_cli_db("hp policy init", db_path)
+    indexed = 0
+    problems: list[str] = []
+    try:
+        repo = Repository(database)
+        for artifact_id in artifact_ids:
+            try:
+                fm, body = store.read(artifact_id)
+                result = await kb_note.execute(fm, body, repo)
+                if result.get("success"):
+                    indexed += 1
+                else:
+                    problems.append(f"{artifact_id}: {result.get('failure_reason', 'failed')}")
+            except Exception as exc:
+                problems.append(f"{artifact_id}: {exc}")
+    finally:
+        await database.close()
+    return indexed, problems
+
+
 @policy_app.command("init")
 def policy_init() -> None:
     """Interactive ~20 question onboarding to seed policy KB."""
@@ -1842,6 +1880,9 @@ def policy_init() -> None:
 
     _get_artifact_store()
     lifecycle = _get_lifecycle()
+    written = 0
+    failed: list[str] = []
+    proposed_ids: list[str] = []
 
     for question_text, key in questions:
         answer = typer.prompt(question_text, default="")
@@ -1859,13 +1900,40 @@ def policy_init() -> None:
             "target": {"kind": "global"},
             "produced_by": {"session": "policy-init", "agent": "cli", "user": "cli"},
         }
-        with contextlib.suppress(Exception):
+        try:
             asyncio.run(lifecycle.propose(spec))
+            written += 1
+            proposed_ids.append(fact_id)
+        except Exception as exc:
+            failed.append(f"{key}: {exc}")
 
-    console.print("\n[green]Policy initialization complete.[/green]")
-    console.print(
-        "[dim]These policies are now in the KB — the agent will find them via search_kb.[/dim]"
-    )
+    # Every propose failure used to be swallowed by `contextlib.suppress` and
+    # the command printed the same green success line, so an operator who
+    # answered nineteen questions into a broken store was told their policies
+    # were in the KB (#648 tranche 6).
+    if failed:
+        err_console.print(f"\n[red]{len(failed)} policy note(s) could not be written:[/red]")
+        for line in failed:
+            err_console.print(f"  [red]{line}[/red]")
+    if not written:
+        err_console.print("[red]No policies were recorded.[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"\n[green]Recorded {written} policy note(s).[/green]")
+
+    # Index them HERE rather than promising someone else will. Writing the
+    # artifact is not the same as putting it in the knowledge base, and this
+    # command's closing line asserted the latter having only done the former
+    # (ADR-004 corollary 4: "Automating a step beats documenting it").
+    indexed, index_errors = asyncio.run(_index_proposed_notes(proposed_ids))
+    if indexed:
+        console.print(f"[dim]{indexed} indexed — the agent will find them via search_kb.[/dim]")
+    for line in index_errors:
+        err_console.print(f"[yellow]not indexed — {line}[/yellow]")
+    if index_errors:
+        err_console.print(
+            "[yellow]Run `hp kb reindex` once the cause is fixed; until then these "
+            "policies are not searchable.[/yellow]"
+        )
 
 
 @kb_app.command("reindex")
@@ -1874,10 +1942,21 @@ def kb_reindex(
     no_embeddings: bool = typer.Option(
         False, "--no-embeddings", help="Skip embedding computation; rebuild keyword metadata only"
     ),
+    force_embeddings: bool = typer.Option(
+        False,
+        "--force-embeddings",
+        help="Drop every stored vector and recompute — run this after changing the embedding model",
+    ),
 ) -> None:
-    """Rewalk all applied kb-note artifacts, recompute embeddings, rebuild SQLite index."""
+    """Re-index every applied kb-note: upsert each, drop the ones no longer applied.
+
+    Row ids are stable across a reindex, and an unchanged note keeps the
+    embedding it has. After changing the embedding MODEL that is the wrong
+    answer - the stored vectors are from a different space - so pass
+    `--force-embeddings` then.
+    """
     if not yes:
-        typer.confirm("Delete and rebuild all KB index entries?", abort=True)
+        typer.confirm("Rebuild the KB search index from the applied notes?", abort=True)
 
     if not no_embeddings:
         # Judge the CONFIGURED service, not a hardcoded Ollama on localhost: with
@@ -1921,7 +2000,7 @@ def kb_reindex(
                 )
                 no_embeddings = True
 
-    async def _kb_reindex_via_api(no_embs: bool) -> dict[str, Any] | None:
+    async def _kb_reindex_via_api(no_embs: bool, force: bool) -> dict[str, Any] | None:
         settings = _get_settings()
         base_url = f"http://127.0.0.1:{settings.daemon_port}"
         # `/kb/reindex` requires the ADMIN SCOPE, i.e. a bearer token. This sent
@@ -1941,7 +2020,7 @@ def kb_reindex(
             try:
                 resp = await client.post(
                     f"{base_url}/kb/reindex",
-                    params={"no_embeddings": no_embs},
+                    params={"no_embeddings": no_embs, "force_embeddings": force},
                     headers=headers,
                 )
                 if resp.status_code == 200:
@@ -1957,8 +2036,8 @@ def kb_reindex(
                 _logging.getLogger(__name__).debug("token API mint failed, using DB", exc_info=True)
         return None
 
-    async def _do(skip_embeddings: bool = False) -> dict[str, Any]:
-        via_api = await _kb_reindex_via_api(skip_embeddings)
+    async def _do(skip_embeddings: bool = False, force: bool = False) -> dict[str, Any]:
+        via_api = await _kb_reindex_via_api(skip_embeddings, force)
         if via_api is not None:
             return via_api
 
@@ -1969,28 +2048,32 @@ def kb_reindex(
         data_dir = Path(settings.data_dir)
         db_path = data_dir / "homepilot.db"
         if not db_path.exists():
-            return {"deleted": 0, "reindexed": 0, "errors": 0}
+            return {"removed": 0, "reindexed": 0, "errors": 0, "errors_detail": []}
 
         database = await _open_cli_db("hp kb reindex", db_path)
         try:
             repo = Repository(database)
             store = _get_artifact_store()
 
-            rows = await database.fetchall(
-                "SELECT id FROM doc_metadata WHERE source LIKE 'artifact:%'"
-            )
-            artifact_doc_ids = [r["id"] for r in rows]
-            for doc_id in artifact_doc_ids:
-                await database.execute("DELETE FROM vec_docs WHERE id = ?", (doc_id,))
-            await database.execute("DELETE FROM doc_metadata WHERE source LIKE 'artifact:%'")
-            await database.conn.commit()
-
-            deleted = len(artifact_doc_ids)
+            # Upsert, never delete-then-rebuild. The old shape deleted every
+            # artifact-backed document up front, so an artifact that could not
+            # be read afterwards was simply GONE from the knowledge base - and
+            # the counters said `0 errors` because `store.list` never offered
+            # it (#648 tranche 6). It also reassigned every doc id.
             reindexed = 0
             errors = 0
+            error_lines: list[str] = []
+            seen_sources: set[str] = set()
+
+            if force and not skip_embeddings:
+                # After a model change every stored vector is from a different
+                # space, and an unchanged note would otherwise keep it.
+                await database.execute("DELETE FROM vec_docs")
+                await database.conn.commit()
 
             for artifact_meta in store.list(kind="kb-note", status="applied"):
                 artifact_id = artifact_meta.get("id", "")
+                seen_sources.add(f"artifact:{artifact_id}")
                 try:
                     fm, body = store.read(artifact_id)
                     result = await kb_note.execute(fm, body, repo, no_embeddings=skip_embeddings)
@@ -1998,20 +2081,71 @@ def kb_reindex(
                         reindexed += 1
                     else:
                         errors += 1
-                except Exception:  # broad catch: increments error counter
+                        error_lines.append(
+                            f"{artifact_id}: {result.get('failure_reason', 'failed')}"
+                        )
+                except Exception as exc:
                     errors += 1
+                    error_lines.append(f"{artifact_id}: {exc}")
+
+            # Retired, never merely unseen: `store.list` skips any file it
+            # cannot open, so pruning on its absence deletes a note because we
+            # could not look at it. The artifacts table is the authority.
+            rows = await database.fetchall(
+                "SELECT id, source FROM doc_metadata WHERE source LIKE 'artifact:%'"
+            )
+            removed = 0
+            unverified: list[str] = []
+            for row in rows:
+                source = str(row["source"])
+                if source in seen_sources:
+                    continue
+                artifact_id = source[len("artifact:") :]
+                if store.exists(artifact_id):
+                    try:
+                        fm_check, _ = store.read(artifact_id)
+                    except Exception:  # "could not look" is the answer, not a failure
+                        unverified.append(artifact_id)
+                        continue
+                    if str(fm_check.get("status")) == "applied":
+                        unverified.append(artifact_id)
+                        continue
+                if await repo.delete_doc_metadata(int(row["id"])):
+                    removed += 1
         finally:
             await database.close()
 
-        return {"deleted": deleted, "reindexed": reindexed, "errors": errors}
+        return {
+            "removed": removed,
+            "reindexed": reindexed,
+            "errors": errors,
+            "errors_detail": error_lines,
+            "unverified": unverified,
+        }
 
-    result = asyncio.run(_do(skip_embeddings=no_embeddings))
+    result = asyncio.run(_do(skip_embeddings=no_embeddings, force=force_embeddings))
+    errors = int(result.get("errors", 0))
+    unverified_ids = list(result.get("unverified") or [])
+    headline = "[green]Reindex complete:[/green]" if not errors else "[red]Reindex FAILED for"
     console.print(
-        f"[green]Reindex complete:[/green] "
-        f"{result['deleted']} removed, "
-        f"{result['reindexed']} reindexed, "
-        f"{result['errors']} errors"
+        f"{headline} "
+        f"{result.get('reindexed', 0)} indexed, "
+        f"{result.get('removed', 0)} removed (no longer applied), "
+        f"{errors} error(s)"
     )
+    # A green "complete" over a rebuild that lost documents is the line an
+    # operator reads and then does not go looking.
+    for line in result.get("errors_detail") or []:
+        err_console.print(f"  [red]{line}[/red]")
+    if unverified_ids:
+        err_console.print(
+            f"[yellow]{len(unverified_ids)} document(s) kept without being able to read "
+            "their artifact — still searchable, but not confirmed current:[/yellow]"
+        )
+        for artifact_id in unverified_ids[:10]:
+            err_console.print(f"  [yellow]{artifact_id}[/yellow]")
+    if errors:
+        raise typer.Exit(code=1)
 
 
 _TOKEN_RULE = (  # nosec B105 - a refusal message about tokens, not a credential

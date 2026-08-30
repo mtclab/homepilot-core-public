@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -1444,6 +1445,69 @@ class Repository:
         await self.db.conn.commit()
         return cursor.lastrowid
 
+    async def upsert_doc_metadata(
+        self,
+        source: str,
+        title: str,
+        content: str,
+        kind: str = "note",
+        target: str | None = None,
+    ) -> tuple[int, bool]:
+        """Index one document BY ITS SOURCE, keeping the row id it already has.
+
+        Returns ``(doc_id, text_changed)``. `text_changed` is False when the row
+        was already there with the same title and content, which is the signal
+        the caller needs to decide whether the stored embedding is still valid.
+
+        Why this exists: `reindex` used to DELETE every artifact-backed row and
+        re-INSERT it. `doc_metadata.id` is a plain `INTEGER PRIMARY KEY`, so
+        SQLite hands out reused rowids - which meant
+
+          * the numeric id `list_kb`/`search_kb` return, and `get_kb_doc`,
+            `update_kb_doc` and `delete_kb_doc` take, pointed at a DIFFERENT
+            document after any KB write (verified on dev 3.6.17: doc 1 was the
+            nginx policy, then the dev-ct-db policy);
+          * `embedded_at` was restamped for every row at once, so "newest
+            indexed first" ordered nothing;
+          * a re-created row could land on a rowid whose `vec_docs` entry had
+            been orphaned by a delete, and inherit a DELETED document's meaning.
+
+        An upsert has none of those. The id is the document's identity, so it
+        has to survive the index being rebuilt.
+        """
+        existing = await self.db.fetchone(
+            "SELECT id, title, content FROM doc_metadata WHERE source = ? ORDER BY id LIMIT 1",
+            (source,),
+        )
+        if existing is None:
+            cursor = await self.db.execute(
+                """INSERT INTO doc_metadata
+                   (source, kind, target, title, content, url, version, embedded_at)
+                   VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                (source, kind, target, title, content, now()),
+            )
+            await self.db.conn.commit()
+            return int(cursor.lastrowid or 0), True
+
+        doc_id = int(existing["id"])
+        changed = existing["title"] != title or existing["content"] != content
+        if changed:
+            # `embedded_at` moves only when the text moved: it is what
+            # "newest-indexed first" orders by, and restamping an unchanged
+            # document on every reindex is what made that ordering meaningless.
+            await self.db.execute(
+                "UPDATE doc_metadata SET kind = ?, target = ?, title = ?, content = ?, "
+                "embedded_at = ? WHERE id = ?",
+                (kind, target, title, content, now(), doc_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE doc_metadata SET kind = ?, target = ? WHERE id = ?",
+                (kind, target, doc_id),
+            )
+        await self.db.conn.commit()
+        return doc_id, changed
+
     async def list_doc_metadata(
         self,
         kind: str | None = None,
@@ -1510,9 +1574,49 @@ class Repository:
         return await self.get_doc_metadata(doc_id)
 
     async def delete_doc_metadata(self, doc_id: int) -> bool:
+        """Delete a KB document AND the embedding that stands for it.
+
+        The embedding was left behind. `doc_metadata.id` is a reused rowid, so
+        the next document to take that id inherited the deleted one's vector and
+        was returned, at full score, as the answer to questions about a document
+        the operator had removed. Reproduced live on 3.6.17: a firewall policy
+        came back as the top hit for a query about a deleted reboot-window
+        policy, with `UNIQUE constraint failed on vec_docs primary key` the only
+        trace in the log.
+
+        A stranded vector also inflated `indexed_with_embeddings` above
+        `total_docs` - the status report showed more embedded documents than
+        documents.
+        """
         cursor = await self.db.execute("DELETE FROM doc_metadata WHERE id = ?", (doc_id,))
+        # Best-effort on the vector side: an install whose sqlite-vec extension
+        # failed to load has no vec_docs table, and that must not turn a KB
+        # delete into an error.
+        try:
+            await self.db.execute("DELETE FROM vec_docs WHERE id = ?", (doc_id,))
+        except sqlite3.OperationalError:
+            logger.debug("vec_docs unavailable while deleting doc %s", doc_id)
         await self.db.conn.commit()
         return cursor.rowcount > 0
+
+    async def has_embedding(self, doc_id: int) -> bool:
+        """Whether this document has a vector of its own."""
+        try:
+            row = await self.db.fetchone("SELECT id FROM vec_docs WHERE id = ?", (doc_id,))
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
+    async def count_orphan_embeddings(self) -> int:
+        """`vec_docs` rows with no document. Should always be zero."""
+        try:
+            row = await self.db.fetchone(
+                "SELECT COUNT(*) AS c FROM vec_docs v "
+                "WHERE NOT EXISTS (SELECT 1 FROM doc_metadata dm WHERE dm.id = v.id)"
+            )
+        except sqlite3.OperationalError:
+            return 0
+        return int(row["c"]) if row else 0
 
     async def search_docs_by_source(self, source: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = await self.db.fetchall(

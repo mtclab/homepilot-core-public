@@ -948,6 +948,24 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             "hosts_matched",
         ),
     ],
+    32: [
+        # Drop embeddings that belong to documents which no longer exist
+        # (#648 tranche 6).
+        #
+        # `delete_doc_metadata` removed the row and left the `vec_docs` entry.
+        # `doc_metadata.id` is a plain `INTEGER PRIMARY KEY`, so SQLite reuses
+        # rowids: the next document to take that id was silently indexed under
+        # the DELETED document's vector and returned, at full score, as the
+        # answer to questions about a note the operator had removed. The insert
+        # that should have replaced it failed with `UNIQUE constraint failed on
+        # vec_docs primary key` and was swallowed at WARNING.
+        #
+        # The code no longer strands them. This clears the ones already there,
+        # because they are actively wrong answers, not dead weight. Every
+        # document that loses its embedding this way is picked up by the next
+        # reindex sweep, which embeds anything missing one.
+        "DELETE FROM vec_docs WHERE id NOT IN (SELECT id FROM doc_metadata)",
+    ],
 }
 
 

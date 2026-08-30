@@ -589,9 +589,24 @@ note_kind: note | policy | decision
 **Executor algorithm:**
 
 1. Validate body is non-empty Markdown.
-2. Index in SQLite: insert into `kb_entries (id, target, note_kind, content, embedding, applied_at)`.
-3. Compute embedding via local model (sqlite-vec) if available; fall back to keyword-only if not.
-4. No external side effects.
+2. Index in SQLite: UPSERT into `doc_metadata` keyed on `source = artifact:<id>`.
+   The row id is the document's identity - `list_kb`, `search_kb`, `get_kb_doc`,
+   `update_kb_doc` and `delete_kb_doc` all speak in it - so it must survive a
+   reindex. A delete-then-insert rebuild reassigned it, and because
+   `doc_metadata.id` is a reusable rowid a document could take over a deleted
+   document's embedding (#648 tranche 6).
+3. Compute an embedding (sqlite-vec, `vec_docs`) when one is needed - the text
+   changed, or the document has none - and REPLACE rather than insert. Failing
+   to store one is reported, never logged as "embedding stored"; the note stays
+   keyword-only.
+4. A failed step 2 is a FAILURE. The note is not in the knowledge base and no
+   search will find it, so it must not return success with the word "indexed".
+5. No external side effects.
+
+**Indexed on propose.** `propose` writes a kb-note `applied` without running the
+executor, so nothing indexed it: `propose_artifact` answered `applied` for a note
+`get_kb_doc` could not find. The lifecycle indexes every kb-note as it proposes
+it, and `record_fact` / `POST /kb` report `indexed` in their answer.
 
 **Idempotence:** N/A (`idempotence: not-applicable` allowed for kb-note only).
 
@@ -884,7 +899,8 @@ Function calls (including `.get()`, `.json()`) and private/dunder attributes are
 ### D5. KB embeddings are derived, not artifact content
 **Decision:** embeddings live in SQLite (sqlite-vec) only. The artifact file contains the human-readable Markdown body; embeddings are computed on `apply` and on `hp kb reindex`.
 **Why:** keeps artifact files portable (someone with `git clone` and no embedding model can still read them); embeddings are model-dependent and regenerating from text is fast.
-**Reindex path:** `hp kb reindex` re-embeds every applied `kb-note` artifact. Run after restoring from a backup, after changing the embedding model, or after migrating to a different host.
+**Reindex path:** `hp kb reindex` walks every applied `kb-note` artifact and upserts it, embedding anything whose text changed or that has no vector. Run after restoring from a backup, after changing the embedding model, or after migrating to a different host. It never deletes the index to rebuild it: a rebuild that starts by emptying the table loses every document it then fails to restore, and it reassigns the ids every other KB surface hands out.
+**After a model change:** re-embedding is keyed on the TEXT changing, so an unchanged document keeps the vector it has - right on every ordinary rebuild, wrong once the embedding MODEL changes. `hp kb reindex --force-embeddings` (or `reindex_kb(force_embeddings=true)`) drops every stored vector and recomputes.
 **Consequence:** `hp export` does NOT include embeddings. The export README points at `hp kb reindex` as the post-restore step.
 
 ### D6. Audit log is SQLite-only

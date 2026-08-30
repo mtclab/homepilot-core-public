@@ -222,28 +222,40 @@ async def propose_artifact(request: Request, token: _TokenDep) -> dict[str, Any]
 
 
 async def _policies_for(kb_service: Any, host: str) -> list[dict[str, Any]]:
-    """KB entries an approver should read before letting a change run on `host`.
+    """The rules that BIND this host, for an approver to read beside the plan.
 
-    Kept to `kind == "policy"`: the plan already says what will change, so what
-    an operator needs beside it is the rules they wrote about this machine - not
-    every note that mentions its name.
+    Selected by what a policy is ABOUT, not by text similarity to the hostname.
+    Free-text search got this wrong in both directions, reproduced on dev 3.6.17
+    while reviewing a change to `hp-test-server`:
+
+      * shown - a policy whose target was `dev-ct-db` and whose own text read
+        *"This rule is about dev-ct-db only"*, because it happened to name
+        `hp-test-server` in passing. The keyword pass was
+        `content LIKE '%hp-test-server%'`.
+      * not shown - *"No package installs on any managed machine without a
+        snapshot taken first. Applies to every host in the fleet."*, a GLOBAL
+        policy, against a plan that installs packages. It never named the host,
+        so nothing matched it. Every one of the 19 policies `hp policy init`
+        writes is global and none of them could ever have appeared here.
+
+    With embeddings on it was worse: a k-nearest query always returns k rows, so
+    the screen showed the five nearest policies for ANY host - verified, both
+    policies in the KB returned for `mail-relay-99`, which is mentioned by
+    neither, at the maximum-distance floor.
+
+    A policy applies to a machine because of its target. So: policies targeting
+    this host, plus policies targeting nothing (or `global`), which is what
+    "applies to everything" is stored as. Each entry carries `applies_via` so
+    the screen can say why it is there.
     """
     if kb_service is None or not host:
         return []
     try:
-        results = await kb_service.search(host, kind="policy", limit=5)
+        rows: list[dict[str, Any]] = await kb_service.policies_for_target(host)
     except Exception:
         logger.warning("KB policy lookup failed for %s", host, exc_info=True)
         return []
-    return [
-        {
-            "id": entry.get("id"),
-            "title": entry.get("title", ""),
-            "content": entry.get("content", ""),
-            "target": entry.get("target"),
-        }
-        for entry in results
-    ]
+    return rows
 
 
 async def build_artifact_plan(

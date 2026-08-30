@@ -713,7 +713,14 @@ class TestKBReindexIfNeeded:
                 "test-note-reindex-fail", "applied despite failure"
             )
 
-    async def test_reindex_if_needed_creates_task(self, kb_service, repo):
+    async def test_record_fact_is_searchable_without_any_reindex(self, kb_service, repo):
+        """A recorded fact is IN the knowledge base when record_fact returns.
+
+        It used to depend on `reindex_if_needed` noticing a count mismatch and
+        rebuilding the whole index in the background - which is why the same
+        note written over HTTP (`POST /kb`), which does not call it, was not in
+        the KB at all.
+        """
         with (
             patch(
                 "homepilot.kb.service._get_embedding",
@@ -726,11 +733,43 @@ class TestKBReindexIfNeeded:
                 return_value=None,
             ),
         ):
-            await kb_service.record_fact(
+            artifact_id = await kb_service.record_fact(
                 target="async-reindex-test",
                 kind="note",
                 content="Trigger async reindex.",
             )
+
+        row = await repo.get_doc_by_source(f"artifact:{artifact_id}")
+        assert row is not None, "record_fact returned an id for a note not in the KB"
+
+        # And with the index already correct, nothing needs rebuilding.
+        with patch("homepilot.kb.service.asyncio.create_task") as mock_create_task:
+            await kb_service.reindex_if_needed(reason="startup")
+            mock_create_task.assert_not_called()
+
+    async def test_reindex_if_needed_creates_task_for_an_unindexed_note(
+        self, kb_service, repo, artifact_store
+    ):
+        """A note on disk that never reached the index still triggers a rebuild."""
+        with (
+            patch(
+                "homepilot.kb.service._get_embedding",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "homepilot.executor.kb_note._compute_embedding",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            artifact_id = await kb_service.record_fact(
+                target="stale-index-test",
+                kind="note",
+                content="Recorded, then dropped from the index.",
+            )
+        row = await repo.get_doc_by_source(f"artifact:{artifact_id}")
+        await repo.delete_doc_metadata(int(row["id"]))
 
         with patch("homepilot.kb.service.asyncio.create_task") as mock_create_task:
             await kb_service.reindex_if_needed(reason="startup")

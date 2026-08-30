@@ -1,5 +1,52 @@
 # Changelog
 
+## 3.6.18 - 2026-08-30
+
+Tranche 6 of the platform review (#648): the knowledge base and search.
+
+### A document was returned as the answer about a different, deleted document
+
+Reproduced on the shipped image: a firewall policy came back, at full score,
+tied with the genuine match for a query about a reboot-window policy the
+operator had DELETED. Four shipped behaviours lined up to do it - `doc_metadata.id`
+is a reusable rowid, deleting a document left its vector row behind, `reindex`
+reassigned every id on every run, and the embedding store was a bare INSERT
+whose `UNIQUE constraint failed` was swallowed at WARNING while the executor
+still logged ", embedding stored". `get_kb_embedding_status` read 5/5 embedded
+throughout.
+
+### One write and a restart destroyed the vector index
+
+Against a healthy embedding service, `indexed_with_embeddings` went 2 -> 0 while
+search kept reporting `search_mode: "vector"`, and nothing rebuilt it.
+
+### A note the product called `applied` was not in the knowledge base
+
+`propose_artifact` returned `status: "applied"` for a note `get_kb_doc` then
+answered "KB entry not found" for. That is the path `hp policy init` uses, which
+prints "These policies are now in the KB" afterwards.
+
+### Keyword search - the default mode of every install - looked for the whole query
+
+It was one `LIKE '%<the entire query string>%'`, so `nginx business hours` found
+nothing in a note containing exactly those words. Vector search had no relevance
+floor, so a nonsense query returned every document. `search_mode` was read from
+a key the service never set, so it was structurally always "unknown".
+
+### The policy panel was wrong in both directions
+
+Reviewing a change to one host it showed a policy whose own text said it applied
+to a different host, and hid the global "no package installs without a snapshot"
+rule against a plan that installs packages. All 19 notes `hp policy init` writes
+are global, so none of them could ever have appeared.
+
+### Two tests had enshrined the defects
+
+`test_doc_insert_fails_still_succeeds` asserted that a KB note whose database
+insert FAILED must report success; another asserted `search_mode == "vector"`
+over an empty index. The suite was not blind to these - it was defending them.
+Both flipped.
+
 ## 3.6.17 - 2026-08-30
 
 Tranche 5 of the platform review (#648): metrics and alerting.

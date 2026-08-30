@@ -151,19 +151,60 @@ class TestEmbeddingStatus:
         assert status["primary_ok"] is False
         assert status["fallback_ok"] is False
 
-    async def test_embedding_status_returns_vector_mode_when_primary_works(
+    async def test_a_reachable_service_over_an_unembedded_index_is_not_vector_mode(
         self, kb_service, repo, both_services_configured
     ):
-        fake_embedding = [0.1] * 1024
+        """`search_mode` describes what will happen to the NEXT query.
+
+        It described the SERVICE instead, so a healthy embedding service over an
+        index with zero embeddings reported `search_mode: "vector"` when no
+        search could possibly be a vector search. Reproduced on the shipped
+        3.6.17 image: `{"primary_ok": true, "indexed_with_embeddings": 0,
+        "search_mode": "vector"}`, and the query that had returned two documents
+        semantically minutes earlier returned none (#648 tranche 6).
+        """
+        await repo.create_doc_metadata(
+            source="test:unembedded",
+            title="A document with no vector",
+            content="body",
+            kind="note",
+        )
         with patch(
             "homepilot.kb.service._call_embed_service",
             new_callable=AsyncMock,
-            return_value=fake_embedding,
+            return_value=[0.1] * 1024,
+        ):
+            status = await kb_service.embedding_status()
+
+        assert status["primary_ok"] is True, "the service itself is up"
+        assert status["indexed_with_embeddings"] == 0
+        assert status["pending_embeddings"] == 1
+        assert status["search_mode"] == "keyword"
+
+    async def test_embedding_status_returns_vector_mode_when_every_doc_is_embedded(
+        self, kb_service, repo, both_services_configured
+    ):
+        doc_id = await repo.create_doc_metadata(
+            source="test:embedded",
+            title="An embedded document",
+            content="body",
+            kind="note",
+        )
+        from homepilot.executor.kb_note import _store_embedding
+
+        await _store_embedding(repo, doc_id, [0.1] * 768)
+
+        with patch(
+            "homepilot.kb.service._call_embed_service",
+            new_callable=AsyncMock,
+            return_value=[0.1] * 768,
         ):
             status = await kb_service.embedding_status()
 
         assert status["search_mode"] == "vector"
         assert status["primary_ok"] is True
+        assert status["pending_embeddings"] == 0
+        assert status["orphan_embeddings"] == 0
 
     async def test_embedding_status_returns_fallback_vector_mode(
         self, kb_service, repo, both_services_configured
@@ -177,6 +218,16 @@ class TestEmbeddingStatus:
             if call_count == 1:
                 return None
             return fake_embedding
+
+        doc_id = await repo.create_doc_metadata(
+            source="test:embedded-fallback",
+            title="An embedded document",
+            content="body",
+            kind="note",
+        )
+        from homepilot.executor.kb_note import _store_embedding
+
+        await _store_embedding(repo, doc_id, fake_embedding)
 
         with patch(
             "homepilot.kb.service._call_embed_service",

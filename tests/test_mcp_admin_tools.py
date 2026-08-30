@@ -100,7 +100,9 @@ class TestKbAdmin:
 
         reindex = await _handle_tool("reindex_kb", {"no_embeddings": True}, c)
         assert reindex["status"] == "ok"
-        svc.reindex.assert_awaited_once_with(no_embeddings=True, reason="manual")
+        svc.reindex.assert_awaited_once_with(
+            no_embeddings=True, reason="manual", force_embeddings=False
+        )
 
         status = await _handle_tool("get_kb_embedding_status", {}, c)
         assert status["primary_ok"] is True

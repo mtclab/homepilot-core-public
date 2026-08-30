@@ -90,11 +90,11 @@ async def test_client(tmp_path: Path):
 class TestKBReindexService:
     async def test_reindex_empty_db(self, kb_service):
         result = await kb_service.reindex(no_embeddings=True)
-        assert result["deleted"] == 0
+        assert result["removed"] == 0
         assert result["reindexed"] == 0
         assert result["errors"] == 0
 
-    async def test_reindex_deletes_artifact_rows(self, kb_service, repo):
+    async def test_reindex_removes_docs_whose_artifact_is_gone(self, kb_service, repo):
         await repo.create_doc_metadata(
             source="artifact:test-note",
             title="Test",
@@ -108,7 +108,7 @@ class TestKBReindexService:
             kind="note",
         )
         result = await kb_service.reindex(no_embeddings=True)
-        assert result["deleted"] == 1
+        assert result["removed"] == 1
         remaining = await repo.db.fetchall("SELECT * FROM doc_metadata")
         assert len(remaining) == 1
         assert remaining[0]["source"] == "manual:something"
@@ -168,7 +168,7 @@ class TestKBReindexEndpoint:
             resp = client.post("/kb/reindex?no_embeddings=true")
         assert resp.status_code == 200
         data = resp.json()
-        assert "deleted" in data
+        assert "removed" in data
         assert "reindexed" in data
         assert "errors" in data
 
@@ -177,7 +177,7 @@ class TestKBReindexEndpoint:
         resp = client.post("/kb/reindex?no_embeddings=true")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["deleted"] == 0
+        assert data["removed"] == 0
         assert data["reindexed"] == 0
 
     async def test_reindex_after_note_creation(self, test_client):
@@ -259,7 +259,7 @@ class TestReindexIfNeeded:
 
     async def test_reindex_reentrancy_returns_early(self, kb_service):
         result = await kb_service.reindex(no_embeddings=True, reason="manual")
-        assert result["deleted"] == 0
+        assert result["removed"] == 0
 
         kb_service._reindexing = True
         try:

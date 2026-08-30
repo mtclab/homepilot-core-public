@@ -94,6 +94,7 @@ class TestARecordedFactIsSearchableNow:
         lifecycle = AsyncMock()
         lifecycle.propose = AsyncMock(return_value="2026-08-21-fact-abc123")
         kb_service = AsyncMock()
+        kb_service.index_note = AsyncMock(return_value={"indexed": True, "doc_id": 7})
         ctx = {"lifecycle": lifecycle, "kb_service": kb_service}
 
         result = await handle_record_fact(
@@ -101,7 +102,12 @@ class TestARecordedFactIsSearchableNow:
         )
 
         assert result["status"] == "applied"
-        kb_service.reindex_if_needed.assert_awaited_once()
+        # THIS note, indexed. It used to call `reindex_if_needed`, which rebuilt
+        # the entire index with embeddings switched off and destroyed every
+        # vector in it (#648 tranche 6).
+        kb_service.index_note.assert_awaited_once_with("2026-08-21-fact-abc123")
+        kb_service.reindex_if_needed.assert_not_awaited()
+        assert result["indexed"] is True
 
     async def test_an_indexing_failure_does_not_lose_the_fact(self):
         from homepilot.mcp.tools.kb_tools import handle_record_fact
@@ -109,7 +115,7 @@ class TestARecordedFactIsSearchableNow:
         lifecycle = AsyncMock()
         lifecycle.propose = AsyncMock(return_value="2026-08-21-fact-abc123")
         kb_service = AsyncMock()
-        kb_service.reindex_if_needed = AsyncMock(side_effect=RuntimeError("index down"))
+        kb_service.index_note = AsyncMock(side_effect=RuntimeError("index down"))
 
         result = await handle_record_fact(
             {"content": "a fact", "kind": "fact", "target": "web01"},
@@ -117,6 +123,9 @@ class TestARecordedFactIsSearchableNow:
         )
 
         assert result["id"] == "2026-08-21-fact-abc123"
+        # The fact survives, and the caller is TOLD it is not searchable rather
+        # than left to assume it is.
+        assert result["indexed"] is False
 
 
 class TestTheWebhookCliDoesNotLeakOrLie:

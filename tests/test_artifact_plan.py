@@ -97,18 +97,21 @@ def client():
     )
     app.state.artifact_executor = executor
     app.state.task_repo = MagicMock(get_active_task=AsyncMock(return_value=None))
-    # The plan carries the operator's policies for the host (#429).
+    # The plan carries the operator's policies for the host (#429). Selected by
+    # TARGET, not by text similarity - see `_policies_for` (#648 tranche 6).
     kb = MagicMock()
-    kb.search = AsyncMock(
+    kb.policies_for_target = AsyncMock(
         return_value=[
             {
                 "id": 1,
                 "title": "nginx on web01",
                 "content": "reload, never restart - it terminates in-flight uploads",
                 "target": "web01",
+                "applies_via": "target",
             }
         ]
     )
+    kb.search = AsyncMock(return_value=[])
     app.state.kb_service = kb
     app.dependency_overrides[require_token] = lambda: {"scope": "*", "role": "admin"}
     return TestClient(app)
@@ -128,17 +131,20 @@ class TestThePlanCarriesThePoliciesForTheHost:
     def test_they_are_looked_up_for_the_target_host(self, client):
         client.post("/artifacts/2026-08-20-nginx-abc123/plan")
 
-        client.app.state.kb_service.search.assert_awaited_once()
-        call = client.app.state.kb_service.search.await_args
-        assert (call.args[0] if call.args else call.kwargs.get("query")) == "web01"
-        assert call.kwargs.get("kind") == "policy", (
-            "every note mentioning the host would bury the rules that matter"
-        )
+        client.app.state.kb_service.policies_for_target.assert_awaited_once()
+        call = client.app.state.kb_service.policies_for_target.await_args
+        assert (call.args[0] if call.args else call.kwargs.get("host")) == "web01"
+        # Never free-text search: `search("web01", kind="policy")` surfaced a
+        # policy whose own text said it was about a DIFFERENT host, and hid every
+        # global policy - reproduced on dev 3.6.17 (#648 tranche 6).
+        client.app.state.kb_service.search.assert_not_awaited()
 
     def test_a_kb_failure_does_not_block_the_plan(self, client):
         """The plan is what an approver came for; a KB that is down must not take
         the approval screen with it."""
-        client.app.state.kb_service.search = AsyncMock(side_effect=RuntimeError("kb down"))
+        client.app.state.kb_service.policies_for_target = AsyncMock(
+            side_effect=RuntimeError("kb down")
+        )
 
         resp = client.post("/artifacts/2026-08-20-nginx-abc123/plan")
 

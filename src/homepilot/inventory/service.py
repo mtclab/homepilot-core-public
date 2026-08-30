@@ -666,37 +666,64 @@ class InventoryService:
         )
 
     async def get_environment_doc(self, target: str) -> dict[str, Any]:
+        """Everything HomePilot knows about a target - and which parts it could
+        not read.
+
+        This fuses three sources. When the KB half raised, `kb_entries` stayed
+        `[]` and the rendered document simply omitted the section, so "the KB
+        said nothing about this host" and "the KB could not be asked" printed
+        identically - the shape #642 exists to stamp out. `sources` now records
+        the outcome of each half, so a hole is visible as a hole.
+        """
         doc: dict[str, Any] = {
             "target": target,
             "hosts": [],
             "services": [],
             "kb_entries": [],
             "artifact_history": [],
+            "sources": {},
         }
 
-        hosts = await self.repo.db.fetchall(
-            "SELECT * FROM hosts WHERE hostname LIKE ? ESCAPE '\\' OR node LIKE ? ESCAPE '\\'",
-            [f"%{escape_like(target)}%", f"%{escape_like(target)}%"],
-        )
-        for host in hosts:
-            host_dict = dict(host)
-            host_services = await self.repo.list_services(host_id=host_dict.get("id"))
-            host_dict["services"] = [dict(s) for s in host_services]
-            doc["hosts"].append(host_dict)
-            doc["services"].extend(host_dict["services"])
+        try:
+            hosts = await self.repo.db.fetchall(
+                "SELECT * FROM hosts WHERE hostname LIKE ? ESCAPE '\\' OR node LIKE ? ESCAPE '\\'",
+                [f"%{escape_like(target)}%", f"%{escape_like(target)}%"],
+            )
+            for host in hosts:
+                host_dict = dict(host)
+                host_services = await self.repo.list_services(host_id=host_dict.get("id"))
+                host_dict["services"] = [dict(s) for s in host_services]
+                doc["hosts"].append(host_dict)
+                doc["services"].extend(host_dict["services"])
+            doc["sources"]["inventory"] = {"read": True}
+        except Exception as e:
+            logger.warning("Inventory read failed for %s: %s", target, e)
+            doc["sources"]["inventory"] = {"read": False, "error": str(e)}
 
         if self.kb_service:
             try:
                 kb_results = await self.kb_service.search(target, limit=20)
                 doc["kb_entries"] = kb_results
+                doc["sources"]["knowledge_base"] = {"read": True}
             except Exception as e:
                 logger.warning("KB search failed for %s: %s", target, e)
+                doc["sources"]["knowledge_base"] = {"read": False, "error": str(e)}
+        else:
+            doc["sources"]["knowledge_base"] = {
+                "read": False,
+                "error": "no KB service is wired into this instance",
+            }
 
-        artifacts = await self.repo.db.fetchall(
-            "SELECT id, kind, intent, status, created_at FROM artifacts "
-            "WHERE target_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 20",
-            [f"%{escape_like(target)}%"],
-        )
-        doc["artifact_history"] = [dict(a) for a in artifacts]
+        try:
+            artifacts = await self.repo.db.fetchall(
+                "SELECT id, kind, intent, status, created_at FROM artifacts "
+                "WHERE target_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 20",
+                [f"%{escape_like(target)}%"],
+            )
+            doc["artifact_history"] = [dict(a) for a in artifacts]
+            doc["sources"]["artifact_history"] = {"read": True}
+        except Exception as e:
+            logger.warning("Artifact history read failed for %s: %s", target, e)
+            doc["sources"]["artifact_history"] = {"read": False, "error": str(e)}
 
         return doc
