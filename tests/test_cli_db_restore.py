@@ -41,6 +41,14 @@ def clear_settings_cache():
 
 
 def _out(result) -> str:
+    """The command's output as ONE line, whitespace collapsed.
+
+    `rich` hard-wraps to the console width, so a phrase a test asserts on gets a
+    newline wherever the terminal happens to end: `"is not a sound SQLite
+    database"` came back as `"is not \na sound\nSQLite database"` on CI and
+    passed here. conftest pins COLUMNS so that cannot happen, and this collapses
+    whitespace so an assertion is about the WORDS, not the layout.
+    """
     text = result.stdout
     with contextlib.suppress(ValueError):
         text += result.stderr
@@ -50,7 +58,7 @@ def _out(result) -> str:
                 type(result.exception), result.exception, result.exception.__traceback__
             )
         )
-    return text
+    return " ".join(text.split())
 
 
 async def _seed(db_path: Path, hostname: str) -> None:

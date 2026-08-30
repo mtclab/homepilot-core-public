@@ -18,6 +18,13 @@ import pytest
 os.environ.pop("FORCE_COLOR", None)
 os.environ["NO_COLOR"] = "1"
 os.environ["TERM"] = "dumb"
+# WIDTH too, for the same reason. `rich` hard-wraps to the console width, so a
+# message a test asserts on is broken by newlines wherever the terminal happens
+# to end - and CI's terminal is not this one's. `"... is not a sound SQLite
+# database"` passed locally and failed on the mirror as `"is not \na sound\n"`,
+# which is the colour bug wearing a different hat: a gate whose result depends
+# on the caller's environment is not a gate.
+os.environ["COLUMNS"] = "200"
 
 
 @pytest.fixture(scope="session", autouse=True)
