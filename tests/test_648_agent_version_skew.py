@@ -23,6 +23,7 @@ from homepilot.selfcheck import (
     STATE_OK,
     STATE_UNKNOWN,
     STATE_UNREACHABLE,
+    ProbeVerdict,
     selfcheck_report,
 )
 
@@ -249,3 +250,84 @@ class TestBothStateObjectsStayInStep:
 
         for field in ("proxmox", "mcp_app", "reconciler_scheduler"):
             assert field in AppState.__dataclass_fields__, field
+
+
+@pytest.mark.asyncio
+class TestARefusedTokenIsSlowOnPurpose:
+    """The probe must outlive the answer it exists to see (#648, from the drive).
+
+    PVE DELAYS a refused credential - measured at a steady ~3.0s against the
+    live dev cluster, warm and cold alike. The self-check's 2s bound therefore
+    bought a probe that could only ever see the HEALTHY case: with a genuinely
+    refused write token it timed out and reported `unknown`, "treat it as
+    unproven", while `/health` (which has no such bound) correctly said
+    `write_token_refused`. A check that cannot outlast the fault it hunts is not
+    a check.
+
+    Teeth: drop `timeout=SLOW_PROBE_TIMEOUT_SECONDS` from the Proxmox subsystem
+    and the slow-probe test fails on `unknown`.
+    """
+
+    async def test_a_slow_refusal_still_reaches_a_verdict(self):
+        import asyncio
+
+        from homepilot.selfcheck import STATE_UNREACHABLE, _evaluate
+
+        async def slow_refusal():
+            # Longer than the report-wide bound, shorter than this probe's.
+            await asyncio.sleep(3.0)
+            return ProbeVerdict(STATE_UNREACHABLE, "the write token is refused")
+
+        from homepilot.selfcheck import SLOW_PROBE_TIMEOUT_SECONDS, Subsystem
+
+        sub = Subsystem(
+            name="proxmox",
+            label="the Proxmox API",
+            configured=True,
+            target="pve",
+            off="off",
+            ok="ok",
+            broken="broken",
+            probe=slow_refusal,
+            timeout=SLOW_PROBE_TIMEOUT_SECONDS,
+        )
+        entry = await _evaluate(sub, 2.0)
+        assert entry["state"] == STATE_UNREACHABLE
+        assert "refused" in entry["consequence"]
+
+    async def test_the_report_wide_bound_still_applies_to_everyone_else(self):
+        """The larger budget is opt-in, not a loosening of the whole report."""
+        import asyncio
+
+        from homepilot.selfcheck import STATE_UNKNOWN, Subsystem, _evaluate
+
+        async def slow():
+            await asyncio.sleep(3.0)
+            return True
+
+        sub = Subsystem(
+            name="embeddings",
+            label="x",
+            configured=True,
+            target="t",
+            off="off",
+            ok="ok",
+            broken="broken",
+            probe=slow,
+        )
+        entry = await _evaluate(sub, 0.2)
+        assert entry["state"] == STATE_UNKNOWN
+
+    async def test_the_proxmox_subsystem_actually_asks_for_the_longer_budget(self):
+        from types import SimpleNamespace
+
+        from homepilot.selfcheck import SLOW_PROBE_TIMEOUT_SECONDS, build_subsystems
+
+        subs = {
+            s.name: s
+            for s in build_subsystems(
+                SimpleNamespace(proxmox=None, vault=None, agent_hub=None, mcp_app=None),
+                _settings(proxmox_host="pve.example.com"),
+            )
+        }
+        assert subs["proxmox"].timeout == SLOW_PROBE_TIMEOUT_SECONDS
