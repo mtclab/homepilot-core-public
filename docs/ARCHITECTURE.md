@@ -491,19 +491,39 @@ All state transitions also write an append-only `audit_log` table in SQLite (see
 ## Data Layer
 
 ```
-~/.hp/
-├── homepilot.db          SQLite: hosts, services, artifacts index,
-│                         KB entries (+ sqlite-vec for embeddings),
-│                         audit log
-├── artifacts/
-│   └── YYYY-MM-DD-<slug>-<hash>.md   one file per artifact
-│                         frontmatter (YAML) + body (playbook/spec)
-└── vault/
-    ├── master.protected  age-encrypted master identity
-    └── secrets/          per-secret .age files
-        ├── pve-token.age
-        └── <service>.age
+~/.hp/                        (HP_DATA_DIR; /data in the compose deployment)
+├── homepilot.db              SQLite: hosts, services, artifacts index,
+│   ├── homepilot.db-wal      KB entries (+ sqlite-vec for embeddings),
+│   └── homepilot.db-shm      audit log, tasks, metrics, settings
+├── homepilot.lock            advisory lock — one backend per data dir
+├── artifacts/                a git repository, history included
+│   └── YYYY/MM/<id>.md       one file per artifact: YAML frontmatter + body
+├── backups/
+│   ├── pre-migration-v<N>.db taken before each schema migration
+│   ├── pre-import-<ts>/      what `hp import` replaced
+│   └── pre-restore-<ts>/     what `hp db restore` replaced
+├── vault/
+│   ├── identities/
+│   │   └── master.protected  age master identity, AES-256-GCM wrapped
+│   └── secrets/              per-secret .age files
+│       ├── pve-token.age
+│       └── <service>.age
+├── .vault_passphrase         ONLY on the auto-generated shape (0600)
+├── .agent_hub_token          fleet enrolment token, if auto-generated
+├── api-token                 first-run claim credential
+├── ssh/                      managed-host SSH keys
+└── hub/                      agent-hub TLS material
 ```
+
+**What has to be backed up, and what cannot be rebuilt.** `homepilot.db` and
+`artifacts/` are the state; `vault/` is worthless without the passphrase, which
+is only in this directory on the auto-generated shape (see
+[`vault.md`](vault.md#durability-losing-the-passphrase-is-losing-the-secrets)).
+`hp export --include-secrets` collects all of it, resolving the passphrase from
+the environment when it is not in the data dir. KB embeddings are NOT exported —
+`hp kb reindex` rebuilds them. `homepilot.db-wal`/`-shm` must never be copied
+into a backup: SQLite replays a WAL onto whatever database file is beside it, so
+a stale journal corrupts a restored database.
 
 Vault encryption: `pyrage` (pure Python age implementation). No system `age` binary required. Master identity protected with AES-256-GCM derived from `HP_VAULT_PASSPHRASE`.
 

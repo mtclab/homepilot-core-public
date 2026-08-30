@@ -33,7 +33,12 @@ from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
 from .instance_lock import InstanceLock
-from .selfcheck import agent_hub_listening, mcp_transport_running, schedule_boot_selfcheck
+from .selfcheck import (
+    agent_hub_listening,
+    mcp_transport_running,
+    schedule_boot_selfcheck,
+    vault_unlocked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +347,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         startup_delay=120.0,
     )
     app.state.retention_reconciler = retention_reconciler
+
+    # Is the database FILE still sound? Nothing asked until #648 tranche 4, and
+    # the backend's own connection cannot answer: its page cache serves rows out
+    # of memory long after the file is damaged. Its own read-only connection,
+    # off the request path, on a long interval; /health reports the verdict.
+    if settings.db_integrity_interval_seconds > 0:
+        from .reconciler.db_integrity import DatabaseIntegrityReconciler
+
+        db_integrity = DatabaseIntegrityReconciler(state.database.db_path, state.repo)
+        reconciler_scheduler.register(
+            db_integrity,
+            interval=float(settings.db_integrity_interval_seconds),
+            # Early, and before the first retention sweep: an instance that came
+            # up on a corrupt file should say so within a minute of booting,
+            # not six hours later.
+            startup_delay=30.0,
+        )
+        app.state.db_integrity = db_integrity
+
     alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo)
     reconciler_scheduler.register(
         alert_evaluator,
@@ -1159,7 +1183,36 @@ async def health(request: Request) -> JSONResponse:
         if db is None:
             db_status = "error"
         else:
-            await db.execute("SELECT 1")
+            # A REAL READ, not `SELECT 1`. `SELECT 1` is answered by the
+            # expression evaluator: it opens no table, touches no page, and
+            # therefore proves only that a connection object exists. On
+            # 2026-08-29 an OOM kill corrupted the database mid-write and this
+            # endpoint went on reporting `database: ok` throughout, while
+            # `list_tasks` returned 500 and `PRAGMA integrity_check` failed
+            # (#642). Reproduced on 3.6.15: with the file corrupted under a
+            # running backend, `SELECT 1` still answered and `/health` still
+            # said ok, while a settings read on the SAME connection raised
+            # `database disk image is malformed`. So the probe reads the row
+            # every install has - one page, no scan - and a database that
+            # cannot produce it is not ok.
+            #
+            # It reads the integrity verdict in the SAME statement, because a
+            # row read on this connection is still not proof the FILE is sound:
+            # the page cache serves rows out of memory long after the file
+            # underneath is damaged (verified on dev - every endpoint 200 while
+            # a fresh connection said `database disk image is malformed`). The
+            # reconciler that CAN see it records its answer here.
+            rows = await db.fetchall(
+                "SELECT key, value FROM settings WHERE key IN ('schema_version', 'db_integrity_ok')"
+            )
+            values = {row["key"]: row["value"] for row in rows}
+            if "schema_version" not in values:
+                db_status = "error"
+            elif values.get("db_integrity_ok") == "0":
+                # A distinct word, because it is a distinct fault: the process
+                # is serving and the file is damaged. `hp db check` prints what
+                # quick_check found; `hp db restore` is the way back.
+                db_status = "corrupt"
     except Exception as exc:
         logger.debug("database health check failed: %s", exc)
         db_status = "error"
@@ -1192,12 +1245,12 @@ async def health(request: Request) -> JSONResponse:
     if vault is None:
         vault_status = "not_configured"
     else:
-        try:
-            await vault.list_secrets()
-            vault_status = "ok"
-        except Exception as exc:
-            logger.debug("vault health check failed: %s", exc)
-            vault_status = "locked"
+        # Shared with /admin/selfcheck so both surfaces judge the vault the same
+        # way, and for the same reason /health stopped judging the hub by the
+        # registry object: `list_secrets()` is a directory listing, so "unlocked"
+        # was established by filenames existing. A vault whose passphrase no
+        # longer matches its identity listed just as happily.
+        vault_status = "ok" if await vault_unlocked(vault) else "locked"
     checks["vault"] = vault_status
 
     # "ok" only when the hub is ACTUALLY LISTENING - the same rule the MCP check

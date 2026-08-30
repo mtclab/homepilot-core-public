@@ -15,9 +15,15 @@ What this does NOT prune is as deliberate as what it does:
 * **metrics** has its own pruner with its own horizon (ADR-004 S5), because the
   right retention for a time series is not the right retention for an audit log.
 
-`incremental_vacuum` runs after a prune that actually deleted something: SQLite
-does not return freed pages to the filesystem on its own, so a delete-only
-retention policy shrinks nothing an operator can see.
+What this does NOT do, contrary to what it used to say: shrink the file. SQLite
+does not return freed pages to the filesystem on its own, and `PRAGMA
+incremental_vacuum` - the call made here after a prune that deleted something -
+is a no-op unless the database is in `auto_vacuum=INCREMENTAL`, which HomePilot
+has never set (dev 3.6.15: `auto_vacuum=0`). Pruning therefore bounds the
+database's GROWTH; it does not reduce its size on disk. The freed pages are
+reported per cycle so the claim is checkable rather than assumed, and compaction
+stays an operator decision - a plain `VACUUM` rewrites the whole file, needs
+twice its size free, and blocks every writer while it runs.
 """
 
 from __future__ import annotations
@@ -101,6 +107,7 @@ class RetentionReconciler(Reconciler):
                 deleted["tasks"] = count
                 total += count
 
+        freed_pages = 0
         if total:
             logger.info(
                 "retention: deleted %d row(s) older than %d days: %s",
@@ -108,12 +115,17 @@ class RetentionReconciler(Reconciler):
                 self._retention_days,
                 ", ".join(f"{t}={n}" for t, n in sorted(deleted.items())),
             )
-            # Freed pages are not returned to the filesystem otherwise, so the
-            # file an operator has to back up never actually shrinks.
-            await self._repo.reclaim_free_pages()
+            # Reported, not assumed: this is 0 on every install that has not
+            # opted into auto_vacuum=INCREMENTAL, which is all of them.
+            freed_pages = await self._repo.reclaim_free_pages()
 
         return ReconcilerResult(
             name="retention",
             success=True,
-            details={"deleted": deleted, "total": total, "retention_days": self._retention_days},
+            details={
+                "deleted": deleted,
+                "total": total,
+                "retention_days": self._retention_days,
+                "freed_pages": freed_pages,
+            },
         )

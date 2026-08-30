@@ -1,8 +1,30 @@
 # ADR-001: Zero-Secrets Vault Architecture
 
-**Status:** Accepted  
+**Status:** Accepted, with two decisions below never implemented (noted 2026-08-30, #648)  
 **Date:** 2026-05-17  
 **Deciders:** Architect, Security, PO
+
+> **What shipped, versus what this ADR decided.** Recorded rather than silently
+> edited, because the gap is the point.
+>
+> * **"the vault passphrase is auto-generated on `hp init` and stored in the
+>   system keychain, never in plaintext files"** — there is no keychain
+>   integration anywhere in the codebase. The passphrase is a plaintext file at
+>   `<data_dir>/.vault_passphrase` (0600), or `HP_VAULT_PASSPHRASE` in the
+>   environment, or the file `HP_VAULT_PASSPHRASE_FILE` names. See
+>   [`docs/vault.md`](../vault.md) for what actually happens.
+> * **"Mitigated by backup-strategy skill that archives passphrase separately"**
+>   under *Keychain loss* — no such skill exists. Until 3.6.16 the passphrase was
+>   not archived by `hp export --include-secrets` either, so on the documented
+>   compose deployment a "full" backup contained the vault and no key.
+> * **"Audit log of vault access via keychain entries"** follows the keychain and
+>   does not exist. Vault reads are not audited.
+>
+> The consequence the ADR names is real and stands: lose the passphrase and every
+> secret is unrecoverable. What it claims as mitigation does not exist, so the
+> mitigation is now stated in `docs/vault.md` and enforced by the export
+> verifying, and recording in the manifest, whether the archive holds a
+> passphrase that opens the identity it carries.
 
 ## Context
 

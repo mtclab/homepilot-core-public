@@ -959,17 +959,32 @@ async def _backup_before_migration(db: Database, current_version: int) -> Path |
     if row is not None and int(row["cnt"]) == 0:
         return None
 
-    backup_path = Path(db.db_path).parent / "backups" / f"pre-migration-v{current_version}.db"
+    backups_dir = Path(db.db_path).parent / "backups"
+    backup_path = backups_dir / f"pre-migration-v{current_version}.db"
+    staging_path = backups_dir / f".pre-migration-v{current_version}.partial"
     try:
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        # sqlite backup API, never a file copy: copying a live WAL database
-        # file-by-file yields a torn snapshot (#421).
-        target = sqlite3.connect(str(backup_path), check_same_thread=False)
-        try:
-            await db.conn.backup(target)
-        finally:
-            target.close()
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        staging_path.unlink(missing_ok=True)
+        # VACUUM INTO, not the sqlite backup API and never a file copy. All
+        # three read a consistent snapshot of a live WAL database; only VACUUM
+        # INTO writes its output in ROLLBACK-JOURNAL mode. The backup API copies
+        # pages, so the file it produces inherits the source's WAL header - and
+        # a WAL-mode file dropped over homepilot.db while the previous
+        # database's `-wal` is still lying beside it gets that journal replayed
+        # onto it. SQLite binds a WAL to no particular database, so it replays
+        # happily and the result is `database disk image is malformed`. That is
+        # not theory: it destroyed a dev database on 2026-08-29, using this very
+        # file, by following the restore this module's own refusal recommends.
+        # A rollback-journal file cannot be replayed into, so the artefact we
+        # tell an operator to restore is now safe to restore (`hp db restore`
+        # clears the sidecars as well).
+        await db.conn.commit()
+        await db.execute("VACUUM INTO ?", (str(staging_path),))
+        # Rename only once the snapshot is complete: a failure must not leave a
+        # truncated file under the name an operator would restore.
+        staging_path.replace(backup_path)
     except Exception as exc:
+        staging_path.unlink(missing_ok=True)
         raise RuntimeError(
             f"Pre-migration backup to {backup_path} failed: {exc}. "
             "Migrations aborted - the database is unchanged."
@@ -1054,11 +1069,21 @@ async def run_migrations(db: Database) -> None:
 
     target_version = max(MIGRATIONS.keys())
     if current_version > target_version:
+        # Name the REMEDY, not just the file. The old wording pointed at
+        # `backups/pre-migration-v<version>.db` and stopped there, so the
+        # obvious next move - copy it over homepilot.db - was the one that
+        # corrupts both the backup and the database, because SQLite replays the
+        # stale `-wal` still sitting beside it. `hp db restore` is the same
+        # operation done safely; the sentence has to say so.
         raise RuntimeError(
             f"Database schema version {current_version} is newer than this build supports "
-            f"(version {target_version}). No down-migrations exist: to run this build, restore "
-            f"the database backup matching schema version {target_version} "
-            "(<data_dir>/backups/pre-migration-v<version>.db)."
+            f"(version {target_version}). No down-migrations exist. Either run the image "
+            f"that wrote this database, or roll back to the snapshot taken at version "
+            f"{target_version}:  hp db restore <data_dir>/backups/"
+            f"pre-migration-v{target_version}.db  - which stops the backend, clears the "
+            "stale -wal/-shm SQLite would otherwise replay onto the restored file, and "
+            "verifies it. Do NOT copy the file into place by hand: that corrupts it. "
+            "Either way, everything written since the upgrade is lost."
         )
     if current_version == target_version:
         return

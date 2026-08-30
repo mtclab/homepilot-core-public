@@ -390,6 +390,9 @@ hp doc <topic>                # look up environment documentation
 hp export                     # export DB + artifacts as tarball (NO secrets - cannot restore a host)
                               #   --include-secrets makes it restorable (holds the vault: treat as a credential)
 hp import <file>              # restore from tarball (stop the backend first)
+hp db restore <file.db>       # put ONE database backup back (clears the stale -wal;
+                              #   never `cp` a backup over homepilot.db - it corrupts it)
+hp db check                   # PRAGMA quick_check on the live database
 hp policy init                # global interactive onboarding to seed the policy KB
 hp kb reindex                 # rebuild KB search index from artifacts
 hp token create               # mint an API token (needs an admin credential - see below)
@@ -529,10 +532,15 @@ See [`docs/testing.md`](docs/testing.md) for the full testing guide including ma
 
 **Retention.** `audit_log`, `agent_audit`, finished `tasks` and
 `webhook_deliveries` are pruned past `HP_RETENTION_DAYS` (default 90) by a
-reconciler, and freed pages are returned to the filesystem afterwards - a
-delete-only policy shrinks nothing an operator can see. Nothing was pruned at all
-before: each of those gains a row per operation, and a year on a homelab VM is a
-multi-GB SQLite file and a backup too big to move.
+reconciler. Nothing was pruned at all before: each of those gains a row per
+operation, and a year on a homelab VM is a multi-GB SQLite file and a backup too
+big to move. Pruning bounds the database's **growth**; it does not shrink the
+file on disk. SQLite keeps freed pages in the file, and `PRAGMA
+incremental_vacuum` only reclaims them under `auto_vacuum=INCREMENTAL`, which
+HomePilot does not set - so the reconciler reports `freed_pages: 0` and says so
+rather than claiming a compaction that never happened. To actually shrink the
+file, stop the backend and take a `hp export`-style snapshot: `VACUUM INTO`
+writes a compacted copy.
 
 Not pruned, deliberately: **artifacts** (the record of intent), **hosts /
 services / agents** (the estate, not its history), **drift_checks** (one upserted

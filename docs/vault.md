@@ -170,6 +170,40 @@ docker compose exec backend hp token create
 docker compose restart backend
 ```
 
+## Durability: losing the passphrase is losing the secrets
+
+There is no recovery. `master.protected` is the age identity wrapped with
+AES-256-GCM under a key derived from the passphrase; without the passphrase the
+wrapped identity is ciphertext, and every `vault/secrets/*.age` under it is
+ciphertext with no key. No escrow, no second recipient, no reset — by design.
+
+What that costs, concretely: `pve-token` (the control plane loses Proxmox),
+`admin-secret` (token minting through `hp token create` refuses, and the
+bootstrap path refuses too once any live token exists), `webhook-secret`,
+`proxmox-config`. The backend still starts — it logs `VAULT LOCKED`, `/health`
+reports `vault: locked` and `/admin/selfcheck` states the consequence — but
+nothing that needs a secret works. (Before 3.6.16 it did not start at all: the
+lifespan raised and the container crash-looped on exit 3.)
+
+So:
+
+- **Back the passphrase up separately from the vault.** `hp export
+  --include-secrets` puts both in one file on purpose, which is a restore
+  convenience and a single point of compromise; a copy of the passphrase in a
+  password manager is what survives losing that file too.
+- **Know which of the three shapes you are on.** `hp init` writes
+  `HP_VAULT_PASSPHRASE` into `.env`; plain `docker compose up` auto-generates
+  `<data_dir>/.vault_passphrase`; `HP_VAULT_PASSPHRASE_FILE` is wherever you
+  pointed it. Only the second is inside the data dir, so only the second is
+  covered by a data-dir backup.
+- **Check your archives.** `tar xzOf homepilot-export-*.tar.gz manifest.json`
+  records `includes_vault_passphrase`, verified against the identity at export
+  time rather than assumed from the flag.
+
+`HP_ENV=production` refuses to auto-generate a passphrase for exactly this
+reason: a generated one that nobody knows about is a vault waiting to be
+orphaned by the next volume.
+
 ## Security Considerations
 
 - Passphrase file (`{data_dir}/.vault_passphrase`) is mode `0o600` — only the HomePilot process can read it

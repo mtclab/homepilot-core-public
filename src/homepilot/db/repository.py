@@ -1699,21 +1699,38 @@ class Repository:
         await self.db.conn.commit()
         return int(cursor.rowcount or 0)
 
-    async def reclaim_free_pages(self) -> None:
-        """Return freed pages to the filesystem.
+    async def reclaim_free_pages(self) -> int:
+        """Try to return freed pages to the filesystem. Returns the pages freed.
 
-        SQLite keeps them in the file otherwise, so a delete-only retention
-        policy shrinks nothing an operator can see - which is the whole reason
-        they asked for retention. `incremental_vacuum` is a no-op unless the
-        database is in `auto_vacuum=INCREMENTAL`, so a plain `VACUUM` is the
-        fallback; both are best-effort because neither is worth failing a
-        reconciler cycle over.
+        Read the return value before believing the file shrank. `PRAGMA
+        incremental_vacuum` is a NO-OP unless the database is in
+        `auto_vacuum=INCREMENTAL`, and HomePilot has never set that: dev 3.6.15
+        reports `auto_vacuum=0` (NONE). So this call has never reclaimed a
+        single page, while the docstring here promised a `VACUUM` fallback that
+        does not exist in the code, the retention module said freed pages were
+        returned, and README told operators the same. Three statements of a
+        thing that does not happen.
+
+        The fallback is deliberately still absent. A plain `VACUUM` rewrites the
+        entire database, needs roughly twice its size in free space, and blocks
+        every writer for as long as it takes - which is not a thing to do inside
+        a reconciler cycle on a multi-GB file, unannounced, on a homelab volume
+        that may not have the room. Compaction is an operator decision; what
+        this method owes the caller is the truth about whether anything
+        happened.
         """
         try:
+            before = await self.db.fetchone("PRAGMA freelist_count")
             await self.db.execute("PRAGMA incremental_vacuum")
             await self.db.conn.commit()
+            after = await self.db.fetchone("PRAGMA freelist_count")
         except Exception as exc:
             logger.debug("incremental_vacuum unavailable: %s", exc)
+            return 0
+        if before is None or after is None:
+            return 0
+        freed = int(next(iter(before.values()))) - int(next(iter(after.values())))
+        return max(0, freed)
 
     async def get_drift_checks(
         self,

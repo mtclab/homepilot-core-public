@@ -1003,7 +1003,8 @@ tarball without secrets cannot bring a host back on its own.
 | `artifacts/` (the artifact Git repo, history included) | yes | yes |
 | `secrets/vault/identities/master.protected` (the vault identity) | **no** | yes |
 | `secrets/vault/secrets/*.age` (pve-token, admin-secret, webhook secrets, …) | **no** | yes |
-| `secrets/.env`, `secrets/.vault_passphrase` (the passphrase that unwraps the identity) | **no** | yes |
+| `secrets/.vault_passphrase` (the passphrase that unwraps the identity — see below) | **no** | yes, when it opens the vault |
+| `secrets/.env` (only when a `.env` sits *inside* the data dir) | **no** | yes |
 | `secrets/api-token` | **no** | yes |
 | `secrets/ssh/` (managed-host SSH keys) | **no** | yes |
 
@@ -1035,6 +1036,34 @@ anyone who reads it can decrypt everything HomePilot holds. Encrypt it at rest,
 keep it out of Git and off shared storage, and delete the working copy once the
 restore is done.
 
+**The passphrase, and how to tell whether you have one.** The vault identity is
+useless without the passphrase that unwraps it, and that passphrase lives in one
+of three places (see [`vault.md`](vault.md)): `<data_dir>/.vault_passphrase`,
+`HP_VAULT_PASSPHRASE` in the environment, or the file
+`HP_VAULT_PASSPHRASE_FILE` points at. Only the first is inside the data dir —
+and the compose deployment above puts it in the *second*, because `.env` sits
+beside `docker-compose.yml` and is read with `env_file:`.
+
+Until 3.6.16, `--include-secrets` archived only what was under the data dir, so
+on that deployment it produced an archive of encrypted material **with no key**
+while printing "It holds the vault identity and passphrase". Restored on a
+rebuilt host, every secret was permanently undecryptable and the backend
+would not start.
+
+It now resolves the passphrase from wherever it is, **verifies that it actually
+opens `vault/identities/master.protected`**, and only then archives it as
+`secrets/.vault_passphrase`. The manifest records the outcome:
+
+```bash
+tar xzOf homepilot-export-*.tar.gz manifest.json | grep includes_vault_passphrase
+```
+
+`false` on an archive that carries `vault/identities` means that archive cannot
+restore a working host on its own — the export says so, loudly, and you must
+keep the passphrase somewhere else (a password manager, a secrets manager, a
+sealed envelope). **Do that anyway**: an archive that holds both the vault and
+its key is a single file that gives up everything.
+
 ### Restore recipe
 
 1. **Stop the backend.** `hp import` refuses to run while any process holds the
@@ -1061,17 +1090,58 @@ restore is done.
    `homepilot.db-wal` / `-shm`, restore secrets if asked (stashing the ones it
    replaces into the same backup dir), and run migrations.
 
+   If the archive restores a vault this host cannot open, `hp import` says so
+   in red before you start anything. Set `HP_VAULT_PASSPHRASE` (or
+   `HP_VAULT_PASSPHRASE_FILE`) to the passphrase from the **source** host and
+   import again — the backend otherwise comes up with `vault: locked` and no
+   Proxmox token, admin secret or webhook secret.
+
 3. **Start and verify.**
 
    ```bash
    docker compose start backend
-   curl http://localhost:8000/health
+   curl http://localhost:8000/health          # database: ok, vault: ok
    docker compose exec backend hp status
-   docker compose exec backend hp kb reindex   # embeddings are not exported
+   docker compose exec backend hp db check    # PRAGMA quick_check on the file
+   docker compose exec backend hp kb reindex  # embeddings are not exported
    ```
+
+   `/health` reads a row from the `settings` table rather than answering
+   `SELECT 1`, so `database: ok` means the file can be read — it used to mean
+   only that a connection object existed, and reported `ok` throughout an
+   incident in which every real query failed.
 
 If the restore was wrong, everything it replaced is under
 `<data_dir>/backups/pre-import-<timestamp>/`.
+
+### Restoring a single database backup
+
+HomePilot writes `<data_dir>/backups/pre-migration-v<N>.db` before every schema
+migration, and `run_migrations` names that file when it refuses a database newer
+than the running build. **Restore it with `hp db restore`, never with `cp`:**
+
+```bash
+docker compose stop backend
+docker compose run --rm --entrypoint hp backend \
+  db restore /data/backups/pre-migration-v29.db
+docker compose start backend
+```
+
+Copying the file into place by hand corrupts it. SQLite binds a write-ahead log
+to no particular database file, so a `homepilot.db-wal` left behind by the
+database you just replaced — an OOM kill, a `docker kill`, a host that lost
+power — is replayed into the file that replaced it, and the result is `database
+disk image is malformed`. That destroyed a dev database and the backup being
+restored, in one command, on 2026-08-29.
+
+`hp db restore` does the four things `cp` cannot: refuses while a backend holds
+the database, verifies the source with `PRAGMA quick_check` before installing it
+(a corrupt backup laid over a working database loses both copies), removes the
+stale `-wal`/`-shm`, and snapshots what it is about to overwrite into
+`<data_dir>/backups/pre-restore-<timestamp>/` before migrating the result
+forward.
+
+`hp db check` runs the same integrity check on the live database at any time.
 
 ### Version rules
 
@@ -1085,6 +1155,22 @@ If the restore was wrong, everything it replaced is under
 - **Tarballs without a `manifest.json` are refused.** Archives produced before
   the backup fix contain a raw copy of a live WAL database and can be torn;
   re-export from the source host instead.
+- **Archives written before 3.6.16 carry no passphrase.** They restore data and
+  a vault nobody can open unless you supply `HP_VAULT_PASSPHRASE` from the
+  source host. `hp import` checks after restoring and tells you.
+
+### What is NOT covered by any of this
+
+- **The database file never shrinks on its own.** Retention deletes rows and
+  bounds growth, but SQLite keeps the freed pages (`auto_vacuum` is `NONE`), so
+  the reconciler reports `freed_pages: 0` rather than claiming a compaction.
+  To reclaim the space, stop the backend and take an export: the snapshot inside
+  it is written with `VACUUM INTO` and is compacted.
+- **`backups/` is never pruned.** `pre-migration-v<N>.db` is bounded by the
+  number of schema versions, but `pre-import-<ts>/` and `pre-restore-<ts>/` are
+  written once per restore and kept forever. Each holds a full database and
+  artifacts tree. Delete the ones you no longer need.
+- **KB embeddings are not exported.** Run `hp kb reindex` after a restore.
 
 ---
 
@@ -1092,7 +1178,7 @@ If the restore was wrong, everything it replaced is under
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.15` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.16` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1144,6 +1230,7 @@ If the restore was wrong, everything it replaced is under
 | `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
+| `HP_DB_INTEGRITY_INTERVAL_SECONDS` | `21600` | How often `PRAGMA quick_check` runs against the database file, on its own read-only connection. `0` turns it off. `/health` reports the verdict as `database: corrupt`; `hp db check` runs it on demand |
 | `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` | `3600` | How often the artifact store is pushed to `HP_ARTIFACTS_REMOTE` (only when a remote is set) |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |

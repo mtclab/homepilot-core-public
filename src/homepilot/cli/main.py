@@ -59,6 +59,9 @@ app.add_typer(inventory_app, name="inventory")
 webhook_app = typer.Typer(help="Webhook management")
 app.add_typer(webhook_app, name="webhook")
 
+db_app = typer.Typer(help="Database file operations (restore a backup, check integrity)")
+app.add_typer(db_app, name="db")
+
 invite_app = typer.Typer(help="Self-service provisioning invites (#442 portal)")
 app.add_typer(invite_app, name="invite")
 quota_app = typer.Typer(
@@ -1032,9 +1035,60 @@ SECRET_PATHS: tuple[str, ...] = (
     "ssh",
 )
 
+# The archive entry a passphrase harvested from the ENVIRONMENT is written to.
+# It is the same name the auto-generated shape uses, so a restored host loads it
+# with no further configuration.
+PASSPHRASE_REL = ".vault_passphrase"  # nosec B105 - a FILE NAME, not a credential
+
+# The vault identity. An archive holding this and no passphrase source is the
+# trap this pair of constants exists to detect: it looks like a full backup,
+# `includes_secrets` is true, and nothing in it can be decrypted.
+IDENTITY_REL = "vault/identities"
+
 
 def _present_secret_paths(data_dir: Path) -> list[str]:
     return [rel for rel in SECRET_PATHS if (data_dir / rel).exists()]
+
+
+def _resolved_passphrase(settings: Any) -> str:
+    """The passphrase actually in force, wherever it came from.
+
+    `.vault_passphrase` under the data dir is only ONE of the three shapes
+    `docs/vault.md` documents. `hp init` writes `HP_VAULT_PASSPHRASE` into a
+    `.env` beside docker-compose.yml, and `HP_VAULT_PASSPHRASE_FILE` points
+    wherever the operator chose - neither is inside the data dir, so neither was
+    ever archived. On the compose deployment `docs/deployment.md` describes,
+    that made `hp export --include-secrets` produce an archive of encrypted
+    material with no key: the restore then boots into
+    `Failed to decrypt identity (wrong passphrase?)`, and every vault secret is
+    gone for good. Verified live on dev 3.6.15, where the archive's manifest
+    listed exactly `vault/identities` and `vault/secrets`.
+    """
+    return str(getattr(settings, "vault_passphrase", "") or "")
+
+
+def _passphrase_opens_identity(data_dir: Path, passphrase: str) -> bool:
+    """Whether `passphrase` actually unwraps this data dir's vault identity.
+
+    ESTABLISHED, not assumed - the whole point. `Settings` auto-generates a
+    passphrase when none is configured, so "there is a passphrase" is not the
+    same claim as "this passphrase opens this vault": an export that archived
+    the auto-generated one beside somebody else's identity would ship a key that
+    fits nothing and say `includes_vault_passphrase: true` about it.
+
+    Only ever called when `master.protected` already exists, because
+    `ensure_master_identity()` CREATES one when it does not - a check that
+    quietly writes a new vault identity would be worse than no check.
+    """
+    if not passphrase:
+        return False
+    from homepilot.vault import VaultManager
+
+    try:
+        asyncio.run(VaultManager(data_dir, passphrase).ensure_master_identity())
+    except Exception:
+        return False
+    return True
 
 
 def _print_no_secrets_warning(missing: list[str]) -> None:
@@ -1051,22 +1105,67 @@ def _print_no_secrets_warning(missing: list[str]) -> None:
     err_console.print("[yellow]restorable backup.[/yellow]")
 
 
-def _print_secrets_banner(tarball_path: Path) -> None:
+def _print_secrets_banner(tarball_path: Path, has_passphrase: bool) -> None:
+    """Say what this archive HOLDS, not what the flag was called.
+
+    The wording used to assert "the vault identity and passphrase" from the flag
+    alone. On any install whose passphrase lives outside the data dir that was
+    simply false, and it was the reassuring half of a two-part trap: a red
+    banner claiming a full backup, over an archive that cannot decrypt itself.
+    """
     err_console.print("[bold red]DANGER: this tarball CONTAINS SECRETS.[/bold red]")
-    err_console.print("[red]It holds the vault identity and passphrase,[/red]")
-    err_console.print("[red]so anyone who reads it can decrypt every[/red]")
-    err_console.print("[red]secret HomePilot holds.[/red]")
+    if has_passphrase:
+        err_console.print("[red]It holds the vault identity AND the[/red]")
+        err_console.print("[red]passphrase that unwraps it, so anyone who[/red]")
+        err_console.print("[red]reads it can decrypt every secret[/red]")
+        err_console.print("[red]HomePilot holds.[/red]")
+    else:
+        err_console.print("[red]It holds the vault identity and the[/red]")
+        err_console.print("[red]encrypted secrets.[/red]")
     err_console.print(f"[red]Treat {tarball_path.name} as a credential:[/red]")
     err_console.print("[red]encrypt it at rest, never commit it,[/red]")
     err_console.print("[red]delete it once restored.[/red]")
 
 
-def _export_readme(includes_secrets: bool) -> str:
-    secrets_section = (
-        "- `secrets/` - vault identity, vault secrets and key material\n"
-        if includes_secrets
-        else "- (no `secrets/` - this archive cannot restore a working host)\n"
-    )
+def _print_no_passphrase_warning(mismatch: bool) -> None:
+    """The archive has the vault but not a key that opens it. Say so, now.
+
+    Silence here is how a "full" backup becomes unrecoverable: the operator
+    finds out at restore time, on a host whose original passphrase is gone.
+    """
+    err_console.print("[bold yellow]WARNING: no usable vault passphrase in[/bold yellow]")
+    err_console.print("[bold yellow]this backup.[/bold yellow]")
+    if mismatch:
+        err_console.print("[yellow]The passphrase this host is configured[/yellow]")
+        err_console.print("[yellow]with does NOT open[/yellow]")
+        err_console.print("[yellow]vault/identities/master.protected, so it[/yellow]")
+        err_console.print("[yellow]was not archived as one.[/yellow]")
+    else:
+        err_console.print("[yellow]It holds vault/identities and[/yellow]")
+        err_console.print("[yellow]vault/secrets but nothing that can unwrap[/yellow]")
+        err_console.print("[yellow]them: neither HP_VAULT_PASSPHRASE,[/yellow]")
+        err_console.print("[yellow]HP_VAULT_PASSPHRASE_FILE nor[/yellow]")
+        err_console.print("[yellow]<data_dir>/.vault_passphrase is set.[/yellow]")
+    err_console.print("[yellow]Restored elsewhere, every secret in it stays[/yellow]")
+    err_console.print("[yellow]undecryptable FOREVER - pve-token,[/yellow]")
+    err_console.print("[yellow]admin-secret, webhook secrets - and the[/yellow]")
+    err_console.print("[yellow]backend starts with the vault locked.[/yellow]")
+    err_console.print("[yellow]Back the passphrase up separately.[/yellow]")
+
+
+def _export_readme(includes_secrets: bool, has_passphrase: bool = False) -> str:
+    if not includes_secrets:
+        secrets_section = "- (no `secrets/` - this archive cannot restore a working host)\n"
+    elif has_passphrase:
+        secrets_section = (
+            "- `secrets/` - vault identity, vault secrets, key material AND the\n"
+            "  vault passphrase (`secrets/.vault_passphrase`)\n"
+        )
+    else:
+        secrets_section = (
+            "- `secrets/` - vault identity and vault secrets, but NO passphrase:\n"
+            "  restored on another host nothing in the vault can be decrypted\n"
+        )
     return (
         "# HomePilot Export\n\n"
         f"Generated: {datetime.now(UTC).isoformat()}\n\n"
@@ -1124,6 +1223,42 @@ def export(
         err_console.print("[yellow]--include-secrets: no secret files found in[/yellow]")
         err_console.print(f"[yellow]{data_dir}[/yellow]")
 
+    # Does this archive carry something that OPENS the vault it carries? Not
+    # "was --include-secrets passed", which is what the old banner answered.
+    # The passphrase is harvested from wherever the operator put it, so
+    # `--include-secrets` means what `docs/deployment.md` says on all three
+    # documented shapes and not only the auto-generated one - and it is
+    # VERIFIED against the identity before the archive claims to hold it.
+    harvested_passphrase = ""
+    passphrase_ok = True
+    identity_present = include_secrets and (data_dir / IDENTITY_REL / "master.protected").exists()
+    if identity_present:
+        # The IN-FORCE passphrase first, in `config.py`'s own resolution order
+        # (env, passphrase file, then `<data_dir>/.vault_passphrase`), because
+        # that is the one the running backend opens the vault with. Preferring
+        # the data-dir FILE would archive a stale auto-generated passphrase over
+        # a working environment one - seen on a dev instance, where the export
+        # then correctly but uselessly reported "no usable vault passphrase"
+        # about a vault it was, at that moment, decrypting.
+        candidates = [_resolved_passphrase(settings)]
+        if PASSPHRASE_REL in secret_rels:
+            candidates.append((data_dir / PASSPHRASE_REL).read_text(encoding="utf-8").strip())
+        working = next(
+            (c for c in candidates if c and _passphrase_opens_identity(data_dir, c)),
+            "",
+        )
+        passphrase_ok = bool(working)
+        if passphrase_ok:
+            # Always staged, even when a `.vault_passphrase` exists: the archive
+            # must carry the one that WORKS, not whichever file is lying there.
+            harvested_passphrase = working
+            if PASSPHRASE_REL not in secret_rels:
+                secret_rels = [*secret_rels, PASSPHRASE_REL]
+        elif PASSPHRASE_REL in secret_rels:
+            # Archiving a key that fits nothing, under a manifest flag saying it
+            # does, is worse than shipping no key at all.
+            secret_rels = [rel for rel in secret_rels if rel != PASSPHRASE_REL]
+
     with tempfile.TemporaryDirectory(prefix="hp-export-") as staging_str:
         staging = Path(staging_str)
 
@@ -1137,6 +1272,12 @@ def export(
                 raise typer.Exit(1) from exc
             db_schema_version = read_schema_version(db_snapshot)
 
+        staged_passphrase: Path | None = None
+        if harvested_passphrase:
+            staged_passphrase = staging / "vault_passphrase"
+            staged_passphrase.write_text(harvested_passphrase, encoding="utf-8")
+            staged_passphrase.chmod(0o600)
+
         contents = [MANIFEST_NAME, "README.md"]
         if db_snapshot.exists():
             contents.append("homepilot.db")
@@ -1145,11 +1286,17 @@ def export(
         if secret_rels:
             contents.append("secrets")
 
+        # Recorded, not inferred: `hp import` refuses to call an archive
+        # restorable on the strength of `includes_secrets` alone, and an
+        # operator auditing old tarballs can tell which of them are keys and
+        # which are ballast.
+        has_passphrase = PASSPHRASE_REL in secret_rels and passphrase_ok
         manifest = {
             "manifest_schema_version": EXPORT_MANIFEST_SCHEMA_VERSION,
             "homepilot_version": __version__,
             "created_at": datetime.now(UTC).isoformat(),
             "includes_secrets": bool(secret_rels),
+            "includes_vault_passphrase": has_passphrase,
             "secret_paths": secret_rels,
             "db_schema_version": db_schema_version,
             "build_supports_db_schema_version": max(MIGRATIONS.keys()),
@@ -1158,7 +1305,7 @@ def export(
         manifest_path = staging / MANIFEST_NAME
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         readme_path = staging / "README.md"
-        readme_path.write_text(_export_readme(bool(secret_rels)), encoding="utf-8")
+        readme_path.write_text(_export_readme(bool(secret_rels), has_passphrase), encoding="utf-8")
 
         with tarfile.open(str(tarball_path), "w:gz") as tar:
             tar.add(str(manifest_path), arcname=MANIFEST_NAME)
@@ -1170,7 +1317,12 @@ def export(
             if artifacts_dir.exists():
                 tar.add(str(artifacts_dir), arcname="artifacts")
             for rel in secret_rels:
-                tar.add(str(data_dir / rel), arcname=f"secrets/{rel}")
+                source = (
+                    staged_passphrase
+                    if rel == PASSPHRASE_REL and staged_passphrase is not None
+                    else data_dir / rel
+                )
+                tar.add(str(source), arcname=f"secrets/{rel}")
 
     if secret_rels:
         # The archive is now a credential; keep it off other users' reach.
@@ -1178,7 +1330,9 @@ def export(
 
     console.print(f"[green]Exported to {tarball_path}[/green]")
     if secret_rels:
-        _print_secrets_banner(tarball_path)
+        _print_secrets_banner(tarball_path, has_passphrase)
+        if identity_present and not has_passphrase:
+            _print_no_passphrase_warning(mismatch=bool(_resolved_passphrase(settings)))
     else:
         # Name what this host actually holds and the archive left behind, so the
         # warning is a fact about this backup, not a generic notice.
@@ -1225,6 +1379,30 @@ def _check_manifest_versions(manifest: dict[str, Any]) -> None:
             f"build supports (version {supported}). No down-migrations exist: run "
             "the image that produced the archive."
         )
+
+
+def _vault_opens_after_import(data_dir: Path) -> bool:
+    """Whether the vault just restored can actually be OPENED on this host.
+
+    Tried, not inferred from the manifest - the same rule that stops `/health`
+    calling a directory listing an unlocked vault. An archive written before
+    3.6.16 can carry a `.vault_passphrase` belonging to a different identity,
+    and this host may hold an auto-generated one that opens nothing; both look
+    fine in a flag and fail at boot.
+
+    Sources in the order `config.py` resolves them: the environment, the
+    passphrase file it points at, then `<data_dir>/.vault_passphrase`.
+    """
+    if not (data_dir / IDENTITY_REL / "master.protected").exists():
+        return True
+    passphrase = os.environ.get("HP_VAULT_PASSPHRASE", "").strip()
+    if not passphrase:
+        pass_file = os.environ.get("HP_VAULT_PASSPHRASE_FILE", "").strip()
+        if pass_file and Path(pass_file).exists():
+            passphrase = Path(pass_file).read_text(encoding="utf-8").strip()
+    if not passphrase and (data_dir / PASSPHRASE_REL).exists():
+        passphrase = (data_dir / PASSPHRASE_REL).read_text(encoding="utf-8").strip()
+    return _passphrase_opens_identity(data_dir, passphrase)
 
 
 def _backup_dir_for_import(data_dir: Path, ts: str) -> Path:
@@ -1290,7 +1468,12 @@ def import_backup(
     ),
 ) -> None:
     """Restore a HomePilot data dir from a tarball. Backs up current state first."""
-    from homepilot.db.backup import DatabaseLockedError, SnapshotError, ensure_not_locked
+    from homepilot.db.backup import (
+        DatabaseLockedError,
+        SnapshotError,
+        ensure_not_locked,
+        remove_wal_sidecars,
+    )
 
     if not path.exists():
         err_console.print(f"[red]File not found: {path}[/red]")
@@ -1364,17 +1547,16 @@ def import_backup(
         staged_db = staging / "homepilot.db"
         if staged_db.exists():
             data_dir.mkdir(parents=True, exist_ok=True)
+            # Sidecars go FIRST, before the file is replaced. A stale -wal/-shm
+            # beside a replaced database is replayed onto it by SQLite - the
+            # restored data corrupted by the journal of the database it just
+            # replaced (#421). Clearing them afterwards leaves a window in which
+            # a crash, an OOM kill or a Ctrl-C lands exactly in that state; the
+            # old database has already been snapshotted into `backup_dir` above,
+            # so nothing is lost by dropping its journal first.
+            for sidecar in remove_wal_sidecars(db_path):
+                console.print(f"[dim]Removed stale {sidecar.name}[/dim]")
             _restore_tree(staged_db, db_path)
-            # A stale -wal/-shm left beside a replaced database file is replayed
-            # onto it by SQLite - the restored data would be corrupted by the
-            # journal of the database it just replaced (#421).
-            for sidecar in (
-                db_path.with_name(db_path.name + "-wal"),
-                db_path.with_name(db_path.name + "-shm"),
-            ):
-                if sidecar.exists():
-                    sidecar.unlink()
-                    console.print(f"[dim]Removed stale {sidecar.name}[/dim]")
             console.print(f"[green]Database restored to {db_path}[/green]")
         else:
             console.print("[yellow]No homepilot.db in archive - skipped[/yellow]")
@@ -1413,6 +1595,24 @@ def import_backup(
         console.print(f"[dim]Schema migrated to version {version}[/dim]")
 
     console.print("[bold green]Import complete.[/bold green]")
+    if restore_secrets and not _vault_opens_after_import(data_dir):
+        # The one outcome an operator must never learn from a crash loop. A
+        # restore that puts the identity back without a key leaves a host that
+        # cannot start: `create_app_state` fails on
+        # `Failed to decrypt identity (wrong passphrase?)`. Reproduced end to
+        # end on 3.6.15 - export --include-secrets, import --restore-secrets,
+        # container exits 3 - with "Import complete." as the only thing said
+        # about it.
+        err_console.print("[bold red]The restored vault CANNOT BE OPENED.[/bold red]")
+        err_console.print("[red]The identity is back, but no passphrase on[/red]")
+        err_console.print("[red]this host unwraps it - not the environment,[/red]")
+        err_console.print("[red]not the archive, not .vault_passphrase.[/red]")
+        err_console.print("[red]Set HP_VAULT_PASSPHRASE (or[/red]")
+        err_console.print("[red]HP_VAULT_PASSPHRASE_FILE) to the passphrase[/red]")
+        err_console.print("[red]from the SOURCE host before starting the[/red]")
+        err_console.print("[red]backend. Until then every vault secret -[/red]")
+        err_console.print("[red]pve-token, admin-secret, webhook secrets -[/red]")
+        err_console.print("[red]stays undecryptable.[/red]")
     if not archive_has_secrets:
         err_console.print("[bold yellow]No secrets in this archive.[/bold yellow]")
         err_console.print("[yellow]The vault on this host is unchanged; if[/yellow]")
@@ -1422,6 +1622,195 @@ def import_backup(
         err_console.print("[yellow]Archive contains secrets; they were NOT[/yellow]")
         err_console.print("[yellow]restored. Pass --restore-secrets to[/yellow]")
         err_console.print("[yellow]replace the vault on this host.[/yellow]")
+
+
+@db_app.command("restore")
+def db_restore(
+    path: Path = typer.Argument(  # noqa: B008
+        ..., help="A .db file written by HomePilot (backups/pre-migration-v<N>.db)"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Put a single database backup back in place, safely.
+
+    The operation `run_migrations` recommends when a database is newer than the
+    build, and the one that had no supported form. The product WRITES
+    `backups/pre-migration-v<N>.db`, its own refusal names that file, and
+    `docs/deployment.md` documented restoring only tarballs - so the remaining
+    step was a `cp`, which destroys the database: SQLite replays the previous
+    database's `-wal` onto the file that just replaced it and the result is
+    `database disk image is malformed`. That happened on dev on 2026-08-29, to
+    the live database and the backup at once.
+
+    Four things `cp` cannot do, and all four are the point:
+      * refuse while a backend holds the database (the same exclusive-lock
+        check `hp import` makes);
+      * verify the SOURCE before installing it - a corrupt backup laid over a
+        working database loses both copies;
+      * clear the `-wal`/`-shm` that would otherwise be replayed;
+      * snapshot what it is about to overwrite, and migrate afterwards.
+    """
+    from homepilot.db.backup import (
+        DatabaseLockedError,
+        SnapshotError,
+        ensure_not_locked,
+        integrity_problems,
+        read_schema_version,
+        remove_wal_sidecars,
+        snapshot_database,
+        wal_sidecars,
+    )
+    from homepilot.db.migrations import MIGRATIONS
+
+    settings = _get_settings()
+    data_dir = Path(settings.data_dir)
+    db_path = data_dir / "homepilot.db"
+
+    if not path.exists() or not path.is_file():
+        err_console.print(f"[red]No such database file: {path}[/red]")
+        raise typer.Exit(1)
+    if path.resolve() == db_path.resolve():
+        err_console.print("[red]That is the live database, not a backup.[/red]")
+        raise typer.Exit(1)
+
+    try:
+        ensure_not_locked(db_path)
+    except DatabaseLockedError as exc:
+        err_console.print("[red]Refusing to restore: the database is in use.[/red]")
+        err_console.print(f"[red]{exc}[/red]", soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+    # Fail closed on the SOURCE first: everything after this point overwrites
+    # the only other copy of the data.
+    problems = integrity_problems(path)
+    if problems:
+        err_console.print(f"[red]Refusing to restore: {path} is not a sound[/red]")
+        err_console.print("[red]SQLite database.[/red]")
+        for problem in problems[:5]:
+            err_console.print(f"[red]  {problem}[/red]", soft_wrap=True)
+        err_console.print("[red]Nothing was changed.[/red]")
+        raise typer.Exit(1)
+
+    source_version = read_schema_version(path)
+    supported = max(MIGRATIONS.keys())
+    if source_version > supported:
+        err_console.print(
+            f"[red]Refusing to restore: {path} is at schema version {source_version}, "
+            f"newer than this build supports ({supported}). No down-migrations exist - "
+            "run the image that wrote it.[/red]",
+            soft_wrap=True,
+        )
+        raise typer.Exit(1)
+
+    live_version = read_schema_version(db_path) if db_path.exists() else 0
+    if not yes:
+        typer.confirm(
+            f"Replace {db_path} (schema v{live_version}) with {path} (schema "
+            f"v{source_version})? Everything written since that snapshot is lost. "
+            "The current database is backed up first. Continue?",
+            abort=True,
+        )
+
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    backup_dir = data_dir / "backups" / f"pre-restore-{ts}"
+    if db_path.exists():
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            snapshot_database(db_path, backup_dir / "homepilot.db")
+            console.print(f"[dim]Current database backed up to {backup_dir}[/dim]")
+        except (SnapshotError, OSError) as exc:
+            # The database being replaced is usually the REASON for the restore,
+            # and a corrupt one cannot be snapshotted at all: VACUUM INTO reads
+            # every page. Refusing here made this command useless in the case it
+            # exists for - found by running it against a dev database that was
+            # genuinely `database disk image is malformed`.
+            #
+            # So keep the bytes instead. A raw copy of a corrupt database is
+            # evidence, not a restorable backup, and it is saved under names
+            # SQLite will never pick up as a journal so that the directory
+            # cannot repeat the very accident being recovered from.
+            try:
+                shutil.copyfile(str(db_path), str(backup_dir / "homepilot.db.corrupt"))
+                for sidecar in wal_sidecars(db_path):
+                    if sidecar.exists():
+                        shutil.copyfile(str(sidecar), str(backup_dir / f"{sidecar.name}.saved"))
+            except OSError as copy_exc:
+                err_console.print(f"[red]Pre-restore backup failed: {exc}[/red]", soft_wrap=True)
+                err_console.print(
+                    f"[red]and the raw copy failed too: {copy_exc}[/red]", soft_wrap=True
+                )
+                err_console.print("[red]Nothing was changed.[/red]")
+                raise typer.Exit(1) from copy_exc
+            err_console.print("[yellow]The current database could not be snapshotted[/yellow]")
+            err_console.print(f"[yellow]({exc}).[/yellow]", soft_wrap=True)
+            err_console.print("[yellow]Its raw bytes were kept for forensics as[/yellow]")
+            err_console.print(f"[yellow]{backup_dir}/homepilot.db.corrupt[/yellow]")
+            err_console.print("[yellow]That copy is EVIDENCE, not a backup: it[/yellow]")
+            err_console.print("[yellow]cannot be restored. Continuing.[/yellow]")
+
+    # Sidecars first, then the file: never leave a new database beside an old
+    # journal, not even for the length of one copy.
+    for sidecar in remove_wal_sidecars(db_path):
+        console.print(f"[dim]Removed stale {sidecar.name}[/dim]")
+    shutil.copyfile(str(path), str(db_path))
+    console.print(f"[green]Restored {path} to {db_path}[/green]")
+
+    async def _migrate() -> int:
+        database = await _open_cli_db("hp db restore", db_path)
+        try:
+            row = await database.fetchone("SELECT value FROM settings WHERE key = 'schema_version'")
+            return int(row["value"]) if row else 0
+        finally:
+            await database.close()
+
+    try:
+        version = asyncio.run(_migrate())
+    except Exception as exc:
+        err_console.print(f"[red]Migrations after restore failed: {exc}[/red]", soft_wrap=True)
+        err_console.print(f"[red]The previous database is at {backup_dir}[/red]")
+        raise typer.Exit(1) from exc
+
+    remaining = integrity_problems(db_path)
+    if remaining:
+        # The restored file passed its check and the migration ran, so this
+        # should be unreachable - which is exactly why it is worth saying out
+        # loud rather than assuming.
+        err_console.print("[red]The restored database does not pass its[/red]")
+        err_console.print("[red]integrity check:[/red]")
+        for problem in remaining[:5]:
+            err_console.print(f"[red]  {problem}[/red]", soft_wrap=True)
+        err_console.print(f"[red]The previous database is at {backup_dir}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Schema migrated to version {version}[/dim]")
+    console.print("[bold green]Restore complete.[/bold green]")
+
+
+@db_app.command("check")
+def db_check() -> None:
+    """Verify the database file is readable and sound.
+
+    The product had no way to ask this. `/health` answered `database: ok` from
+    `SELECT 1`, which never touches a page, so a database corrupted under a
+    running backend reported healthy while real reads returned 500 (#642).
+    """
+    from homepilot.db.backup import integrity_problems, read_schema_version
+
+    settings = _get_settings()
+    db_path = Path(settings.data_dir) / "homepilot.db"
+    if not db_path.exists():
+        err_console.print(f"[red]No database at {db_path}[/red]")
+        raise typer.Exit(1)
+
+    problems = integrity_problems(db_path, limit=20)
+    if problems:
+        err_console.print(f"[bold red]{db_path} is CORRUPT.[/bold red]")
+        for problem in problems:
+            err_console.print(f"[red]  {problem}[/red]", soft_wrap=True)
+        err_console.print("[red]Restore a backup: hp db restore <file>[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]{db_path} passes PRAGMA quick_check[/green]")
+    console.print(f"[dim]Schema version {read_schema_version(db_path)}[/dim]")
 
 
 @policy_app.command("init")
