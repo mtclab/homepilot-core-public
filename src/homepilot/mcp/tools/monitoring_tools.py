@@ -14,8 +14,19 @@ import time
 from typing import Any
 
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
-from homepilot.metrics.repository import MAX_SERIES_POINTS, VALID_COMPARISONS
+from homepilot.metrics.repository import (
+    AGENT_METRICS,
+    MAX_SERIES_POINTS,
+    VALID_COMPARISONS,
+)
 from homepilot.metrics.router import MAX_WINDOW_HOURS
+
+# Named in every description that has to give an example, so a caller is never
+# invited to ask for a metric this fleet does not have. The list used to say
+# "cpu.percent" - a metric no HomePilot agent has ever emitted - and a rule
+# created on it was accepted, listed and enabled while being skipped on every
+# evaluation cycle (#648 tranche 5).
+_METRIC_EXAMPLES = ", ".join(AGENT_METRICS)
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -23,8 +34,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Every configured alert rule: name, metric, comparison, threshold, the "
             "for_seconds duration the condition must hold, the host_filter it applies "
-            "to, and whether it is enabled. Read-only - it cannot add, silence or "
-            "delete a rule."
+            "to, and whether it is enabled. Each rule also carries `hosts_matched` and "
+            "`last_eval_at` from its last evaluation: `hosts_matched: 0` means the rule "
+            "is guarding NOTHING - its filter matched no host, or no host reports that "
+            "metric - and `last_eval_at: null` means it has not been evaluated yet. "
+            "Read-only - it cannot add, silence or delete a rule."
         ),
         "inputSchema": {"type": "object", "properties": {}},
         "outputSchema": {
@@ -41,7 +55,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Alerts firing RIGHT NOW, each joined to the rule that raised it and the "
             "host it fired for. An empty list means nothing is currently breaching a "
-            "rule - it does not mean no rules exist (use list_alert_rules for that). "
+            "rule. It does NOT mean the fleet is well: there may be no rules at all, "
+            "or every rule may be matching no host. Confirm with list_alert_rules and "
+            "its `hosts_matched` before reporting an empty list as good news. "
             "Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}},
@@ -57,11 +73,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_host_metrics",
         "description": (
-            "The newest value of every metric one host has reported (cpu, memory, "
-            "disk, load and whatever else its agent sends), as a list of "
-            "{metric, ts, value}. Reads stored samples - it does not touch the host, "
-            "so a host whose agent is offline returns its last known values, not "
-            "fresh ones, and an unknown host returns an empty list."
+            "The newest value of every metric one host has reported, as a list of "
+            f"{{metric, ts, value}}. A current agent reports exactly: {_METRIC_EXAMPLES}. "
+            "Reads stored samples - it does not touch the host, so a host whose agent "
+            "is offline returns its last known values, not fresh ones (check `ts` "
+            "before trusting them), and an unknown host returns an empty list."
         ),
         "inputSchema": {
             "type": "object",
@@ -95,7 +111,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 **host_properties("The host's name"),
                 "metric": {
                     "type": "string",
-                    "description": 'Metric name, e.g. "cpu.percent" or "disk.free_gb"',
+                    "description": f"Metric name. A current agent reports: {_METRIC_EXAMPLES}. "
+                    "Any other name returns an empty series rather than an error.",
                 },
                 "hours": {
                     "type": "number",
@@ -130,13 +147,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Create an alert rule: fire when `metric` on hosts matching `host_filter` "
             "is `comparison` (gt/gte/lt/lte) `threshold` for at least `for_seconds` "
             "(0 = fire on the first breaching sample). Returns the stored rule. Admin "
-            "only."
+            "only.\n\nA rule can only ever fire on a metric hosts actually report "
+            f"({_METRIC_EXAMPLES}) - any other name is accepted and then never "
+            "matches anything. Check `hosts_matched` with list_alert_rules after the "
+            "next evaluation to confirm the rule is watching what you meant."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Human-readable rule name"},
-                "metric": {"type": "string", "description": "Metric key, e.g. cpu.percent"},
+                "metric": {
+                    "type": "string",
+                    "description": f"Metric key. Hosts report: {_METRIC_EXAMPLES}",
+                },
                 "comparison": {"type": "string", "description": "One of gt, gte, lt, lte"},
                 "threshold": {"type": "number"},
                 "for_seconds": {
@@ -145,7 +168,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "host_filter": {
                     "type": "string",
-                    "description": "Hostname glob the rule applies to (default '*')",
+                    "description": (
+                        "Hostname glob the rule applies to - '*' for every host, "
+                        "'web-*' for a prefix, or a bare hostname for one machine "
+                        "(default '*')"
+                    ),
                 },
                 "enabled": {"type": "boolean", "description": "Default true"},
             },
@@ -169,7 +196,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "rule_id": {"type": "string", "description": "The rule's id"},
                 "name": {"type": "string", "description": "Human-readable rule name"},
-                "metric": {"type": "string", "description": "Metric key, e.g. cpu.percent"},
+                "metric": {
+                    "type": "string",
+                    "description": f"Metric key. Hosts report: {_METRIC_EXAMPLES}",
+                },
                 "comparison": {"type": "string", "description": "One of gt, gte, lt, lte"},
                 "threshold": {"type": "number"},
                 "for_seconds": {
@@ -178,7 +208,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "host_filter": {
                     "type": "string",
-                    "description": "Hostname glob the rule applies to",
+                    "description": (
+                        "Hostname glob the rule applies to - '*', a pattern like "
+                        "'web-*', or a bare hostname"
+                    ),
                 },
                 "enabled": {"type": "boolean", "description": "New enabled state"},
             },

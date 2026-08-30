@@ -47,7 +47,7 @@ function summary(over: Record<string, unknown> = {}) {
 		artifacts: { applied: 3 },
 		tasks: {},
 		agents: { known: 2, connected: 2 },
-		metrics: { firing_alerts: 0, retention_days: 7 },
+		metrics: { firing_alerts: 0, retention_days: 7, rules_enabled: 1, rules_watching_nothing: 0 },
 		...over,
 	};
 }
@@ -205,6 +205,47 @@ describe('Overview: needs attention', () => {
 			'href',
 			'/ui/records/tasks',
 		);
+	});
+
+	// #648 tranche 5: `firing_alerts: 0` on an install with no rules is not good
+	// news, it is the absence of news - and it sat on the first screen reading
+	// green. A calm estate that is watching nothing must say so.
+	it('says nothing is watched when no alert rule is enabled', async () => {
+		seed({
+			hosts: [HEALTHY_HOST],
+			summary: {
+				metrics: {
+					firing_alerts: 0,
+					retention_days: 7,
+					rules_enabled: 0,
+					rules_watching_nothing: 0,
+				},
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(zone.getByText(/no alert rule is enabled/i)).toBeInTheDocument();
+	});
+
+	it('says so when a rule is enabled but matches no host', async () => {
+		seed({
+			hosts: [HEALTHY_HOST],
+			summary: {
+				metrics: {
+					firing_alerts: 0,
+					retention_days: 7,
+					rules_enabled: 2,
+					rules_watching_nothing: 1,
+				},
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(zone.getByText(/matches no host/i)).toBeInTheDocument();
 	});
 
 	it('a calm estate gets one line and no attention chrome at all', async () => {

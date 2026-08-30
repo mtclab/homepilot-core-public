@@ -1,5 +1,58 @@
 # Changelog
 
+## 3.6.17 - 2026-08-30
+
+Tranche 5 of the platform review (#648): metrics and alerting.
+
+### An alert rule that could never fire looked exactly like one standing guard
+
+`host_filter` is offered as a pattern - `*` is its default and its documented
+"everything" - and it was compared with `==`. So a rule for `db-*` matched no
+host, was skipped silently every evaluation cycle, and was indistinguishable in
+`list_alert_rules` from a rule watching the fleet. Reproduced live in the
+reconciler's own words: three enabled rules, `{'rules': 3, 'evaluated': 1}`.
+
+The metric NAME was validated against nothing, and the MCP tool schema's own
+example was `cpu.percent` - a metric no agent has ever emitted. The metrics test
+suite is written on that same invented name, so the mismatch could not have been
+caught by it. An operator, or an assistant reading the tool description, who set
+up "disk low on all db-* hosts" was watching nothing at all.
+
+Now: real glob matching, one metric vocabulary derived from the agent's own
+source and gated against it, and `hosts_matched` / `last_eval_at` recorded per
+rule so an inert rule says it is inert. The Overview reports
+`rules_watching_nothing`.
+
+### "Monitoring is part of the product" was true of collection, not of alerting
+
+ADR-004 S5 says *"Nothing installs, imports or configures; monitoring is part of
+the product."* Collection honours that. Alerting did not: a fresh install had
+ZERO rules, so `firing_alerts: 0` sat green on the first screen an operator sees
+while meaning "nothing is being watched". A fresh install now starts with two
+default rules, guarded so an existing policy is never added to.
+
+### Also
+
+A latched alert on a deleted host could never resolve, because `delete_host` left
+`alert_state` behind. A nameless agent was refused nowhere: its samples were
+dropped while the hub acked them as accepted, so the agent freed its buffer over
+data nobody stored. The self-check's events line named "artifact and task events"
+only, though `alert_firing` rides that channel and, unlike an artifact, leaves no
+durable record.
+
+### S5's deferred decision, answered
+
+S5 deliberately did not build rollups: *"measure a week of real data first"*. The
+week has happened. Storage is a non-issue (128.9 bytes per row, ~6.3 MB per host
+per week). The READ side is the problem: asked for the 7-day window it
+advertises, dev returned 34.5 hours - 21% of it. Rollups are needed to make the
+window readable, not to bound the table. Recorded in the ADR rather than
+rewriting it.
+
+Retention itself is sound, proved against real data: a 1-day horizon deleted
+exactly the rows past the cutoff and nothing else, and no configuration can
+delete a sample younger than 24 hours.
+
 ## 3.6.16 - 2026-08-30
 
 Tranche 4 of the platform review (#648): backup, restore and data durability -

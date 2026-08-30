@@ -433,9 +433,25 @@ serves the retention pruner, which deletes raw samples older than
 
 **Alerting.** A rule is `(host filter, metric, comparison, threshold,
 for_seconds)` and fires only when the condition held for that whole span, so a
-single spike cannot page anyone. Firing and recovery both go out as
-`alert_firing` / `alert_resolved` through the existing SSE + webhook event
-machinery. See `/monitoring/*` in the README for the API.
+single spike cannot page anyone. The host filter is a **glob** — `*`, `web-*`,
+or a bare hostname. The metric must be one of the eight above: any other name is
+stored as a rule and then never matches anything, which is why every rule
+carries `hosts_matched` and `last_eval_at` from its last evaluation, and why
+`hosts_matched: 0` is surfaced in the console and counted on the Overview. Two
+default rules are seeded on first boot (`disk.free_gb < 1`,
+`memory.free_gb < 0.2`, both for ten minutes across every host) so an install
+watches something without being configured — ADR-004 corollary 2. Firing and
+recovery both go out as `alert_firing` / `alert_resolved` through the existing
+SSE + webhook event machinery; with no events webhook configured that means the
+log and an open browser, and **nothing durable** — there is no alert history,
+only current state. See `/monitoring/*` in the README for the API.
+
+**What alerting deliberately does not do.** There is no "host stopped
+reporting" rule: a rule only ever fires on a threshold, and a host whose agent
+went quiet drops out of evaluation rather than raising anything (a stale number
+is a connectivity problem, not a breach). The console's Overview surfaces
+`agent offline` as a warning, but nothing is emitted, so nothing reaches a
+webhook. That gap is tracked, not accidental.
 
 ### Audit logging
 

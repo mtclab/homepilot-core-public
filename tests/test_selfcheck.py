@@ -104,7 +104,10 @@ class TestStockInstallIsHonest:
         entries = _by_name(await selfcheck_report(_stock_state(), _stock_settings()))
 
         assert "keyword-only" in entries["embeddings"]["consequence"]
-        assert "not forwarded anywhere" in entries["events_webhook"]["consequence"]
+        # Not just "events": the line has to name ALERTS, which ride this exact
+        # channel since ADR-004 S5 (#648 tranche 5).
+        assert "forwarded anywhere" in entries["events_webhook"]["consequence"]
+        assert "ALERT" in entries["events_webhook"]["consequence"].upper()
         assert "inventory" in entries["proxmox"]["consequence"]
 
     async def test_stock_install_reports_nothing_broken(self, monkeypatch):

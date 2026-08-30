@@ -240,7 +240,13 @@ export interface DashboardSummary {
 	artifacts: Record<string, number>;
 	tasks: Record<string, number>;
 	agents: { known: number; connected: number };
-	metrics: { firing_alerts: number; retention_days: number };
+	metrics: {
+		firing_alerts: number;
+		retention_days: number;
+		// firing_alerts alone cannot tell "all well" from "nothing is watched".
+		rules_enabled: number;
+		rules_watching_nothing: number;
+	};
 }
 
 // --- Native metrics (ADR-004 S5) ---
@@ -280,6 +286,12 @@ export interface AlertRule {
 	enabled: number;
 	created_at: string;
 	updated_at: string;
+	// What the LAST evaluation actually looked at. `hosts_matched: 0` is a rule
+	// guarding nothing - its filter matched no host, or no host reports that
+	// metric - which used to be indistinguishable from a rule watching the whole
+	// fleet. null on a rule the evaluator has not reached yet.
+	hosts_matched: number | null;
+	last_eval_at: string | null;
 }
 
 export interface FiringAlert {

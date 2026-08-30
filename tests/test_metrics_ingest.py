@@ -186,6 +186,68 @@ class TestMetricsFrameIngest:
         assert ack["rejected"] == 10
 
 
+class TestANamelessAgentCannotBeMonitored:
+    """A host with no name has nowhere for its samples to be filed (#648 t5).
+
+    ``metrics`` rows are keyed by hostname and every alert rule joins on it, so
+    an agent that registered with ``""`` was connected, green, and had every
+    frame it sent silently dropped - while the hub acked the frame as ACCEPTED,
+    which is the signal that frees the agent's buffer. The samples were gone for
+    good and nothing anywhere said so. The Go agent takes its name from
+    ``os.Hostname()`` and discards the error, so ``""`` is reachable.
+
+    Teeth: change the register guard back to `if False:` and this goes red."""
+
+    async def _register(self, wired, hostname):
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", wired.srv._server.sockets[0].getsockname()[1]
+        )
+        writer.write(
+            _encode(
+                {
+                    "action": "register",
+                    "auth_token": AUTH,
+                    "agent_id": "nameless-1",
+                    "hostname": hostname,
+                    "request_id": "reg-x",
+                }
+            )
+        )
+        await writer.drain()
+        reply = await _recv(reader)
+        return reply, writer
+
+    async def test_an_empty_hostname_is_refused_at_register(self, wired):
+        reply, writer = await self._register(wired, "")
+        try:
+            assert "error" in reply, f"a nameless agent was accepted: {reply}"
+            assert "hostname" in reply["error"]
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
+
+    async def test_a_whitespace_hostname_is_refused_too(self, wired):
+        reply, writer = await self._register(wired, "   ")
+        try:
+            assert "error" in reply, f"a whitespace-named agent was accepted: {reply}"
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
+
+    async def test_samples_that_could_not_be_stored_are_never_acked_as_accepted(self, wired):
+        """The belt to the register braces: whatever the reason storage did not
+        happen, the count sent back must not claim it did."""
+        wired.srv.registry.metrics_repo = None
+        stored, rejected = await wired.srv._ingest_metrics(
+            "agent-1",
+            {"samples": [{"metric": "load.1m", "value": 1.0, "clock": NOW}]},
+        )
+        assert stored == 0, "the hub reported storing a sample it dropped"
+        assert rejected == 1
+
+
 class TestSampleValidation:
     @pytest.mark.parametrize(
         "sample",
