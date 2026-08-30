@@ -66,6 +66,13 @@ class AppState:
     # a state object without it reports MCP as broken - which is why it is a
     # field here rather than an attribute only `app.state` carries (#514).
     mcp_app: Any = None
+    # The reconciler scheduler, set by the lifespan. Declared HERE and not only
+    # on `app.state` because the self-check's `reconcilers` subsystem reads it
+    # off whichever state object its caller holds - the MCP tool holds this one
+    # - and an absent attribute made that surface report "No reconciler is
+    # registered" about an instance running seven of them (#648 tranche 8,
+    # found by driving 3.6.19 on dev).
+    reconciler_scheduler: Any = None
     # Why the hub is not running despite being enabled, in the operator's words.
     # Empty when the hub is off by configuration or running normally.
     agent_hub_disabled_reason: str = ""

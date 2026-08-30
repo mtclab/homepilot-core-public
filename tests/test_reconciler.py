@@ -421,10 +421,21 @@ class TestSchedulerLifespanWiring:
         from homepilot import selfcheck as selfcheck_mod
 
         lifespan_src = inspect.getsource(main_mod.lifespan)
-        assert "app.state.reconciler_scheduler = reconciler_scheduler" in lifespan_src
-
         probe_src = inspect.getsource(selfcheck_mod._reconcilers_subsystem)
         assert '"reconciler_scheduler"' in probe_src
+
+        # BOTH objects. The first version of this test asserted only the
+        # `app.state` assignment and passed while the MCP surface - which holds
+        # the AppState, not `app.state` - reported "No reconciler is registered
+        # ... nothing maintains the estate" about an instance running seven of
+        # them. /admin/selfcheck on the SAME process said they were all on time.
+        # Two surfaces, two answers, from one rule reading two objects (#631),
+        # and the string-level test could not see it because both strings were
+        # there. `mcp_app` is set on both for exactly this reason.
+        assert "app.state.reconciler_scheduler = reconciler_scheduler" in lifespan_src
+        assert "state.reconciler_scheduler = reconciler_scheduler" in lifespan_src.replace(
+            "app.state.reconciler_scheduler = reconciler_scheduler", ""
+        ), "the AppState assignment is missing: the MCP self-check will report no reconcilers"
 
     async def test_the_scheduler_exposes_the_status_the_selfcheck_asks_for(self):
         """The other half of that contract: the shape, not just the name."""

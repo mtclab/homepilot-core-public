@@ -23,6 +23,8 @@ const SUBSYSTEM_LABELS: Record<string, string> = {
 	events_webhook: 'Events webhook',
 	mcp: 'MCP',
 	artifacts_remote: 'Artifact backup',
+	reconcilers: 'Scheduled reconcilers',
+	agent_versions: 'Agent versions',
 };
 
 export function subsystemLabel(sub: Pick<SelfcheckSubsystem, 'name' | 'label'>): string {

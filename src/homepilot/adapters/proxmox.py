@@ -651,10 +651,17 @@ class ProxmoxClient:
             except httpx.RequestError as exc:
                 return {"ok": False, "status": 0, "detail": f"the cluster is unreachable: {exc}"}
 
-        out["read"] = await _probe(self._client)
+        # CONCURRENTLY. Two sequential probes doubled the work inside the
+        # self-check's 2-second budget and pushed the Proxmox subsystem from
+        # `ok` to `unknown` on a real cluster - a check that times out is a
+        # check that establishes nothing, which is the opposite of the point
+        # (caught driving 3.6.19 on dev, not by the suite).
         if self._has_separate_write:
-            out["write"] = await _probe(self._write_client)
+            out["read"], out["write"] = await asyncio.gather(
+                _probe(self._client), _probe(self._write_client)
+            )
         else:
+            out["read"] = await _probe(self._client)
             # No separate credential: the read token IS the write token, so its
             # verdict is the whole answer and inventing a second one would imply
             # a check that never happened.

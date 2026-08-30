@@ -177,6 +177,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # of parsing HP_TRUSTED_PROXIES a second time.
     app.state.trusted_proxy_networks = _trusted_proxy_networks
 
+    # The AppState itself, so anything that must keep BOTH state objects in
+    # step can reach it by name. `_do_reload` rebuilds the Proxmox client and
+    # closed the old one while only `app.state` learned about the new one, so
+    # every MCP-side surface - which holds the AppState - went on using a CLOSED
+    # client and reported `connection_status: error` with an empty token verdict
+    # while /health on the same process was fine. Same shape as the scheduler
+    # above and as #631: one rule, two objects, two answers.
+    app.state.hp_state = state
     app.state.db = state.database
     app.state.repo = state.repo
 
@@ -483,6 +491,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await reconciler_scheduler.start()
     app.state.reconciler_scheduler = reconciler_scheduler
+    # BOTH state objects, for the same reason `mcp_app` is set on both below:
+    # the self-check reads whichever one its caller holds, and the MCP tool
+    # holds the AppState while the HTTP route holds `app.state`. Set on one
+    # only, the MCP surface reported "No reconciler is registered ... nothing
+    # maintains the estate on a timer" about an instance running seven of them,
+    # while /admin/selfcheck on the same process said they were all on time.
+    # Two surfaces, two answers, from one rule reading two objects - #631
+    # exactly, found by driving 3.6.19 on dev rather than by the suite.
+    state.reconciler_scheduler = reconciler_scheduler
     app.state.drift_reconciler = drift_reconciler
 
     try:
