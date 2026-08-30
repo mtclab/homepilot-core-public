@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.6.21 - 2026-08-30
+
+**The self-check could only ever see a HEALTHY Proxmox token.** Found by
+re-driving 3.6.20 on a real control plane: with a genuinely refused write token
+the Proxmox probe timed out and reported `unknown` - "treat it as unproven" -
+while `/health` on the same instance correctly said `write_token_refused`. The
+check added in 3.6.19 to notice a refused write token could see a good token and
+never a bad one, which is the entire thing it exists for.
+
+Measured rather than guessed: PVE delays a refused credential by a steady ~3.0s,
+warm and cold alike - deliberate anti-brute-force behaviour on their side, so
+3.6.20's "one round trip" change could not have helped. The latency is in the
+refusal, not in the number of calls.
+
+A probe may now declare its own budget. Proxmox asks for 8s, with the reason
+recorded beside the number. The report stays bounded, the larger budget is
+opt-in, and a gate proves it does not loosen anyone else's.
+
+*A check that cannot outlast the fault it hunts is not a check.*
+
 ## 3.6.20 - 2026-08-30
 
 Four defects that DRIVING 3.6.19 found and the green suite did not. Three are

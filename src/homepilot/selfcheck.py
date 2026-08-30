@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 # holding the report - or the operator - open.
 PROBE_TIMEOUT_SECONDS = 2.0
 
+# Some probes cannot answer inside that. PVE DELAYS A REFUSED CREDENTIAL on
+# purpose - measured at a steady ~3.0s against a live cluster, warm or cold -
+# so a check whose whole job is to notice a refused token needs a budget larger
+# than a healthy answer needs. Two seconds bought a report that could only ever
+# see the good case, and reported the bad one as "unverified" (#648, found by
+# driving 3.6.20 on dev). This is the ceiling for such a probe; the report is
+# still bounded, just by a number that lets the answer arrive.
+SLOW_PROBE_TIMEOUT_SECONDS = 8.0
+
 # The boot report is scheduled, not awaited, so startup is never delayed by it.
 # The delay lets the agent-hub task finish binding before the report judges it: a
 # report that races the thing it describes reads as a fault that is not there.
@@ -77,6 +86,9 @@ class Subsystem:
     ok: str
     broken: str
     probe: Callable[[], Awaitable[bool | ProbeVerdict]] | None = None
+    # Seconds this probe may take, when the default is not enough to see the
+    # answer it exists to see. None means the report-wide bound.
+    timeout: float | None = None
 
 
 async def _tcp_reachable(host: str, port: int) -> bool:
@@ -298,6 +310,10 @@ def _proxmox_subsystem(state: Any, settings: Any) -> Subsystem:
             "unavailable."
         ),
         probe=probe if host else None,
+        # A REFUSED PVE credential is answered slowly on purpose (~3s measured
+        # live), and noticing a refused write token is the entire point of this
+        # probe. At the default bound it could only ever see the healthy case.
+        timeout=SLOW_PROBE_TIMEOUT_SECONDS,
     )
 
 
@@ -720,6 +736,9 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
 
 
 async def _evaluate(subsystem: Subsystem, timeout: float) -> dict[str, Any]:
+    # A subsystem may ask for longer than the report-wide bound when the answer
+    # it exists to establish cannot arrive inside it.
+    timeout = subsystem.timeout or timeout
     if not subsystem.configured:
         return {
             "name": subsystem.name,
