@@ -247,12 +247,11 @@ def _proxmox_subsystem(state: Any, settings: Any) -> Subsystem:
     async def probe() -> bool | ProbeVerdict:
         if client is None:
             return False
-        if not bool(await client.test_connection()):
-            return False
-        # The read token answered. That is not the claim an operator needs:
-        # every clone, snapshot and delete goes through the WRITE token, and a
-        # stale one is invisible until a guest's first provision 401s in their
-        # face - which is exactly how it surfaced on prod (#624).
+        # ONE round trip, not two. `check_tokens` already asks both credentials
+        # the same harmless question `test_connection` asks, so calling both put
+        # three sequential requests inside a 2-second budget and the subsystem
+        # timed out into `unknown` against a real cluster. The read verdict IS
+        # the connection verdict.
         try:
             tokens = await client.check_tokens()
         except Exception:
@@ -262,6 +261,10 @@ def _proxmox_subsystem(state: Any, settings: Any) -> Subsystem:
                 "token could not be checked, so nothing is known about whether "
                 "provisioning would work.",
             )
+        if tokens.get("read", {}).get("ok") is False:
+            # The API did not answer the read token at all: the existing
+            # `broken` copy is the right sentence for that.
+            return False
         write = tokens.get("write", {})
         if write.get("ok") is False:
             return ProbeVerdict(

@@ -527,6 +527,11 @@ async def _do_reload(request: Request) -> dict[str, Any]:
                         logger.debug("Error closing old ProxmoxClient", exc_info=True)
 
                 request.app.state.proxmox = new_proxmox
+                # And the AppState, which the MCP tools hold. Left behind, it
+                # kept the client this reload just CLOSED.
+                hp_state = getattr(request.app.state, "hp_state", None)
+                if hp_state is not None:
+                    hp_state.proxmox = new_proxmox
                 _proxmox_version += 1
                 request.app.state.proxmox_version = _proxmox_version
 

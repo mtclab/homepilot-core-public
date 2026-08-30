@@ -205,3 +205,47 @@ class TestTheWriteTokenIsExercised:
         result = await client.check_tokens()
         assert result["write"]["ok"] is True
         assert "used for writes too" in result["write"]["detail"]
+
+
+class TestBothStateObjectsStayInStep:
+    """A reload must not leave the AppState holding the client it just closed.
+
+    Found by driving 3.6.19 on dev, not by the suite: after changing the Proxmox
+    write token, `/health` and `/admin/settings/proxmox` (which hold
+    `app.state`) reported correctly, while the MCP `get_proxmox_settings` (which
+    holds the `AppState`) answered `connection_status: error` with an EMPTY
+    token verdict - because `_do_reload` swapped the client on one object and
+    closed the old one the other was still using. One rule, two objects, two
+    answers: #631's shape, and the third time this session.
+
+    Teeth: drop the `hp_state.proxmox = new_proxmox` line and the first test
+    fails; drop `app.state.hp_state = state` from the lifespan and the second.
+    """
+
+    def test_the_reload_updates_the_appstate_client_too(self):
+        import importlib
+        import inspect
+        import sys
+
+        # `from homepilot.admin import router` hands back the APIRouter the
+        # package exports, not the module; go through sys.modules for the file.
+        importlib.import_module("homepilot.admin.router")
+        src = inspect.getsource(sys.modules["homepilot.admin.router"]._do_reload)
+        assert "hp_state.proxmox = new_proxmox" in src, (
+            "the AppState keeps the closed client; every MCP-side report goes wrong"
+        )
+
+    def test_the_lifespan_exposes_the_appstate_by_name(self):
+        import inspect
+
+        from homepilot import main as main_mod
+
+        assert "app.state.hp_state = state" in inspect.getsource(main_mod.lifespan)
+
+    def test_the_appstate_declares_the_fields_the_selfcheck_reads(self):
+        """Both attributes the report reads off `state` are on the dataclass, so
+        a caller holding an AppState cannot silently miss one."""
+        from homepilot.app_state import AppState
+
+        for field in ("proxmox", "mcp_app", "reconciler_scheduler"):
+            assert field in AppState.__dataclass_fields__, field
