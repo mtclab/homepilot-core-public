@@ -145,12 +145,21 @@ async def proxmox_settings_report(state: Any) -> dict[str, Any]:
     token, source = await _resolve_proxmox_token(state)
     write_token, write_source = await _resolve_proxmox_write_token(state)
     proxmox = getattr(state, "proxmox", None)
+    # Each token's own verdict. `connection_status: ok` beside
+    # `write_token_configured: true` used to be read as "writes will work" - it
+    # only ever meant the READ token answered, and a friend's first redemption
+    # 401ed on prod because of it (#624).
+    token_status: dict[str, Any] = {}
     if proxmox is not None:
         try:
             connected = await proxmox.test_connection()
             status = "ok" if connected else "unreachable"
         except Exception:
             status = "error"
+        try:
+            token_status = await proxmox.check_tokens()
+        except Exception:
+            token_status = {}
     elif host:
         status = "unreachable"
     else:
@@ -166,6 +175,10 @@ async def proxmox_settings_report(state: Any) -> dict[str, Any]:
         "write_token_source": write_source if write_token else "",
         "write_token_is_separate": has_separate_write,
         "connection_status": status,
+        # Per credential, because "configured" and "authenticates" are different
+        # claims and only one of them was ever checked. Empty when the cluster
+        # could not be asked at all - which is not the same as either answer.
+        "token_auth": token_status,
     }
 
 

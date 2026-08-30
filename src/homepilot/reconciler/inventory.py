@@ -52,14 +52,49 @@ class InventoryReconciler(Reconciler):
 
             result = await self.inventory_service.refresh_inventory()
 
+            # A sweep that did not finish saw only part of the hypervisor, so
+            # "everything I did not see is gone" is not a sentence it has
+            # earned. Reported anyway, this wrote the WHOLE fleet into the
+            # journal as absent whenever the node list failed - or simply
+            # whenever no Proxmox was configured, every cycle, forever (#648
+            # tranche 8). The service already refuses to MARK anything absent
+            # off a partial picture; this is the other half - refusing to say
+            # it. Absence of the key means an older service: treat it as
+            # incomplete, the fail-safe direction.
+            if not result.get("complete", False):
+                incomplete: dict[str, Any] = {
+                    "complete": False,
+                    "hosts_refreshed": result.get("hosts", 0),
+                    "services_refreshed": result.get("services", 0),
+                    "error": result.get("error", "the hypervisor sweep did not complete"),
+                }
+                try:
+                    await self.repo.log_audit(
+                        user_id="system",
+                        source="reconciler:inventory",
+                        action="refresh_incomplete",
+                        details_json=json.dumps(incomplete),
+                    )
+                except (
+                    sqlite3.OperationalError,
+                    sqlite3.IntegrityError,
+                    OSError,
+                    RuntimeError,
+                ) as exc:
+                    logger.exception("InventoryReconciler audit log failed: %s", exc)
+                    incomplete["audit_log_error"] = True
+                return ReconcilerResult(name="inventory", success=False, details=incomplete)
+
             # Enrich after refresh so IPs and derived status stay current without
             # a manual Sync. Best-effort: enrichment does per-host network calls
             # (guest agent / DNS) and must never fail the reconciler cycle.
             enriched = 0
+            unchanged = 0
             try:
                 enrich_result = await self.inventory_service.enrich_inventory()
                 if isinstance(enrich_result, dict):
                     enriched = int(enrich_result.get("enriched", 0))
+                    unchanged = int(enrich_result.get("unchanged", 0))
             except Exception:
                 logger.warning("InventoryReconciler enrichment pass failed", exc_info=True)
 
@@ -79,6 +114,8 @@ class InventoryReconciler(Reconciler):
                 "hosts_refreshed": result.get("hosts", 0),
                 "services_refreshed": result.get("services", 0),
                 "hosts_enriched": enriched,
+                "hosts_unchanged": unchanged,
+                "complete": True,
                 "absent_hosts": len(absent_ids),
                 "new_hosts": len(new_ids),
                 "changed_hosts": len(changed_ids),

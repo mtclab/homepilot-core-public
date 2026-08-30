@@ -1246,6 +1246,19 @@ async def health(request: Request) -> JSONResponse:
         except Exception as exc:
             logger.debug("proxmox health check failed: %s", exc)
             proxmox_status = "unreachable"
+        if proxmox_status == "ok":
+            # A read token that answers says nothing about the WRITE one, and
+            # every provision, clone, snapshot and delete goes through that
+            # second credential. Reported green, this told an operator their
+            # cluster was fine right up to a friend's first redemption 401ing
+            # (#624).
+            try:
+                tokens = await proxmox.check_tokens()
+            except Exception as exc:
+                logger.debug("proxmox token check failed: %s", exc)
+            else:
+                if tokens.get("write", {}).get("ok") is False:
+                    proxmox_status = "write_token_refused"
     checks["proxmox"] = proxmox_status
 
     vault_status: str

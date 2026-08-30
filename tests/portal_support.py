@@ -241,3 +241,35 @@ async def poll_status(
             return response
         await asyncio.sleep(0.05)
     raise AssertionError("the status page never left the 'Building' state")
+
+
+def strip_task_result(db_path: str, invite_id: str) -> None:
+    """Blank a provision task's result_json, as a row from an older build has it."""
+    conn = sqlite3.connect(db_path)
+    try:
+        task_id = conn.execute(
+            "SELECT resulting_task_id FROM invites WHERE id = ?", (invite_id,)
+        ).fetchone()[0]
+        conn.execute("UPDATE tasks SET result_json = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def poll_for_task_end(db: Any, invite_id: str, timeout: float = 10.0) -> None:
+    """Wait until the invite's provision task reaches a terminal state."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        conn = sqlite3.connect(db.db_path)
+        try:
+            row = conn.execute(
+                "SELECT t.status FROM invites i JOIN tasks t ON t.id = i.resulting_task_id "
+                "WHERE i.id = ?",
+                (invite_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0] in ("succeeded", "failed", "cancelled"):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the provision task never finished")

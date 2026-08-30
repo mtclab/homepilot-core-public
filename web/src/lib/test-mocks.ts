@@ -204,6 +204,7 @@ vi.mock('$lib/api', async () => {
 		getToken: vi.fn(() => ''),
 		hasCookieSession: vi.fn(() => false),
 		refreshSession: vi.fn().mockResolvedValue(null),
+		refreshSessionResult: vi.fn().mockResolvedValue({ me: null, failure: 'rejected' }),
 	};
 });
 

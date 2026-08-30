@@ -29,7 +29,7 @@
 		subsystemTarget,
 	} from '$lib/selfcheck';
 	import { EXTRA_GROUPS, SUBSYSTEM_SETTINGS, settingsFor, unplacedSettings } from '$lib/settingFields';
-	import { api, setToken, getToken, hasCookieSession, refreshSession, sessionStore, type HealthInfo, type SelfcheckReport, type SettingOverride } from '$lib/api';
+	import { api, setToken, getToken, hasCookieSession, refreshSession, refreshSessionResult, sessionStore, type HealthInfo, type SelfcheckReport, type SettingOverride } from '$lib/api';
 	import { isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { envApiBase, readStoredApiBase, resolveApiBase, writeStoredApiBase } from '$lib/apiBase';
 	import { startEventStream, stopEventStream } from '$lib/events';
@@ -304,17 +304,26 @@
 				// The bearer token stays in memory and the layout now accepts it as a
 				// credential, so this session survives navigation — but confirm the
 				// token actually works before claiming it did.
-				const info = await refreshSession();
-				if (info) {
-					currentScope = info.scope || '';
-					currentCaps = info.capabilities ?? [];
-					currentLabel = info.token_label || '';
+				const res = await refreshSessionResult();
+				if (res.me) {
+					currentScope = res.me.scope || '';
+					currentCaps = res.me.capabilities ?? [];
+					currentLabel = res.me.token_label || '';
 					notify('Settings saved — no cookie; using the in-memory token (cleared on page reload)');
 				} else {
 					currentScope = '';
 					currentCaps = [];
 					currentLabel = '';
-					notify('Settings saved, but the token was rejected — check it and try again', 'err');
+					// "Rejected" is a verdict on the TOKEN. Saying it when nothing
+					// answered sends the operator to rotate a credential that was
+					// never the problem, and leaves the real fault (the backend is
+					// down) unmentioned.
+					notify(
+						res.failure === 'unreachable'
+							? 'Settings saved, but HomePilot could not be reached to check the token — the token may be fine'
+							: 'Settings saved, but the token was rejected — check it and try again',
+						'err',
+					);
 				}
 			}
 		} else {

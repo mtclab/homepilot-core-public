@@ -258,6 +258,35 @@ describe('Host page attention zone', () => {
 		await waitFor(() => expect(screen.getByText(/Nothing needs you/i)).toBeTruthy());
 	});
 
+	it('raises an agent binary older than the control plane', async () => {
+		// Nothing upgrades an enrolled agent, so a fix living in the Go binary
+		// can ship, release and deploy without reaching this machine - and every
+		// surface stayed green while it did (#648 tranche-1 follow-up). The
+		// server decides `behind`, so the page cannot disagree with the
+		// self-check about it.
+		getHost.mockResolvedValue({
+			...HOST,
+			agent: { ...HOST.agent, version: 'v3.6.15', control_version: '3.6.18', behind: true },
+		});
+		render(HostPage);
+
+		await waitFor(() => expect(screen.getByRole('heading', { name: 'llm' })).toBeTruthy());
+		const line = screen.getByText(/older than HomePilot 3\.6\.18/i);
+		expect(line.closest('a')).toHaveAttribute('href', '/ui/hosts/h-llm?tab=agent');
+	});
+
+	it('says nothing about the agent version when it matches', async () => {
+		// The quiet case has to stay quiet, or the line becomes noise.
+		getHost.mockResolvedValue({
+			...HOST,
+			agent: { ...HOST.agent, version: 'v3.6.18', control_version: '3.6.18', behind: false },
+		});
+		render(HostPage);
+
+		await waitFor(() => expect(screen.getByRole('heading', { name: 'llm' })).toBeTruthy());
+		expect(screen.queryByText(/older than HomePilot/i)).toBeNull();
+	});
+
 	it('raises a dead agent channel, pointing at the Agent sector', async () => {
 		getHost.mockResolvedValue({
 			...HOST,
@@ -271,12 +300,29 @@ describe('Host page attention zone', () => {
 		expect(refusal.closest('a')).toHaveAttribute('href', '/ui/hosts/h-llm?tab=agent');
 	});
 
-	it('survives the drift check being unavailable', async () => {
-		// The drift service is optional wiring; a host page that blanks because it
-		// is down is a worse failure than not knowing about drift.
+	it('survives the drift check being unavailable, and SAYS drift is unread', async () => {
+		// This gate used to assert the opposite: that an unreadable drift check
+		// must render "Nothing needs you". It was defending the defect (#648
+		// tranche 7). Two things are true at once and the test now holds both:
+		// the page must not BLANK because optional wiring is down, and it must
+		// not report a clean host it has not established. An empty drifted set
+		// is what a failed read and a genuinely in-spec host look like from
+		// here, and only one of them means nothing needs the operator.
 		(api.getDriftStatus as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('down'));
 		render(HostPage);
 		await waitFor(() => expect(screen.getByRole('heading', { name: 'llm' })).toBeTruthy());
+		expect(screen.queryByText(/Nothing needs you/i)).toBeNull();
+		const line = screen.getByText(/cannot say whether this host/i);
+		expect(line.closest('a')).toHaveAttribute('href', '/ui/changes/drift');
+	});
+
+	it('says nothing needs you when drift was actually read and is clean', async () => {
+		// The other half of the pair: the honest "clean" must still be reachable,
+		// or the fix above would just have swapped one false report for another.
+		(api.getDriftStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ items: [], total: 0 });
+		render(HostPage);
+		await waitFor(() => expect(screen.getByRole('heading', { name: 'llm' })).toBeTruthy());
 		expect(screen.getByText(/Nothing needs you/i)).toBeTruthy();
+		expect(screen.queryByText(/cannot say whether this host/i)).toBeNull();
 	});
 });

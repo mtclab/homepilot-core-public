@@ -380,3 +380,84 @@ describe('Overview: recent movement', () => {
 		expect(rows.length).toBe(10);
 	});
 });
+
+/**
+ * Overview when a read did not come back (#648 tranche 7).
+ *
+ * Zone 1 is composed from four side calls made with `Promise.allSettled`. A
+ * rejection there used to become an empty array and nothing else, so a
+ * backend that could not answer produced the same screen as an estate with
+ * nothing wrong: "Nothing needs you." The KB page names this class in its own
+ * source - a failure rendered as a successful empty result is the worst way to
+ * be wrong, because the operator concludes all is well and stops looking.
+ *
+ * Teeth (each verified by reverting the fix): drop the `unread` push in
+ * `load()` and every test below fails on the missing line AND on the calm
+ * sentence appearing next to a failed read.
+ */
+describe('Overview: a read that did not come back', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser: the test still holds */
+		}
+	});
+
+	it('never says nothing needs you when it could not ask', async () => {
+		seed({});
+		listTasks.mockRejectedValue(new Error('502 Bad Gateway'));
+
+		render(Overview);
+
+		const zone = within(await attentionZone());
+		expect(zone.getByText(/could not read recent tasks/i)).toBeInTheDocument();
+		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
+	});
+
+	it('names each unread source separately and doors it to the page that owns it', async () => {
+		seed({});
+		listInventory.mockRejectedValue(new Error('down'));
+		listFiringAlerts.mockRejectedValue(new Error('down'));
+		listAudit.mockRejectedValue(new Error('down'));
+
+		const zone = (render(Overview), within(await attentionZone()));
+		expect(zone.getByText(/could not read the host inventory/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/hosts',
+		);
+		expect(zone.getByText(/could not read firing alerts/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/hosts',
+		);
+		expect(zone.getByText(/could not read the journal/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/records/journal',
+		);
+	});
+
+	it('does not call an unreadable feed "nothing has happened yet"', async () => {
+		seed({});
+		listTasks.mockRejectedValue(new Error('down'));
+		listAudit.mockRejectedValue(new Error('down'));
+
+		render(Overview);
+
+		const heading = await screen.findByRole('heading', { name: /recent movement/i });
+		const feed = within(heading.closest('section') as HTMLElement);
+		expect(feed.getByText(/could not be read, not because nothing happened/i)).toBeInTheDocument();
+		expect(feed.queryByText(/Nothing has happened yet/i)).not.toBeInTheDocument();
+	});
+
+	it('still reaches the calm screen when every read actually answered', async () => {
+		// The other half: the fix must not make "all clear" unreachable, or the
+		// zone becomes noise an operator learns to ignore.
+		seed({});
+
+		render(Overview);
+
+		await waitFor(() => expect(screen.getByText(/Nothing needs you/i)).toBeInTheDocument());
+		expect(screen.queryByText(/could not read/i)).not.toBeInTheDocument();
+	});
+});

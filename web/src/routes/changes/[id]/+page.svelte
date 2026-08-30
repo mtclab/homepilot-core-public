@@ -15,6 +15,14 @@
 	let working = false;
 	let activeTask: Task | null = null;
 	let pollHandle: ReturnType<typeof setInterval> | null = null;
+	// A poll that throws used to stop the timer and say nothing, leaving the
+	// spinner claiming "in progress" and every action disabled with nothing left
+	// running to ever correct it - the same dead end the `cancelled` allow-list
+	// caused below, reached by a different road (#648 tranche 7). One blip is not
+	// a lost task, so tolerate a couple; past that, SAY the outcome is unknown.
+	let pollFailures = 0;
+	let pollLost = false;
+	const POLL_MAX_FAILURES = 3;
 	let confirmAction: { fn: () => Promise<void>; label: string } | null = null;
 	let confirmEl: HTMLDivElement | null = null;
 
@@ -79,6 +87,9 @@
 		if (initial) loading = true;
 		try {
 			detail = await api.getArtifact(id);
+			// A read that got through re-establishes the truth the lost poll left
+			// unknown, so the banner stops saying it is lost.
+			pollLost = false;
 			if (detail?.active_task) {
 				startPolling(detail.active_task.id);
 			}
@@ -158,9 +169,12 @@
 
 	function startPolling(taskId: string) {
 		stopPolling();
+		pollFailures = 0;
+		pollLost = false;
 		pollHandle = setInterval(async () => {
 			try {
 				const task = await api.getTask(taskId);
+				pollFailures = 0;
 				activeTask = task;
 				// Anything that is not pending/running is finished — an allow-list
 				// here missed `cancelled` and polled a dead task forever, with the
@@ -178,7 +192,15 @@
 					await load();
 				}
 			} catch {
-				stopPolling();
+				pollFailures += 1;
+				if (pollFailures >= POLL_MAX_FAILURES) {
+					stopPolling();
+					activeTask = null;
+					pollLost = true;
+					notify('Lost contact while the task was running — its outcome is unknown here', 'err');
+					// One more read, in case the backend is back and the task is done.
+					await load(false);
+				}
 			}
 		}, 2000);
 	}
@@ -299,7 +321,16 @@
 			</dl>
 		</div>
 
-		{#if hasActiveTask || activeTask}
+		{#if pollLost}
+			<div class="card flex items-center gap-2 text-xs text-danger">
+				<span
+					>Lost contact while the task was running — this page cannot say how it ended.</span
+				>
+				<button class="btn btn-ghost text-xs" on:click={() => load()} disabled={loading}
+					>Retry</button
+				>
+			</div>
+		{:else if hasActiveTask || activeTask}
 			<div class="card flex items-center gap-2 text-xs text-warn">
 				<svg class="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
 					<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>

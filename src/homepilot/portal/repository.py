@@ -172,6 +172,36 @@ class InviteRepository:
         )
         await self.db.conn.commit()
 
+    async def reopen_after_failed_build(self, invite_id: str, task_id: str) -> bool:
+        """Give the link back when the build failed and built NOTHING (#625).
+
+        The first real redemption on prod claimed its invite (atomically, which
+        is right), then the build failed on the OPERATOR's side - a stale write
+        token. The invite stayed `redeemed`, so a blameless friend could not
+        retry and needed a freshly minted link for a fault that was never
+        theirs.
+
+        Two guards, both necessary. `resulting_task_id = ?` means only the task
+        the caller actually examined can unlatch the invite, so a later
+        provision can never be unlatched by a stale page. `resulting_host_id IS
+        NULL` means no machine was ever recorded against it - because reopening
+        an invite that DID build something would hand out a second machine past
+        the quota, which is the failure mode in the other direction. The caller
+        additionally checks the task carried no vmid: a build that made a VM and
+        then failed leaves a machine behind, and that is an operator's problem
+        to clean up, not a link to hand back.
+
+        Returns whether the invite was actually reopened.
+        """
+        cursor = await self.db.execute(
+            """UPDATE invites
+                  SET redeemed_at = NULL, redeemed_cn = NULL, resulting_task_id = NULL
+                WHERE id = ? AND resulting_task_id = ? AND resulting_host_id IS NULL""",
+            (invite_id, task_id),
+        )
+        await self.db.conn.commit()
+        return bool(cursor.rowcount == 1)
+
     async def record_task(self, invite_id: str, task_id: str) -> None:
         await self.db.execute(
             "UPDATE invites SET resulting_task_id = ? WHERE id = ?", (task_id, invite_id)

@@ -127,6 +127,7 @@ class TestInventoryReconciler:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 3,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -162,6 +163,7 @@ class TestInventoryReconciler:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 0,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -180,6 +182,7 @@ class TestInventoryReconciler:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 2,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": ["new-1", "new-2"],
         }
 
@@ -199,7 +202,7 @@ class TestInventoryReconciler:
 
         async def refresh_with_update():
             await repo.update_host(host_id, ip_address="10.0.0.99")
-            return {"hosts": 1, "services": 0, "proxmox_host_ids": [host_id]}
+            return {"hosts": 1, "services": 0, "complete": True, "proxmox_host_ids": [host_id]}
 
         mock_svc = AsyncMock()
         mock_svc.refresh_inventory.side_effect = refresh_with_update
@@ -218,6 +221,7 @@ class TestInventoryReconciler:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 1,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -240,6 +244,7 @@ class TestInventoryReconciler:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 1,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -400,10 +405,37 @@ class TestMigrationV2:
 
 
 class TestSchedulerLifespanWiring:
-    async def test_scheduler_on_app_state(self):
-        from homepilot.main import app
+    async def test_the_lifespan_stores_the_scheduler_where_the_selfcheck_reads_it(self):
+        """This test used to be `assert hasattr(...) or True` - it could not fail.
 
-        assert hasattr(app.state, "reconciler_scheduler") or True
+        The attribute is a contract between two modules that never import each
+        other: `main.lifespan` puts the scheduler on `app.state`, and the
+        self-check's `reconcilers` subsystem (#648 tranche 8) reads it back off
+        state to say whether the estate is being maintained. Rename either side
+        and the report silently degrades to "no reconciler is registered" on a
+        perfectly healthy instance - which is why the name itself is gated.
+        """
+        import inspect
+
+        from homepilot import main as main_mod
+        from homepilot import selfcheck as selfcheck_mod
+
+        lifespan_src = inspect.getsource(main_mod.lifespan)
+        assert "app.state.reconciler_scheduler = reconciler_scheduler" in lifespan_src
+
+        probe_src = inspect.getsource(selfcheck_mod._reconcilers_subsystem)
+        assert '"reconciler_scheduler"' in probe_src
+
+    async def test_the_scheduler_exposes_the_status_the_selfcheck_asks_for(self):
+        """The other half of that contract: the shape, not just the name."""
+        scheduler = ReconcilerScheduler()
+        mock_reconciler = AsyncMock(spec=Reconciler)
+        mock_reconciler.run.return_value = ReconcilerResult(name="inventory", success=True)
+        scheduler.register(mock_reconciler, interval=300, startup_delay=0)
+
+        (status,) = scheduler.status()
+        for field in ("name", "runs", "last_ok", "consecutive_failures", "interval_seconds"):
+            assert hasattr(status, field), f"the self-check reads .{field}"
 
     async def test_scheduler_start_stop_lifecycle(self):
         scheduler = ReconcilerScheduler()
@@ -466,6 +498,7 @@ class TestSchedulerInventoryIntegration:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 1,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -491,6 +524,7 @@ class TestInventoryReconcilerEdgeCases:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 0,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -513,6 +547,7 @@ class TestInventoryReconcilerEdgeCases:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 3,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": ["phantom-1", "phantom-2", "phantom-3"],
         }
 
@@ -531,6 +566,7 @@ class TestInventoryReconcilerEdgeCases:
         mock_svc.refresh_inventory.return_value = {
             "hosts": 0,
             "services": 0,
+            "complete": True,
             "proxmox_host_ids": [],
         }
 
@@ -553,6 +589,7 @@ class TestInventoryReconcilerEdgeCases:
             return {
                 "hosts": 1,
                 "services": 0,
+                "complete": True,
                 "proxmox_host_ids": [h1_id, "brand-new"],
             }
 
@@ -570,7 +607,17 @@ class TestInventoryReconcilerEdgeCases:
         assert result.details["new_hosts"] == 1
         assert result.details["changed_hosts"] == 1
 
-    async def test_run_refresh_inventory_missing_proxmox_host_ids_key(self, repo):
+    async def test_a_sweep_that_named_no_hosts_declares_nobody_absent(self, repo):
+        """A result with no host ids is an UNANSWERED sweep, not an empty estate.
+
+        This test used to assert the opposite: that a refresh returning no
+        `proxmox_host_ids` at all must report `success=True` and every host in
+        the database as absent. It was defending the defect (#648 tranche 8).
+        That shape is exactly what a swallowed failure returns - and what an
+        install with no Proxmox configured returns on EVERY cycle - so the
+        journal filled with "the whole fleet went absent" for estates where
+        nothing had happened at all.
+        """
         await repo.create_host(hostname="host-x", host_type="node", role="node")
 
         mock_svc = AsyncMock()
@@ -585,5 +632,31 @@ class TestInventoryReconcilerEdgeCases:
         )
         result = await reconciler.run()
 
-        assert result.success is True
-        assert result.details["absent_hosts"] == 1
+        assert result.success is False
+        assert result.details["complete"] is False
+        # It must not state the counts it could not establish.
+        assert "absent_hosts" not in result.details
+        assert "absent_host_ids" not in result.details
+
+    async def test_an_incomplete_sweep_is_recorded_as_incomplete(self, repo):
+        """The other half: the journal has to carry the incompleteness too."""
+        await repo.create_host(hostname="host-y", host_type="node", role="node")
+
+        mock_svc = AsyncMock()
+        mock_svc.refresh_inventory.return_value = {
+            "hosts": 0,
+            "services": 0,
+            "complete": False,
+            "proxmox_host_ids": [],
+            "error": "no Proxmox is configured, so no hypervisor was read",
+        }
+
+        reconciler = InventoryReconciler(inventory_service=mock_svc, repo=repo)
+        result = await reconciler.run()
+
+        assert result.success is False
+        assert "no Proxmox is configured" in result.details["error"]
+        rows = await repo.query_audit_log(limit=10)
+        actions = [r["action"] for r in rows]
+        assert "refresh_incomplete" in actions
+        assert "refresh" not in actions

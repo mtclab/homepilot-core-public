@@ -9,7 +9,7 @@ import time
 from enum import StrEnum
 from typing import Any
 
-from ..adapters.proxmox import ProxmoxClient
+from ..adapters.proxmox import ProxmoxClient, ProxmoxError
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
@@ -511,6 +511,7 @@ class ProvisionService:
         # that is already gone - which would turn a clean unwind into a spurious
         # "cleanup FAILED" on a vmid that no longer exists (#595).
         guest_unwound = False
+        unwind_cleanup = ""
         # The per-VM firewall this run actually wrote, for the provision record.
         # None means no fence was applied - the result says so rather than
         # leaving the question open.
@@ -552,17 +553,30 @@ class ProvisionService:
             # attempted destroy of a VM that was never created is a cheap,
             # reported failure - a leaked guest is not.
             clone_issued = True
-            upid = await proxmox.clone_vm(
-                node=request.node,
-                template_vmid=request.template_vmid,
-                new_vmid=vmid,
-                name=request.name,
-                full=request.full,
-                pool=request.pool,
-                # None means "inherit the template's storage" all the way down
-                # to the PVE body, which then carries no storage key at all.
-                storage=request.storage,
-            )
+            try:
+                upid = await proxmox.clone_vm(
+                    node=request.node,
+                    template_vmid=request.template_vmid,
+                    new_vmid=vmid,
+                    name=request.name,
+                    full=request.full,
+                    pool=request.pool,
+                    # None means "inherit the template's storage" all the way down
+                    # to the PVE body, which then carries no storage key at all.
+                    storage=request.storage,
+                )
+            except ProxmoxError as exc:
+                # PVE authorises BEFORE it acts, so a refused request is one
+                # that never ran: nothing was created and there is nothing to
+                # take back. Every other failure - a timeout, a 500, a dropped
+                # connection - leaves the clone's fate genuinely unknown, which
+                # is the case `clone_issued = True` above exists for. Collapsing
+                # the two made a stale write token (401, the #625 shape) look
+                # like a guest that might be stranded, so the friend's invite
+                # stayed burned for a request PVE had refused outright.
+                if exc.status_code in (401, 403):
+                    clone_issued = False
+                raise
             inflight_upid = upid
             await proxmox.wait_for_task(
                 request.node, upid, timeout_s=self.task_timeout_s, poll_interval=self.poll_interval
@@ -589,6 +603,13 @@ class ProvisionService:
                     # to make impossible.
                     outcome = await self._destroy_unfenced(request, vmid)
                     guest_unwound = True
+                    # Prose in a raised message cannot be read by anything: the
+                    # verdict is recorded structurally too, so a caller can
+                    # establish whether a guest remains instead of parsing
+                    # English (#648 tranche 9).
+                    unwind_cleanup = (
+                        "deleted" if outcome == "the half-made guest was destroyed" else "failed"
+                    )
                     raise RuntimeError(
                         f"could not write the guest firewall rules ({exc}); {outcome}"
                     ) from exc
@@ -701,11 +722,31 @@ class ProvisionService:
             # failure BEFORE the clone has nothing to unwind, and the fence path
             # has already taken its guest back, so neither destroys here.
             error = f"failed at {step}: {exc}"
+            # The CANCEL path has always recorded its unwind structurally -
+            # nothing_created / deleted / failed - precisely so an operator can
+            # tell "we took it back" from "a guest may still be on the node".
+            # The FAILURE path, doing the identical unwind, said it only in
+            # English inside `error`, so nothing downstream could read it and the
+            # portal could not tell whether a failed build had left a machine
+            # behind (#648 tranche 9, and what makes #625 safe).
+            failure_outcome: dict[str, Any] = {"failed": True, "step": step}
             if clone_issued and vmid is not None and not guest_unwound:
-                error = f"{error}; {await self._destroy_after_failure(request, vmid)}"
+                failure_outcome["vmid"] = vmid
+                cleanup_state, note = await self._destroy_after_failure(request, vmid)
+                failure_outcome["cleanup"] = cleanup_state
+                error = f"{error}; {note}"
+            elif guest_unwound:
+                failure_outcome["vmid"] = vmid
+                failure_outcome["cleanup"] = unwind_cleanup or "failed"
+            else:
+                failure_outcome["cleanup"] = "nothing_created"
             try:
-                await self.task_repo.update_task_status(task_id, "failed", error=error)
-                await self._audit(actor, request, "provision_failed", {"error": error})
+                await self.task_repo.update_task_status(
+                    task_id, "failed", error=error, result_json=json.dumps(failure_outcome)
+                )
+                await self._audit(
+                    actor, request, "provision_failed", {"error": error, **failure_outcome}
+                )
             except Exception:
                 logger.error("Could not mark provision task %s failed", task_id, exc_info=True)
         finally:
@@ -925,7 +966,7 @@ class ProvisionService:
                 poll_interval=self.poll_interval,
             )
 
-    async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> str:
+    async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> tuple[str, str]:
         """Take back a guest a post-clone failure would otherwise strand (#595).
 
         Unlike :meth:`_destroy_unfenced` (whose guest is always still stopped,
@@ -938,14 +979,14 @@ class ProvisionService:
         node, rather than the cleanup itself becoming a second failure.
         """
         if self.proxmox is None:  # pragma: no cover - the caller checked clone_issued
-            return f"no Proxmox client to destroy with, vmid {vmid} may remain"
+            return "failed", f"no Proxmox client to destroy with, vmid {vmid} may remain"
         node = request.node
         try:
             await self._stop_then_destroy(node, vmid)
         except Exception as exc:
             logger.error("Could not destroy the orphaned guest %s on %s: %s", vmid, node, exc)
-            return f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"
-        return f"destroyed guest vmid {vmid}"
+            return "failed", f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"
+        return "deleted", f"destroyed guest vmid {vmid}"
 
     async def _destroy_unfenced(self, request: ProvisionRequest, vmid: int) -> str:
         """Take back a guest whose fence could not be written.

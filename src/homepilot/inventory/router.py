@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 
 from ..adapters.agent import AgentAdapter
+from ..agent_hub.version_skew import control_plane_version as _control_plane_version
+from ..agent_hub.version_skew import is_behind as _is_behind
 from ..auth.deps import require_scope
 from .service import InventoryService
 
@@ -229,6 +231,9 @@ async def list_inventory(
                     h["agent_version"] = _json.loads(a["system_info"] or "{}").get("agent_version")
                 except (ValueError, TypeError):
                     h["agent_version"] = None
+                # An agent older than the control plane is not running the code
+                # that shipped. `None` = could not be told, never "fine".
+                h["agent_behind"] = _is_behind(h["agent_version"], _control_plane_version())
     return {"items": hosts, "total": total}
 
 

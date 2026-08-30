@@ -614,6 +614,53 @@ class ProxmoxClient:
         except ProxmoxError:
             return False
 
+    async def check_tokens(self) -> dict[str, dict[str, Any]]:
+        """Does EACH configured token actually authenticate? (#624)
+
+        `test_connection` only ever exercised the read client, so a stale or
+        rotated WRITE token was invisible until the first mutating call - and on
+        prod, 2026-08-28, that call was a friend's first invite redemption:
+        `write_token_configured: true`, `connection_status: ok`, and every
+        clone 401ing in their face. "Configured" is not "authenticates", which
+        is the same distinction the artifacts remote had to learn.
+
+        Each token is checked with the same harmless authenticated read, sent
+        through ITS OWN client so the credential under test is the one on the
+        wire. Bounded honestly: this proves the credential AUTHENTICATES. It
+        does not prove it carries the privileges a clone needs, because the only
+        way to establish that is to mutate something, and a health check may not.
+        """
+        out: dict[str, dict[str, Any]] = {}
+
+        async def _probe(client: httpx.AsyncClient) -> dict[str, Any]:
+            try:
+                response = await client.request(method="GET", url="/version")
+                response.raise_for_status()
+                return {"ok": True, "status": 0, "detail": ""}
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                return {
+                    "ok": False,
+                    "status": code,
+                    "detail": (
+                        "the token was refused (401)"
+                        if code == 401
+                        else f"the cluster answered {code}"
+                    ),
+                }
+            except httpx.RequestError as exc:
+                return {"ok": False, "status": 0, "detail": f"the cluster is unreachable: {exc}"}
+
+        out["read"] = await _probe(self._client)
+        if self._has_separate_write:
+            out["write"] = await _probe(self._write_client)
+        else:
+            # No separate credential: the read token IS the write token, so its
+            # verdict is the whole answer and inventing a second one would imply
+            # a check that never happened.
+            out["write"] = dict(out["read"], detail="the read token is used for writes too")
+        return out
+
     async def get_node_status(self, node: str) -> dict[str, Any]:
         return await self.read(f"/nodes/{node}/status")
 

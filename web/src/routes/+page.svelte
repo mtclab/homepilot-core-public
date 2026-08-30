@@ -71,6 +71,19 @@
 	let tasks: Task[] = [];
 	let journal: AuditEntry[] = [];
 
+	// A side call that FAILED is not a side call that returned nothing. Emptying
+	// the arrays and saying nothing turned an unanswered question into "Nothing
+	// needs you." - a conclusion this page had not established (#642, #648
+	// tranche 7), and exactly the mistake the KB page names at #663: a failure
+	// rendered as a successful empty result is the worst way to be wrong,
+	// because the operator concludes all is well and stops looking.
+	interface Unread {
+		key: string;
+		text: string;
+		href: string;
+	}
+	let unread: Unread[] = [];
+
 	async function load() {
 		loading = true;
 		try {
@@ -87,6 +100,32 @@
 			// leave stale rows claiming to be current: empty is the honest answer.
 			tasks = taskRes.status === 'fulfilled' ? (taskRes.value.items ?? []) : [];
 			journal = auditRes.status === 'fulfilled' ? (auditRes.value.items ?? []) : [];
+			// ...and empty is only honest while the page SAYS the read failed.
+			unread = [];
+			if (inv.status === 'rejected')
+				unread.push({
+					key: 'unread:hosts',
+					text: 'Could not read the host inventory, so no host or alert can be reported here',
+					href: `${base}/hosts`,
+				});
+			if (alerts.status === 'rejected')
+				unread.push({
+					key: 'unread:alerts',
+					text: 'Could not read firing alerts, so this page cannot say whether anything is alerting',
+					href: `${base}/hosts`,
+				});
+			if (taskRes.status === 'rejected')
+				unread.push({
+					key: 'unread:tasks',
+					text: 'Could not read recent tasks, so no failed or stuck task can be reported here',
+					href: `${base}/records/tasks`,
+				});
+			if (auditRes.status === 'rejected')
+				unread.push({
+					key: 'unread:journal',
+					text: 'Could not read the journal, so recent movement is incomplete',
+					href: `${base}/records/journal`,
+				});
 		} catch (e) {
 			error = String(e);
 		} finally {
@@ -203,8 +242,23 @@
 		hosts: Host[],
 		alerts: FiringAlert[],
 		taskList: Task[],
+		unreadList: Unread[],
 	): Attention[] {
 		const out: Attention[] = [];
+
+		// First, and before anything the page DOES know: what it could not ask.
+		// A blind spot outranks a review queue, because everything below it is
+		// only as complete as the reads that fed it.
+		for (const u of unreadList) {
+			out.push({
+				key: u.key,
+				severity: 'warning',
+				label: 'unread',
+				text: u.text,
+				href: u.href,
+				meta: '',
+			});
+		}
 		if (!summary) return out;
 
 		// Drift: the summary counts it, the drift page names it.
@@ -390,7 +444,10 @@
 	$: nextStep = d ? d.onboarding.steps.find((s) => !s.done) : undefined;
 	$: statusSegments = d ? toSegments(d.inventory.by_status, STATUS_COLORS) : [];
 	$: artifactSegments = d ? toSegments(d.artifacts) : [];
-	$: attention = buildAttention(d, fleet, firing, tasks);
+	$: attention = buildAttention(d, fleet, firing, tasks, unread);
+	// Zone 3 is fed by the two reads that can go unanswered, so its empty state
+	// has the same two meanings and must not collapse them into "nothing yet".
+	$: movementUnread = unread.some((u) => u.key === 'unread:tasks' || u.key === 'unread:journal');
 	$: movement = buildMovement(tasks, journal);
 </script>
 
@@ -603,6 +660,11 @@
 						</li>
 					{/each}
 				</ul>
+			{:else if movementUnread}
+				<p class="prose-note text-xs">
+					This feed is empty because the record could not be read, not because nothing
+					happened.
+				</p>
 			{:else}
 				<p class="prose-note text-xs">Nothing has happened yet.</p>
 			{/if}

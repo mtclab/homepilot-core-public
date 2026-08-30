@@ -81,6 +81,9 @@ class TestStockInstallIsHonest:
         entries = _by_name(report)
 
         # Every optional subsystem is present and every one of them is off.
+        # `reconcilers` is here too (#648 tranche 8): this state carries no
+        # scheduler, so nothing is registered - which is genuinely `off`, and
+        # its consequence has to say what an estate nobody maintains looks like.
         assert set(entries) == {
             "proxmox",
             "agent_hub",
@@ -89,6 +92,8 @@ class TestStockInstallIsHonest:
             "events_webhook",
             "mcp",
             "artifacts_remote",
+            "reconcilers",
+            "agent_versions",
         }
         for name, entry in entries.items():
             assert entry["configured"] is False, (
@@ -160,6 +165,9 @@ class TestOffIsNotBroken:
         """
         proxmox = MagicMock()
         proxmox.test_connection = AsyncMock(return_value=True)
+        # Both tokens authenticate: the real client answers this, so a fake that
+        # does not is modelling a client that cannot be asked (#624).
+        proxmox.check_tokens = AsyncMock(return_value={"read": {"ok": True}, "write": {"ok": True}})
         state = _stock_state(proxmox=proxmox, proxmox_host="pve.example.com")
 
         entry = _by_name(await selfcheck_report(state, _stock_settings(proxmox_host="")))["proxmox"]
@@ -201,6 +209,9 @@ class TestOffIsNotBroken:
     async def test_working_subsystem_reports_ok(self):
         proxmox = MagicMock()
         proxmox.test_connection = AsyncMock(return_value=True)
+        # Both tokens authenticate: the real client answers this, so a fake that
+        # does not is modelling a client that cannot be asked (#624).
+        proxmox.check_tokens = AsyncMock(return_value={"read": {"ok": True}, "write": {"ok": True}})
         vault = MagicMock()
         vault.list_secrets = AsyncMock(return_value=[])
         vault.ensure_master_identity = AsyncMock(return_value="age1x")
@@ -389,6 +400,9 @@ class TestNoSecretsInTheReport:
         monkeypatch.setenv("HP_MCP_TOKEN", f"{self.SECRET}-mcp")
         proxmox = MagicMock()
         proxmox.test_connection = AsyncMock(return_value=True)
+        # Both tokens authenticate: the real client answers this, so a fake that
+        # does not is modelling a client that cannot be asked (#624).
+        proxmox.check_tokens = AsyncMock(return_value={"read": {"ok": True}, "write": {"ok": True}})
         vault = MagicMock()
         vault.list_secrets = AsyncMock(return_value=[])
         vault.ensure_master_identity = AsyncMock(return_value="age1x")

@@ -489,6 +489,12 @@ export interface Host {
 	agent_id?: string | null;
 	agent_connected?: boolean;
 	agent_version?: string | null;
+	/**
+	 * Is this host's agent OLDER than the control plane? The server decides it,
+	 * so the host list, the host page and the self-check cannot disagree.
+	 * `null` means it could not be told - which is never the same as fine.
+	 */
+	agent_behind?: boolean | null;
 }
 
 /** The host page's Agent section (#514 S2): the channel, and why it last broke. */
@@ -496,6 +502,10 @@ export interface AgentOnHost {
 	agent_id: string;
 	connected: boolean;
 	version?: string | null;
+	/** The control plane's own version, for comparison. */
+	control_version?: string | null;
+	/** Older than the control plane? `null` = could not be told, never "fine". */
+	behind?: boolean | null;
 	arch?: string | null;
 	runtime?: string | null;
 	first_seen?: string | null;
@@ -767,11 +777,21 @@ export const api = {
 	forgetHost(hostId: string) {
 		return req<{ id: string; forgotten: boolean }>(`/inventory/${hostId}`, { method: 'DELETE' });
 	},
+	/**
+	 * Sweep the hypervisor. `complete` is false when the sweep did NOT see the
+	 * whole estate - a node listing failed, or no Proxmox is configured - and
+	 * the counts are then a partial answer, not a small one (#648 tranche 8).
+	 * Absent on an older backend, which is why the caller must treat missing as
+	 * unestablished rather than as success.
+	 */
 	refreshInventory() {
-		return req<{ hosts: number; services: number }>('/inventory/refresh', { method: 'POST' });
+		return req<{ hosts: number; services: number; complete?: boolean; error?: string }>(
+			'/inventory/refresh',
+			{ method: 'POST' },
+		);
 	},
 	enrichInventory(host_ids?: string[], scope?: string) {
-		return req<{ enriched: number; failed: number; skipped: number }>('/inventory/enrich', {
+		return req<{ enriched: number; failed: number; skipped: number; unchanged?: number }>('/inventory/enrich', {
 			method: 'POST',
 			body: JSON.stringify({ host_ids, scope }),
 		});
@@ -1095,15 +1115,31 @@ export function hasCookieSession(): boolean {
 	return getCsrfToken() !== '';
 }
 
-export async function refreshSession(): Promise<MeInfo | null> {
+/**
+ * Why a session refresh came back empty. `rejected` is the server ANSWERING
+ * that the credential is no good; `unreachable` is no answer at all. Collapsing
+ * the two told an operator their token was rejected when the backend was simply
+ * down, sending them to rotate a credential that was never the problem (#648
+ * tranche 7). The discriminator is whether anything answered: an `ApiError`
+ * carries a status, so the server spoke; anything else is transport.
+ */
+export type SessionFailure = 'rejected' | 'unreachable';
+
+export async function refreshSessionResult(): Promise<
+	{ me: MeInfo; failure: null } | { me: null; failure: SessionFailure }
+> {
 	try {
 		const me = await api.me();
 		sessionStore.set(me);
-		return me;
-	} catch {
+		return { me, failure: null };
+	} catch (e) {
 		sessionStore.set(null);
-		return null;
+		return { me: null, failure: e instanceof ApiError ? 'rejected' : 'unreachable' };
 	}
+}
+
+export async function refreshSession(): Promise<MeInfo | null> {
+	return (await refreshSessionResult()).me;
 }
 // Link to a host's own metrics inside HomePilot (#514 S2): the host page is
 // where a machine's stats live now. Takes the host ID when the caller has it;
