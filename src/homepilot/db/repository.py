@@ -926,7 +926,29 @@ class Repository:
         return dict(row) if row is not None else None
 
     async def get_host_by_proxmox_id(self, proxmox_id: int) -> dict[str, Any] | None:
-        row = await self.db.fetchone("SELECT * FROM hosts WHERE proxmox_id = ?", (proxmox_id,))
+        """The row for a VMID - the NEWEST one, because PVE reuses VMIDs.
+
+        A VMID is not an identity. PVE hands the same number out again the
+        moment a guest is destroyed, so `hosts` accumulates a row per occupant
+        and this returned whichever SQLite happened to give first - in practice
+        the oldest. On prod, vmid 116 had three rows: an imported machine from
+        June, a guest destroyed in August, and the one a friend was logged into.
+        The refresh kept updating the June row, so the LIVE guest was never in
+        the seen set and the absent sweep marked it gone three minutes after it
+        was built. His portal showed both his machines "gone" with a Start
+        button, and his budget read 0 of 1 while he sat inside one - which would
+        have let him redeem a second machine past his own quota (#648).
+
+        Newest wins: the most recently created row for a VMID is its current
+        occupant, and the sweep then retires the earlier ones properly instead
+        of retiring the real machine. `created_at` is an ISO-8601 UTC string, so
+        it orders lexicographically - no date function needed, and none that
+        SQLite would have to parse per row.
+        """
+        row = await self.db.fetchone(
+            "SELECT * FROM hosts WHERE proxmox_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (proxmox_id,),
+        )
         return dict(row) if row is not None else None
 
     async def update_host(self, host_id: str, **kwargs: Any) -> None:

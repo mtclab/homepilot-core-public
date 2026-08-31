@@ -190,9 +190,22 @@ class ShellGuest:
     def key_file_exists(self) -> bool:
         return self.key_file.exists()
 
+    async def get_vm_current(self, node: str, vmid: int) -> dict[str, Any]:
+        """This guest EXISTS and is running.
+
+        Modelled explicitly because the join now asks before naming a cause: an
+        agent that says nothing has more than one explanation, and a fake that
+        cannot answer "is the machine even there" would let the code take a
+        branch no real cluster would give it. These guests are here and running
+        - a silent agent on one of them really is the template's fault, which
+        is what the tests using this fake are about.
+        """
+        return {"data": {"status": "running", "vmid": vmid}}
+
     def bind(self, proxmox: Any) -> ShellGuest:
         """Put this guest behind a mocked ProxmoxClient's agent surface."""
         proxmox.agent_ping = self.agent_ping
         proxmox.agent_run = self.agent_run
         proxmox.agent_write_file = self.agent_write_file
+        proxmox.get_vm_current = self.get_vm_current
         return self

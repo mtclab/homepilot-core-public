@@ -1,5 +1,56 @@
 # Changelog
 
+## 3.6.22 - 2026-08-31
+
+Five fixes, all from one afternoon of a friend redeeming an invite on prod.
+
+### A VMID is not an identity
+
+PVE hands the same number out again the moment a guest is destroyed, so `hosts`
+accumulates a row per occupant - and the lookup returned whichever the database
+gave first, in practice the oldest. On prod, vmid 116 carried THREE rows: a
+machine imported in June, a guest destroyed in August, and the one its owner was
+logged into. The refresh kept updating the June row, so the live guest was never
+in the seen set and the absent sweep marked it gone three minutes after it was
+built.
+
+The redeemer's portal showed both his machines "gone", offered a Start button
+for one that does not exist, and reported his budget as **0 of 1 while he was
+sitting inside a machine** - which would have let him take a second past his own
+quota. That is #613 from the other direction: it fixed a destroyed machine
+holding a slot; this was a live machine holding none.
+
+### Guests get their own VMID range
+
+`/cluster/nextid` returns the LOWEST free id, which is what made the reuse
+possible at all. The new `provision_vmid_range` (e.g. `8000-8999`; empty keeps
+the previous behaviour) allocates highest-first, so a guest's id is never reused
+and cannot collide with the operator's own machines. A full range refuses rather
+than falling back.
+
+### A refused resize reported a finished provision
+
+`resize_disk` answers with a UPID that nothing waited on - the fifth
+"acceptance is not completion" site in this codebase. An invite promised 30 GB
+from a 32 GB template, PVE declined the shrink, and the provision reported
+success. Harmless in that direction; in the other, you would be told you got
+40 GB of a 32 GB template and find out when the disk filled.
+
+### An invite may not promise a disk PVE will refuse to make
+
+The caps are frozen at mint - the contract the redeemer is promised - so that is
+where the disk is now clamped to the template's own.
+
+### A reason truncated before the reason is not a reason
+
+Failure detail kept the FIRST 240 characters of guest output. Tailscale's
+installer runs under `set -x`, so that kept the command trace and discarded the
+error: all anyone could see of a real failure was `+ mkdir ... + curl ... +
+tee ... + curl`, which sent the operator hunting a template that was fine. The
+tail is kept now, and the install waits for the guest's own package lock with
+its own exit code - apt exiting 100 because `unattended-upgrades` still held the
+lock is not an install failure.
+
 ## 3.6.21 - 2026-08-30
 
 **The self-check could only ever see a HEALTHY Proxmox token.** Found by

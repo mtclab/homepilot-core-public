@@ -13,6 +13,8 @@ API tokens and to the CLI behaviour.
 
 from __future__ import annotations
 
+import logging
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -33,6 +35,7 @@ from ..provision.defaults import (
 )
 from .quota import delete_quota, get_quota, set_quota, usage_for
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/guests", tags=["guests"])
 
 _admin = Depends(require_scope("admin"))
@@ -209,6 +212,40 @@ async def drop_quota(request: Request, cn: str) -> dict[str, Any]:
     }
 
 
+async def _disk_floor(state: Any, node: str, template_vmid: int, asked_gb: int) -> int:
+    """`asked_gb`, or the template's own disk when that is larger.
+
+    Returns what was asked whenever the template cannot be read: an invite that
+    cannot be minted because the cluster is briefly unreachable is a worse
+    outcome than one whose size the provision will report on.
+    """
+    proxmox = getattr(state, "proxmox", None)
+    if proxmox is None or not template_vmid:
+        return asked_gb
+    try:
+        config = await proxmox.get_vm_config(node, template_vmid)
+    except Exception:
+        logger.warning("Could not read template %s to size the invite", template_vmid)
+        return asked_gb
+    data = config.get("data", config) if isinstance(config, dict) else {}
+    units = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    biggest = 0
+    for key, spec in (data or {}).items():
+        if not re.match(r"^(scsi|virtio|sata|ide)\d+$", str(key)):
+            continue
+        match = re.search(r"\bsize=(\d+)([KMGT]?)", str(spec))
+        if match:
+            biggest = max(biggest, int(match.group(1)) * units[match.group(2)])
+    if not biggest:
+        return asked_gb
+    # Round DOWN. The point is a promise the redeemer actually gets: a 32972M
+    # template is 32.19 GB, so promising 32 is honest and needs no resize at
+    # all, while rounding up to 33 would promise more than exists and make
+    # every provision grow the disk for nothing.
+    floor_gb = biggest // (1024**3)
+    return max(asked_gb, floor_gb)
+
+
 @router.post("/invites", dependencies=[_admin], status_code=201)
 async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
     """Mint a one-time, CN-bound invite. The token in this response is shown
@@ -222,6 +259,14 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
         template_vmid = resolve_template_vmid(body.template_vmid, defaults)
     except MissingProvisioningDefaultError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # The disk the TEMPLATE gives is the floor. PVE cannot shrink a disk, so an
+    # invite promising less than the template carries is a promise the cluster
+    # will refuse - and it did: a redeemer was promised 30 GB from a 32 GB
+    # template, PVE declined the shrink, and the provision reported success
+    # anyway (#648). The contract is frozen here, so this is where it must stop
+    # being written. Unreadable template: keep what was asked and let the
+    # provision report honestly.
+    disk_gb = await _disk_floor(request.app.state, node, template_vmid, body.disk_gb)
     caps = InviteCaps(
         template_vmid=template_vmid,
         node=node,
@@ -230,7 +275,7 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
         ipconfig0=resolve_ipconfig(None, defaults),
         cores=body.cores,
         memory_mb=body.memory_mb,
-        disk_gb=body.disk_gb,
+        disk_gb=disk_gb,
     )
     invite_id, full_token = await _invites(request).create_invite(
         bound_cn=body.cn,

@@ -33,7 +33,10 @@ every five seconds; it takes a couple of minutes.</p>
     {% endif %}
   </dl>
 </div>
-{% if tailnet and tailnet != "joined" and not rejoin_running %}
+{% if machine_gone %}
+<p class="notice">This machine no longer exists. Nothing here can be retried - ask the operator for a new invite if you still want one.</p>
+{% endif %}
+{% if tailnet and tailnet != "joined" and not rejoin_running and not machine_gone %}
 <p class="notice">{{ tailnet_detail or "The tailnet join did not succeed, and no reason was recorded." }}</p>
 {% endif %}
 {% if result.ip %}

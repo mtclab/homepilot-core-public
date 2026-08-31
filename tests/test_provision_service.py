@@ -61,6 +61,10 @@ def proxmox() -> AsyncMock:
     px.resize_disk = AsyncMock(return_value={"data": None})
     px.start_vm = AsyncMock(return_value="UPID:pve1:start:")
     px.get_vm_agent_network = AsyncMock(return_value=AGENT_OK)
+    # The guest EXISTS and is running. Modelled explicitly because the join now
+    # asks before naming a cause for a silent agent: "no answer" and "no
+    # machine" are different answers and must not share a sentence.
+    px.get_vm_current = AsyncMock(return_value={"data": {"status": "running"}})
     return px
 
 
@@ -960,3 +964,130 @@ class TestCancelReachesProxmox:
 
     async def test_cancel_of_an_unknown_task_returns_none(self, service: ProvisionService):
         assert await service.cancel("no-such-task") is None
+
+
+@pytest.mark.asyncio
+class TestGuestVmidsAreNeverReused:
+    """PVE's /cluster/nextid hands back the LOWEST free id (#648).
+
+    Destroy a guest and the next one gets its number, so `hosts` ends up with
+    two rows for one id - and on prod a third, from an unrelated machine
+    imported months earlier. That is how a live guest came to be marked absent
+    three minutes after it was built, with its owner logged into it.
+
+    A configured range is allocated HIGHEST-first, so a guest's id is never
+    reused and can never be one of the operator's own machines.
+
+    Teeth: return `min(used)` instead of `max(used) + 1` and the first test
+    fails; drop the range check and the exhaustion test fails.
+    """
+
+    @staticmethod
+    def _defaults(span: str):
+        from homepilot.provision.defaults import ProvisioningDefaults
+
+        return ProvisioningDefaults(node="pve1", template_vmid=9001, vmid_range=span)
+
+    async def test_a_range_allocates_above_everything_in_use(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.cluster_vmids = AsyncMock(return_value={100, 116, 8000, 8001, 8003, 9001})
+
+        vmid = await service._next_vmid("pve1", self._defaults("8000-8999"))
+
+        assert vmid == 8004, "the id must clear everything in the range, not fill a gap"
+        proxmox.next_vmid.assert_not_awaited()
+
+    async def test_an_empty_range_falls_through_to_pve(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """No range configured is the previous behaviour, unchanged."""
+        vmid = await service._next_vmid("pve1", self._defaults(""))
+
+        assert vmid == 105
+        proxmox.next_vmid.assert_awaited()
+
+    async def test_an_empty_range_starts_at_the_floor(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.cluster_vmids = AsyncMock(return_value={100, 116, 9001})
+
+        assert await service._next_vmid("pve1", self._defaults("8000-8999")) == 8000
+
+    async def test_a_full_range_refuses_rather_than_reusing(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """The day the range fills is the worst day to silently start reusing."""
+        proxmox.cluster_vmids = AsyncMock(return_value={8000, 8001, 8002})
+
+        with pytest.raises(RuntimeError, match="full"):
+            await service._next_vmid("pve1", self._defaults("8000-8002"))
+        proxmox.next_vmid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestARefusedResizeIsNotASuccess:
+    """A disk that could not be resized must not report a finished provision.
+
+    From prod (#648): an invite promised 30 GB from a template carrying 32 GB.
+    PVE refuses to SHRINK, so the resize task failed - and the provision
+    reported `succeeded` anyway, because `resize_disk` answers with a UPID that
+    nobody waited on. "Acceptance is not completion", the fifth site of it in
+    this codebase.
+
+    Benign in that direction (the redeemer got more than promised). Not benign
+    in the other: ask 40 GB of a 32 GB template and you would be told you got
+    40, and find out when the disk filled.
+
+    Teeth: drop the current-size check and the shrink test fails on an attempted
+    resize; stop waiting on the UPID and the failure test fails.
+    """
+
+    @staticmethod
+    def _sized(gb: int):
+        return {"data": {"scsi0": f"fast1:116/vm-116-disk-0.raw,discard=on,size={gb * 1024}M"}}
+
+    async def test_a_shrink_is_not_attempted_at_all(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.get_vm_config = AsyncMock(return_value=self._sized(32))
+        request = _request(disk_gb=30)
+
+        await service._resize_disk(request, 116)
+
+        proxmox.resize_disk.assert_not_awaited()
+
+    async def test_a_grow_is_attempted_and_waited_for(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.get_vm_config = AsyncMock(return_value=self._sized(32))
+        proxmox.resize_disk = AsyncMock(return_value={"data": "UPID:pve1:resize:116:"})
+        request = _request(disk_gb=64)
+
+        await service._resize_disk(request, 116)
+
+        proxmox.resize_disk.assert_awaited_once()
+        proxmox.wait_for_task.assert_awaited()
+
+    async def test_a_resize_that_fails_fails_the_provision(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """The whole point: the caller must learn the disk is not what was asked."""
+        proxmox.get_vm_config = AsyncMock(return_value=self._sized(32))
+        proxmox.resize_disk = AsyncMock(return_value={"data": "UPID:pve1:resize:116:"})
+        proxmox.wait_for_task = AsyncMock(side_effect=RuntimeError("storage is full"))
+        request = _request(disk_gb=64)
+
+        with pytest.raises(RuntimeError, match="storage is full"):
+            await service._resize_disk(request, 116)
+
+    async def test_an_unreadable_config_still_attempts_the_resize(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """Not knowing the size is not a reason to skip: attempt, and report."""
+        proxmox.get_vm_config = AsyncMock(side_effect=RuntimeError("no answer"))
+        proxmox.resize_disk = AsyncMock(return_value={"data": "UPID:pve1:resize:116:"})
+
+        await service._resize_disk(_request(disk_gb=30), 116)
+
+        proxmox.resize_disk.assert_awaited_once()

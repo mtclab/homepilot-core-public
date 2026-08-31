@@ -597,3 +597,80 @@ class TestAConfinedAgentIsNotANetworkFault:
         assert outcome == "failed"
         assert "SELinux" not in detail
         assert "route out" in detail
+
+
+class TestSilenceIsNotACause:
+    """A silent guest agent has more than one explanation (#648, from a real user).
+
+    A redeemer pressed "retry tailnet join" twice against a guest that had been
+    DESTROYED three days earlier. Both times HomePilot answered:
+
+        "The guest's qemu-guest-agent never answered... The template needs
+         qemu-guest-agent installed, started, and allowed to run commands."
+
+    The template was fine - its agent had demonstrably run commands inside a
+    guest cloned from it. The machine simply did not exist. The operator went
+    looking at the image, which is exactly where that sentence sends someone.
+
+    Silence establishes that nothing answered. It does not establish WHY, and
+    the three whys send an operator to three different places.
+
+    Teeth: make `_why_no_agent` return the template sentence unconditionally and
+    the first two tests fail.
+    """
+
+    @staticmethod
+    def _service(monkeypatch, current):
+        from unittest.mock import AsyncMock
+
+        from homepilot.provision.service import ProvisionService
+
+        svc = ProvisionService.__new__(ProvisionService)
+        svc.proxmox = AsyncMock()
+        svc.proxmox.get_vm_current = current
+        return svc
+
+    async def test_a_destroyed_machine_is_named_as_gone(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from homepilot.adapters.proxmox import ProxmoxError
+
+        svc = self._service(
+            monkeypatch,
+            AsyncMock(side_effect=ProxmoxError("GET", "/nodes/n/qemu/116/status/current", 500, "")),
+        )
+        detail = await svc._why_no_agent("elizabeth", 116)
+
+        assert "no longer exists" in detail
+        # And it must NOT send them to the template, which is the wrong turn.
+        assert "qemu-guest-agent installed" not in detail
+
+    async def test_a_stopped_machine_is_named_as_stopped(self):
+        from unittest.mock import AsyncMock
+
+        svc = self._service(None, AsyncMock(return_value={"data": {"status": "stopped"}}))
+        detail = await svc._why_no_agent("elizabeth", 116)
+
+        assert "stopped" in detail
+        assert "qemu-guest-agent installed" not in detail
+
+    async def test_a_running_machine_really_does_point_at_the_template(self):
+        """The original sentence is RIGHT in the one case it was written for, so
+        the fix must not make a genuine missing-agent undiagnosable."""
+        from unittest.mock import AsyncMock
+
+        svc = self._service(None, AsyncMock(return_value={"data": {"status": "running"}}))
+        detail = await svc._why_no_agent("elizabeth", 116)
+
+        assert "qemu-guest-agent installed" in detail
+
+    async def test_a_cluster_that_cannot_be_asked_names_no_cause_at_all(self):
+        """Unknown is unknown. Guessing here would rebuild the whole defect."""
+        from unittest.mock import AsyncMock
+
+        svc = self._service(None, AsyncMock(side_effect=RuntimeError("connection reset")))
+        detail = await svc._why_no_agent("elizabeth", 116)
+
+        assert "could not be" in detail
+        assert "no longer exists" not in detail
+        assert "qemu-guest-agent installed" not in detail

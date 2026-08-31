@@ -109,6 +109,27 @@ def _template_vmid(raw: Any) -> int:
     return value
 
 
+def _vmid_range(raw: str) -> str:
+    """'<low>-<high>', or empty. Validated here so a bad range cannot be stored.
+
+    PVE VMIDs run 100-999999999; anything outside that, inverted, or too narrow
+    to hold a guest is refused with the reason, rather than failing at the first
+    provision that tries to use it.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", text)
+    if not match:
+        raise SettingError("expected '<low>-<high>', e.g. 8000-8999")
+    low, high = int(match.group(1)), int(match.group(2))
+    if low < 100:
+        raise SettingError("PVE reserves VMIDs below 100")
+    if high < low:
+        raise SettingError(f"the range is inverted: {low} is above {high}")
+    return f"{low}-{high}"
+
+
 def _vlan_tag(raw: Any) -> int:
     value = _unset_or_positive_int(raw)
     if value > 4094:
@@ -423,6 +444,21 @@ REGISTRY: dict[str, SettingSpec] = {
             hot_reloadable=True,
             parse=_vlan_tag,
             probe=_cluster_probe("provision_default_vlan_tag"),
+        ),
+        SettingSpec(
+            key="provision_vmid_range",
+            type_="str",
+            description=(
+                "VMID range provisioned guests are allocated from, as "
+                "'<low>-<high>' (e.g. 8000-8999). Empty keeps PVE's own "
+                "/cluster/nextid, which hands back the LOWEST free id and so "
+                "reuses the number of a guest you just destroyed. A range is "
+                "allocated highest-first instead, so a guest's id is never "
+                "reused and can never collide with your infrastructure's."
+            ),
+            hot_reloadable=True,
+            parse=_vmid_range,
+            probe=None,
         ),
         SettingSpec(
             key="provision_default_ipconfig",

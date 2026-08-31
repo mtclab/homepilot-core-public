@@ -273,3 +273,20 @@ async def poll_for_task_end(db: Any, invite_id: str, timeout: float = 10.0) -> N
             return
         await asyncio.sleep(0.05)
     raise AssertionError("the provision task never finished")
+
+
+def mark_invite_host_absent(db_path: str, invite_id: str) -> None:
+    """Mark the host this invite built as gone, the way the reconciler does."""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT resulting_host_id FROM invites WHERE id = ?", (invite_id,)
+        ).fetchone()
+        assert row and row[0], "the invite recorded no host to mark absent"
+        conn.execute(
+            "UPDATE hosts SET absent_since = ? WHERE id = ?",
+            ("2026-08-31T00:00:00Z", row[0]),
+        )
+        conn.commit()
+    finally:
+        conn.close()

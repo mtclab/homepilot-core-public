@@ -308,3 +308,62 @@ class TestRemovingABudget:
 
         rows = await repo.db.fetchall("SELECT action, target_host FROM audit_log")
         assert ("guest_quota_removed", CN) in [(r["action"], r["target_host"]) for r in rows]
+
+
+class TestAnInviteNeverPromisesLessThanTheTemplate:
+    """PVE cannot shrink a disk, so an invite promising less is a promise the
+    cluster will refuse (#648).
+
+    From prod: an invite promised 30 GB from a 32 GB template. PVE declined the
+    shrink and the provision reported success anyway, so the redeemer's machine
+    and his contract disagreed. The caps are frozen at mint - the code calls
+    them "the contract the redeemer is promised" - so this is where a size the
+    cluster will not honour must stop being written.
+
+    Teeth: return `asked_gb` unconditionally from `_disk_floor` and the first
+    test fails on the 30 it should have raised.
+    """
+
+    @staticmethod
+    async def _floor(config, asked):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        mod = sys.modules["homepilot.guest.admin_router"]
+        proxmox = SimpleNamespace(get_vm_config=AsyncMock(return_value=config))
+        return await mod._disk_floor(SimpleNamespace(proxmox=proxmox), "pve1", 9001, asked)
+
+    async def test_a_promise_below_the_template_is_raised_to_it(self):
+        floor = await self._floor(
+            {"data": {"scsi0": "local-lvm:base-9001-disk-0,discard=on,size=32972M"}}, 30
+        )
+        assert floor == 32, "an invite may not promise a disk PVE will refuse to make"
+
+    async def test_a_larger_request_is_left_alone(self):
+        floor = await self._floor({"data": {"scsi0": "local-lvm:d,size=32972M"}}, 64)
+        assert floor == 64
+
+    async def test_the_biggest_disk_wins_when_a_template_has_several(self):
+        floor = await self._floor(
+            {"data": {"scsi0": "local:a,size=10G", "virtio1": "local:b,size=40G"}}, 5
+        )
+        assert floor == 40
+
+    async def test_an_unreadable_template_keeps_what_was_asked(self):
+        """A briefly unreachable cluster must not block minting an invite."""
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        mod = sys.modules["homepilot.guest.admin_router"]
+        proxmox = SimpleNamespace(get_vm_config=AsyncMock(side_effect=RuntimeError("down")))
+        got = await mod._disk_floor(SimpleNamespace(proxmox=proxmox), "pve1", 9001, 30)
+        assert got == 30
+
+    async def test_no_proxmox_keeps_what_was_asked(self):
+        import sys
+        from types import SimpleNamespace
+
+        mod = sys.modules["homepilot.guest.admin_router"]
+        assert await mod._disk_floor(SimpleNamespace(proxmox=None), "pve1", 9001, 30) == 30

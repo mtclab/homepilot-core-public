@@ -35,6 +35,7 @@ KEYS = (
     "provision_default_bridge",
     "provision_default_vlan_tag",
     "provision_default_ipconfig",
+    "provision_vmid_range",
     "provision_tailscale_install",
     "provision_ip_mode",
     "provision_default_nameserver",
@@ -56,6 +57,8 @@ class ProvisioningDefaults:
     bridge: str = ""
     vlan_tag: int = 0
     ipconfig: str = ""
+    # "<low>-<high>" or empty. See ProvisionService._next_vmid.
+    vmid_range: str = ""
     # Whether a guest with no tailscale gets it installed before a tailnet join.
     # Defaults to True so a fresh install can actually honour a key it is given
     # - nothing installed it before, which is why no join could ever work.
@@ -124,6 +127,7 @@ async def provisioning_defaults(source: Any = None) -> ProvisioningDefaults:
         bridge=str(values["provision_default_bridge"] or ""),
         vlan_tag=int(values["provision_default_vlan_tag"] or 0),
         ipconfig=str(values["provision_default_ipconfig"] or ""),
+        vmid_range=str(values["provision_vmid_range"] or ""),
         tailscale_install=bool(
             1
             if values.get("provision_tailscale_install") is None
