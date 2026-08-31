@@ -55,6 +55,16 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          # Stamp the agent binary baked INTO the image. The Dockerfile has
+          # always read this arg and its comment has always claimed "the release
+          # passes --build-arg HP_VERSION=<tag>" - and this step never did, so
+          # every published image shipped an agent that reports itself as `dev`.
+          # The sibling build-agent job below stamps the RELEASE ASSET binaries
+          # correctly, which is why the gap was invisible: the versioned binary
+          # is the one nobody installs, and the `dev` one is what enrolment
+          # actually hands to a guest. Found by driving 3.6.21 (#648).
+          build-args: |
+            HP_VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
