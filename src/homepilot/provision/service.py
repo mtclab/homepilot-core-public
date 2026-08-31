@@ -48,6 +48,17 @@ _RC_NO_DOWNLOADER = 90
 _RC_DOWNLOAD_FAILED = 91
 _RC_DNS_FAILED = 92
 _RC_INSTALLED_NOTHING = 93
+# The guest's package manager was still busy when the wait ran out. Its own
+# code, because "apt was locked" and "the install failed" send an operator to
+# different places - and the first one is not a fault at all, just a guest that
+# was still finishing its own boot.
+_RC_PACKAGE_MANAGER_BUSY = 94
+
+# How long to wait for the guest's own package manager to be free. Generous:
+# unattended-upgrades on a fresh cloud image routinely holds the lock for
+# minutes, and waiting is far cheaper than handing someone a machine with no
+# tailscale on it.
+_PACKAGE_LOCK_WAIT_S = 300
 # The guest agent itself is forbidden to reach the network, whatever the network
 # says. Proven live on dev 2026-08-29: on a Fedora guest, qemu-guest-agent runs
 # as the CONFINED SELinux domain `virt_qemu_ga_t`, and a connect() from it to an
@@ -116,6 +127,15 @@ else
   exit {_RC_NO_DOWNLOADER}
 fi
 [ -s "$out" ] || fetch_failed
+# WAIT FOR THE PACKAGE LOCK. cloud-init finishing is not the same as apt being
+# free: `apt-daily` and `unattended-upgrades` start on their own timers after
+# it, so an install seconds into a guest's life races them and apt exits 100.
+# Bounded, and it degrades to "carry on" on an image without flock or dpkg
+# rather than refusing to install on one it cannot inspect.
+if command -v dpkg >/dev/null 2>&1 && command -v flock >/dev/null 2>&1; then
+  flock -w {_PACKAGE_LOCK_WAIT_S} /var/lib/dpkg/lock-frontend true \
+    || exit {_RC_PACKAGE_MANAGER_BUSY}
+fi
 sh "$out"
 command -v tailscale >/dev/null 2>&1 || exit {_RC_INSTALLED_NOTHING}
 """
@@ -141,7 +161,7 @@ _TSKEY_RE = re.compile(r"tskey-[A-Za-z0-9-]+")
 # How much of the guest's own words a failure detail may carry. Long enough for
 # tailscale's actual sentence ("invalid key: unknown key"), short enough that a
 # task result cannot become a log dump.
-_DETAIL_LIMIT = 240
+_DETAIL_LIMIT = 700
 
 
 def _safe_detail(text: str, key: str | None) -> str:
@@ -158,7 +178,16 @@ def _safe_detail(text: str, key: str | None) -> str:
         cleaned = cleaned.replace(key, "<redacted>")
     cleaned = _TSKEY_RE.sub("<redacted>", cleaned)
     cleaned = " ".join(cleaned.split())
-    return cleaned[:_DETAIL_LIMIT]
+    # The TAIL, not the head. Tailscale's installer runs under `set -x`, so its
+    # output is a command trace followed by the actual error - and keeping the
+    # first N characters kept the trace and threw away the reason. A real
+    # redeemer's install failed with apt exit 100 and all anyone could see was
+    # "+ mkdir ... + curl ... + tee ... + curl", which sent the operator
+    # hunting the template. A reason truncated before the reason is not a
+    # reason (#648).
+    if len(cleaned) <= _DETAIL_LIMIT:
+        return cleaned
+    return "..." + cleaned[-_DETAIL_LIMIT:]
 
 
 # What inventory refresh writes for a qemu guest. A provisioned VM MUST use the
@@ -545,7 +574,7 @@ class ProvisionService:
             allocation = await self._allocate_address(defaults, fence, request.ipconfig0)
 
             step = "next_vmid"
-            vmid = await proxmox.next_vmid(request.node)
+            vmid = await self._next_vmid(request.node, defaults)
 
             step = "clone"
             # Set BEFORE the call, not after: if a cancel lands while the clone
@@ -615,11 +644,8 @@ class ProvisionService:
                     ) from exc
 
             if request.disk_gb is not None:
-                # PVE resize is grow-only and refuses a shrink; we cannot know the
-                # template's disk size cheaply, so a too-small request surfaces as
-                # the PVE error on a failed task rather than a silent no-op.
                 step = "resize_disk"
-                await proxmox.resize_disk(request.node, vmid, request.disk, f"{request.disk_gb}G")
+                await self._resize_disk(request, vmid)
 
             step = "start_vm"
             start_upid = await proxmox.start_vm(request.node, vmid)
@@ -966,6 +992,108 @@ class ProvisionService:
                 poll_interval=self.poll_interval,
             )
 
+    async def _next_vmid(self, node: str, defaults: ProvisioningDefaults) -> int:
+        """The VMID for a new guest - never one that has been used before.
+
+        PVE's `/cluster/nextid` hands back the LOWEST free id, so destroying a
+        guest and provisioning another gives the new machine the dead one's
+        number. `hosts` then carries two rows for one id, and on prod a third
+        from an unrelated machine imported months earlier - which is how a live
+        guest came to be marked absent three minutes after it was built (#648).
+
+        With a range configured, ids are taken HIGHEST-FIRST inside it, so a
+        guest's number is never reused and can never be one of the operator's
+        own machines. Without one, this is exactly the previous behaviour.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            raise RuntimeError("Proxmox not configured")
+        span = (defaults.vmid_range or "").strip()
+        if not span:
+            return int(await proxmox.next_vmid(node))
+        low_s, _, high_s = span.partition("-")
+        low, high = int(low_s), int(high_s)
+        taken = await proxmox.cluster_vmids()
+        used = [v for v in taken if low <= v <= high]
+        candidate = (max(used) + 1) if used else low
+        if candidate > high:
+            # REFUSE, loudly. Falling back to lowest-free here would quietly
+            # reintroduce the reuse this range exists to prevent, on the day
+            # the range fills - which is the worst day to discover it.
+            raise RuntimeError(
+                f"the guest VMID range {span} is full: {len(used)} id(s) in use and the "
+                f"highest is {max(used)}. Widen provision_vmid_range before provisioning "
+                "another guest."
+            )
+        return candidate
+
+    async def _resize_disk(self, request: ProvisionRequest, vmid: int) -> None:
+        """Grow the clone's disk to the requested size, and WAIT to find out.
+
+        Three things were wrong here at once, and a real redeemer got all of
+        them (#648). PVE resize is a TASK: `resize_disk` answers with a UPID, so
+        firing it and moving on is "acceptance is not completion" - the fifth
+        site of that mistake in this codebase. PVE also refuses to SHRINK, and
+        the old comment justified not checking by saying the template's size
+        could not be known cheaply. It can: the guest's own config carries it,
+        and this method has just cloned that guest.
+
+        So: a request SMALLER than the disk the template gave is not an error
+        and not an attempt - the machine already exceeds what was promised, and
+        the invite that promised less is the thing to fix. Anything larger is
+        attempted and WAITED for, and a refusal fails the provision rather than
+        handing someone a disk they were told they would not get.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return
+        if request.disk_gb is None:  # pragma: no cover - the caller checked
+            return
+        wanted_bytes = request.disk_gb * 1024 * 1024 * 1024
+        current = await self._disk_size_bytes(request.node, vmid, request.disk)
+        if current is not None and wanted_bytes <= current:
+            logger.info(
+                "vmid %s already has %d bytes on %s, at or above the %dG asked for; "
+                "not resizing (PVE cannot shrink)",
+                vmid,
+                current,
+                request.disk,
+                request.disk_gb,
+            )
+            return
+        result = await proxmox.resize_disk(request.node, vmid, request.disk, f"{request.disk_gb}G")
+        upid = proxmox.upid_of(result)
+        if upid:
+            await proxmox.wait_for_task(
+                request.node,
+                upid,
+                timeout_s=self.task_timeout_s,
+                poll_interval=self.poll_interval,
+            )
+
+    async def _disk_size_bytes(self, node: str, vmid: int, disk: str) -> int | None:
+        """The size PVE currently reports for one of a guest's disks, in bytes.
+
+        None when it cannot be read or parsed - and None means "do not decide",
+        so an unreadable config lets the resize be attempted rather than
+        silently skipped.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return None
+        try:
+            config = await proxmox.get_vm_config(node, vmid)
+        except Exception as exc:
+            logger.warning("Could not read vmid %s config to size %s: %s", vmid, disk, exc)
+            return None
+        data = config.get("data", config) if isinstance(config, dict) else {}
+        spec = str((data or {}).get(disk) or "")
+        match = re.search(r"\bsize=(\d+)([KMGT]?)", spec)
+        if not match:
+            return None
+        units = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+        return int(match.group(1)) * units[match.group(2)]
+
     async def _destroy_after_failure(self, request: ProvisionRequest, vmid: int) -> tuple[str, str]:
         """Take back a guest a post-clone failure would otherwise strand (#595).
 
@@ -1261,11 +1389,17 @@ class ProvisionService:
         # an image with no qemu-guest-agent at all never answers and the
         # requester must be told that rather than left watching a spinner.
         if not await self._wait_for_agent(node, vmid):
-            return TailnetOutcome.UNKNOWN, (
-                "The guest's qemu-guest-agent never answered, so HomePilot could not run "
-                "anything inside it. The template needs qemu-guest-agent installed, started, "
-                "and allowed to run commands."
-            )
+            # ASK WHY before naming a cause. Silence from the agent has more than
+            # one explanation and they send an operator to entirely different
+            # places: a template without the package, a guest that is switched
+            # off, or - the case this was written for - a machine that no longer
+            # exists at all. A redeemer retried a join against a guest destroyed
+            # three days earlier and was told his TEMPLATE needed
+            # qemu-guest-agent, on a template whose agent had demonstrably run
+            # commands. The operator then went looking at the image. #642's
+            # shape: a conclusion drawn from a read that only established
+            # silence.
+            return TailnetOutcome.UNKNOWN, await self._why_no_agent(node, vmid)
 
         try:
             rc, _out, _err = await proxmox.agent_run(
@@ -1385,6 +1519,49 @@ class ProvisionService:
                 else f"Installing tailscale exited {rc}."
             )
         return None, ""
+
+    async def _why_no_agent(self, node: str, vmid: int) -> str:
+        """Why the guest agent said nothing, in the redeemer's own words.
+
+        Only what can be ESTABLISHED. When the cluster cannot be asked either,
+        the answer says the agent did not answer and stops there rather than
+        naming a cause it has not checked.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return "The guest's qemu-guest-agent never answered."
+        try:
+            current = await proxmox.get_vm_current(node, vmid)
+        except ProxmoxError as exc:
+            if exc.status_code in (404, 500, 501, 595):
+                # PVE answers a missing guest with an error, not an empty
+                # record. This is the destroyed-machine case.
+                return (
+                    f"This machine no longer exists on {node} - there is nothing to join to "
+                    "a tailnet. If you expected it to be here, ask the operator; a new "
+                    "invite gets you a fresh machine."
+                )
+            return (
+                "The guest's qemu-guest-agent never answered, and the cluster could not be "
+                f"asked why ({exc})."
+            )
+        except Exception as exc:
+            return (
+                "The guest's qemu-guest-agent never answered, and the cluster could not be "
+                f"asked why ({exc})."
+            )
+        status = str((current.get("data") or current).get("status") or "").strip()
+        if status and status != "running":
+            return (
+                f"This machine is {status}, so nothing inside it can be reached. Start it "
+                "and try again."
+            )
+        # It is here and running, so the template really is the thing to look at.
+        return (
+            "The guest's qemu-guest-agent never answered, so HomePilot could not run "
+            "anything inside it. The machine is running, so the template needs "
+            "qemu-guest-agent installed, started, and allowed to run commands."
+        )
 
     async def _wait_for_agent(self, node: str, vmid: int) -> bool:
         """Poll until qemu-guest-agent answers, or the wait runs out.

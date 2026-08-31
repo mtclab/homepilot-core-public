@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # leaves the template's own NIC exactly as it was cloned.
     provision_default_bridge: str = ""
     provision_default_vlan_tag: int = 0
+    # VMID range provisioned guests come from, "<low>-<high>". Empty keeps
+    # PVE's lowest-free /cluster/nextid, which REUSES the id of a destroyed
+    # guest - the collision behind #648's "both machines gone" portal.
+    provision_vmid_range: str = ""
     provision_default_ipconfig: str = "ip=dhcp"
     # Who decides a guest's address (#630). "static" - the default - means
     # HomePilot allocates one from the guest subnet itself at provision time;

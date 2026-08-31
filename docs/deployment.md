@@ -1178,7 +1178,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.21` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.22` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1196,6 +1196,7 @@ forward.
 | `HP_PROVISION_DEFAULT_STORAGE` | — | Storage the clone's disks land on. Empty inherits the template's own storage (the clone call then carries no `storage` at all) |
 | `HP_PROVISION_DEFAULT_BRIDGE` | — | Bridge the guest NIC is put on. Setting it is what makes provisioning write `net0` at all; empty leaves the template's NIC untouched |
 | `HP_PROVISION_DEFAULT_VLAN_TAG` | `0` | VLAN tag for the guest NIC, applied only together with the bridge above. `0` is untagged |
+| `HP_PROVISION_VMID_RANGE` | (empty) | VMID range provisioned guests are allocated from, `<low>-<high>` (e.g. `8000-8999`). Empty keeps PVE's `/cluster/nextid`, which returns the LOWEST free id and therefore reuses a destroyed guest's number. A range is allocated highest-first, so a guest's id is never reused and cannot collide with your own machines; when it fills, provisioning refuses rather than falling back |
 | `HP_PROVISION_DEFAULT_IPCONFIG` | `ip=dhcp` | cloud-init `ipconfig0` used when the request does not give one |
 | `HP_PROVISION_TAILSCALE_INSTALL` | `1` | Install tailscale in a guest that has none before joining it to the requester's tailnet. `0` for an image that ships tailscale itself, or a guest with no route out - the join is then reported failed rather than attempted |
 | `HP_PROVISION_IP_MODE` | `static` | Who decides a guest's address: `static` allocates a free one from the guest subnet at provision time; `dhcp` writes `ip=dhcp` and leaves it to a DHCP server on the wire |

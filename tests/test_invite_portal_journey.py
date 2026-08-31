@@ -28,12 +28,17 @@ from .portal_support import (
     cert_headers,
     client_for,
     invite_row,
+    mark_invite_host_absent,
     mint,
     poll_for_task_end,
     poll_status,
     strip_task_result,
     task_rows,
 )
+
+# A key the fake guest refuses, so the machine comes up with its tailnet DOWN -
+# the only state in which the page offers a retry at all.
+REFUSED_KEY = "tskey-auth-k7Ab3CNTRL-9xQwErTyUiOpAsDfGhJk"
 
 
 class TestInviteJourney:
@@ -278,3 +283,68 @@ class TestAFailedBuildDoesNotBurnTheLink:
 
         row = invite_row(portal_db.db_path, invite_id)
         assert row["redeemed_at"] is not None
+
+
+class TestARetryIsNotOfferedOnAMachineThatIsGone:
+    """The status page offered "retry tailnet join" for a destroyed guest (#648).
+
+    `can_rejoin` carried the comment "Only a machine that exists can be
+    re-joined" while checking only that a vmid had been RECORDED - which proves
+    a machine was once built, never that it is still there. A redeemer pressed
+    it twice against a guest destroyed three days earlier.
+
+    Both tests redeem with a key the guest REFUSES, because that is the only
+    state in which the retry is ever on offer: an invite whose join never failed
+    gets no form at all, and asserting the form's absence on such a page would
+    hold no matter what the code did. The first version of this gate did exactly
+    that and stayed green with the fix reverted.
+
+    Teeth: drop `machine_gone` from the `can_rejoin` expression and
+    `test_a_destroyed_machine_offers_no_retry_and_says_why` fails on the offered
+    form.
+    """
+
+    async def _redeem_with_a_refused_key(self, client: Any, portal_pve: FakePVE, token: str) -> Any:
+        """Land on the page that DOES offer a retry: machine up, tailnet not."""
+        portal_pve.tailscale_up_rc = 1
+        portal_pve.tailscale_up_err = "backend error: invalid key: already used"
+        redeemed = await client.post(
+            f"/invite/{token}",
+            data={**REDEEM_FORM, "tailscale_auth_key": REFUSED_KEY},
+            headers=cert_headers(),
+        )
+        assert redeemed.status_code == 303, redeemed.text
+        return await poll_status(client, token)
+
+    async def test_a_destroyed_machine_offers_no_retry_and_says_why(
+        self, portal_app: FastAPI, portal_db: Database, portal_pve: FakePVE
+    ):
+        invite_id, token = await mint(portal_db)
+
+        async with client_for(portal_app) as client:
+            live = await self._redeem_with_a_refused_key(client, portal_pve, token)
+            # The retry is genuinely on the page while the machine is there.
+            # Without this line the assertion at the end would prove nothing.
+            assert "tailnet-join" in live.text, "the fixture never offered a retry to take away"
+
+            # The reconciler has since found the guest gone from the hypervisor.
+            mark_invite_host_absent(portal_db.db_path, invite_id)
+
+            page = await client.get(f"/invite/{token}/status", headers=cert_headers())
+
+        assert "no longer exists" in page.text
+        assert "tailnet-join" not in page.text, "a retry was offered for a machine that is gone"
+
+    async def test_a_live_machine_still_gets_its_retry(
+        self, portal_app: FastAPI, portal_db: Database, portal_pve: FakePVE
+    ):
+        """The other half: taking the retry away from a live machine would
+        remove the one action a redeemer has."""
+        _, token = await mint(portal_db)
+
+        async with client_for(portal_app) as client:
+            page = await self._redeem_with_a_refused_key(client, portal_pve, token)
+
+        assert "no longer exists" not in page.text
+        assert "tailnet-join" in page.text
+        assert 'name="tailscale_auth_key"' in page.text

@@ -749,3 +749,59 @@ class TestRefreshInventoryNewColumns:
         assert guest["ip_address"] == "1.2.3.4"
         assert guest["ip_source"] == "user"
         assert guest["source"] == "imported"
+
+
+class TestAVmidIsNotAnIdentity:
+    """PVE reuses VMIDs, so `hosts` accumulates a row per occupant (#648).
+
+    Reproduced from prod: vmid 116 carried THREE rows - a machine imported in
+    June, a guest destroyed in August, and the one a friend was logged into.
+    `get_host_by_proxmox_id` returned whichever SQLite gave first, which was the
+    June row, so the refresh kept updating a machine that no longer existed and
+    the absent sweep marked the LIVE guest gone three minutes after it was
+    built. His portal showed both his machines "gone" with a Start button, and
+    his budget read 0 of 1 while he sat inside one - which would have let him
+    take a second machine past his own quota.
+
+    Teeth: drop the ORDER BY and the first test fails on the June row.
+    """
+
+    async def test_the_newest_row_wins_for_a_reused_vmid(self, repo):
+        old = await repo.create_host(
+            hostname="homelab-dev-proxmox3", host_type="qemu", role="guest", proxmox_id=116
+        )
+        await repo.db.execute(
+            "UPDATE hosts SET created_at = ? WHERE id = ?", ("2026-06-10T08:39:11Z", old)
+        )
+        destroyed = await repo.create_host(
+            hostname="kanasalaatti", host_type="qemu", role="guest", proxmox_id=116
+        )
+        await repo.db.execute(
+            "UPDATE hosts SET created_at = ? WHERE id = ?", ("2026-08-28T18:46:33Z", destroyed)
+        )
+        live = await repo.create_host(
+            hostname="nakkisoppa", host_type="qemu", role="guest", proxmox_id=116
+        )
+        await repo.db.execute(
+            "UPDATE hosts SET created_at = ? WHERE id = ?", ("2026-08-31T16:13:48Z", live)
+        )
+        await repo.db.conn.commit()
+
+        found = await repo.get_host_by_proxmox_id(116)
+
+        assert found is not None
+        assert found["hostname"] == "nakkisoppa", (
+            f"a refresh would update {found['hostname']} and mark the live guest absent"
+        )
+        assert found["id"] == live
+
+    async def test_one_row_is_still_found(self, repo):
+        """The ordinary case must keep working."""
+        only = await repo.create_host(
+            hostname="solo", host_type="qemu", role="guest", proxmox_id=204
+        )
+        found = await repo.get_host_by_proxmox_id(204)
+        assert found is not None and found["id"] == only
+
+    async def test_an_unknown_vmid_is_still_none(self, repo):
+        assert await repo.get_host_by_proxmox_id(9999) is None

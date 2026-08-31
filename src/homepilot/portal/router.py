@@ -321,6 +321,33 @@ async def invite_redeem(request: Request, token: str) -> Any:
     )
 
 
+async def _machine_is_gone(request: Request, row: dict[str, Any]) -> bool:
+    """Has the machine this invite built since been destroyed?
+
+    Read off the INVENTORY, which the reconciler already maintains: a host it
+    can no longer find on the hypervisor carries `absent_since`. Cheaper than
+    asking PVE on every page render, and it is the same fact the operator's own
+    host page shows.
+
+    False when it cannot be told - an unknown is not a disappearance, and
+    hiding the retry on a machine that is merely unlisted would take away the
+    one action a redeemer has.
+    """
+    host_id = row.get("resulting_host_id")
+    if not host_id:
+        return False
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        return False
+    try:
+        host = await repo.get_host(str(host_id))
+    except Exception:
+        return False
+    if host is None:
+        return False
+    return bool(dict(host).get("absent_since"))
+
+
 def _cleanup_verdict(task: dict[str, Any] | None) -> str:
     """What a failed provision established about what it left behind.
 
@@ -381,6 +408,7 @@ async def _render_status(
         task = await task_repo.get_task(str(row["resulting_task_id"]))
 
     status_name = str(task["status"]) if task else "pending"
+    machine_gone = await _machine_is_gone(request, row)
     facts = _machine_facts(task)
 
     if status_name == "succeeded":
@@ -464,10 +492,21 @@ async def _render_status(
         # redemption form does - the token is already in the address bar, and
         # building the URL here keeps it out of the template's hands.
         join_url=f"/invite/{token}/tailnet-join",
-        # Only a machine that exists can be re-joined, and only when a key was
+        # Only a machine that EXISTS can be re-joined, and only when a key was
         # part of the deal in the first place: an invite whose redeemer never
         # gave one gets no form, because there would be nothing to retry.
-        can_rejoin=state == "ok" and facts.get("vmid") is not None and tailnet is not None,
+        #
+        # That first clause used to be a comment rather than a check - a
+        # recorded vmid proves a machine was once BUILT, never that it is still
+        # there. A redeemer pressed this button twice against a guest destroyed
+        # three days earlier and got told his template was at fault.
+        can_rejoin=(
+            state == "ok"
+            and facts.get("vmid") is not None
+            and tailnet is not None
+            and not machine_gone
+        ),
+        machine_gone=machine_gone,
         join_error=join_error,
         username=facts.get("ciuser") or "",
     )
