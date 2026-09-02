@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.6.23 - 2026-09-02
+
+### The fence is verified from inside the guest (#648)
+
+Every layer reported the guest fence as a fact about configuration: the per-VM
+rules on the tap, `firewall=1` on the NIC, the datacenter firewall on, the node
+on an enforcing stack. All of it was true of the first real friend's guest on
+prod - and nobody had ever run a command inside a guest and watched a packet
+towards the operator LAN go nowhere. Written is not established, and the fence
+is the one property of this product where the difference is a stranger on your
+LAN.
+
+A provision now asks the guest itself, through qemu-guest-agent, before the
+machine is recorded or handed to anyone: a TCP connect to the Proxmox host
+(known alive - it just cloned this guest - and inside the isolate list) on its
+API port and on tcp/53, and to the guest gateway's resolver and the guest's
+nameserver as controls. The DNS port is there for SELinux-enforcing images,
+whose confined qemu-guest-agent may open 53 and little else; a reset from it
+proves the host was reached as well as a handshake does. The result
+carries `fence: verified` when the isolated address stayed silent while a
+control answered, `fence: unverified` with the reason when nothing was
+established (no agent, silence on both sides, an SELinux-confined agent, no
+python3 or bash, nothing known alive inside the fence), and
+`guest_network_fence.verification` records every probe. A guest that REACHES
+the isolated range fails the provision and is stopped and destroyed, exactly as
+a guest whose rules could not be written. The check can never itself fail a
+provision.
+
+What the fence check learns about the guest agent is handed to the tailnet
+join, so an image with no agent costs one bounded wait, not two.
+
 ## 3.6.22 - 2026-08-31
 
 Five fixes, all from one afternoon of a friend redeeming an invite on prod.

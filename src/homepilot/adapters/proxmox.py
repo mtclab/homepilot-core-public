@@ -5,7 +5,7 @@ import contextlib
 import logging
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -126,6 +126,21 @@ class ProxmoxClient:
                 status_code=0,
                 body=str(exc),
             ) from exc
+
+    @property
+    def api_host(self) -> str | None:
+        """The host this client talks to, as configured (a name or an address).
+
+        Read by the fence verification: the Proxmox host is the one address
+        HomePilot KNOWS is alive when a guest has just been cloned through it.
+        """
+        parsed = urlparse(self._base_url if "://" in self._base_url else f"//{self._base_url}")
+        return parsed.hostname or None
+
+    @property
+    def api_port(self) -> int:
+        parsed = urlparse(self._base_url if "://" in self._base_url else f"//{self._base_url}")
+        return parsed.port or 8006
 
     async def read(self, path: str, query: dict[str, Any] | None = None) -> dict[str, Any]:
         return await self.call("GET", path, query=query)

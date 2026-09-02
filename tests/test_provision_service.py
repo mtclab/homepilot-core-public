@@ -134,6 +134,12 @@ class TestHappyPath:
             # WHY, when there is a why. A bare "failed" with no reason is what
             # the first live run left the operator with (#628).
             "tailnet_detail": None,
+            # What the guest itself said about its fence (#648): null here
+            # because there is no fence to ask about. 'verified' / 'unverified'
+            # are the only values a succeeded task can carry - a breach is a
+            # failed provision and a destroyed guest, never a result.
+            "fence": None,
+            "fence_detail": None,
             # The guest network fence (#553), stated even when there is none:
             # "this guest is not fenced" is a fact about the machine an operator
             # must be able to read, and an absent key would leave it ambiguous.
