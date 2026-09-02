@@ -14,6 +14,14 @@ from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
 from .defaults import ProvisioningDefaults, provisioning_defaults
+from .fence_verify import (
+    FenceVerdict,
+    control_targets,
+    isolated_targets,
+    judge,
+    parse_probe_output,
+    probe_script,
+)
 from .guest_network import (
     DesiredGuestNetwork,
     desired_from_settings,
@@ -196,6 +204,11 @@ def _safe_detail(text: str, key: str | None) -> str:
 # second, duplicate row for the same VM on its next pass.
 HOST_TYPE = "qemu"
 
+# The one sentence that means a taken-back guest is OFF the node, compared by
+# value where the unwind is recorded structurally.
+_GUEST_DESTROYED = "the half-made guest was destroyed"
+_BREACHER_DESTROYED = "the guest was stopped and destroyed"
+
 
 class TailnetOutcome(StrEnum):
     """What a tailnet join ESTABLISHED, which is not the same as what it wanted.
@@ -265,6 +278,7 @@ class ProvisionService:
         agent_wait_s: float = 180.0,
         agent_interval: float = 3.0,
         cloud_init_wait_s: float = 300.0,
+        fence_probe_timeout_s: float = 60.0,
     ):
         self.proxmox = proxmox
         # Where the provisioning defaults are read from at RUN time (#553 C3):
@@ -301,6 +315,9 @@ class ProvisionService:
         # cloud-init's own `status --wait`. Its default first boot on a cloud
         # image is tens of seconds; a package-installing one is minutes.
         self.cloud_init_wait_s = cloud_init_wait_s
+        # The in-guest fence probe: three connect()s of four seconds each plus
+        # an interpreter start. A DROP costs the full four; an answer, none.
+        self.fence_probe_timeout_s = fence_probe_timeout_s
         self._running_tasks: set[asyncio.Task[Any]] = set()
         # task_id → in-flight asyncio.Task, so cancel() can reach the coroutine
         # that is actually talking to Proxmox (#452). Without it, a cancel only
@@ -546,6 +563,16 @@ class ProvisionService:
         # leaving the question open.
         fence: DesiredGuestNetwork | None = None
         applied_rules: list[dict[str, Any]] | None = None
+        # What the guest itself said about the fence once it was up (#648):
+        # a verdict, the sentence behind it, and the probe record. None until
+        # a fence exists to verify.
+        fence_verdict: FenceVerdict | None = None
+        fence_detail: str | None = None
+        fence_probes: list[dict[str, Any]] = []
+        # Whether qemu-guest-agent answered during the fence check, so the
+        # tailnet join does not sit through the same bounded wait twice on an
+        # image that has no agent at all. None means nobody asked yet.
+        agent_answered: bool | None = None
         # The address this run allocated for the guest (#630), or None when the
         # guest is addressed some other way (an explicit static, DHCP mode, a
         # guest that is not on the guest network at all).
@@ -673,13 +700,39 @@ class ProvisionService:
                 # reconciler fills the IP in on a later pass.
                 ip = await self._discover_ip(request.node, vmid)
 
+            # WRITTEN is not ESTABLISHED. The rules are on the tap, the NIC
+            # carries firewall=1, the datacenter firewall is on - and until
+            # here nothing had ever asked the guest whether a packet towards
+            # the operator LAN actually goes nowhere. It is asked now, from
+            # inside, before the machine is recorded or handed to anyone. A
+            # guest that CAN reach the isolated range is treated exactly like
+            # one whose rules could not be written: destroyed, loudly (#648).
+            if fence is not None:
+                step = "verify_fence"
+                (
+                    fence_verdict,
+                    fence_detail,
+                    fence_probes,
+                    agent_answered,
+                ) = await self._verify_fence(request, vmid, fence, defaults)
+                if fence_verdict is FenceVerdict.BREACHED:
+                    outcome = await self._destroy_breached(request, vmid)
+                    guest_unwound = True
+                    unwind_cleanup = "deleted" if outcome == _BREACHER_DESTROYED else "failed"
+                    raise RuntimeError(
+                        f"the fence was written but the guest reached the isolated range - "
+                        f"{fence_detail} {outcome}"
+                    )
+
             step = "record_host"
             host_id = await self._record_host(request, vmid, ip)
 
             # Best-effort like the IP discovery above: a tailnet that did not
             # come up is reported to the requester, never a failed provision.
             step = "tailscale_join"
-            tailnet, tailnet_detail = await self._join_tailnet(request, vmid)
+            tailnet, tailnet_detail = await self._join_tailnet(
+                request, vmid, agent_answered=agent_answered
+            )
 
             result = {
                 "vmid": vmid,
@@ -702,13 +755,29 @@ class ProvisionService:
                 # first live run left behind, and nobody - not the redeemer, not
                 # the operator reading the task row - could act on it.
                 "tailnet_detail": tailnet_detail or None,
+                # What the guest ITSELF said about the fence: 'verified' when a
+                # known-alive address inside the isolated range gave no answer
+                # while one outside it did, 'unverified' when nothing was
+                # established (and fence_detail says why), null when there was
+                # no fence to verify. 'breached' never reaches a succeeded
+                # task - that guest was destroyed above.
+                "fence": str(fence_verdict) if fence_verdict is not None else None,
+                "fence_detail": fence_detail or None,
                 # What fences this guest, in full. An operator asking "is my
-                # friend's box walled off" gets the ruleset that was applied,
-                # not a boolean they have to trust.
+                # friend's box walled off" gets the ruleset that was applied
+                # AND the probe that tested it, not a boolean they have to trust.
                 "guest_network_fence": (
                     None
                     if fence is None or applied_rules is None
-                    else {"vnet": fence.vnet, "rules": applied_rules}
+                    else {
+                        "vnet": fence.vnet,
+                        "rules": applied_rules,
+                        "verification": {
+                            "verdict": str(fence_verdict) if fence_verdict else None,
+                            "detail": fence_detail,
+                            "probes": fence_probes,
+                        },
+                    }
                 ),
             }
             await self.task_repo.update_task_status(
@@ -1147,7 +1216,111 @@ class ProvisionService:
                 f"and the guest could NOT be destroyed ({exc}); vmid {vmid} may still "
                 f"be on {request.node}, unfenced"
             )
-        return "the half-made guest was destroyed"
+        return _GUEST_DESTROYED
+
+    async def _destroy_breached(self, request: ProvisionRequest, vmid: int) -> str:
+        """Take back a RUNNING guest that reached the isolated range.
+
+        The same sentence as `_destroy_unfenced` and for the same reason: the
+        guest is on the operator's LAN. The difference is that this one has
+        booted, so it is stopped first - PVE refuses to destroy a running
+        guest, and a destroy that was refused would leave the breaching machine
+        up while the record said it was gone (#626).
+        """
+        try:
+            await self._stop_then_destroy(request.node, vmid)
+        except Exception as exc:
+            logger.error("Could not destroy the breaching guest %s: %s", vmid, exc)
+            return (
+                f"and the guest could NOT be destroyed ({exc}); vmid {vmid} may still "
+                f"be running on {request.node} with the isolated range in reach"
+            )
+        return _BREACHER_DESTROYED
+
+    async def _verify_fence(
+        self,
+        request: ProvisionRequest,
+        vmid: int,
+        fence: DesiredGuestNetwork,
+        defaults: ProvisioningDefaults,
+    ) -> tuple[FenceVerdict, str, list[dict[str, Any]], bool | None]:
+        """Ask the guest whether the fence holds. See `fence_verify` for the rules.
+
+        Returns (verdict, detail, probe records, agent_answered). Never raises:
+        a check that could not be run is UNVERIFIED with the reason, and the
+        provision goes on - an unverified fence is still a written one, and the
+        operator is told exactly which it is. Only BREACHED changes the run.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return FenceVerdict.UNVERIFIED, "Proxmox is not configured.", [], None
+        try:
+            return await self._probe_fence(proxmox, request, vmid, fence, defaults)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The check is evidence, never a hazard: a bug in it must not turn
+            # a fenced, booted guest into a failed provision and a destroy.
+            logger.exception("Fence check for vmid %s could not be run", vmid)
+            return (
+                FenceVerdict.UNVERIFIED,
+                f"The fence check itself failed before it could ask the guest: {exc}",
+                [],
+                None,
+            )
+
+    async def _probe_fence(
+        self,
+        proxmox: ProxmoxClient,
+        request: ProvisionRequest,
+        vmid: int,
+        fence: DesiredGuestNetwork,
+        defaults: ProvisioningDefaults,
+    ) -> tuple[FenceVerdict, str, list[dict[str, Any]], bool | None]:
+        isolated = await isolated_targets(proxmox.api_host, proxmox.api_port, fence.isolate_cidrs)
+        if not isolated:
+            verdict, detail = judge([])
+            return verdict, detail, [], None
+        targets = [
+            *isolated,
+            *control_targets(fence.gateway, defaults.nameserver, fence.isolate_cidrs),
+        ]
+        if not await self._wait_for_agent(request.node, vmid):
+            return (
+                FenceVerdict.UNVERIFIED,
+                "Nothing could be run inside the guest to check the fence. "
+                + await self._why_no_agent(request.node, vmid),
+                [],
+                False,
+            )
+        try:
+            _rc, out, _err = await proxmox.agent_run(
+                request.node, vmid, probe_script(targets), timeout_s=self.fence_probe_timeout_s
+            )
+        except TimeoutError:
+            return (
+                FenceVerdict.UNVERIFIED,
+                f"The fence probe had not finished after {self.fence_probe_timeout_s:.0f}s "
+                "inside the guest.",
+                [],
+                True,
+            )
+        except Exception as exc:
+            logger.warning("Could not run the fence probe in vmid %s: %s", vmid, exc)
+            return (
+                FenceVerdict.UNVERIFIED,
+                _safe_detail(
+                    "The guest agent answered a ping but would not run the fence probe: "
+                    f"{exc}. Some images ship qemu-guest-agent with guest-exec disabled.",
+                    None,
+                ),
+                [],
+                True,
+            )
+        results = parse_probe_output(out, targets)
+        verdict, detail = judge(results)
+        logger.info("Fence check for vmid %s: %s - %s", vmid, verdict, detail)
+        return verdict, detail, [r.as_record() for r in results], True
 
     def _build_config(
         self,
@@ -1188,7 +1361,9 @@ class ProvisionService:
             config["memory"] = request.memory_mb
         return config
 
-    async def _join_tailnet(self, request: ProvisionRequest, vmid: int) -> tuple[str | None, str]:
+    async def _join_tailnet(
+        self, request: ProvisionRequest, vmid: int, agent_answered: bool | None = None
+    ) -> tuple[str | None, str]:
         """The provision run's tailnet join: (None | 'joined' | 'failed', detail).
 
         A thin adapter over `join_tailnet`, which is the reusable one - a join
@@ -1213,6 +1388,7 @@ class ProvisionService:
                 vmid=vmid,
                 hostname=request.name,
                 key=request.tailscale_auth_key,
+                agent_answered=agent_answered,
             )
         except asyncio.CancelledError:
             raise
@@ -1227,8 +1403,21 @@ class ProvisionService:
         finally:
             self._release_join(request.node, vmid)
 
-    async def join_tailnet(self, node: str, vmid: int, hostname: str, key: str) -> tuple[str, str]:
+    async def join_tailnet(
+        self,
+        node: str,
+        vmid: int,
+        hostname: str,
+        key: str,
+        agent_answered: bool | None = None,
+    ) -> tuple[str, str]:
         """Join ONE guest to a tailnet with ONE key. Returns (TailnetOutcome, detail).
+
+        `agent_answered` is what an earlier step of the SAME run already
+        learned about qemu-guest-agent: True skips the wait it has already
+        won, False skips the wait it has already lost (an image with no agent
+        would otherwise cost the bounded wait twice), None asks afresh - which
+        is what every re-join does.
 
         NOT part of _build_config on purpose: PVE's cloud-init drive exposes no
         free-form user-data field over the API. The only cloud-init key that
@@ -1258,7 +1447,9 @@ class ProvisionService:
         # setting can be flipped without a restart and mean it.
         defaults = await provisioning_defaults(self.defaults_source)
         install_allowed = self.tailscale_install and defaults.tailscale_install
-        outcome, detail = await self._ensure_tailscale(node, vmid, install_allowed)
+        outcome, detail = await self._ensure_tailscale(
+            node, vmid, install_allowed, agent_answered=agent_answered
+        )
         if outcome is not None:
             return outcome, detail
 
@@ -1359,7 +1550,11 @@ class ProvisionService:
             )
 
     async def _ensure_tailscale(
-        self, node: str, vmid: int, install_allowed: bool
+        self,
+        node: str,
+        vmid: int,
+        install_allowed: bool,
+        agent_answered: bool | None = None,
     ) -> tuple[TailnetOutcome | None, str]:
         """Is tailscale in the guest? Install it if not.
 
@@ -1388,7 +1583,9 @@ class ProvisionService:
         # seconds after it started. Waiting is the fix; a BOUNDED wait, because
         # an image with no qemu-guest-agent at all never answers and the
         # requester must be told that rather than left watching a spinner.
-        if not await self._wait_for_agent(node, vmid):
+        if agent_answered is None:
+            agent_answered = await self._wait_for_agent(node, vmid)
+        if not agent_answered:
             # ASK WHY before naming a cause. Silence from the agent has more than
             # one explanation and they send an operator to entirely different
             # places: a template without the package, a guest that is switched

@@ -125,7 +125,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "shapes), or when a provision for the same name is already in flight. "
             "node, template_vmid, pool, storage and ipconfig0 may be omitted when the instance "
             "has provisioning defaults configured; without both a value and a default "
-            "the call is refused naming the missing setting. Admin only."
+            "the call is refused naming the missing setting. A guest on the guest vnet "
+            "gets the per-VM fence and the result then says whether the guest ITSELF "
+            "confirmed it: 'fence' is 'verified' (an address inside the isolated range "
+            "gave no answer while one outside it did), 'unverified' (nothing was "
+            "established; 'fence_detail' says why), or null (no fence to verify). A "
+            "guest that reaches the isolated range is destroyed and the provision "
+            "fails. Admin only."
         ),
         "inputSchema": {
             "type": "object",

@@ -223,7 +223,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "The outcome of ANY task this install ran - apply, replay, revoke, provision, "
             "tailnet_join, guest-template build: status, error, the execution log the "
             "runner kept, and `result`, the task's own recorded outcome (a provision's "
-            "vmid/ip/tailnet, a tailnet_join's tailnet/tailnet_detail). Pass a task_id, or "
+            "vmid/ip/tailnet/fence, a tailnet_join's tailnet/tailnet_detail). Pass a task_id, or "
             "an artifact_id to get its most recent task. Without this an agent can start "
             "work and never learn whether it succeeded. Requires read scope."
         ),

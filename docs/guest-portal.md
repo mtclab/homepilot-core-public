@@ -191,6 +191,52 @@ half-made guest**, before it ever boots. A guest on the guest wire with the
 operator's LAN in reach is the one outcome this exists to prevent, and "we
 added the rules a second later" is not a property anybody can rely on.
 
+### The fence is verified from inside the guest, not assumed from its rules
+
+Everything above is configuration: rules on the tap, `firewall=1` on the NIC,
+the datacenter switch on, an enforcing stack. All of it was true of the first
+real guest on prod - and nobody had ever run a command inside a guest and
+watched a packet towards the operator LAN go nowhere. Written is not
+established, so once the guest is up the provision **asks the guest itself**
+(through qemu-guest-agent, before the machine is recorded or handed to anyone):
+
+* open a TCP connection to an address HomePilot *knows* is alive inside the
+  isolated range - the Proxmox host it just cloned the guest through, on its
+  API port and on tcp/53. The second port exists for SELinux-enforcing images,
+  where qemu-guest-agent runs confined and gets `EPERM` on arbitrary ports
+  before a packet leaves but may open DNS; behind a DROP both ports are
+  silent, and without one the API port completes a handshake while 53 answers
+  with a reset - either proves the host was reached;
+* and to one it expects to reach outside the fence - the guest gateway's
+  resolver (tcp/53, which the fence ACCEPTs) and the guest's own nameserver.
+
+The provision result carries the verdict as `fence` and the sentence behind it
+as `fence_detail`, and `guest_network_fence.verification` records every probe:
+
+| `fence` | what was established |
+|---|---|
+| `verified` | the isolated address gave no answer while a control answered. A DROP at the tap is exactly "silence while the network is fine". |
+| `unverified` | nothing was established, and `fence_detail` says why: no qemu-guest-agent, silence on both sides (a guest with no network yet), the agent confined by SELinux (`EPERM` before a packet leaves), no python3 or bash in the image, or no known-alive address inside the isolate list to probe. The guest is still fenced by its rules; the operator is told the fence was written, not proven. |
+| `null` | the guest is not on the guest vnet, so there is no fence to verify. |
+
+A guest that **reaches** the isolated range - a completed handshake or a reset,
+either proves the host answered - is treated exactly like one whose rules could
+not be written: **the provision fails and the guest is stopped and destroyed**,
+with the address it reached in the error. `breached` never appears on a
+succeeded task. The check itself can never fail a provision: anything that goes
+wrong inside it is reported as `unverified`, with the reason.
+
+A reset is read as a reach on purpose: the fence HomePilot writes is DROP-only,
+so nothing it wrote can produce one. An operator rule of action `REJECT` that
+matches before the fence would - the guest is then destroyed and the error
+names the port that answered with a reset, which is the thing to read.
+
+The probe is only ever run when the Proxmox host resolves to an address inside
+one of the isolate CIDRs. A hypervisor reachable solely over a management
+network the fence does not cover leaves HomePilot with nothing it can vouch for,
+and it says so rather than testing against an address that may simply be
+absent - silence towards a dead host would look like a fence.
+
 ### Where the PVE calls live
 
 HomePilot does not re-implement Proxmox endpoints. The SDN and firewall calls go
