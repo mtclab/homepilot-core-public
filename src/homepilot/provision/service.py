@@ -19,6 +19,7 @@ from .fence_verify import (
     control_targets,
     isolated_targets,
     judge,
+    nothing_answered,
     parse_probe_output,
     probe_script,
 )
@@ -279,6 +280,8 @@ class ProvisionService:
         agent_interval: float = 3.0,
         cloud_init_wait_s: float = 300.0,
         fence_probe_timeout_s: float = 60.0,
+        fence_probe_retries: int = 5,
+        fence_probe_retry_s: float = 5.0,
     ):
         self.proxmox = proxmox
         # Where the provisioning defaults are read from at RUN time (#553 C3):
@@ -318,6 +321,11 @@ class ProvisionService:
         # The in-guest fence probe: three connect()s of four seconds each plus
         # an interpreter start. A DROP costs the full four; an answer, none.
         self.fence_probe_timeout_s = fence_probe_timeout_s
+        # A probe that reached NOTHING - not the isolated range, not a control -
+        # is a guest whose network is not up yet, not a verdict. It is asked
+        # again, a bounded number of times, a few seconds apart.
+        self.fence_probe_retries = fence_probe_retries
+        self.fence_probe_retry_s = fence_probe_retry_s
         self._running_tasks: set[asyncio.Task[Any]] = set()
         # task_id → in-flight asyncio.Task, so cancel() can reach the coroutine
         # that is actually talking to Proxmox (#452). Without it, a cancel only
@@ -1293,32 +1301,56 @@ class ProvisionService:
                 [],
                 False,
             )
-        try:
-            _rc, out, _err = await proxmox.agent_run(
-                request.node, vmid, probe_script(targets), timeout_s=self.fence_probe_timeout_s
+        # The agent answers long before the guest has a network: it starts
+        # early in boot, and cloud-init writes the address afterwards. The
+        # first live run of this check on dev (2026-09-02) probed a guest that
+        # had no route to anything yet and every port said UNREACH. Let
+        # cloud-init finish first (best effort, bounded), then ask - and ask
+        # again while nothing at all answers, because "no network yet" is
+        # not a fact about the fence.
+        await self._wait_for_cloud_init(request.node, vmid)
+        script = probe_script(targets)
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                _rc, out, _err = await proxmox.agent_run(
+                    request.node, vmid, script, timeout_s=self.fence_probe_timeout_s
+                )
+            except TimeoutError:
+                return (
+                    FenceVerdict.UNVERIFIED,
+                    f"The fence probe had not finished after {self.fence_probe_timeout_s:.0f}s "
+                    "inside the guest.",
+                    [],
+                    True,
+                )
+            except Exception as exc:
+                logger.warning("Could not run the fence probe in vmid %s: %s", vmid, exc)
+                return (
+                    FenceVerdict.UNVERIFIED,
+                    _safe_detail(
+                        "The guest agent answered a ping but would not run the fence probe: "
+                        f"{exc}. Some images ship qemu-guest-agent with guest-exec disabled.",
+                        None,
+                    ),
+                    [],
+                    True,
+                )
+            results = parse_probe_output(out, targets)
+            if not nothing_answered(results) or attempts > self.fence_probe_retries:
+                break
+            logger.info(
+                "Fence probe %s/%s for vmid %s reached nothing; the guest network may "
+                "not be up yet",
+                attempts,
+                self.fence_probe_retries + 1,
+                vmid,
             )
-        except TimeoutError:
-            return (
-                FenceVerdict.UNVERIFIED,
-                f"The fence probe had not finished after {self.fence_probe_timeout_s:.0f}s "
-                "inside the guest.",
-                [],
-                True,
-            )
-        except Exception as exc:
-            logger.warning("Could not run the fence probe in vmid %s: %s", vmid, exc)
-            return (
-                FenceVerdict.UNVERIFIED,
-                _safe_detail(
-                    "The guest agent answered a ping but would not run the fence probe: "
-                    f"{exc}. Some images ship qemu-guest-agent with guest-exec disabled.",
-                    None,
-                ),
-                [],
-                True,
-            )
-        results = parse_probe_output(out, targets)
+            await asyncio.sleep(self.fence_probe_retry_s)
         verdict, detail = judge(results)
+        if attempts > 1:
+            detail = f"{detail} (probed {attempts} times)"
         logger.info("Fence check for vmid %s: %s - %s", vmid, verdict, detail)
         return verdict, detail, [r.as_record() for r in results], True
 

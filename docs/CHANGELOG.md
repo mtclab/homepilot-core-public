@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.6.24 - 2026-09-02
+
+### The fence probe waits for the guest's network (#648)
+
+The first live run of 3.6.23's fence check, on dev, probed a guest whose
+cloud-init had not yet written its address: qemu-guest-agent answers long
+before the network exists, and every port came back `UNREACH`. The check now
+waits for cloud-init first (best effort, bounded), and a probe that reached
+NOTHING - not the isolated range, not a control - is repeated a few seconds
+apart, up to five more times, because "no network yet" is not a fact about the
+fence. The verdict is read off the attempt that got an answer, and the detail
+says how many times it asked.
+
+Two wording defects from the same run: the `EPERM` sentence listed every
+isolated port, including one that had said `UNREACH`; it now names only the
+ports that actually hit `EPERM`. And no route to anything is now named as what
+it is - the network was not up - rather than as a missing route to one host.
+
 ## 3.6.23 - 2026-09-02
 
 ### The fence is verified from inside the guest (#648)

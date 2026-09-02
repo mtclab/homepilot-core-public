@@ -103,12 +103,18 @@ async def db(tmp_path):
     await database.close()
 
 
-def _guest(proxmox: AsyncMock, answers: dict[str, str] | None, *, agent: bool = True) -> list[str]:
+def _guest(
+    proxmox: AsyncMock,
+    answers: dict[str, str] | list[dict[str, str]] | None,
+    *,
+    agent: bool = True,
+) -> list[str]:
     """A guest at the exec/exec-status boundary, with the REAL wait loop above it.
 
-    `answers` maps endpoint -> token for the fence probe. The fake reads the
-    targets OUT OF THE SCRIPT (`HP_TARGETS='...'`) and answers only those, so a
-    probe aimed at the wrong address gets "printed nothing" rather than a
+    `answers` maps endpoint -> token for the fence probe - or is a LIST of such
+    maps, one per probe attempt in order (the last one repeats). The fake reads
+    the targets OUT OF THE SCRIPT (`HP_TARGETS='...'`) and answers only those,
+    so a probe aimed at the wrong address gets "printed nothing" rather than a
     convenient answer. Every other script (tailscale probe, cloud-init wait,
     rm) exits 0 with no output.
     """
@@ -116,15 +122,20 @@ def _guest(proxmox: AsyncMock, answers: dict[str, str] | None, *, agent: bool = 
 
     scripts: list[str] = []
     outputs: dict[int, str] = {}
+    rounds = list(answers) if isinstance(answers, list) else [answers]
+    probes_seen = 0
 
     async def agent_exec(node, vmid, command):
+        nonlocal probes_seen
         script = command[-1]
         scripts.append(script)
         pid = len(scripts)
         m = re.search(r"HP_TARGETS='([^']*)'", script)
-        if m and answers is not None:
+        current = rounds[min(probes_seen, len(rounds) - 1)]
+        if m and current is not None:
+            probes_seen += 1
             outputs[pid] = "\n".join(
-                f"{ep} {answers[ep]}" for ep in m.group(1).split() if ep in answers
+                f"{ep} {current[ep]}" for ep in m.group(1).split() if ep in current
             )
         else:
             outputs[pid] = ""
@@ -174,6 +185,9 @@ def _service(db, proxmox, bridge: str = "innkeep", guest_network=GUEST_NETWORK) 
         agent_wait_s=0.05,
         agent_interval=0.01,
         fence_probe_timeout_s=2.0,
+        fence_probe_retries=2,
+        fence_probe_retry_s=0.01,
+        cloud_init_wait_s=0.05,
     )
     service.sdn_gateway = FakeFirewall()
 
@@ -313,6 +327,50 @@ class TestTheFenceIsAskedNotAssumed:
         result = json.loads(row["result_json"])
         assert result["fence"] == "unverified"
         assert "proves nothing" in result["fence_detail"]
+
+    async def test_the_probe_waits_for_cloud_init_before_asking(self, db, proxmox) -> None:
+        """qemu-guest-agent answers before cloud-init has written the address;
+        the first live probe on dev ran into exactly that and every port said
+        UNREACH. The cloud-init wait runs BEFORE the probe script."""
+        scripts = _guest(proxmox, {PVE: fv.TIMEOUT, PVE53: fv.TIMEOUT, GATEWAY: fv.CONNECTED})
+        row = await _run(_service(db, proxmox))
+        assert row["status"] == "succeeded", row["error"]
+        wait_at = next(i for i, s in enumerate(scripts) if s.startswith("command -v cloud-init"))
+        probe_at = next(i for i, s in enumerate(scripts) if "HP_TARGETS" in s)
+        assert wait_at < probe_at, scripts
+
+    async def test_a_guest_whose_network_is_not_up_yet_is_asked_again(self, db, proxmox) -> None:
+        """No route to ANYTHING is a guest still booting, not a verdict. The
+        probe is repeated a few seconds later, and the verdict is read off the
+        attempt that finally got an answer."""
+        not_up = {PVE: fv.EPERM, PVE53: fv.UNREACH, GATEWAY: fv.UNREACH}
+        up = {PVE: fv.EPERM, PVE53: fv.TIMEOUT, GATEWAY: fv.CONNECTED}
+        scripts = _guest(proxmox, [not_up, up])
+        row = await _run(_service(db, proxmox))
+        result = json.loads(row["result_json"])
+        assert result["fence"] == "verified", result["fence_detail"]
+        assert "probed 2 times" in result["fence_detail"]
+        assert sum("HP_TARGETS" in s for s in scripts) == 2
+        assert {
+            p["target"]: p["outcome"]
+            for p in result["guest_network_fence"]["verification"]["probes"]
+        }[GATEWAY] == fv.CONNECTED
+
+    async def test_the_retries_are_bounded_and_the_reason_is_the_network(self, db, proxmox) -> None:
+        not_up = {PVE: fv.EPERM, PVE53: fv.UNREACH, GATEWAY: fv.UNREACH}
+        scripts = _guest(proxmox, not_up)
+        row = await _run(_service(db, proxmox))
+        result = json.loads(row["result_json"])
+        assert result["fence"] == "unverified"
+        assert "network was not up" in result["fence_detail"]
+        assert "probed 3 times" in result["fence_detail"]  # 1 + fence_probe_retries
+        assert sum("HP_TARGETS" in s for s in scripts) == 3
+
+    async def test_an_answer_is_not_asked_again(self, db, proxmox) -> None:
+        """A control that answered settles the network question: one probe."""
+        scripts = _guest(proxmox, {PVE: fv.EPERM, PVE53: fv.EPERM, GATEWAY: fv.CONNECTED})
+        await _run(_service(db, proxmox))
+        assert sum("HP_TARGETS" in s for s in scripts) == 1
 
     async def test_a_confined_agent_is_unverified_naming_selinux(self, db, proxmox) -> None:
         _guest(proxmox, {PVE: fv.EPERM, PVE53: fv.EPERM, GATEWAY: fv.EPERM})
@@ -474,6 +532,30 @@ class TestTheVerdictRules:
             ]
         )
         assert got is verdict, detail
+
+    def test_eperm_names_only_the_ports_that_said_eperm(self) -> None:
+        """The first live run listed the dns port under EPERM while it had said
+        UNREACH. A misreport about WHICH port failed sends the reader after the
+        wrong cause."""
+        _, detail = fv.judge(
+            [
+                fv.ProbeResult(self.ISO, fv.EPERM),
+                fv.ProbeResult(self.ISO53, fv.UNREACH),
+                fv.ProbeResult(self.CTL, fv.CONNECTED),
+            ]
+        )
+        assert "EPERM on " + PVE + ")" in detail, detail
+        assert PVE53 not in detail.split("EPERM on")[1].split(")")[0]
+
+    def test_no_route_anywhere_is_named_as_the_network(self) -> None:
+        verdict, detail = fv.judge(
+            [
+                fv.ProbeResult(self.ISO, fv.EPERM),
+                fv.ProbeResult(self.ISO53, fv.UNREACH),
+                fv.ProbeResult(self.CTL, fv.UNREACH),
+            ]
+        )
+        assert verdict is fv.FenceVerdict.UNVERIFIED and "network was not up" in detail
 
     def test_nothing_to_probe_is_unverified(self) -> None:
         verdict, detail = fv.judge([])
