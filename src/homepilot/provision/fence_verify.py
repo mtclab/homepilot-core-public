@@ -323,8 +323,22 @@ def judge(results: list[ProbeResult]) -> tuple[FenceVerdict, str]:
             "The guest has neither python3 nor bash, so nothing inside it could open a "
             "connection to check the fence."
         )
+    if UNREACH in heads and controls and not any(r.reached for r in controls):
+        # No route to the isolated range AND to anything outside it: the
+        # guest's network was not up when it was asked. Proven live on dev
+        # 2026-09-02 - the first probe ran before cloud-init had written the
+        # static address, and every port came back UNREACH.
+        seen = ", ".join(f"{r.target.endpoint} {r.outcome}" for r in results)
+        return FenceVerdict.UNVERIFIED, (
+            f"The guest had no route to anything it was asked to reach ({seen}): its "
+            "network was not up when the probe ran, so nothing about the fence was "
+            "established."
+        )
     if EPERM in heads:
-        tried = ", ".join(r.target.endpoint for r in isolated)
+        # Only the ports that actually hit EPERM. The first live run listed
+        # every isolated port under this sentence while one of them had said
+        # UNREACH - a misreport that sent the reader after the wrong cause.
+        tried = ", ".join(r.target.endpoint for r in isolated if r.outcome == EPERM)
         return FenceVerdict.UNVERIFIED, (
             f"The guest forbade the probe before a packet left it (EPERM on {tried}) - on "
             "an SELinux-enforcing image qemu-guest-agent runs confined and may not open "
@@ -345,6 +359,18 @@ def judge(results: list[ProbeResult]) -> tuple[FenceVerdict, str]:
     )
 
 
+def nothing_answered(results: list[ProbeResult]) -> bool:
+    """True when NO target answered - the shape of a guest whose network is
+    not up yet, and the only shape worth asking again about. A control that
+    answered, or an isolated port that did, is an answer; a probe that could
+    not run at all (NOTOOL) will not improve with time."""
+    if not results:
+        return False
+    if any(r.reached for r in results):
+        return False
+    return not all(r.outcome == NOTOOL for r in results)
+
+
 __all__ = [
     "CONNECTED",
     "EPERM",
@@ -360,6 +386,7 @@ __all__ = [
     "control_targets",
     "isolated_targets",
     "judge",
+    "nothing_answered",
     "parse_probe_output",
     "probe_script",
 ]

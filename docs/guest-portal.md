@@ -210,6 +210,10 @@ established, so once the guest is up the provision **asks the guest itself**
 * and to one it expects to reach outside the fence - the guest gateway's
   resolver (tcp/53, which the fence ACCEPTs) and the guest's own nameserver.
 
+The probe runs after cloud-init has finished (the agent answers before the
+network exists), and a probe that reached nothing at all is repeated a few
+seconds apart, a bounded number of times, before "no network yet" is reported.
+
 The provision result carries the verdict as `fence` and the sentence behind it
 as `fence_detail`, and `guest_network_fence.verification` records every probe:
 
