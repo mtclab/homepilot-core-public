@@ -33,6 +33,7 @@ import pytest
 from pydantic import ValidationError
 
 from homepilot.config import ConfigError, Settings
+from tests.tree import shipped
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,7 +45,8 @@ _SKIP_DIRS = frozenset(
 # The templates this repo ships today. Discovery below must find at least
 # these, so a broken walk cannot pass the gate by finding nothing.
 _KNOWN_TEMPLATES = frozenset(
-    {".env.example", ".env.example.agent", "deploy/control-plane/.env.example"}
+    p.relative_to(_REPO_ROOT).as_posix()
+    for p in shipped(".env.example", ".env.example.agent", "deploy/control-plane/.env.example")
 )
 
 # `KEY=` followed by nothing but whitespace and then `#`, on an active line or

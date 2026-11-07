@@ -23,14 +23,16 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.tree import shipped
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_COMPOSE_FILES = (
-    _REPO_ROOT / "docker-compose.yml",
-    _REPO_ROOT / "docker-compose.agent.yml",
-    _REPO_ROOT / "deploy" / "control-plane" / "docker-compose.yml",
+_COMPOSE_FILES = shipped(
+    "docker-compose.yml",
+    "docker-compose.agent.yml",
+    "deploy/control-plane/docker-compose.yml",
 )
 _MAIN_COMPOSE = _REPO_ROOT / "docker-compose.yml"
-_ENV_TEMPLATES = (_REPO_ROOT / ".env.example", _REPO_ROOT / ".env.example.agent")
+_ENV_TEMPLATES = shipped(".env.example", ".env.example.agent")
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "[::1]", "localhost"})
 
 
