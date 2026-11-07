@@ -105,6 +105,23 @@ class ArtifactTransitionManager:
         except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
             _logger.exception("DB sync failed for artifact %s: %s", artifact_id, exc)
 
+    async def _forget_drift_verdict(self, artifact_id: str) -> None:
+        """An artifact that leaves the drift universe takes its verdict with it.
+
+        The drift loop re-checks `applied` only, so a revoked artifact's row was
+        frozen at its last check and went on being counted: dev's Overview said
+        "2 artifacts disagree" for one real drift and one revoked artifact.
+        Best-effort, like the DB sync above - the status change is the record;
+        the dashboard also joins on active status, so a row left behind by a
+        failed delete is still not counted.
+        """
+        if self._db is None or not hasattr(self._db, "delete_drift_check"):
+            return
+        try:
+            await self._db.delete_drift_check(artifact_id)
+        except sqlite3.OperationalError as exc:
+            _logger.warning("Could not drop the drift verdict of %s: %s", artifact_id, exc)
+
     async def approve(
         self,
         id: str,
@@ -503,6 +520,7 @@ class ArtifactTransitionManager:
             self.file_store.write(old_id, fm_yml, body, "supersede")
         await self._audit("supersede", old_id)
         await self._sync_to_db(old_id, fm)
+        await self._forget_drift_verdict(old_id)
 
     async def revoke(self, id: str, user: str, reason: str | None = None) -> None:
         with self.file_store.file_lock(id):
@@ -520,3 +538,4 @@ class ArtifactTransitionManager:
             self.file_store.write(id, fm_yml, body, "revoke")
         await self._audit("revoke", id, user)
         await self._sync_to_db(id, fm)
+        await self._forget_drift_verdict(id)

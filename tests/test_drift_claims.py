@@ -93,7 +93,9 @@ class TestProxmoxApiDriftSaysWhatItEstablished:
             result = await _verify_proxmox_api("a", FM, PVE_BODY, _executor())
 
         assert str(result.state) == "unknown"
-        assert result.details["reason"] == "nothing_evaluated"
+        # Asked and unanswered is a failed probe, not "nothing to compare": the
+        # Overview reads `nothing_evaluated` as describe-only (fine).
+        assert result.details["reason"] == "probe_failed"
 
 
 HTTP_BODY = """

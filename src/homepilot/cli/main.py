@@ -3914,6 +3914,10 @@ def agent_bootstrap_cmd(
                     f"HP_AGENT_AUTH_TOKEN={token} "
                     f"hp-agent"
                 ),
+                # The same server-built one-liner the Hosts page shows: installer
+                # and binary from this control plane (lane A3).
+                "install_command": data.get("install_command"),
+                "install_source": data.get("install_source"),
             }
         )
     else:
@@ -3927,6 +3931,17 @@ def agent_bootstrap_cmd(
             f"hp-agent"
         )
         console.print(Panel(cmd, title="Agent command", subtitle="Run on managed host"))
+        install = data.get("install_command")
+        if install:
+            from rich.text import Text
+
+            console.print(
+                Panel(
+                    Text(str(install)),  # a literal command, never Rich markup
+                    title="Install + enrol (run as root on the host)",
+                    subtitle=f"from {data.get('install_source') or 'the control plane'}",
+                )
+            )
 
 
 @agent_app.command("enrolment-window")

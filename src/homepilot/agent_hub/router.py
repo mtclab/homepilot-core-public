@@ -32,6 +32,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+# The agent payload (installer + binary). Mounted by main.py WITHOUT the
+# app-wide `require_token`: the host fetching it holds an enrolment credential
+# (the shared hub token or a bootstrap token), never an API token, and
+# `_enrolment_credential` - which also takes an admin API token - is its gate.
+# Behind `require_token` every such fetch was refused with a 401 before that gate
+# ran, so `--hp-api` installs (the panel one-liner and zero-touch) never worked
+# on a real install; every test built the router alone with `require_token`
+# overridden and so never saw it (3.7.0-rc2 dev walk).
+dist_router = APIRouter(prefix="/agents", tags=["agents"])
 
 _admin_only = Depends(require_scope("admin"))
 _admin_token = Depends(require_scope("admin"))
@@ -340,7 +349,38 @@ async def get_hub_token(request: Request) -> dict[str, Any]:
         "hub_host": host,
         "hub_port": port,
         **_hub_tls_fields(hub),
+        **_install_fields(hub, host, port, token),
     }
+
+
+def _install_fields(hub: Any, host: str, port: int, token: str) -> dict[str, Any]:
+    """The paste-ready install one-liner for this hub and this token (05/1).
+
+    Built server-side so the command, the control plane's ability to serve the
+    payload, and the fallback decision are one tested function
+    (``dist.install_command``) instead of string concatenation in a component.
+    ``install_command`` is ``None`` when the advertised hub address is not a
+    valid host - a root ``curl | bash`` must never carry an unvalidated value.
+    """
+    from .. import __version__
+    from .dist import install_command
+
+    if not token or not _is_valid_hub_host(host):
+        return {
+            "install_command": None,
+            "install_source": None,
+            "install_version": None,
+            "install_fallback_reason": None,
+        }
+    tls = _hub_tls_fields(hub)
+    return install_command(
+        hub_host=host,
+        hub_port=port,
+        token=token,
+        tls=bool(tls.get("hub_tls")),
+        pin=str(tls.get("hub_cert_sha256") or ""),
+        control_version=__version__,
+    )
 
 
 class MigrateTLSRequest(BaseModel):
@@ -351,11 +391,18 @@ class MigrateTLSRequest(BaseModel):
 
 
 async def _enrolment_credential(request: Request) -> None:
-    """Accept the hub's enrolment token, or an unexpired ADMIN API token.
+    """Accept the hub's enrolment token, a live bootstrap token, or an unexpired
+    ADMIN API token.
 
     The guest fetching this payload holds exactly the enrolment token and nothing
     else - that is the whole reason the control plane serves it (#464) - so that
-    is the credential this route is built around. An API token is also accepted,
+    is the credential this route is built around. "The enrolment token" is
+    whichever one the host was given: the shared fleet token, or the single-use
+    bootstrap token the UI one-liner and the zero-touch install both hand out.
+    A bootstrap token is only CHECKED here, not consumed - the register that
+    follows is what spends it. It used to be refused outright, so every install
+    that pointed `--hp-api` at this control plane with a bootstrap token died on
+    a 401 before the binary was fetched. An API token is also accepted,
     for the operator running the one-liner by hand - held to the same terms as
     every other enrolment surface (bootstrap, install, the enrolment window are
     all admin): not expired, and admin scope. It used to be prefix + hash only,
@@ -379,6 +426,9 @@ async def _enrolment_credential(request: Request) -> None:
     hub = getattr(registry, "hub_server", None) if registry is not None else None
     hub_token = str(getattr(hub, "auth_token", "") or "")
     if hub_token and secrets.compare_digest(presented, hub_token):
+        return
+    token_store = getattr(hub, "_token_store", None) if hub is not None else None
+    if token_store is not None and token_store.verify(presented):
         return
 
     repo = getattr(request.app.state, "repo", None)
@@ -437,7 +487,7 @@ def _dist_response(path: Path, media_type: str) -> FileResponse:
     )
 
 
-@router.get("/dist/install-agent.sh", dependencies=[_enrolment_only])
+@dist_router.get("/dist/install-agent.sh", dependencies=[_enrolment_only])
 async def agent_installer() -> FileResponse:
     """The installer, served by the control plane doing the enrolling.
 
@@ -454,7 +504,7 @@ async def agent_installer() -> FileResponse:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/dist/hp-agent-linux-{arch}", dependencies=[_enrolment_only])
+@dist_router.get("/dist/hp-agent-linux-{arch}", dependencies=[_enrolment_only])
 async def agent_binary_download(arch: str) -> FileResponse:
     """The architecture-matched agent binary, from this image."""
     from .dist import DistUnavailableError, agent_binary
@@ -515,19 +565,35 @@ async def migrate_fleet_tls(request: Request, body: MigrateTLSRequest) -> dict[s
 # from any origin. Minting is a mutation; it gets a mutating method and the CSRF
 # gate that comes with it.
 @router.post("/bootstrap", dependencies=[_admin_only])
-async def create_bootstrap_token(request: Request) -> dict[str, Any]:
+async def create_bootstrap_token(
+    request: Request, caller: dict[str, Any] = _admin_token
+) -> dict[str, Any]:
     registry = _get_registry()
     hub = registry.hub_server
     if hub is None:
         raise HTTPException(status_code=503, detail="Agent hub server not available")
-    token = await hub._token_store.create()
+    token = await hub._token_store.create(minted_by=_caller_label(caller))
     host, port = _advertised_hub(request, hub.host, hub.port)
     return {
         "bootstrap_token": token,
         "hub_host": host,
         "hub_port": port,
         **_hub_tls_fields(hub),
+        **_install_fields(hub, host, port, token),
     }
+
+
+@router.get("/enrolment-requests", dependencies=[_read_only])
+async def get_enrolment_requests(request: Request) -> dict[str, Any]:
+    """Who is knocking and being refused, which bootstrap tokens are still out,
+    and the window state that decides whether a knocking host gets in (05/3).
+
+    Hostnames, peer addresses and refusal reasons only: nothing a refused peer
+    presented as a credential is stored, and pending tokens are listed by a
+    hash prefix."""
+    from .join_requests import payload as join_payload
+
+    return await join_payload(_window_repo(request))
 
 
 # ── Enrolment window (#537) ──────────────────────────────────────────────────

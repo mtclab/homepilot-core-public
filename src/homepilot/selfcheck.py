@@ -246,11 +246,16 @@ def _events_webhook_subsystem(settings: Any) -> Subsystem:
         # nothing else - and, unlike artifacts and tasks, an alert leaves no
         # durable record to look at afterwards. That is the consequence this
         # line exists to state (#642, #648 tranche 5).
+        # Alerts have their own record now (alert_events, #660) and their own
+        # native channel (the `notifications` line below), so this line no
+        # longer claims a resolved alert vanishes - it says what the webhook
+        # alone would have carried.
         off=(
-            "Nothing is forwarded anywhere because no events webhook is configured. "
-            "That includes ALERTS: a firing alert reaches the log and an open browser "
-            "and nowhere else, and it leaves no record once it resolves. Artifact and "
-            "task events are still recorded and shown in the UI."
+            "No events webhook is configured, so no event is forwarded anywhere by "
+            "webhook (an external router such as n8n). ALERTS are still recorded in the "
+            "alert history and "
+            "reach any notification channel (see `notifications`); artifact and task "
+            "events are still recorded and shown in the UI."
         ),
         ok=(
             f"Events, including firing and resolved alerts, are posted to {target}, "
@@ -262,6 +267,79 @@ def _events_webhook_subsystem(settings: Any) -> Subsystem:
             "connections. Every artifact, task and ALERT notification is lost."
         ),
         probe=probe if url else None,
+    )
+
+
+def _notifications_subsystem(state: Any) -> Subsystem:
+    """Does a firing alert reach a person? (#660, review 03 step 3)
+
+    Read from the channels' own delivery record - the last test or real alert -
+    rather than by sending something: a self-check that buzzes the operator's
+    phone on every boot would be muted within a day. "Configured, never
+    delivered" is its own answer, not "ok"."""
+    notifier = getattr(state, "notifier", None)
+
+    async def probe() -> bool | ProbeVerdict:
+        if notifier is None:
+            return ProbeVerdict(
+                STATE_UNKNOWN, "No notifier is wired in, so channel delivery cannot be read."
+            )
+        every = await notifier.summary()
+        if not every:
+            return ProbeVerdict(
+                STATE_OFF,
+                "No notification channel is configured, so a firing alert reaches this "
+                "console and the alert history and no phone. Add an ntfy topic in "
+                "Settings -> Monitoring.",
+            )
+        channels = [c for c in every if c["enabled"]]
+        if not channels:
+            return ProbeVerdict(
+                STATE_OFF,
+                "Every notification channel is disabled, so a firing alert reaches this "
+                "console and its history and no phone.",
+            )
+        failing = [c for c in channels if c["state"] == "failing"]
+        untested = [c for c in channels if c["state"] == "untested"]
+        ok = [c for c in channels if c["state"] == "ok"]
+        if failing:
+            names = ", ".join(c["name"] for c in failing)
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                f"{len(failing)} of {len(channels)} channel(s) failed their LAST delivery: "
+                f"{names}. Alerts sent there are not arriving. The error is on the channel "
+                "in Settings -> Monitoring; press Send test once it is fixed.",
+            )
+        if not ok:
+            names = ", ".join(c["name"] for c in untested)
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"Channel(s) {names} have never delivered anything, so nothing proves an "
+                "alert would arrive. Press Send test in Settings -> Monitoring.",
+            )
+        newest = max(str(c["last_ok_at"]) for c in ok)
+        age = _age_seconds(newest)
+        when = f"{_humanise(age)} ago" if age is not None else f"at {newest}"
+        extra = f" ({len(untested)} more never tested)" if untested else ""
+        return ProbeVerdict(
+            STATE_OK,
+            f"Alerts go to {len(ok)} channel(s): {', '.join(c['name'] for c in ok)}{extra}; "
+            f"the last delivery succeeded {when}.",
+        )
+
+    configured = notifier is not None
+    return Subsystem(
+        name="notifications",
+        label="the notification channels",
+        configured=configured,
+        target="",
+        off=(
+            "No notification channel is wired in, so a firing alert reaches this "
+            "console, its history and any events webhook - and no phone."
+        ),
+        ok="Alerts are delivered to the configured notification channels.",
+        broken="The last delivery to a notification channel failed.",
+        probe=probe if configured else None,
     )
 
 
@@ -749,6 +827,7 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _vault_subsystem(state),
         _embeddings_subsystem(settings, state),
         _events_webhook_subsystem(settings),
+        _notifications_subsystem(state),
         _mcp_subsystem(state),
         _artifacts_remote_subsystem(state, settings),
         _reconcilers_subsystem(state),
@@ -803,6 +882,11 @@ async def _evaluate(subsystem: Subsystem, timeout: float) -> dict[str, Any]:
     if isinstance(reachable, ProbeVerdict):
         entry["state"] = reachable.state
         entry["consequence"] = reachable.consequence
+        if reachable.state == STATE_OFF:
+            # A probe may find there is nothing configured after all (no
+            # notification channel yet); `off` and `configured` must agree.
+            entry["configured"] = False
+            entry["target"] = ""
         return entry
 
     entry["state"] = STATE_OK if reachable else STATE_UNREACHABLE

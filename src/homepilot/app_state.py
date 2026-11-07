@@ -10,6 +10,7 @@ from .config import get_settings
 from .db.connection import Database
 from .db.migrations import run_migrations
 from .db.repository import Repository
+from .notifications import Notifier
 
 if TYPE_CHECKING:
     from .agent_hub.registry import AgentRegistry
@@ -59,6 +60,10 @@ class AppState:
     agent_hub: Any = None
     agent_registry: Any = None
     metrics_repo: Any = None
+    # Native alert channels (#660). Built beside the metrics repo so every
+    # surface - the evaluator, the admin routes, the MCP tools and the
+    # self-check - talks to ONE notifier.
+    notifier: Any = None
     # The mounted MCP Starlette app, assigned by main.py once it exists. The
     # selfcheck report reads it to say whether the MCP transport is RUNNING, so
     # a state object without it reports MCP as broken - which is why it is a
@@ -451,5 +456,6 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         agent_hub=agent_hub,
         agent_registry=agent_registry,
         metrics_repo=metrics_repo,
+        notifier=Notifier(database, vault, metrics_repo=metrics_repo),
         agent_hub_disabled_reason=agent_hub_disabled_reason,
     )

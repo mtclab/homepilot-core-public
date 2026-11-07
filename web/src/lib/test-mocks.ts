@@ -97,6 +97,20 @@ vi.mock('$lib/api', async () => {
 			bulkHosts: vi.fn(),
 			listAgents: vi.fn().mockResolvedValue([]),
 			listFiringAlerts: vi.fn().mockResolvedValue({ items: [] }),
+			// Alert history + channels (#660). Empty by default: no event, no channel.
+			listAlertEvents: vi.fn().mockResolvedValue({
+				items: [],
+				total: 0,
+				since: '2026-01-01T00:00:00Z',
+				hours: 24,
+				hostname: null,
+				channels: [],
+			}),
+			listNotificationChannels: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			createNotificationChannel: vi.fn(),
+			setNotificationChannelEnabled: vi.fn(),
+			deleteNotificationChannel: vi.fn(),
+			testNotificationChannel: vi.fn(),
 			listAlertRules: vi.fn().mockResolvedValue({ items: [] }),
 			listWebhooks: vi.fn().mockResolvedValue({ items: [], total: 0, event_types: [], wildcard: '*' }),
 			createWebhook: vi.fn(),
@@ -109,6 +123,12 @@ vi.mock('$lib/api', async () => {
 			getHostSeries: vi.fn().mockResolvedValue({ hostname: '', metric: '', points: [] }),
 			getHubToken: vi.fn(),
 			getBootstrapToken: vi.fn(),
+			getEnrolmentRequests: vi.fn().mockResolvedValue({
+				attempts: [],
+				pending_tokens: [],
+				window: { open: false, expires_at: null, seconds_remaining: 0, fleet_empty: false },
+				summary: { wants_to_join: 0, refused: 0, pending_tokens: 0, expired_unused_tokens: 0 },
+			}),
 			// The enrolment window (#537): the enrol panel reads it on mount, so a
 			// default that resolves keeps every OTHER page test out of it.
 			getEnrolmentWindow: vi.fn().mockResolvedValue({

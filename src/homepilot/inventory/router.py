@@ -227,14 +227,38 @@ async def list_inventory(
             # nosec B608 - only `?` placeholders are interpolated (one per id);
             # every VALUE goes through bound parameters. Bandit sees an f-string
             # near SQL and cannot tell placeholders from data.
-            f"SELECT agent_id, connected, system_info FROM agents WHERE agent_id IN ({marks})",  # nosec B608
+            "SELECT agent_id, connected, system_info, disconnected_at, last_heartbeat "
+            f"FROM agents WHERE agent_id IN ({marks})",  # nosec B608
             agent_ids,
         )
         by_id = {a["agent_id"]: a for a in agents}
+        # Connected means dialled in to THIS hub now - the live registry, the
+        # same source /dashboard/summary and /agents/ answer from (#469). The
+        # `connected` column stays 1 for an agent that vanished without a clean
+        # goodbye (a killed process, a backend restart), so believing it here
+        # let the Overview say "no agent is connected" above per-host lines all
+        # reading connected. The column is only the fallback when no hub runs.
+        from ..app_state import get_agent_registry
+
+        # The app's own registry first (the one its hub registers into), the
+        # process singleton otherwise - the same pair GET /agents/ consults.
+        registry = getattr(request.app.state, "agent_registry", None) or get_agent_registry()
+        live_ids = (
+            {a["agent_id"] for a in registry.list_connected()} if registry is not None else None
+        )
         for h in hosts:
             a = by_id.get(h.get("agent_id") or "")
             if a is not None:
-                h["agent_connected"] = bool(a["connected"])
+                connected = (
+                    a["agent_id"] in live_ids if live_ids is not None else bool(a["connected"])
+                )
+                h["agent_connected"] = connected
+                # Since when the channel has been dark: the clean goodbye if
+                # there was one, else the last heartbeat heard. A 30 s blip and
+                # a week-long outage must not read as the same line.
+                h["agent_offline_since"] = (
+                    None if connected else (a["disconnected_at"] or a["last_heartbeat"])
+                )
                 try:
                     h["agent_version"] = _json.loads(a["system_info"] or "{}").get("agent_version")
                 except (ValueError, TypeError):

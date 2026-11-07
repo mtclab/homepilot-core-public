@@ -12,6 +12,7 @@
 	// operator can see which of the three is in force.
 	import AlertRules from '$lib/components/AlertRules.svelte';
 	import WebhooksPanel from '$lib/components/WebhooksPanel.svelte';
+	import NotificationChannels from '$lib/components/NotificationChannels.svelte';
 	import SettingFields from '$lib/components/SettingFields.svelte';
 	import GuestNetworkCard from '$lib/components/GuestNetworkCard.svelte';
 	import GuestsPanel from '$lib/components/GuestsPanel.svelte';
@@ -698,6 +699,17 @@
 			<div class="card space-y-3 max-w-3xl">
 				<h2 class="section-title">Monitoring</h2>
 				<AlertRules />
+			</div>
+			<div class="card space-y-3 max-w-3xl mt-4">
+				<h2 class="section-title">Notification channels</h2>
+				{#if sessionIsAdmin}
+					<NotificationChannels />
+				{:else}
+					<p class="prose-note text-xs">
+						Channels decide who is woken up for an alert, and their URLs are
+						credentials, so they need an admin session.
+					</p>
+				{/if}
 			</div>
 			<div class="card space-y-3 max-w-3xl mt-4">
 				<h2 class="section-title">Webhooks</h2>

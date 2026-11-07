@@ -9,6 +9,11 @@
 	import { metricLabel } from '$lib/sparkline';
 
 	const RULE_METRICS = ['load.1m', 'load.5m', 'load.15m', 'memory.free_gb', 'disk.free_gb'];
+	// Not a metric: picking it makes a `nodata` rule (#660) - an enrolled host
+	// that has reported nothing for the duration. It takes no threshold.
+	const NODATA = '__nodata';
+	// The agent reports once a minute; the backend refuses anything shorter.
+	const NODATA_MIN_MINUTES = 2;
 
 	let rules: AlertRule[] = [];
 	let savingRule = false;
@@ -44,14 +49,21 @@
 		}
 		savingRule = true;
 		try {
-			await api.createAlertRule({
+			const common = {
 				name: draft.name.trim(),
-				metric: draft.metric,
-				comparison: draft.comparison,
-				threshold: Number(draft.threshold),
 				for_seconds: Math.round(Number(draft.for_minutes) * 60),
 				host_filter: draft.host_filter.trim() || '*'
-			});
+			};
+			await api.createAlertRule(
+				draft.metric === NODATA
+					? { ...common, kind: 'nodata' }
+					: {
+							...common,
+							metric: draft.metric,
+							comparison: draft.comparison,
+							threshold: Number(draft.threshold)
+						}
+			);
 			draft = { ...draft, name: '' };
 			await loadRules();
 			notify('Alert rule created', 'ok');
@@ -92,11 +104,14 @@
 	async function saveEdit(rule: AlertRule) {
 		savingRule = true;
 		try {
-			await api.updateAlertRule(rule.id, {
-				comparison: edit.comparison,
-				threshold: Number(edit.threshold),
-				for_seconds: Math.round(Number(edit.for_minutes) * 60)
-			});
+			const for_seconds = Math.round(Number(edit.for_minutes) * 60);
+			// A nodata rule has no comparison or threshold to retune.
+			await api.updateAlertRule(
+				rule.id,
+				rule.kind === 'nodata'
+					? { for_seconds }
+					: { comparison: edit.comparison, threshold: Number(edit.threshold), for_seconds }
+			);
 			editingId = null;
 			await loadRules();
 			notify('Alert rule updated', 'ok');
@@ -123,11 +138,12 @@
 	<p class="prose-note prose-measure text-xs">
 		An alert rule watches one metric on one host - or on all of them - and fires
 		only when its condition has held for the whole duration, so a single spike
-		never raises one. Firing and recovery both go out as events; firing alerts
-		show on the Overview and on the affected host. There is no mail and no
-		pager: to get an alert off this box, point the events webhook at something
-		(Settings → Subsystems). Until you do, a firing alert reaches the log and
-		this console and nowhere else, and it leaves no record once it resolves.
+		never raises one. A <em>nothing heard</em> rule instead fires when a host with
+		an agent stops reporting at all - "host went dark" - and not for a guest the
+		hypervisor reports stopped. Firing and recovery are kept in the alert history,
+		shown on the Overview and on the affected host, and pushed to the notification
+		channels below;
+		with no channel, they reach this console and nowhere else.
 	</p>
 	<!-- One line instead of six ragged notes under six narrow inputs: the row
 	     already reads left to right, so saying so explains every field at once
@@ -156,23 +172,32 @@
 				{#each RULE_METRICS as m (m)}
 					<option value={m}>{metricLabel(m)}</option>
 				{/each}
+				<option value={NODATA}>Nothing heard (host went dark)</option>
 			</select>
 		</label>
-		<label class="flex flex-col gap-1">
-			<span class="field-label">Is</span>
-			<select class="input" bind:value={draft.comparison}>
-				{#each Object.entries(COMPARISON_LABELS) as [value, label] (value)}
-					<option {value}>{label}</option>
-				{/each}
-			</select>
-		</label>
-		<label class="flex flex-col gap-1">
-			<span class="field-label">Threshold</span>
-			<input class="input num w-20" type="number" step="0.1" bind:value={draft.threshold} />
-		</label>
+		{#if draft.metric !== NODATA}
+			<label class="flex flex-col gap-1">
+				<span class="field-label">Is</span>
+				<select class="input" bind:value={draft.comparison}>
+					{#each Object.entries(COMPARISON_LABELS) as [value, label] (value)}
+						<option {value}>{label}</option>
+					{/each}
+				</select>
+			</label>
+			<label class="flex flex-col gap-1">
+				<span class="field-label">Threshold</span>
+				<input class="input num w-20" type="number" step="0.1" bind:value={draft.threshold} />
+			</label>
+		{/if}
 		<label class="flex flex-col gap-1">
 			<span class="field-label">For (minutes)</span>
-			<input class="input num w-20" type="number" min="0" step="1" bind:value={draft.for_minutes} />
+			<input
+				class="input num w-20"
+				type="number"
+				min={draft.metric === NODATA ? NODATA_MIN_MINUTES : 0}
+				step="1"
+				bind:value={draft.for_minutes}
+			/>
 		</label>
 		<label class="flex flex-col gap-1">
 			<span class="field-label">Host (* = all)</span>
@@ -205,19 +230,23 @@
 							     Metric and host stay fixed here - change those by making a new
 							     rule - but the numbers you actually tune are inline (#593). -->
 							<td class="text-muted">
-								{metricLabel(r.metric)}
-								<select class="input" bind:value={edit.comparison} aria-label="Comparison">
-									{#each Object.entries(COMPARISON_LABELS) as [value, label] (value)}
-										<option {value}>{label}</option>
-									{/each}
-								</select>
-								<input
-									class="input num w-20"
-									type="number"
-									step="0.1"
-									bind:value={edit.threshold}
-									aria-label="Threshold"
-								/>
+								{#if r.kind === 'nodata'}
+									nothing heard
+								{:else}
+									{metricLabel(r.metric)}
+									<select class="input" bind:value={edit.comparison} aria-label="Comparison">
+										{#each Object.entries(COMPARISON_LABELS) as [value, label] (value)}
+											<option {value}>{label}</option>
+										{/each}
+									</select>
+									<input
+										class="input num w-20"
+										type="number"
+										step="0.1"
+										bind:value={edit.threshold}
+										aria-label="Threshold"
+									/>
+								{/if}
 								for
 								<input
 									class="input num w-16"
@@ -230,9 +259,13 @@
 								min
 							</td>
 						{:else}
-							<td class="text-muted">
-								{metricLabel(r.metric)} {COMPARISON_LABELS[r.comparison]}
-								<span class="num-inline text-ink">{r.threshold}</span>
+							<td class="text-muted" data-rule-condition>
+								{#if r.kind === 'nodata'}
+									nothing heard from a host with an agent
+								{:else}
+									{metricLabel(r.metric)} {COMPARISON_LABELS[r.comparison]}
+									<span class="num-inline text-ink">{r.threshold}</span>
+								{/if}
 								for {Math.round(r.for_seconds / 60)} min
 							</td>
 						{/if}

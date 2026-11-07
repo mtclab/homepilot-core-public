@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 from pathlib import Path
+from typing import Any
 
 # Where the image puts the payload (see the Dockerfile). Overridable so tests -
 # and a source checkout, which has no built binaries - can point somewhere real.
@@ -122,3 +124,113 @@ def manifest() -> dict[str, dict[str, object]]:
                 "size_bytes": path.stat().st_size,
             }
     return entries
+
+
+# ── The by-hand install one-liner (lane A3, review 05/1) ─────────────────────
+#
+# The Hosts page used to render a one-liner that fetched the installer from
+# GitHub `releases/latest`, and the installer then pulled the binary from there
+# too: `--hp-api` existed but the UI never passed it. So a host installed by
+# hand ran "whatever GitHub's latest release is", not the version of the hub
+# that enrolled it - the two matched only by accident of release timing. The
+# command is built HERE, on the server that knows whether it can serve the
+# payload, and the UI shows it verbatim.
+
+# The public mirror the fallback names. Used ONLY when this control plane cannot
+# serve the payload itself (a source checkout with no built binaries), and then
+# pinned to THIS control plane's release, never `latest`.
+PUBLIC_RELEASES = "https://github.com/mtclab/homepilot-core-public/releases"
+
+
+def api_base_for(hub_host: str) -> str:
+    """The HomePilot API address a host being enrolled reaches the control plane
+    on: the advertised hub host on the API port.
+
+    One answer for both install paths (the zero-touch install stages the same
+    value), so a by-hand install and an automatic one fetch from one place.
+    """
+    from ..config import get_settings
+
+    host = hub_host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # a bare IPv6 literal needs brackets inside a URL
+    return f"http://{host}:{get_settings().daemon_port}"
+
+
+def control_plane_can_serve() -> tuple[bool, str]:
+    """Whether a host can install entirely from this control plane: the
+    installer plus at least one agent binary. Returns ``(ok, why_not)``."""
+    entries = manifest()
+    if not entries[INSTALLER_NAME]["available"]:
+        return False, str(entries[INSTALLER_NAME]["reason"])
+    arches = sorted(set(ARCH_ALIASES.values()))
+    if not any(entries[f"hp-agent-linux-{arch}"]["available"] for arch in arches):
+        return False, "no hp-agent binary is in this image"
+    return True, ""
+
+
+# Printed when the one-liner fails, after whatever curl or the installer said.
+INSTALL_FAILED_MESSAGE = "HomePilot agent install FAILED - see the error above"
+
+
+def install_command(
+    *,
+    hub_host: str,
+    hub_port: int,
+    token: str,
+    tls: bool,
+    pin: str,
+    control_version: str,
+) -> dict[str, Any]:
+    """The one-liner an operator pastes on a host, and where it installs from.
+
+    ``source`` is ``"control_plane"`` (the normal case: installer and binary
+    both come from this HomePilot, so the agent IS this hub's version and the
+    host needs no internet) or ``"github"`` (the documented fallback, with
+    ``fallback_reason`` saying why, pinned to ``control_version``).
+
+    Every value is shell-quoted: the shared token is operator-settable and this
+    string is pasted into a root shell.
+    """
+    hub = f"{hub_host}:{hub_port}"
+    flags = ["--hub", hub, "--token", token]
+    if tls:
+        flags += ["--tls-pin", f"sha256:{pin}"] if pin else ["--tls"]
+    ok, why_not = control_plane_can_serve()
+    if ok:
+        api = api_base_for(hub_host)
+        fetch = [
+            "curl",
+            "-fsSL",
+            "-H",
+            f"x-hp-agent-token: {token}",
+            f"{api}/agents/dist/{INSTALLER_NAME}",
+        ]
+        run = ["--hp-api", api, *flags]
+        source, reason, version_note = "control_plane", None, control_version
+    else:
+        tag = f"v{control_version.lstrip('v')}"
+        fetch = ["curl", "-fsSL", f"{PUBLIC_RELEASES}/download/{tag}/{INSTALLER_NAME}"]
+        run = ["--version", tag, *flags]
+        source, reason, version_note = "github", why_not, tag
+    # Downloaded to a file and run from it, never `curl ... | bash`: in a pipe
+    # the shell reports bash's status, and bash given nothing (curl refused,
+    # 401) exits 0 - the 3.7.0-rc2 dev walk printed one curl error, returned
+    # success and left the old agent in place. Each step is chained with `&&`,
+    # NOT `set -e`: bash ignores `set -e` inside a subshell that is the left
+    # side of `||`, so a refused fetch would run the empty file and "succeed"
+    # all the same. A failed step ends the subshell with its own status, the
+    # line after `||` says so in words, and a root shell the operator pasted
+    # into stays open. The token is in curl's and the installer's argv exactly
+    # as before.
+    command = (
+        f'( f="$(mktemp)" && trap \'rm -f "$f"\' EXIT && '
+        f'{shlex.join(fetch)} -o "$f" && bash "$f" {shlex.join(run)} ) '
+        f"|| {{ echo {shlex.quote(INSTALL_FAILED_MESSAGE)} >&2; false; }}"
+    )
+    return {
+        "install_command": command,
+        "install_source": source,
+        "install_version": version_note,
+        "install_fallback_reason": reason,
+    }

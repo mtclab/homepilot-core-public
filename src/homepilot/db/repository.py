@@ -499,6 +499,82 @@ class Repository:
         await self.db.conn.commit()
         return cursor.rowcount > 0
 
+    async def upsert_enrolment_attempt(
+        self,
+        *,
+        hostname: str,
+        peer: str,
+        reason_code: str,
+        reason: str,
+        agent_id: str | None,
+        at: str,
+        stale_before: str,
+        max_rows: int,
+        keep_codes: tuple[str, ...],
+    ) -> None:
+        """Record one refused register against its hostname + peer row, then
+        hold the table to its bounds (lane A3).
+
+        One row per (hostname, peer), updated in place: ``attempts`` counts,
+        ``last_seen``/``reason`` follow the latest refusal. Rows older than
+        ``stale_before`` age out, and past ``max_rows`` the oldest go first -
+        rows whose code is NOT in ``keep_codes`` (a wrong token) before rows
+        that are (a genuine agent waiting for a window), so a guessing flood
+        from many addresses evicts itself rather than the host an operator is
+        waiting for. Nothing about the presented credential is a parameter.
+        """
+        await self.db.execute(
+            "INSERT INTO enrolment_attempts "
+            "(hostname, peer, reason_code, reason, agent_id, first_seen, last_seen, attempts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(hostname, peer) DO UPDATE SET "
+            "reason_code = excluded.reason_code, reason = excluded.reason, "
+            "agent_id = excluded.agent_id, last_seen = excluded.last_seen, "
+            "attempts = enrolment_attempts.attempts + 1",
+            (hostname, peer, reason_code, reason, agent_id, at, at),
+        )
+        await self.db.execute("DELETE FROM enrolment_attempts WHERE last_seen < ?", (stale_before,))
+        placeholders = ",".join("?" for _ in keep_codes) or "''"
+        await self.db.execute(
+            "DELETE FROM enrolment_attempts WHERE rowid IN ("
+            "SELECT rowid FROM enrolment_attempts ORDER BY "
+            f"CASE WHEN reason_code IN ({placeholders}) THEN 1 ELSE 0 END DESC, "
+            "last_seen DESC LIMIT -1 OFFSET ?)",
+            (*keep_codes, max_rows),
+        )
+        await self.db.conn.commit()
+
+    async def list_enrolment_attempts(self, stale_before: str) -> list[dict[str, Any]]:
+        """Every live knock, newest first. Aged-out rows are not reported even
+        before the next write prunes them."""
+        rows = await self.db.fetchall(
+            "SELECT hostname, peer, reason_code, reason, agent_id, first_seen, "
+            "last_seen, attempts FROM enrolment_attempts WHERE last_seen >= ? "
+            "ORDER BY last_seen DESC",
+            (stale_before,),
+        )
+        return [dict(r) for r in rows]
+
+    async def clear_enrolment_attempts(self, hostname: str) -> int:
+        """Forget a hostname's knocks: it has joined, so they are answered."""
+        cursor = await self.db.execute(
+            "DELETE FROM enrolment_attempts WHERE hostname = ?", (hostname,)
+        )
+        await self.db.conn.commit()
+        return int(cursor.rowcount or 0)
+
+    async def list_bootstrap_tokens(self, limit: int) -> list[dict[str, Any]]:
+        """Minted, unconsumed bootstrap tokens (consuming one deletes its row).
+
+        Returns the hash, never a token - the raw value is shown once at mint
+        and stored nowhere."""
+        rows = await self.db.fetchall(
+            "SELECT token_hash, expires_at, created_at, minted_by FROM bootstrap_tokens "
+            "ORDER BY expires_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
     async def set_agent_credential(
         self, agent_id: str, hostname: str, credential_hash: str
     ) -> None:
@@ -1143,6 +1219,21 @@ class Repository:
             [now(), now(), *params],
         )
         newly_absent = [str(row["id"]) for row in await cursor.fetchall()]
+        # ...and KEEP it unknown. The stamp above runs once per absence, so a row
+        # stamped before #613 kept the status it was last seen with, and a later
+        # writer (an agent disconnect sets 'offline') could put one back. Dev
+        # carried three hosts gone since August reading `online`, counted as
+        # online by the Overview. Repaired here on every full sweep, so it heals
+        # without a migration. A host whose agent is still dialled in is left
+        # alone: the machine answers, so its agent-reported status is a fact.
+        await self.db.execute(
+            f"UPDATE hosts SET status = 'unknown', pve_status = 'unknown', updated_at = ? "
+            f"WHERE source IN ({placeholders}) AND absent_since IS NOT NULL{seen_clause} "
+            "AND (COALESCE(status, '') != 'unknown' OR COALESCE(pve_status, '') != 'unknown') "
+            "AND NOT EXISTS (SELECT 1 FROM agents a "
+            "WHERE a.agent_id = hosts.agent_id AND a.connected = 1)",
+            [now(), *params],
+        )
         if seen:
             await self.db.execute(
                 f"UPDATE hosts SET absent_since = NULL, updated_at = ? "
@@ -1874,6 +1965,7 @@ class Repository:
         "audit_log": "timestamp",
         "agent_audit": "ts",
         "webhook_deliveries": "created_at",
+        "alert_events": "at",
     }
 
     async def prune_before(self, table: str, column: str, cutoff: str) -> int:
@@ -1957,6 +2049,19 @@ class Repository:
                 (limit, offset),
             )
         return [dict(r) for r in rows]
+
+    async def delete_drift_check(self, artifact_id: str) -> bool:
+        """Drop an artifact's stored verdict. Returns True if a row went.
+
+        For an artifact that has LEFT the drift universe (revoked, superseded):
+        the loop never re-checks it, so its last verdict would otherwise stand
+        forever and be counted by anything reading the table.
+        """
+        cursor = await self.db.execute(
+            "DELETE FROM drift_checks WHERE artifact_id = ?", (artifact_id,)
+        )
+        await self.db.conn.commit()
+        return bool(cursor.rowcount)
 
     async def get_drift_check(self, artifact_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone(

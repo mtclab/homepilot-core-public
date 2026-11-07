@@ -214,6 +214,17 @@ it is not invisible - but nothing is emitted, so nothing can reach a webhook.
 For a monitoring system replacing Zabbix, that is a real omission and it should
 be an explicit decision rather than an implicit one.
 
+**Outcome (#660, 2026-11):** built. A `nodata` rule kind fires when a host with
+an enrolled agent has been heard from not at all for `for_seconds`; its
+candidate set is the inventory's enrolled hosts, not the metrics table. A
+"Host went dark (5 min)" rule is seeded once onto every install. Hosts that
+never had an agent are deliberately not candidates (coverage, not an outage),
+nor is a guest the hypervisor reports stopped. Alongside it, alert transitions
+are kept in an `alert_events` history, and a native ntfy channel means "notify
+someone" no longer needs a hand-built webhook + router + bot - so the
+"notifications reuse the existing webhook" line above is now one channel of
+several. See `docs/notifications.md`.
+
 ### S6 - Honest defaults
 
 Optional services work or are off. A startup self-check reports what is

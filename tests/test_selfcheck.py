@@ -90,6 +90,7 @@ class TestStockInstallIsHonest:
             "vault",
             "embeddings",
             "events_webhook",
+            "notifications",
             "mcp",
             "artifacts_remote",
             "reconcilers",

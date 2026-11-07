@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 // test-mocks MUST come before the component, or the component resolves the real
 // $lib/api and never sees the mock.
@@ -551,5 +551,459 @@ describe('Overview: says how much it read', () => {
 
 		expect(chip).toHaveClass('badge-neutral');
 		expect(chip).not.toHaveClass('badge-proposed');
+	});
+});
+
+/**
+ * Attention honesty (review 01, steps 1-6): the zone says what is true, ranks it
+ * by consequence and age, and stops repeating what was already settled.
+ *
+ * Teeth (each verified by reverting the behaviour in +page.svelte, see PR):
+ *   - drop the `fleetDark` line and "every agent gone is ONE critical line" fails;
+ *     keep the per-host agent lines under it and the same test fails on them;
+ *   - drop the selfcheck loop and both self-check tests fail;
+ *   - drop `settled()` from the failed filter and the superseded tests fail;
+ *     make failures critical regardless of age and the 24 h test fails;
+ *   - drop the `gone` block and the gone-host tests fail;
+ *   - drop the `drift:unknown` block and the by-reason test fails.
+ */
+const getSelfcheck = api.getSelfcheck as ReturnType<typeof vi.fn>;
+const forgetHost = api.forgetHost as ReturnType<typeof vi.fn>;
+
+function minutesAgo(n: number): string {
+	return new Date(Date.now() - n * 60 * 1000).toISOString();
+}
+
+/** The severity chip of the attention line whose text matches. */
+function chipOf(zone: ReturnType<typeof within>, text: RegExp): HTMLElement {
+	const line = zone.getByText(text).closest('a, div') as HTMLElement;
+	return line.querySelector('.badge') as HTMLElement;
+}
+
+describe('Overview: attention honesty', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		getSelfcheck.mockResolvedValue({ timeout_seconds: 2, counts: {}, subsystems: [] });
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser */
+		}
+	});
+
+	it('says every agent gone as ONE critical line with how long, not N quiet ones', async () => {
+		// Prod, a week: two enrolled agents, none connected, the seeded rules
+		// blind because nothing reports, and the self-check unable to read any
+		// agent's version for the same reason.
+		getSelfcheck.mockResolvedValue({
+			timeout_seconds: 2,
+			counts: {},
+			subsystems: [
+				{
+					name: 'agent_versions',
+					configured: true,
+					state: 'unknown',
+					target: '',
+					consequence: 'No agent is connected, so nothing can be said about what versions the fleet is running.',
+				},
+			],
+		});
+		seed({
+			summary: {
+				agents: {
+					known: 2,
+					connected: 0,
+					enrolled: 2,
+					offline_since: minutesAgo(3 * 24 * 60 + 5),
+					offline_alarm: true,
+				},
+				metrics: {
+					firing_alerts: 0,
+					retention_days: 7,
+					rules_enabled: 2,
+					rules_watching_nothing: 2,
+				},
+			},
+			hosts: [
+				{ ...AGENT_ABSENT_HOST, agent_offline_since: minutesAgo(3 * 24 * 60) },
+				{ ...AGENT_ABSENT_HOST, id: 'h3', hostname: 'app-01', agent_id: 'ag-3' },
+			],
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const fleet = zone.getByRole('link', { name: /no agent is connected \(2 enrolled\)/i });
+		expect(fleet).toHaveAttribute('href', '/ui/hosts');
+		expect(fleet.textContent).toContain('2 alert rules watch nothing');
+		expect(fleet.textContent).toContain('for 3d');
+		expect(fleet.querySelector('.badge')).toHaveClass('badge-critical');
+		// The cause absorbed its effects: no per-host agent lines, no separate
+		// "rules match no host" line saying the same thing again.
+		expect(zone.queryByText(/agent enrolled but not connected/i)).not.toBeInTheDocument();
+		expect(zone.queryByText(/matches no host|match no host/i)).not.toBeInTheDocument();
+		expect(zone.queryByText(/what versions the fleet is running/i)).not.toBeInTheDocument();
+	});
+
+	it('gives each absent agent its duration, and calls an hour-long one critical', async () => {
+		seed({
+			hosts: [
+				{ ...AGENT_ABSENT_HOST, agent_offline_since: minutesAgo(125) },
+				{
+					...AGENT_ABSENT_HOST,
+					id: 'h3',
+					hostname: 'app-01',
+					agent_id: 'ag-3',
+					agent_offline_since: minutesAgo(7),
+				},
+			],
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const long = zone.getByRole('link', { name: /db-01: agent enrolled/i });
+		expect(long.textContent).toContain('for 2h');
+		expect(long.querySelector('.badge')).toHaveClass('badge-critical');
+		const blip = zone.getByRole('link', { name: /app-01: agent enrolled/i });
+		expect(blip.textContent).toContain('for 7m');
+		expect(blip.querySelector('.badge')).toHaveClass('badge-warning');
+	});
+
+	it('puts a subsystem the self-check cannot reach on the Overview, in its own words', async () => {
+		const skew =
+			'1 of 1 connected agents are OLDER than this control plane (3.6.25): web-01. Nothing upgrades an enrolled agent.';
+		getSelfcheck.mockResolvedValue({
+			timeout_seconds: 2,
+			counts: {},
+			subsystems: [
+				{ name: 'agent_versions', configured: true, state: 'unreachable', target: '', consequence: skew },
+				{
+					name: 'proxmox',
+					configured: true,
+					state: 'unreachable',
+					target: 'https://pve.example.com:8006',
+					consequence: 'Proxmox refused the token, so inventory is frozen.',
+				},
+				{
+					name: 'reconcilers',
+					configured: true,
+					state: 'unknown',
+					target: '',
+					consequence: 'Could not check the reconcilers within 2s.',
+				},
+				{ name: 'vault', configured: true, state: 'ok', target: '', consequence: 'Vault is unlocked.' },
+				{
+					name: 'events_webhook',
+					configured: false,
+					state: 'off',
+					target: '',
+					consequence: 'Alerts reach the log and an open browser and nowhere else.',
+				},
+			],
+		});
+		seed({});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const versions = zone.getByText(skew).closest('a') as HTMLElement;
+		expect(versions).toHaveAttribute('href', '/ui/settings?tab=subsystems');
+		expect(versions.querySelector('.badge')).toHaveClass('badge-warning');
+		expect(chipOf(zone, /Proxmox refused the token/)).toHaveClass('badge-critical');
+		expect(chipOf(zone, /Could not check the reconcilers/)).toHaveClass('badge-warning');
+		// ok and off are not attention.
+		expect(zone.queryByText(/Vault is unlocked/)).not.toBeInTheDocument();
+		expect(zone.queryByText(/nowhere else/)).not.toBeInTheDocument();
+	});
+
+	it('says so when the self-check itself could not be read', async () => {
+		seed({});
+		getSelfcheck.mockRejectedValue(new Error('502'));
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(zone.getByText(/could not read the self-check/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/settings?tab=subsystems',
+		);
+		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
+	});
+
+	it('drops a failure a later run settled, and an install the agent made moot', async () => {
+		seed({
+			hosts: [HEALTHY_HOST],
+			tasks: [
+				// Newest first, as the API returns them.
+				{
+					...FAILED_TASK,
+					id: 'task-replay-ok',
+					action: 'replay',
+					status: 'succeeded',
+					error: null,
+					created_at: minutesAgo(60 * 24 * 9),
+					finished_at: minutesAgo(60 * 24 * 9),
+				},
+				{
+					...FAILED_TASK,
+					id: 'task-apply-failed',
+					created_at: minutesAgo(60 * 24 * 10),
+					finished_at: minutesAgo(60 * 24 * 10),
+				},
+				{
+					...FAILED_TASK,
+					id: 'task-install-failed',
+					artifact_id: null,
+					action: 'install_agent',
+					error: 'install: the installer exited 7',
+					result_json: JSON.stringify({ host_id: 'h1', hostname: 'web-01' }),
+					created_at: minutesAgo(60 * 24 * 10),
+					finished_at: minutesAgo(60 * 24 * 10),
+				},
+			],
+		});
+
+		render(Overview);
+
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+		expect(screen.queryByText(/apply nginx-conf failed/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/installer exited 7/i)).not.toBeInTheDocument();
+	});
+
+	it('keeps an unsettled failure, critical for a day and a warning after', async () => {
+		seed({
+			tasks: [
+				{
+					...FAILED_TASK,
+					id: 'task-fresh',
+					artifact_id: 'pg-tune',
+					created_at: minutesAgo(90),
+					finished_at: minutesAgo(89),
+				},
+				{
+					...FAILED_TASK,
+					id: 'task-old',
+					created_at: minutesAgo(60 * 24 * 3),
+					finished_at: minutesAgo(60 * 24 * 3),
+				},
+				// A failure on ANOTHER artifact does not settle it, nor does an
+				// install whose host cannot be told (recorded before tasks named it).
+				{
+					...FAILED_TASK,
+					id: 'task-legacy-install',
+					artifact_id: null,
+					action: 'install_agent',
+					error: 'install: the installer exited 7',
+					result_json: null,
+					created_at: minutesAgo(60 * 24 * 70),
+					finished_at: minutesAgo(60 * 24 * 70),
+				},
+			],
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(chipOf(zone, /apply pg-tune failed/)).toHaveClass('badge-critical');
+		expect(chipOf(zone, /apply nginx-conf failed/)).toHaveClass('badge-warning');
+		expect(chipOf(zone, /installer exited 7/)).toHaveClass('badge-warning');
+	});
+
+	it('names a host Proxmox stopped reporting, with how long and a Forget', async () => {
+		const GONE = {
+			id: 'h9',
+			hostname: 'old-build-vm',
+			status: 'unknown',
+			source: 'hp_created',
+			import_state: 'adopted',
+			absent_since: minutesAgo(60 * 24 * 70),
+			agent_id: 'ag-9',
+			agent_connected: false,
+			agent_offline_since: minutesAgo(60 * 24 * 70),
+		};
+		seed({
+			hosts: [
+				HEALTHY_HOST,
+				GONE,
+				// Never adopted: not news, as on the Hosts page.
+				{ ...GONE, id: 'h10', hostname: 'never-adopted-vm', import_state: 'pending' },
+			],
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const line = zone.getByRole('link', { name: /old-build-vm: proxmox no longer reports/i });
+		expect(line).toHaveAttribute('href', '/ui/hosts/h9');
+		expect(line.textContent).toContain('for 70d');
+		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
+		// One reason per host: gone, not also "agent offline".
+		expect(zone.queryByText(/old-build-vm: agent enrolled/i)).not.toBeInTheDocument();
+		expect(zone.queryByText(/never-adopted-vm/i)).not.toBeInTheDocument();
+
+		// Forget is the irreversible one, so it asks first.
+		const row = within(line.closest('[data-testid="attention-gone"]') as HTMLElement);
+		await fireEvent.click(row.getByRole('button', { name: /^forget$/i }));
+		expect(forgetHost).not.toHaveBeenCalled();
+		await fireEvent.click(row.getByRole('button', { name: /confirm forget/i }));
+		await waitFor(() => expect(forgetHost).toHaveBeenCalledWith('h9'));
+	});
+
+	it('says why drift is unverified, and stays calm when it is only by design', async () => {
+		// Prod-shaped: 16 of 17 unknown because no agent could read the hosts.
+		seed({
+			summary: {
+				drift: {
+					total: 17,
+					drifted: 0,
+					in_spec: 1,
+					unknown: 16,
+					checked: 1,
+					in_spec_pct: 100,
+					unknown_by_reason: { no_agent: 14, check_failed: 0, no_proxmox: 0, by_design: 2, other: 0 },
+				},
+			},
+		});
+
+		const first = render(Overview);
+		const zone = within(await attentionZone());
+		const line = zone.getByRole('link', { name: /16 artifacts unverified/i });
+		expect(line.textContent).toContain('14 no agent on the host');
+		expect(line.textContent).toContain('2 describe-only (fine)');
+		expect(line).toHaveAttribute('href', '/ui/changes/drift');
+		first.unmount();
+
+		// Describe-only artifacts are their nature, not a fault: no line at all.
+		seed({
+			summary: {
+				drift: {
+					total: 3,
+					drifted: 0,
+					in_spec: 1,
+					unknown: 2,
+					checked: 1,
+					in_spec_pct: 100,
+					unknown_by_reason: { no_agent: 0, check_failed: 0, no_proxmox: 0, by_design: 2, other: 0 },
+				},
+			},
+		});
+		render(Overview);
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+		expect(screen.getByText(/2 not established \(2 describe-only\)/)).toBeInTheDocument();
+	});
+});
+
+/**
+ * Release 3.7.0: the three Phase A lanes, read together on the Overview.
+ *
+ * Teeth (each verified by reverting the behaviour):
+ *   - word every inert rule as a threshold rule again and the "went dark" test
+ *     finds no line of its own;
+ *   - drop the waiting-to-join block and its test finds no line;
+ *   - count rows instead of hostnames and it reads "2 hosts".
+ */
+describe('Overview: the Phase A lanes together', () => {
+	const getEnrolmentRequests = api.getEnrolmentRequests as ReturnType<typeof vi.fn>;
+	const WINDOW_SHUT = { open: false, expires_at: null, seconds_remaining: 0, fleet_empty: false };
+	const NOBODY = { wants_to_join: 0, refused: 0, pending_tokens: 0, expired_unused_tokens: 0 };
+
+	function knocking(window: typeof WINDOW_SHUT = WINDOW_SHUT) {
+		const attempt = {
+			hostname: 'new-01',
+			peer: '192.0.2.10',
+			reason_code: 'window_closed',
+			reason: 'not accepting new hosts right now',
+			agent_id: null,
+			first_seen: minutesAgo(30),
+			last_seen: minutesAgo(1),
+			attempts: 12,
+			wants_to_join: true,
+		};
+		return {
+			// One host knocking from two addresses is one host waiting, and a
+			// wrong-token host is refused, not waiting.
+			attempts: [
+				attempt,
+				{ ...attempt, peer: '192.0.2.11' },
+				{ ...attempt, hostname: 'guess-01', reason_code: 'bad_token', wants_to_join: false },
+			],
+			pending_tokens: [],
+			window,
+			summary: { wants_to_join: 2, refused: 1, pending_tokens: 0, expired_unused_tokens: 0 },
+		};
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		getSelfcheck.mockResolvedValue({ timeout_seconds: 2, counts: {}, subsystems: [] });
+		getEnrolmentRequests.mockResolvedValue({
+			attempts: [],
+			pending_tokens: [],
+			window: WINDOW_SHUT,
+			summary: NOBODY,
+		});
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser */
+		}
+	});
+
+	it('words a "went dark" rule that matches no host by its own cause', async () => {
+		seed({
+			summary: {
+				metrics: {
+					firing_alerts: 0,
+					retention_days: 7,
+					rules_enabled: 3,
+					rules_watching_nothing: 2,
+					nodata_rules_watching_nothing: 1,
+				},
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const dark = zone.getByRole('link', { name: /"went dark" rule watches no host/i });
+		expect(dark.textContent).toContain('has an agent enrolled');
+		expect(dark.textContent).not.toMatch(/metric name/i);
+		expect(dark).toHaveAttribute('href', '/ui/hosts');
+		// The threshold rule keeps its own advice, counted without the dark one.
+		const typo = zone.getByRole('link', { name: /1 alert rule matches no host/i });
+		expect(typo.textContent).toContain('check the metric name');
+	});
+
+	it('says how many hosts are waiting to join, and links to Hosts', async () => {
+		getEnrolmentRequests.mockResolvedValue(knocking());
+		seed({});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const line = zone.getByRole('link', { name: /waiting to join/i });
+		expect(line.textContent).toContain('1 host is waiting to join');
+		expect(line).toHaveAttribute('href', '/ui/hosts');
+		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
+	});
+
+	it('stays calm about knocking hosts while the window is open', async () => {
+		getEnrolmentRequests.mockResolvedValue(
+			knocking({ open: true, expires_at: null, seconds_remaining: 600, fleet_empty: false }),
+		);
+		seed({});
+
+		render(Overview);
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+	});
+
+	it('says so when the enrolment requests could not be read', async () => {
+		getEnrolmentRequests.mockRejectedValue(new Error('503'));
+		seed({});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+		expect(zone.getByText(/a host waiting to join cannot be reported here/i)).toBeInTheDocument();
 	});
 });

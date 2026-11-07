@@ -282,7 +282,9 @@ class AgentEnrollService:
             # button mints. The agent trades it for a durable per-agent credential
             # on first connect, so the value staged in the guest stops being
             # usable the moment enrolment succeeds.
-            token = await hub._token_store.create()
+            token = await hub._token_store.create(
+                minted_by=f"zero-touch install on {hostname or host_id}"
+            )
             tls = bool(getattr(hub, "tls_enabled", False))
             pin = str(getattr(hub, "cert_fingerprint", "") or "")
 
@@ -291,9 +293,9 @@ class AgentEnrollService:
             # hub on - that address is already resolved for this guest's network -
             # so the binary comes from the control plane rather than the internet
             # (#464). A guest on an egress-limited VLAN can then still enrol.
-            from ..config import get_settings
+            from .dist import api_base_for
 
-            api_base = f"http://{hub_host}:{get_settings().daemon_port}"
+            api_base = api_base_for(hub_host)
             env_body = _env_file(hub_host, hub_port, token, tls, pin, api_base)
             await proxmox.agent_write_file(node, vmid, _ENV_PATH, env_body)
 
@@ -331,7 +333,14 @@ class AgentEnrollService:
             logger.error("Agent install task %s failed at step %s", task_id, step)
             await self._cleanup(node, vmid)
             try:
-                await self.task_repo.update_task_status(task_id, "failed", error=error)
+                # WHICH host failed, on the task itself: an install task has no
+                # artifact, so without this a failure can never be matched to
+                # the later install (or the connected agent) that made it moot,
+                # and it stays on the Overview until it ages off the page.
+                failed_on = {"host_id": host_id, "hostname": hostname, "step": step}
+                await self.task_repo.update_task_status(
+                    task_id, "failed", error=error, result_json=json.dumps(failed_on)
+                )
                 await self._audit(actor, hostname, "install_agent_failed", {"error": error})
             except Exception:
                 logger.error("Could not mark agent-install task %s failed", task_id, exc_info=True)

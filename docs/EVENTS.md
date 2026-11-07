@@ -117,6 +117,25 @@ Actual state on a host has diverged from the desired state defined by an applied
 }
 ```
 
+### `alert_firing` / `alert_resolved`
+
+An alert rule started firing on a host, or stopped (#660). Both are also kept
+in the alert history and pushed to the notification channels - see
+`docs/notifications.md`. On a webhook the body is `{"event": "<type>", ...fields}`.
+
+| Field              | Type          | Description |
+|--------------------|---------------|-------------|
+| `rule_id`, `rule_name` | string    | The rule |
+| `kind`             | string        | `threshold` or `nodata` (host went dark) |
+| `hostname`         | string        | The host |
+| `metric`, `comparison`, `threshold` | | The condition; placeholders (`*`, `gt`, `0`) for `nodata` |
+| `for_seconds`      | int           | The duration condition |
+| `value`            | number        | Newest value; for `nodata`, seconds since the host was last heard |
+| `since`            | string        | ISO time the breach began / the host was last heard |
+| `message`          | string        | One plain sentence describing the transition |
+| `alert_event_id`   | int           | The history row |
+| `resolved_at`, `duration_seconds`, `reason` | | `alert_resolved` only; `reason` says why a `nodata` alert resolved without the host speaking (e.g. it was stopped) |
+
 ## SSE Streaming
 
 Clients connect to `GET /artifacts/events/stream` (read scope) to receive events in real time via Server-Sent Events. Each SSE message has `event` (the type), `data` (JSON payload), and `id` fields.

@@ -95,7 +95,7 @@ The dashboard loads with the session the claim created. Settings → Proxmox sho
 │  └─ piper (TTS)                        │
 ├─────────────────────────────────────────┤
 │  Agent Hub (TCP 8443)                   │
-│  ├─ hp-agent enroll → managed hosts    │
+│  ├─ hp-agent ← managed hosts dial in   │
 │  └─ TLS-encrypted JSON protocol          │
 ├─────────────────────────────────────────┤
 │  Proxmox VE (via API)                   │
@@ -168,24 +168,14 @@ RADICALE_PASSWORD=...
 
 ## Managed Host Deployment
 
-### Install agent binary
+### Install and enroll the agent
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/mtclab/homepilot-core-public/main/scripts/install-agent.sh | bash
-```
-
-### Enroll with hub
-
-```bash
-hp-agent enroll --hub https://homepilot-host:8443 --token <HUB_TOKEN>
-hp-agent start
-```
-
-Or systemd:
-```bash
-hp-agent service install
-sudo systemctl enable --now hp-agent
-```
+`hp-agent` has no `enroll`/`start`/`service` subcommands: it is configured by
+`/etc/homepilot/agent.env` and run by a systemd unit, both written by
+`scripts/install-agent.sh`. Copy the one-liner from **Hosts → Enroll agent**
+(it installs from the control plane itself) and run it as root on the host - see
+`skills/homepilot-agent-install.md`. A Proxmox QEMU guest with qemu-guest-agent
+needs no one-liner: press **Install agent** on its host page.
 
 ## Operations
 

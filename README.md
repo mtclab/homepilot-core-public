@@ -176,7 +176,16 @@ hp agent enrolment-window close               # shut it again
 
 A refused agent is told why and logs it verbatim (`not accepting new hosts right
 now`), the hub audits the refusal with the hostname that was claimed, and no
-agent row is created for the stranger.
+agent row is created for the stranger. It is not hidden either: the **Hosts**
+page lists it under **Waiting to join** (hostname, address, how many times it
+was refused, since when) with an **Open enrolment window** button, and the next
+retry lets it in - nothing needs doing on the host. Such a refusal does not
+count toward the 5-failures-in-a-row peer ban (it holds the real token; the ban
+is for guessing), so an agent waiting for a window is never locked out by it.
+Wrong-token knocks are listed too, and still banned. Bootstrap tokens minted and
+not yet used are listed with who minted them and when they expire. The same
+answer is `GET /agents/enrolment-requests` and the `get_enrolment_requests` MCP
+tool; neither stores nor returns any token a host presented.
 
 #### Manual install
 

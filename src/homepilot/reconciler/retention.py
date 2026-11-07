@@ -45,6 +45,9 @@ PRUNABLE_TABLES: tuple[tuple[str, str], ...] = (
     ("audit_log", "timestamp"),
     ("agent_audit", "ts"),
     ("webhook_deliveries", "created_at"),
+    # Alert history (#660): operational history, so this horizon rather than
+    # the metrics one - "did anything fire last month?" outlives the samples.
+    ("alert_events", "at"),
 )
 
 # Tasks are pruned only when FINISHED: a pending or running task older than the

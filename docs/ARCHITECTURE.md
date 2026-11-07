@@ -32,6 +32,7 @@
 ║  │   agents      list_agents  get_agent  get_agent_audit        │   ║
 ║  │               get_enrolment_window  check_host_reachable     │   ║
 ║  │   monitoring  list_alert_rules  get_monitoring_alerts        │   ║
+║  │               get_alert_events                               │   ║
 ║  │               get_host_metrics  get_host_metrics_series      │   ║
 ║  │   kb          search_kb  list_kb  get_kb_doc  record_fact    │   ║
 ║  │               get_kb_embedding_status                        │   ║
@@ -241,6 +242,9 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `clear_setting_override` | settings table | admin | Drop a stored setting so the install falls back to the environment or the code default. Same refusals |
 | `probe_setting_override` | no | admin | Ask the cluster about a candidate value WITHOUT saving it (is this node real, is this bridge on it, is this vmid a template). Admin-tier despite writing nothing: its route is |
 | `list_webhooks` | no | admin | The configured event webhooks: endpoint as scheme://host:port only (paths carry credentials), event types, enabled, signed, retries (#700) |
+| `get_alert_events` | no | read | The alert history: every fire and recovery in a window, with duration, reason and the channels that accepted it, plus where alerts are sent (no URLs) (#660) |
+| `list_notification_channels` | no | admin | The ntfy channels: endpoint as scheme://host:port only (the topic is the credential), enabled, last delivery state/error (#660) |
+| `test_notification_channel` | no | admin | One test message to a channel; says whether it was accepted and why not. Creating, pausing and deleting channels are NOT tools: creating takes the topic URL as input (#660) |
 | `test_webhook` | no | admin | One `webhook_test` delivery to a configured webhook; says whether the endpoint accepted it. Creating and deleting webhooks are NOT tools: an endpoint receives the approval codes (#681) |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |

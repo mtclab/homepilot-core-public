@@ -53,7 +53,7 @@ class _FakeTokenStore:
     def __init__(self) -> None:
         self.created: list[str] = []
 
-    async def create(self) -> str:
+    async def create(self, minted_by: str = "") -> str:
         token = f"hpbat_enrol-token-{len(self.created)}"
         self.created.append(token)
         return token
@@ -542,6 +542,27 @@ class TestEveryFailingStepIsTerminal:
         assert cleanup[:2] == ["rm", "-f"]
         assert _ENV_PATH in cleanup
 
+    async def test_a_failed_install_names_the_host_it_failed_on(
+        self, db: Database, service: AgentEnrollService, host: dict[str, Any], proxmox: AsyncMock
+    ):
+        """An install task has no artifact, so the failure must say WHICH host,
+        or the Overview can never tell that a later install - or the agent now
+        connected there - made it moot, and it stays on the first screen until
+        it ages off the page (the ten-week-old install failures on dev).
+
+        Teeth: drop the `result_json` from the failed-status write in
+        `AgentEnrollService._run` and this fails on `None`.
+        """
+        proxmox.agent_write_file = AsyncMock(
+            side_effect=ProxmoxError("POST", "/agent/file-write", 500, "denied")
+        )
+        task = await _run_to_completion(service, host)
+        assert task["status"] == "failed"
+        assert task["result_json"] is not None, "the failed install does not say which host"
+        recorded = json.loads(task["result_json"])
+        assert recorded["host_id"] == host["id"]
+        assert recorded["hostname"] == "web-01"
+
     async def test_an_audit_row_records_the_failure(
         self, db: Database, service: AgentEnrollService, host: dict[str, Any], proxmox: AsyncMock
     ):
@@ -640,7 +661,7 @@ class TestShellSafety:
         hub = registry.hub_server
 
         class _EvilStore:
-            async def create(self) -> str:
+            async def create(self, minted_by: str = "") -> str:
                 return "hpbat_x\nrm -rf /"
 
         hub._token_store = _EvilStore()  # type: ignore[union-attr]

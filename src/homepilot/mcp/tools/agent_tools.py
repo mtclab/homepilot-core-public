@@ -3,8 +3,8 @@
 Every handler answers from / acts through the SAME registry/repo call the
 matching management route uses, so the console and the assistant cannot report
 or change different fleets. The read tools (list_agents, get_agent,
-get_agent_audit, get_enrolment_window) are read-tier; the fleet-CHANGING tools
-below (open/close_enrolment_window, revoke_agent, forget_agent,
+get_agent_audit, get_enrolment_window, get_enrolment_requests) are read-tier;
+the fleet-CHANGING tools below (open/close_enrolment_window, revoke_agent, forget_agent,
 migrate_agents_tls, exec_on_host, write_file_on_host) mirror API routes guarded
 by require_scope("admin") and are held at the admin MCP tier.
 
@@ -123,6 +123,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "fleet_empty": {"type": "boolean"},
             },
             "required": ["open", "fleet_empty"],
+        },
+    },
+    {
+        "name": "get_enrolment_requests",
+        "description": (
+            "Hosts that are knocking on the agent hub and being refused, and bootstrap "
+            "tokens minted but not yet used. attempts: one entry per claimed hostname + "
+            "peer address with reason_code, reason, attempts, first_seen, last_seen and "
+            "wants_to_join (true when the host holds a genuine token and is refused only "
+            "because no enrolment window is open - opening one lets it in on its next "
+            "retry). pending_tokens: id (a hash prefix, never the token), minted_by, "
+            "created_at, expires_at, expired. Also the window state and summary counts. "
+            "Read-only; no credential is stored or returned."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "attempts": {"type": "array", "items": {"type": "object"}},
+                "pending_tokens": {"type": "array", "items": {"type": "object"}},
+                "window": {"type": "object"},
+                "summary": {"type": "object"},
+            },
+            "required": ["attempts", "pending_tokens", "window", "summary"],
         },
     },
     # ── Admin tier (MCP<->API parity, wave 3). Each mirrors an API route guarded
@@ -359,6 +383,18 @@ async def handle_get_enrolment_window(
     repo = ctx.get("repo")
     if repo is None:
         raise RuntimeError("Enrolment window store not available")
+    result: dict[str, Any] = await payload(repo)
+    return result
+
+
+async def handle_get_enrolment_requests(
+    arguments: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    from homepilot.agent_hub.join_requests import payload
+
+    repo = ctx.get("repo")
+    if repo is None:
+        raise RuntimeError("Enrolment store not available")
     result: dict[str, Any] = await payload(repo)
     return result
 

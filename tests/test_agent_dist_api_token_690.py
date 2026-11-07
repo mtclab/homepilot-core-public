@@ -63,10 +63,13 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repo: _Repo) -> Test
     (root / "install-agent.sh").write_text("#!/usr/bin/env bash\necho installer\n")
     monkeypatch.setenv("HP_AGENT_DIST_DIR", str(root))
 
+    from homepilot.agent_hub.router import dist_router as agents_dist_router
     from homepilot.agent_hub.router import router as agents_router
 
     app = FastAPI()
     app.include_router(agents_router)
+    # Mounted as main.py mounts it: without require_token (3.7.0-rc2).
+    app.include_router(agents_dist_router)
 
     class _Hub:
         auth_token = ENROLMENT_TOKEN

@@ -234,6 +234,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.kb_service = state.kb_service
     app.state.sse_bus = state.sse_bus
     app.state.metrics_repo = state.metrics_repo
+    app.state.notifier = state.notifier
 
     # A fresh install must WATCH something, not merely store samples (ADR-004
     # corollary 2). Seeded once, marker-guarded, and never resurrected after an
@@ -368,7 +369,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         app.state.db_integrity = db_integrity
 
-    alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo)
+    alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo, notifier=state.notifier)
     reconciler_scheduler.register(
         alert_evaluator,
         interval=float(settings.metrics_alert_interval_seconds),
@@ -601,6 +602,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # HTTP MCP reported an empty invite list.
             "settings": settings,
             "metrics_repo": state.metrics_repo,
+            "notifier": state.notifier,
             "invite_repo": app.state.invite_repo,
             "app_state": state,
             # Wave 2 mutators (apply/replay/cancel) dispatch to these; the
@@ -707,6 +709,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # reindex_if_needed writes to the database from a task nobody
             # awaits (#622).
             ("kb service", getattr(app.state, "kb_service", None)),
+            # Alert pushes in flight record their outcome on the channel and on
+            # the alert event (#660).
+            ("notifier", getattr(app.state, "notifier", None)),
         )
         for label, service in drainable:
             drain = getattr(service, "drain", None)
@@ -967,6 +972,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 from .admin.router import router as admin_router  # noqa: E402
+from .agent_hub.router import dist_router as agent_dist_router  # noqa: E402
 from .agent_hub.router import router as agent_router  # noqa: E402
 from .artifacts.edit_router import router as artifacts_edit_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
@@ -983,6 +989,10 @@ from .tasks.router import router as tasks_router  # noqa: E402
 
 app.include_router(admin_router, prefix="/admin")
 app.include_router(auth_router, prefix="/auth")
+# The agent payload authenticates by enrolment credential, not API token (see
+# agent_hub.router.dist_router); included first so no /agents/{agent_id} route
+# can shadow it.
+app.include_router(agent_dist_router)
 app.include_router(agent_router, tags=["agents"], dependencies=[Depends(require_token)])
 app.include_router(
     audit_router, prefix="/audit", tags=["audit"], dependencies=[Depends(require_token)]
@@ -1021,6 +1031,7 @@ app.include_router(portal_router, prefix="/invite", tags=["invite"])
 # separate guest client (G2) is its only intended consumer.
 from .guest.admin_router import router as guest_admin_router  # noqa: E402
 from .guest.router import router as guest_router  # noqa: E402
+from .notifications.router import router as notifications_router  # noqa: E402
 from .webhooks.router import router as webhooks_router  # noqa: E402
 
 app.include_router(guest_router, prefix="/guest", tags=["guest"])
@@ -1029,6 +1040,9 @@ app.include_router(guest_admin_router, dependencies=[Depends(require_token)])
 # Webhook configs (#700): they existed only in a CLI that opened the database,
 # so a running install could not configure them at all.
 app.include_router(webhooks_router, dependencies=[Depends(require_token)])
+# Native alert channels (#660): ntfy, so an alert can reach a phone without a
+# hand-built webhook + router + bot.
+app.include_router(notifications_router, dependencies=[Depends(require_token)])
 # The first-run claim carries NO token dependency by design: it is the path by
 # which the FIRST token comes into existence, so requiring one is a deadlock.
 # Its own credential is the claim code (constant-time compared, rate limited),

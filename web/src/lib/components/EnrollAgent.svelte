@@ -4,7 +4,7 @@
 	// single-use bootstrap token for a one-off connect, shared hub token for a
 	// permanent install.
 	import { onMount } from 'svelte';
-	import { api, type EnrolmentWindow } from '$lib/api';
+	import { api, type EnrolmentWindow, type HubEndpoint } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { isValidHubHost } from '$lib/hostValidation';
 	import { base } from '$app/paths';
@@ -53,14 +53,8 @@
 
 	onMount(loadWindow);
 
-	interface TokenAnswer {
-		hub_host: string;
-		hub_port: number;
-		hub_tls?: boolean;
-		hub_cert_sha256?: string;
-	}
-	let bootstrapData: (TokenAnswer & { bootstrap_token: string }) | null = null;
-	let hubData: (TokenAnswer & { auth_token: string }) | null = null;
+	let bootstrapData: (HubEndpoint & { bootstrap_token: string }) | null = null;
+	let hubData: (HubEndpoint & { auth_token: string }) | null = null;
 	let generating = false;
 	let loadingHubToken = false;
 
@@ -88,26 +82,43 @@
 		}
 	}
 
-	function fmtHost(host: string, port: number): string {
-		return port === 443 ? `https://${host}` : `http://${host}:${port}`;
+	// The hub is a raw TCP listener, not a web server: shown as host:port, never
+	// as an http:// URL an operator would then try in a browser.
+	function fmtHub(host: string, port: number): string {
+		return `${host}:${port}`;
 	}
 
-	// The hub serves a self-signed certificate by default, so the one-liner has
-	// to carry its fingerprint: that pin is the only thing the agent can verify
-	// the hub against. No pin means no TLS is configured on the hub.
-	function tlsArgs(d: { hub_tls?: boolean; hub_cert_sha256?: string } | null): string {
-		if (!d?.hub_tls) return '';
-		return d.hub_cert_sha256 ? ` --tls --tls-pin sha256:${d.hub_cert_sha256}` : ' --tls';
+	// The one-liner itself is built by the server (lane A3): it knows whether
+	// this control plane can serve the installer and agent binary, so a host
+	// installed by hand gets THIS hub's agent version - not GitHub's latest.
+	function commandFor(d: HubEndpoint | null): string | null {
+		if (!d || !d.install_command || !isValidHubHost(d.hub_host)) return null;
+		return d.install_command;
 	}
 </script>
+
+{#snippet installSource(d: HubEndpoint)}
+	{#if d.install_source === 'control_plane'}
+		<p class="prose-note text-xs" data-testid="install-source">
+			Installs agent {d.install_version} from this HomePilot - the host needs no internet
+			access, and its agent matches this control plane.
+		</p>
+	{:else if d.install_source === 'github'}
+		<p class="text-xs text-warn" data-testid="install-source">
+			This HomePilot cannot serve the agent itself ({d.install_fallback_reason}), so this
+			one-liner fetches release {d.install_version} from GitHub instead. The host needs
+			internet access.
+		</p>
+	{/if}
+{/snippet}
 
 {#if show === 'bootstrap'}
 	<div class="card p-4 space-y-4">
 		<h2 class="section-title">Enroll New Agent</h2>
 		<p class="prose-note text-xs">
-			Bootstrap tokens are single-use and expire — fine for a one-off connect, and they
-			enrol a new host whether or not the enrolment window is open. For a permanent
-			install that survives agent reboots, use the shared Hub Auth Token.
+			A bootstrap token is single-use and expires after a day. It enrols a new host whether
+			or not the enrolment window is open; on first connect the agent trades it for its own
+			permanent credential, so the install survives reboots.
 		</p>
 		<p class="prose-note text-xs">
 			A running Proxmox guest that answers on qemu-guest-agent needs none of this: open its
@@ -123,19 +134,20 @@
 		{:else}
 			<div class="space-y-3">
 				<div class="bg-canvas border border-ok-border rounded p-3">
-					<p class="text-xs text-ok mb-1">Hub endpoint:</p>
-					<code class="text-xs text-ink select-all">{fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)}</code>
+					<p class="text-xs text-ok mb-1">Hub endpoint (agent connection, not a web address):</p>
+					<code class="text-xs text-ink select-all">{fmtHub(bootstrapData.hub_host, bootstrapData.hub_port)}</code>
 				</div>
 				<div class="bg-canvas border border-ok-border rounded p-3">
 					<p class="text-xs text-ok mb-1">Bootstrap token (copy now — shown once):</p>
 					<code class="text-xs text-ink break-all select-all">{bootstrapData.bootstrap_token}</code>
 				</div>
-				{#if isValidHubHost(bootstrapData.hub_host)}
-					<div class="bg-canvas border border-border-strong rounded p-3">
-						<p class="field-label mb-1">One-liner install:</p>
-						<code class="text-xs text-ink break-all select-all">
-							curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(bootstrapData.hub_host, bootstrapData.hub_port)} --token {bootstrapData.bootstrap_token}{tlsArgs(bootstrapData)}
-						</code>
+				{#if commandFor(bootstrapData)}
+					<div class="bg-canvas border border-border-strong rounded p-3 space-y-1">
+						<p class="field-label mb-1">One-liner install (run as root on the host):</p>
+						<code class="text-xs text-ink break-all select-all" data-testid="install-command"
+							>{commandFor(bootstrapData)}</code
+						>
+						{@render installSource(bootstrapData)}
 					</div>
 				{:else}
 					<div class="bg-canvas border border-danger-border rounded p-3">
@@ -212,15 +224,16 @@
 			</button>
 		{:else}
 			<div class="bg-canvas border border-border-strong rounded p-3">
-				<p class="prose-note text-xs mb-1">Hub: <code class="text-ink">{fmtHost(hubData.hub_host, hubData.hub_port)}</code></p>
+				<p class="prose-note text-xs mb-1">Hub: <code class="text-ink">{fmtHub(hubData.hub_host, hubData.hub_port)}</code></p>
 				<code class="text-xs text-ink select-all">{hubData.auth_token}</code>
 			</div>
-			{#if isValidHubHost(hubData.hub_host)}
-				<div class="bg-canvas border border-border-strong rounded p-3">
-					<p class="field-label mb-1">One-liner install (survives reboots):</p>
-					<code class="text-xs text-ink break-all select-all">
-						curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh | bash -s -- --hub {fmtHost(hubData.hub_host, hubData.hub_port)} --token {hubData.auth_token}{tlsArgs(hubData)}
-					</code>
+			{#if commandFor(hubData)}
+				<div class="bg-canvas border border-border-strong rounded p-3 space-y-1">
+					<p class="field-label mb-1">One-liner install with the shared token:</p>
+					<code class="text-xs text-ink break-all select-all" data-testid="install-command"
+						>{commandFor(hubData)}</code
+					>
+					{@render installSource(hubData)}
 				</div>
 			{/if}
 		{/if}

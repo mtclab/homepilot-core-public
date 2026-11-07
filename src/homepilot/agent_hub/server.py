@@ -118,6 +118,24 @@ HOST_HOLDS_CREDENTIAL_ERROR = (
 )
 
 
+# Stable refusal codes. They key the "wants to join" surface (join_requests) and
+# decide which refusals feed the peer ban, so they are data, not prose.
+DENY_NO_CREDENTIAL = "no_token"
+DENY_BAD_CREDENTIAL = "bad_token"
+DENY_REVOKED = "revoked"
+DENY_HOSTNAME_MISMATCH = "hostname_mismatch"
+DENY_WINDOW_CLOSED = "window_closed"
+DENY_HOST_HOLDS_CREDENTIAL = "host_holds_credential"
+
+# Refusals of a token the hub ACCEPTED as genuine, turned away only because no
+# enrolment window is open. The peer ban exists to blunt token GUESSING; a peer
+# holding the real shared token is not guessing, and counting its refusals made
+# an honest agent installed while the window was shut spend a third of its time
+# banned (refuse x5 -> 60 s ban -> refuse), so the window it was waiting for
+# could open and the agent still not get in for another minute.
+VALID_TOKEN_REFUSALS = frozenset({DENY_WINDOW_CLOSED})
+
+
 @dataclass
 class Denial:
     """Why a register frame was refused, in the two shapes a refusal needs.
@@ -126,11 +144,19 @@ class Denial:
     on the agent row as ``last_error`` (#430/#491), so the fleet list can say
     WHY a host is not here. ``wire_error`` is what the refused peer is told,
     which is normally the deliberately uninformative
-    :data:`GENERIC_AUTH_ERROR`.
+    :data:`GENERIC_AUTH_ERROR`. ``code`` is the stable class of the refusal
+    (one of the ``DENY_*`` constants).
     """
 
     reason: str
     wire_error: str = GENERIC_AUTH_ERROR
+    code: str = DENY_BAD_CREDENTIAL
+
+    @property
+    def counts_toward_ban(self) -> bool:
+        """Whether this refusal is a failed credential, i.e. what the peer ban
+        is for. A valid token refused for want of a window is not."""
+        return self.code not in VALID_TOKEN_REFUSALS
 
 
 class ProtocolError(Exception):
@@ -456,6 +482,7 @@ class AgentHubServer:
                     "host, or use a bootstrap token."
                 ),
                 wire_error=HOST_HOLDS_CREDENTIAL_ERROR,
+                code=DENY_HOST_HOLDS_CREDENTIAL,
             )
         if await repo.count_agents() == 0:
             return None
@@ -470,6 +497,7 @@ class AgentHubServer:
                 "Open a window or enrol it with a bootstrap token."
             ),
             wire_error=ENROLMENT_WINDOW_CLOSED_ERROR,
+            code=DENY_WINDOW_CLOSED,
         )
 
     async def _verify_auth(
@@ -504,13 +532,15 @@ class AgentHubServer:
           3. ``"bootstrap"`` — a consumed one-time enrollment token.
         """
 
-        def _deny(reason: str, wire_error: str = GENERIC_AUTH_ERROR) -> None:
+        def _deny(
+            reason: str, wire_error: str = GENERIC_AUTH_ERROR, code: str = DENY_BAD_CREDENTIAL
+        ) -> None:
             if deny is not None:
-                deny.append(Denial(reason=reason, wire_error=wire_error))
+                deny.append(Denial(reason=reason, wire_error=wire_error, code=code))
 
         token = request.get("auth_token", "")
         if not token:
-            _deny("register carried no auth token")
+            _deny("register carried no auth token", code=DENY_NO_CREDENTIAL)
             return None
 
         claimed_agent_id = request.get("agent_id", "")
@@ -523,7 +553,10 @@ class AgentHubServer:
                 # The token IS this agent's per-agent credential.
                 if row.get("revoked_at"):
                     logger.warning("rejecting revoked credential for agent %s", claimed_agent_id)
-                    _deny("credential revoked by an operator; re-enrol this host to restore it")
+                    _deny(
+                        "credential revoked by an operator; re-enrol this host to restore it",
+                        code=DENY_REVOKED,
+                    )
                     return None
                 # Bind check: the credential is tied to the hostname it was issued
                 # to. A token replayed from a different host is rejected.
@@ -538,7 +571,8 @@ class AgentHubServer:
                     )
                     _deny(
                         f"credential is bound to host {bound_host} but was presented "
-                        f"from {claimed_hostname}"
+                        f"from {claimed_hostname}",
+                        code=DENY_HOSTNAME_MISMATCH,
                     )
                     return None
                 return AuthResult(kind="per-agent", agent_id=claimed_agent_id)
@@ -555,7 +589,7 @@ class AgentHubServer:
         if self.auth_token and hmac.compare_digest(token, self.auth_token):
             refusal = await self._enrolment_allowed(claimed_hostname)
             if refusal is not None:
-                _deny(refusal.reason, refusal.wire_error)
+                _deny(refusal.reason, refusal.wire_error, refusal.code)
                 return None
             return AuthResult(kind="shared")
         if await self._token_store.consume(token):
@@ -607,6 +641,47 @@ class AgentHubServer:
             await self._repo.record_agent_error(agent_id, reason, hostname)
         except Exception as exc:
             logger.warning("could not record the rejection reason: %s", exc)
+
+    async def _record_attempt(
+        self, denial: Denial, peer_host: str, handshake: dict[str, Any]
+    ) -> None:
+        """Remember a refused register as a knock on the door (join_requests).
+
+        The audit log already has the refusal, but an audit row is history, not
+        a question an operator can answer; and ``record_agent_error`` rightly
+        writes nothing for a host the fleet has never seen, which is exactly the
+        host that is waiting to be let in. This keeps one bounded row per
+        hostname + peer. The presented token is never passed on: only the
+        refusal's code and operator sentence travel.
+
+        Best-effort, like every other refusal record: storage trouble must not
+        change what the peer is told.
+        """
+        repo = self._repo
+        if repo is None:
+            return
+        from .join_requests import record_attempt
+
+        try:
+            await record_attempt(
+                repo,
+                hostname=handshake.get("hostname"),
+                peer=peer_host,
+                code=denial.code,
+                reason=denial.reason,
+                agent_id=handshake.get("agent_id"),
+            )
+        except Exception as exc:
+            logger.warning("could not record the enrolment attempt: %s", exc)
+
+    async def _clear_attempts(self, hostname: str) -> None:
+        repo = self._repo
+        if repo is None:
+            return
+        try:
+            await repo.clear_enrolment_attempts(hostname)
+        except Exception as exc:
+            logger.warning("could not clear enrolment attempts for %s: %s", hostname, exc)
 
     def _record_auth_failure(self, peer_host: str, loop: asyncio.AbstractEventLoop) -> None:
         """Track consecutive failed registrations from a peer and temp-ban after
@@ -787,7 +862,8 @@ class AgentHubServer:
             auth_result = await self._verify_auth(handshake, deny)
             if auth_result is None:
                 denial = deny[0] if deny else Denial(reason="invalid auth token")
-                self._record_auth_failure(peer_host, loop)
+                if denial.counts_toward_ban:
+                    self._record_auth_failure(peer_host, loop)
                 _release_preauth()
                 await self._record_rejection(
                     reason=denial.reason,
@@ -795,6 +871,7 @@ class AgentHubServer:
                     agent_id=str(handshake.get("agent_id", "")),
                     hostname=str(handshake.get("hostname", "")) or None,
                 )
+                await self._record_attempt(denial, peer_host, handshake)
                 writer.write(
                     _encode(
                         {
@@ -922,6 +999,9 @@ class AgentHubServer:
                 return
             registered = True
             logger.info("agent registered: %s (host=%s)", agent_id, hostname)
+            # The host got in: whatever "wants to join" record it left while it
+            # was being refused is answered, so it leaves the surface.
+            await self._clear_attempts(hostname)
             # Lifecycle audit: record the connection event so the durable trail
             # covers register/disconnect, not just commands (#381). The hub itself
             # is the actor, so the caller is "system".

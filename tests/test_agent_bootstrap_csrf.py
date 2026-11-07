@@ -35,7 +35,7 @@ class _TokenStore:
     def __init__(self) -> None:
         self.mints = 0
 
-    async def create(self) -> str:
+    async def create(self, minted_by: str = "") -> str:
         self.mints += 1
         return MINTED
 

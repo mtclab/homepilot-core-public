@@ -3,18 +3,26 @@
 	import { base } from '$app/paths';
 	import {
 		api,
+		sessionStore,
 		type AuditEntry,
 		type FiringAlert,
 		type Host,
+		type SelfcheckReport,
 		type Task,
 		type DashboardSummary,
+		type EnrolmentRequests,
 	} from '$lib/api';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import { taskStatusClass, shortTaskId } from '$lib/taskStatus';
+	import { attentionReason } from '$lib/hostGroups';
+	import { subsystemLabel } from '$lib/selfcheck';
+	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { notify } from '$lib/stores';
 	import Donut from '$lib/components/Donut.svelte';
 	import StatCard from '$lib/components/StatCard.svelte';
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
+	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
 
 	// Overview is the operator's morning glance (#549 F2). Three zones, in
 	// priority order, no tabs:
@@ -24,10 +32,12 @@
 	//   2. Fleet at a glance — the host chips, coverage, the honest counts.
 	//   3. Recent movement — tasks and journal as ONE short feed.
 	//
-	// Everything below is composed from the four calls this page already makes
-	// plus the task/journal lists Records already serves: nothing new was added
-	// server-side to make the attention zone possible, so the zone can never
-	// disagree with the pages it links to.
+	// Everything below is composed from the summary plus the same reads the
+	// pages it links to make (inventory, firing alerts, tasks, journal, the
+	// self-check), and every count it quotes is computed over the same set as
+	// that page - the drift count over ACTIVE artifacts, as the drift page does.
+	// That is a rule to keep, not a property that holds by itself: a revoked
+	// artifact's frozen verdict once made this zone say 2 where the page said 1.
 
 	let d: DashboardSummary | null = null;
 	let error = '';
@@ -70,6 +80,17 @@
 	// Zone 1 + zone 3 both read these; one fetch each, not one per zone.
 	let tasks: Task[] = [];
 	let journal: AuditEntry[] = [];
+	// The self-check (#549 F6) lived only under Settings -> Subsystems, so a
+	// refused Proxmox token, a dead reconciler loop or an agent fleet behind the
+	// hub was three clicks from the screen an operator actually opens. It runs
+	// live probes, so it is re-read at most once a minute on event-driven
+	// refreshes; the Refresh button always re-reads it.
+	let selfcheck: SelfcheckReport | null = null;
+	let selfcheckAt = 0;
+	const SELFCHECK_TTL_MS = 60 * 1000;
+	// Hosts knocking at the hub (lane A3): the same read the Hosts page's
+	// "Waiting to join" panel makes, so the count here is the panel's count.
+	let joining: EnrolmentRequests | null = null;
 
 	// A side call that FAILED is not a side call that returned nothing. Emptying
 	// the arrays and saying nothing turned an unanswered question into "Nothing
@@ -92,17 +113,30 @@
 	const INVENTORY_PAGE = 100;
 	const TASK_PAGE = 50;
 	let unread: Unread[] = [];
+	// Where every subsystem line (and the self-check's own unread line) goes.
+	const SUBSYSTEMS_HREF = `${base}/settings?tab=subsystems`;
 
-	async function load() {
+	async function load(force = false) {
 		loading = true;
 		try {
 			d = await api.getDashboard();
-			const [inv, alerts, taskRes, auditRes] = await Promise.allSettled([
+			const selfcheckFresh = !force && selfcheck && Date.now() - selfcheckAt < SELFCHECK_TTL_MS;
+			const [inv, alerts, taskRes, auditRes, checkRes, joinRes] = await Promise.allSettled([
 				api.listInventory({ limit: INVENTORY_PAGE }),
 				api.listFiringAlerts(),
 				api.listTasks(undefined, TASK_PAGE, 0),
 				api.listAudit({ limit: 20 }),
+				selfcheckFresh ? Promise.resolve(selfcheck as SelfcheckReport) : api.getSelfcheck(),
+				api.getEnrolmentRequests(),
 			]);
+			joining = joinRes.status === 'fulfilled' ? joinRes.value : null;
+			if (checkRes.status === 'fulfilled') {
+				if (!selfcheckFresh) selfcheckAt = Date.now();
+				selfcheck = checkRes.value;
+			} else {
+				selfcheck = null;
+				selfcheckAt = 0;
+			}
 			fleet = inv.status === 'fulfilled' ? inv.value.items : [];
 			firing = alerts.status === 'fulfilled' ? alerts.value.items : [];
 			// A degraded side call must not blank the zone it feeds AND must not
@@ -128,6 +162,18 @@
 					key: 'unread:tasks',
 					text: 'Could not read recent tasks, so no failed or stuck task can be reported here',
 					href: `${base}/records/tasks`,
+				});
+			if (checkRes.status === 'rejected')
+				unread.push({
+					key: 'unread:selfcheck',
+					text: 'Could not read the self-check, so a subsystem that is down cannot be reported here',
+					href: SUBSYSTEMS_HREF,
+				});
+			if (joinRes.status === 'rejected')
+				unread.push({
+					key: 'unread:joining',
+					text: 'Could not read enrolment requests, so a host waiting to join cannot be reported here',
+					href: `${base}/hosts`,
 				});
 			if (auditRes.status === 'rejected')
 				unread.push({
@@ -156,6 +202,12 @@
 		}
 	}
 
+	// The Alerts list links a hostname to its page when inventory knows it.
+	function alertHostHref(hostname: string): string {
+		const h = fleet.find((x) => x.hostname === hostname);
+		return h ? `${base}/hosts/${h.id}` : '';
+	}
+
 	function alertCount(hostname: string): number {
 		return firing.filter((f) => f.hostname === hostname).length;
 	}
@@ -165,7 +217,7 @@
 		} catch {
 			onboardingHidden = false;
 		}
-		return load();
+		return load(true);
 	});
 	// The dashboard summary rolls up artifact + drift counts, so refresh it live
 	// on any lifecycle/drift event — coalesced, so a burst is one summary call.
@@ -205,16 +257,41 @@
 		text: string;
 		href: string;
 		meta: string;
+		/** A gone host the operator may remove from inventory from this line. */
+		forget?: Host;
 	}
 
 	// A running task that has outlived this is stuck, not busy. Deliberately
 	// generous: an apply over a slow link is not an incident.
 	const STUCK_MS = 15 * 60 * 1000;
+	// A failure is urgent while it is news. Past a day it is still unresolved -
+	// so it stays - but it no longer outranks what broke this morning.
+	const FAILED_CRITICAL_MS = 24 * 60 * 60 * 1000;
+	// A host's agent dark this long is no reconnect blip.
+	const AGENT_CRITICAL_MS = 60 * 60 * 1000;
 	// Per KIND, so one bad night of failures cannot bury the drift line.
 	const PER_KIND = 4;
 
 	function plural(n: number, one: string, many: string): string {
 		return `${n} ${n === 1 ? one : many}`;
+	}
+
+	function sinceMs(iso: string | null | undefined): number | null {
+		if (!iso) return null;
+		const t = Date.parse(iso);
+		return Number.isNaN(t) ? null : Date.now() - t;
+	}
+
+	/** "for 3d": how long a condition has held, from when it started. */
+	function lasting(iso: string | null | undefined): string {
+		const ms = sinceMs(iso);
+		if (ms === null) return '';
+		const mins = Math.floor(ms / 60000);
+		if (mins < 1) return 'for <1m';
+		if (mins < 60) return `for ${mins}m`;
+		const hours = Math.floor(mins / 60);
+		if (hours < 48) return `for ${hours}h`;
+		return `for ${Math.floor(hours / 24)}d`;
 	}
 
 	function ago(iso: string | null | undefined): string {
@@ -234,8 +311,62 @@
 		return t.artifact_id ? `${base}/changes/${t.artifact_id}` : `${base}/records/tasks`;
 	}
 
+	/** What an artifactless task (an agent install) recorded about its host. */
+	function taskHost(t: Task): { host_id?: string; hostname?: string } {
+		if (!t.result_json) return {};
+		try {
+			const parsed: unknown = JSON.parse(t.result_json);
+			return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {};
+		} catch {
+			return {};
+		}
+	}
+
 	function taskTarget(t: Task): string {
-		return t.artifact_id ?? shortTaskId(t.id);
+		return t.artifact_id ?? taskHost(t).hostname ?? shortTaskId(t.id);
+	}
+
+	/** The thing a task acted on, or null when it cannot be told. */
+	function taskSubject(t: Task): string | null {
+		if (t.artifact_id) return `artifact:${t.artifact_id}`;
+		const hostId = taskHost(t).host_id;
+		return hostId ? `host:${hostId}` : null;
+	}
+
+	// Which later successes settle a failure. A failed apply is settled by the
+	// apply or replay that then worked, or by revoking the change outright -
+	// either way there is nothing left to fix. Any other action only by itself.
+	const SETTLED_BY: Record<string, string[]> = {
+		apply: ['apply', 'replay', 'revoke'],
+		replay: ['apply', 'replay', 'revoke'],
+	};
+
+	/**
+	 * A failure something later made moot: a later task on the same subject
+	 * succeeded, or - for an agent install - the host's agent is connected now,
+	 * which is the very thing the install was for. A failure whose subject
+	 * cannot be told (an install recorded before tasks named their host) is
+	 * never settled by guesswork; it only ages.
+	 */
+	function settled(t: Task, taskList: Task[], hosts: Host[]): boolean {
+		const subject = taskSubject(t);
+		if (!subject) return false;
+		const actions = SETTLED_BY[t.action] ?? [t.action];
+		const failedAt = Date.parse(t.created_at);
+		const later = taskList.some(
+			(o) =>
+				o.id !== t.id &&
+				o.status === 'succeeded' &&
+				actions.includes(o.action) &&
+				taskSubject(o) === subject &&
+				Date.parse(o.created_at) > failedAt,
+		);
+		if (later) return true;
+		if (t.action === 'install_agent') {
+			const hostId = taskHost(t).host_id;
+			return hosts.some((h) => h.id === hostId && h.agent_connected === true);
+		}
+		return false;
 	}
 
 	function hostHref(hostname: string): string {
@@ -266,6 +397,8 @@
 		alerts: FiringAlert[],
 		taskList: Task[],
 		unreadList: Unread[],
+		checks: SelfcheckReport | null,
+		join: EnrolmentRequests | null,
 	): Attention[] {
 		const out: Attention[] = [];
 
@@ -284,6 +417,47 @@
 		}
 		if (!summary) return out;
 
+		// The whole fleet dark is ONE fact with one consequence, not N quiet
+		// "agent offline" lines plus a red card: prod sat a week like that and
+		// said nothing louder. The server decides when it has lasted long enough
+		// to say (a restart or a reconnect storm is not an incident); its cause
+		// absorbs the per-host agent lines and the rules it leaves blind.
+		const fleetDark = summary.agents.offline_alarm === true;
+		if (fleetDark) {
+			const enrolled = summary.agents.enrolled ?? summary.agents.known;
+			const blind = summary.metrics.rules_enabled > 0 ? summary.metrics.rules_watching_nothing : 0;
+			out.push({
+				key: 'fleet:no_agent',
+				severity: 'critical',
+				label: 'no agent',
+				text:
+					`No agent is connected (${enrolled} enrolled), so nothing can be changed or measured on any host` +
+					(blind > 0
+						? `, and ${plural(blind, 'alert rule watches', 'alert rules watch')} nothing`
+						: ''),
+				href: `${base}/hosts`,
+				meta: summary.agents.offline_since ? lasting(summary.agents.offline_since) : 'never connected',
+			});
+		}
+
+		// Hosts whose agent holds a genuine token and is refused only because no
+		// enrolment window is open (lane A3). Counted by hostname - the panel
+		// keeps one row per hostname + address - and only while the window is
+		// shut: with it open they get in on their next retry, nothing to do.
+		const waiting = join?.window.open
+			? 0
+			: new Set((join?.attempts ?? []).filter((a) => a.wants_to_join).map((a) => a.hostname)).size;
+		if (waiting > 0) {
+			out.push({
+				key: 'agents:waiting',
+				severity: 'warning',
+				label: 'wants to join',
+				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts to let ${waiting === 1 ? 'it' : 'them'} in`,
+				href: `${base}/hosts`,
+				meta: '',
+			});
+		}
+
 		// Drift: the summary counts it, the drift page names it.
 		if (summary.drift.drifted > 0) {
 			out.push({
@@ -296,13 +470,70 @@
 			});
 		}
 
-		// Failed tasks: a failed apply is fixed on its change page.
-		const failed = taskList.filter((t) => t.status === 'failed');
+		// Unverified drift, by WHY - the answers are different jobs. A set that is
+		// unverifiable by design (describe-only, a kind with no check) is the
+		// artifact's nature, not a fault: it gets no line of its own, and is only
+		// named alongside reasons that are work.
+		const why = summary.drift.unknown_by_reason;
+		if (summary.drift.unknown > 0) {
+			const parts: string[] = [];
+			const n = (k: keyof NonNullable<typeof why>) => why?.[k] ?? 0;
+			if (n('no_agent')) parts.push(`${n('no_agent')} no agent on the host`);
+			if (n('check_failed')) parts.push(`${n('check_failed')} check failed`);
+			if (n('no_proxmox')) parts.push(`${n('no_proxmox')} no Proxmox connection`);
+			if (n('other')) parts.push(`${n('other')} other reason`);
+			const actionable = parts.length > 0 || !why;
+			if (n('by_design')) parts.push(`${n('by_design')} describe-only (fine)`);
+			if (actionable) {
+				out.push({
+					key: 'drift:unknown',
+					severity: 'warning',
+					label: 'unverified',
+					text:
+						`${plural(summary.drift.unknown, 'artifact', 'artifacts')} unverified` +
+						(parts.length ? `: ${parts.join(', ')}` : ''),
+					href: `${base}/changes/drift`,
+					meta: '',
+				});
+			}
+		}
+
+		// Subsystems the self-check could not reach or could not verify, with its
+		// own consequence sentence, verbatim - Settings words it per state, and a
+		// paraphrase here would be a second, drifting copy. `off` is a choice and
+		// stays on the Settings tab.
+		for (const sub of checks?.subsystems ?? []) {
+			if (sub.state !== 'unreachable' && sub.state !== 'unknown') continue;
+			// "No agent is connected, so no version can be read" is the fleet line
+			// again in other words - or, with none enrolled yet, the getting-started
+			// step. Either way it is not a second piece of news.
+			if (sub.name === 'agent_versions' && sub.state === 'unknown' && summary.agents.connected === 0)
+				continue;
+			out.push({
+				key: `selfcheck:${sub.name}`,
+				// An agent behind the hub is serious but not an outage; the others
+				// unreachable mean a whole function of the product is gone.
+				severity:
+					sub.state === 'unreachable' && sub.name !== 'agent_versions' ? 'critical' : 'warning',
+				label: subsystemLabel(sub),
+				text: sub.consequence,
+				href: SUBSYSTEMS_HREF,
+				meta: '',
+			});
+		}
+
+		// Failed tasks: a failed apply is fixed on its change page. One that a
+		// later run settled is not attention any more, and one older than a day
+		// is no longer critical - it was critical "forever" before, so ten-week
+		// old retried failures sat above everything else on the screen.
+		const failed = taskList.filter((t) => t.status === 'failed' && !settled(t, taskList, hosts));
 		out.push(
 			...capped(
 				failed.map((t) => ({
 					key: `task:${t.id}`,
-					severity: 'critical' as const,
+					severity: ((sinceMs(t.finished_at ?? t.created_at) ?? 0) > FAILED_CRITICAL_MS
+						? 'warning'
+						: 'critical') as Attention['severity'],
 					label: 'failed',
 					text: `${t.action} ${taskTarget(t)} failed${t.error ? `: ${t.error}` : ''}`,
 					href: taskHref(t),
@@ -325,15 +556,31 @@
 				href: `${base}/settings#monitoring`,
 				meta: '',
 			});
-		} else if (summary.metrics.rules_watching_nothing > 0) {
-			out.push({
-				key: 'alerts:inert',
-				severity: 'warning',
-				label: 'not watched',
-				text: `${plural(summary.metrics.rules_watching_nothing, 'alert rule matches', 'alert rules match')} no host - check the metric name and the host filter`,
-				href: `${base}/settings#monitoring`,
-				meta: '',
-			});
+		} else if (summary.metrics.rules_watching_nothing > 0 && !fleetDark) {
+			// A "went dark" (nodata) rule watches enrolled hosts, not metric
+			// samples: when it matches none, no host its filter names has an
+			// agent, and "check the metric name" would send the operator to a
+			// field the rule does not have.
+			const darkInert = summary.metrics.nodata_rules_watching_nothing ?? 0;
+			const thresholdInert = summary.metrics.rules_watching_nothing - darkInert;
+			if (thresholdInert > 0)
+				out.push({
+					key: 'alerts:inert',
+					severity: 'warning',
+					label: 'not watched',
+					text: `${plural(thresholdInert, 'alert rule matches', 'alert rules match')} no host - check the metric name and the host filter`,
+					href: `${base}/settings#monitoring`,
+					meta: '',
+				});
+			if (darkInert > 0)
+				out.push({
+					key: 'alerts:inert:nodata',
+					severity: 'warning',
+					label: 'not watched',
+					text: `${plural(darkInert, '"went dark" rule watches', '"went dark" rules watch')} no host - no host its filter matches has an agent enrolled`,
+					href: `${base}/hosts`,
+					meta: '',
+				});
 		}
 
 		// Firing alerts, one line per alert - the host page is where the chart is.
@@ -352,19 +599,45 @@
 			),
 		);
 
-		// A host whose agent is enrolled but absent cannot be changed at all.
-		const disconnected = hosts.filter((h) => h.agent_id && !h.agent_connected);
+		// A host whose agent is enrolled but absent cannot be changed at all. How
+		// long matters: a reconnect blip and a dead week are different news. A
+		// gone host says "gone" below instead - one reason per host, as on Hosts.
+		const disconnected = fleetDark
+			? []
+			: hosts.filter((h) => h.agent_id && !h.agent_connected && !h.absent_since);
 		out.push(
 			...capped(
 				disconnected.map((h) => ({
 					key: `agent:${h.id}`,
-					severity: 'warning' as const,
+					severity: ((sinceMs(h.agent_offline_since) ?? 0) > AGENT_CRITICAL_MS
+						? 'critical'
+						: 'warning') as Attention['severity'],
 					label: 'agent offline',
 					text: `${h.hostname}: agent enrolled but not connected`,
 					href: `${base}/hosts/${h.id}`,
-					meta: '',
+					meta: lasting(h.agent_offline_since),
 				})),
 				'hosts with an absent agent',
+				`${base}/hosts`,
+			),
+		);
+
+		// Hosts Proxmox stopped reporting. The Hosts page grouped them as
+		// attention while this page said nothing and its donut counted them
+		// online. Same membership rule as Hosts: an un-adopted guest is not news.
+		const gone = hosts.filter((h) => attentionReason(h) === 'gone');
+		out.push(
+			...capped(
+				gone.map((h) => ({
+					key: `gone:${h.id}`,
+					severity: 'warning' as const,
+					label: 'gone',
+					text: `${h.hostname}: Proxmox no longer reports this host`,
+					href: `${base}/hosts/${h.id}`,
+					meta: lasting(h.absent_since),
+					forget: h,
+				})),
+				'hosts Proxmox no longer reports',
 				`${base}/hosts`,
 			),
 		);
@@ -405,6 +678,27 @@
 			});
 		}
 		return out;
+	}
+
+	// Forget, from the line that says a host is gone: the same irreversible
+	// DELETE the Hosts page offers (services and the observation note go with
+	// the row), so the same two-step confirm. The server refuses a host
+	// Proxmox still reports, so a stale line cannot delete a live machine.
+	let forgetConfirm: string | null = null;
+	let forgetting: string | null = null;
+
+	async function forgetGone(h: Host) {
+		forgetting = h.id;
+		try {
+			await api.forgetHost(h.id);
+			notify(`Removed ${h.hostname} from inventory`);
+			forgetConfirm = null;
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			forgetting = null;
+		}
 	}
 
 	// --- Zone 3: recent movement ------------------------------------------
@@ -476,7 +770,8 @@
 	$: nextStep = d ? d.onboarding.steps.find((s) => !s.done) : undefined;
 	$: statusSegments = d ? toSegments(d.inventory.by_status, STATUS_COLORS) : [];
 	$: artifactSegments = d ? toSegments(d.artifacts) : [];
-	$: attention = buildAttention(d, fleet, firing, tasks, unread);
+	$: attention = buildAttention(d, fleet, firing, tasks, unread, selfcheck, joining);
+	$: canWrite = capCanWrite($sessionStore?.capabilities);
 	// Zone 3 is fed by the two reads that can go unanswered, so its empty state
 	// has the same two meanings and must not collapse them into "nothing yet".
 	$: movementUnread = unread.some((u) => u.key === 'unread:tasks' || u.key === 'unread:journal');
@@ -486,7 +781,7 @@
 <div class="page-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Overview</h1>
-		<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => load(true)} disabled={loading}>↻ Refresh</button>
 	</div>
 
 	{#if loading && !d}
@@ -547,19 +842,55 @@
 				</div>
 				<div class="flex flex-col">
 					{#each attention as item (item.key)}
-						<AttentionItem
-							severity={item.severity}
-							label={item.label}
-							text={item.text}
-							href={item.href}
-							meta={item.meta}
-						/>
+						{#if item.forget && canWrite}
+							{@const h = item.forget}
+							<div class="flex items-baseline gap-s-2" data-testid="attention-gone">
+								<div class="min-w-0 flex-1">
+									<AttentionItem
+										severity={item.severity}
+										label={item.label}
+										text={item.text}
+										href={item.href}
+										meta={item.meta}
+									/>
+								</div>
+								{#if forgetConfirm === h.id}
+									<button
+										class="btn btn-danger btn-sm text-xs shrink-0"
+										disabled={forgetting === h.id}
+										on:click={() => forgetGone(h)}
+										>{forgetting === h.id ? 'Removing…' : 'Confirm forget'}</button
+									>
+									<button
+										class="btn btn-ghost btn-sm text-xs shrink-0"
+										on:click={() => (forgetConfirm = null)}>Cancel</button
+									>
+								{:else}
+									<button
+										class="btn btn-ghost btn-sm text-xs shrink-0"
+										title="Remove {h.hostname} from inventory, with its services and notes"
+										on:click={() => (forgetConfirm = h.id)}>Forget</button
+									>
+								{/if}
+							</div>
+						{:else}
+							<AttentionItem
+								severity={item.severity}
+								label={item.label}
+								text={item.text}
+								href={item.href}
+								meta={item.meta}
+							/>
+						{/if}
 					{/each}
 				</div>
 			</section>
 		{:else}
 			<p class="prose-note prose-measure text-sm">Nothing needs you.</p>
 		{/if}
+
+		<!-- Alerts (#660): firing now, resolved recently, and where they are sent. -->
+		<AlertsPanel hostHref={alertHostHref} />
 
 		<!-- Zone 2: fleet at a glance. -->
 		<section class="section-stack" aria-labelledby="fleet-at-a-glance">
@@ -583,7 +914,7 @@
 					sub={d.drift.checked === 0
 						? 'nothing checked yet'
 						: d.drift.unknown
-							? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established`
+							? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established${d.drift.unknown_by_reason?.by_design ? ` (${d.drift.unknown_by_reason.by_design} describe-only)` : ''}`
 							: `${d.drift.drifted} drifting / ${d.drift.checked} checked`}
 					accent={d.drift.checked === 0
 						? 'neutral'
