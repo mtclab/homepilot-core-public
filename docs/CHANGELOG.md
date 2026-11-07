@@ -1,5 +1,162 @@
 # Changelog
 
+## 3.7.0 - 2026-11-07
+
+Phase A of the 2026-11 review, "honest and heard": the Overview says what is
+true, an alert reaches someone, and a host that wants to join is seen.
+
+**Upgrade:** two schema migrations run in one start, with the usual
+pre-migration backup (`backups/pre-migration-v34.db`) taken first.
+Migration 35 adds `alert_rules.kind`, `alert_events` and
+`notification_channels`; migration 36 adds `enrolment_attempts` and
+`created_at`/`minted_by` on `bootstrap_tokens`. Rules and tokens from 3.6.25
+carry over (existing rules are `threshold` rules; existing tokens list with no
+minter). The "Host went dark" rule appears on existing installs too. Re-import
+the n8n flow if you use it.
+
+### The Overview says what is true about the estate (attention honesty)
+
+The "Needs attention" zone counted things that were no longer true, ranked
+ten-week-old retried failures above an estate with no agent, and left out what
+Settings and the Hosts page already knew.
+
+- **Drift counts only active artifacts.** The summary joins `drift_checks` to
+  applied/approved artifacts - the set the drift page lists - and revoking or
+  superseding an artifact deletes its stored verdict. A revoked artifact no
+  longer reads "drifted" on the Overview while the page it links to shows none.
+- **No agent connected is one critical line.** When every enrolled agent has
+  been gone for more than 5 minutes (counted from the hub's start, so a
+  restart is not an alarm), the Overview shows one line with how long, folding
+  in the per-host agent lines and the "rule matches no host" line. Each
+  per-host "agent offline" line now says how long, and turns critical after an
+  hour. Inventory reads agent state from the live hub, not the column a crash
+  leaves at "connected".
+- **Self-check findings on the Overview.** Every subsystem the self-check finds
+  unreachable or unverified is a line with its own consequence sentence and a
+  link to Settings -> Subsystems. An outdated agent fleet is a warning; any
+  other unreachable subsystem is critical.
+- **Failed tasks age and settle.** A failed task is critical for 24 hours and a
+  warning after. It leaves the zone once a later apply/replay/revoke of the
+  same artifact succeeded, or - for an agent install - once a later install
+  on that host succeeded or its agent is connected. Agent-install failures now
+  record which host they were for.
+- **Gone hosts.** A host Proxmox stopped reporting is a warning line with how
+  long and a Forget button (two-step, as on Hosts). Hosts stamped absent before
+  #613 taught the sweep to blank the status kept `online`; every full sync now
+  resets an absent host's status to `unknown` unless its agent is connected.
+- **Unverified drift says why.** `drift.unknown_by_reason` splits unknown
+  verdicts into no agent / check failed / no Proxmox / by design / other. The
+  Overview shows one line with that breakdown; artifacts that cannot be checked
+  by design (describe-only, shell, ansible) raise no line of their own. A
+  host-provision check on a host with no agent records `no_agent`, and a
+  precheck that was asked and went unanswered records `probe_failed` instead of
+  being filed as describe-only.
+
+### Alerts are heard: "host went dark", alert history, ntfy (#660)
+
+HomePilot evaluated alerts and told no one: nothing left the box without a
+hand-built webhook, router and chat bot, a host whose agent went silent could
+not alert at all, and an alert that fired and resolved overnight left no
+record. Lane A2 of the 2026-11 review.
+
+- **Host went dark.** A new `nodata` rule kind fires when a host with an
+  enrolled agent has been heard from not at all for the rule's duration, and
+  resolves when it is heard again. "Host went dark (5 min)" is seeded once onto
+  every install (delete it and it stays deleted). Hosts that never had an agent
+  are not watched by it - that is coverage, not an outage - nor are guests the
+  hypervisor reports stopped; a restart of HomePilot itself does not page the
+  fleet.
+- **Alert history.** Every fire and recovery is appended to `alert_events`
+  (kept for `retention_days`), with how long it fired and which channels
+  accepted it. The Overview and each host page gain an **Alerts** list: firing
+  now, and resolved in the last 24 h / 7 d, plus a line saying where alerts go.
+  `GET /monitoring/alert-events`; MCP `get_alert_events`.
+- **ntfy channel.** Settings -> Monitoring -> Notification channels: paste an
+  ntfy topic URL (stored in the vault, never shown again), press *Send test*,
+  and firing/resolved alerts reach the phone. The list shows each channel's last
+  delivery; the self-check gains a `notifications` line. Admin API
+  `/admin/notifications/channels`; MCP `list_notification_channels`,
+  `test_notification_channel`. See `docs/notifications.md`.
+- **The shipped n8n flow handles alerts.** `n8n/artifact-notification.json` had
+  no case for `alert_*`; it also kept its Switch rules in the v1/v2 shape under
+  `typeVersion: 3` (which does not read them) and wrote a `content` parameter
+  the Set node does not have, so Matrix/Telegram got empty messages for every
+  event. The Switch and formatters are now in the shape their node versions
+  read, with alert, test-event and an honest "other event" fallback. A gate
+  holds the flow to every event the backend emits.
+- The `events_webhook: off` self-check line no longer says a resolved alert
+  leaves no record.
+
+### Agents can join: refused hosts are seen, and the one-liner installs this hub's agent
+
+- **A host refused at the hub is no longer invisible.** An agent installed while
+  the enrolment window was shut was refused every 30 s for days, and only the
+  host's journal and the audit trail said so. Each refused register now leaves
+  one bounded record per hostname + peer address (refusal count, first and last
+  seen, reason; at most 50 rows, aged out after 7 days, wrong-token rows evicted
+  first). The **Hosts** page lists them under **Waiting to join**: a host that
+  holds the real token and is refused only for want of a window "wants to join",
+  with an **Open enrolment window** button - its next retry gets in, nothing to
+  do on the host, and its record clears. Wrong-token hosts are listed with the
+  reason. Read API `GET /agents/enrolment-requests` and MCP read tool
+  `get_enrolment_requests` (with summary counts). No presented token is ever
+  stored: only the refusal's code and sentence.
+- **Pending bootstrap tokens are listed** with who minted them (an operator, or
+  "zero-touch install on <host>"), when, and when they expire - "expired unused"
+  once past it. Listed by a hash prefix, never the token.
+- **Waiting for a window no longer gets an agent banned.** Refusals of a valid
+  shared token only because no window is open stopped counting toward the
+  5-failures / 60 s peer ban; an honest agent used to spend a third of its time
+  banned, and stayed locked out for up to a minute after the window opened.
+  Wrong tokens still count and still ban.
+- **The by-hand install one-liner installs from this control plane.** The Hosts
+  page built a one-liner that fetched the installer and binary from GitHub's
+  `releases/latest`, so a hand-installed agent was whatever release was newest,
+  not the hub's version, and a host without internet could not be enrolled by
+  hand. The server now builds the command (installer via
+  `/agents/dist/install-agent.sh`, binary via `--hp-api`); the hub is shown as
+  `host:port` (it is raw TCP, not `http://`). Only when the control plane cannot
+  serve the payload does it fall back to GitHub, pinned to this version and
+  saying why. `hp agent bootstrap` prints the same command.
+- **Fix: a bootstrap token could not download the agent payload.** The
+  `/agents/dist/*` routes accepted only the shared hub token or an admin API
+  token, so any install pointed at the control plane with a bootstrap token -
+  including the zero-touch **Install agent** path, which stages exactly that -
+  failed with a 401 before fetching anything. A live bootstrap token is now
+  accepted (checked, not spent; registering spends it).
+- Docs: the agent-install and setup skills no longer document `hp-agent
+  enroll`/`start`/`service install` or `~/.config/hp-agent/config.json`, none of
+  which exist; the deployment guide shows the control-plane one-liner.
+
+### The three together on the Overview
+
+- **A "went dark" rule that watches no host says why.** The Overview told the
+  operator to "check the metric name and the host filter" for every rule that
+  matched no host. A `nodata` rule has no metric: it watches hosts with an
+  enrolled agent, so matching none means no host its filter names has one. It
+  now gets its own line, linked to Hosts; threshold rules keep the old advice.
+  The summary gains `metrics.nodata_rules_watching_nothing`.
+- **A rule not evaluated yet is not "watching nothing".** The summary counted a
+  rule the evaluator had not looked at since it was created (its first pass is
+  a minute after boot) as matching no host, so the upgrade that seeds "Host
+  went dark" opened on a false "watches no host" line. Both counts now take
+  only evaluated rules, as Settings -> Monitoring ("not evaluated yet") does.
+- **Fix: no host could fetch the agent payload from the control plane.** The
+  agents router is mounted behind the app-wide API-token check, so
+  `/agents/dist/*` refused the enrolment credential a host presents (the hub
+  token or a bootstrap token) with a 401 before the route's own check ran: the
+  panel one-liner and every zero-touch **Install agent** with `--hp-api` failed.
+  The payload routes are now mounted on their own, gated only by that
+  enrolment check (hub token, live bootstrap token, or an admin API token).
+- **The one-liner fails loudly.** It was `curl ... | bash`: a refused download
+  ran bash on nothing and reported success. It now downloads the installer to
+  a temporary file and runs it, chained so any failed step ends the command
+  non-zero with "HomePilot agent install FAILED - see the error above".
+- **Hosts waiting to join reach the Overview.** While the enrolment window is
+  shut, one warning line says how many hosts hold a genuine token and are
+  refused only for want of a window, linked to the Hosts page's Waiting to join
+  panel. It reads the same `GET /agents/enrolment-requests` as the panel.
+
 ## 3.6.25 - 2026-11-07
 
 ### Shutdown waits for the cleanup it starts (#496)

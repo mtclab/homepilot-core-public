@@ -30,10 +30,15 @@ from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
 from homepilot.metrics.defaults import (
     DEFAULT_ALERT_RULES,
+    HOST_WENT_DARK_RULE,
+    NODATA_SEED_MARKER_KEY,
     SEED_MARKER_KEY,
     seed_default_alert_rules,
 )
 from homepilot.metrics.repository import AGENT_METRICS, MetricsRepository
+
+# The threshold floors plus "Host went dark" (#660).
+ALL_DEFAULTS = len(DEFAULT_ALERT_RULES) + 1
 
 
 @pytest.fixture
@@ -59,16 +64,16 @@ class TestAFreshInstallWatchesSomething:
     async def test_the_defaults_are_created_on_first_boot(self, repo, metrics):
         created = await seed_default_alert_rules(repo, metrics)
 
-        assert created == len(DEFAULT_ALERT_RULES)
+        assert created == ALL_DEFAULTS
         rules = await metrics.list_rules(enabled_only=True)
-        assert len(rules) == len(DEFAULT_ALERT_RULES), (
+        assert len(rules) == ALL_DEFAULTS, (
             "a fresh install must WATCH something, not merely store samples - ADR-004 corollary 2"
         )
 
     async def test_they_are_not_created_twice(self, repo, metrics):
         await seed_default_alert_rules(repo, metrics)
         assert await seed_default_alert_rules(repo, metrics) == 0
-        assert len(await metrics.list_rules()) == len(DEFAULT_ALERT_RULES)
+        assert len(await metrics.list_rules()) == ALL_DEFAULTS
 
     async def test_a_deleted_default_stays_deleted(self, repo, metrics):
         """The marker guards on "has this ever been seeded", not on "are there
@@ -89,18 +94,46 @@ class TestAFreshInstallWatchesSomething:
             assert spec["host_filter"] == "*"
             assert spec["for_seconds"] > 0, "a default with no duration would page on a blip"
 
-    async def test_an_upgrade_never_adds_rules_to_an_existing_policy(self, repo, metrics):
-        """An operator with five tuned rules did not ask for two more. The
-        absence of rules is what this fixes; an existing policy is not it."""
+    async def test_an_upgrade_never_adds_threshold_rules_to_an_existing_policy(self, repo, metrics):
+        """An operator with five tuned rules did not ask for two more threshold
+        floors. The absence of rules is what that fixes; an existing policy is
+        not it. "Host went dark" IS added: no existing policy could express it,
+        so none can have chosen to go without it (#660)."""
         await metrics.create_rule(
             name="mine", metric="load.1m", comparison="gt", threshold=4.0, for_seconds=300
         )
 
-        assert await seed_default_alert_rules(repo, metrics) == 0
-        assert [r["name"] for r in await metrics.list_rules()] == ["mine"]
+        assert await seed_default_alert_rules(repo, metrics) == 1
+        assert [r["name"] for r in await metrics.list_rules()] == [
+            "mine",
+            HOST_WENT_DARK_RULE["name"],
+        ]
         assert await repo.get_setting(SEED_MARKER_KEY) is not None, (
             "the question must not be re-asked on every boot"
         )
+        assert await repo.get_setting(NODATA_SEED_MARKER_KEY) is not None
+
+    async def test_host_went_dark_is_a_five_minute_nodata_rule_on_every_host(self, repo, metrics):
+        await seed_default_alert_rules(repo, metrics)
+        dark = [r for r in await metrics.list_rules() if r["kind"] == "nodata"]
+        assert len(dark) == 1
+        assert dark[0]["for_seconds"] == 300
+        assert dark[0]["host_filter"] == "*"
+        assert dark[0]["enabled"] == 1
+
+    async def test_an_install_that_already_has_a_nodata_rule_gets_no_second(self, repo, metrics):
+        await metrics.create_rule(
+            name="my dark rule",
+            kind="nodata",
+            metric="*",
+            comparison="gt",
+            threshold=0,
+            for_seconds=600,
+        )
+        await seed_default_alert_rules(repo, metrics)
+        assert [r["name"] for r in await metrics.list_rules() if r["kind"] == "nodata"] == [
+            "my dark rule"
+        ]
 
     async def test_a_seeding_failure_does_not_stop_the_instance_booting(self, repo, metrics):
         """A control plane that will not start because it could not write a
@@ -185,6 +218,29 @@ class TestTheOverviewCanTellAllWellFromNotWatched:
         summary = await self._summary(db, repo, metrics)
         assert summary["metrics"]["rules_enabled"] == 2
         assert summary["metrics"]["rules_watching_nothing"] == 1
+        assert summary["metrics"]["nodata_rules_watching_nothing"] == 0
+
+    async def test_a_went_dark_rule_watching_nothing_is_counted_apart(self, db, repo, metrics):
+        """Release 3.7.0 cross-lane fix: a nodata rule matches no host because no
+        matching host has an agent, not because of a metric name - the Overview
+        words it differently, so the summary has to say which rules they are."""
+        dark = await metrics.create_rule(
+            name="Host went dark",
+            kind="nodata",
+            metric="*",
+            comparison="gt",
+            threshold=0.0,
+            for_seconds=300,
+        )
+        await metrics.record_rule_coverage(dark["id"], 0)
+        typo = await metrics.create_rule(
+            name="typo", metric="disk.fre_gb", comparison="lt", threshold=1.0, for_seconds=300
+        )
+        await metrics.record_rule_coverage(typo["id"], 0)
+
+        summary = await self._summary(db, repo, metrics)
+        assert summary["metrics"]["rules_watching_nothing"] == 2
+        assert summary["metrics"]["nodata_rules_watching_nothing"] == 1
 
     async def test_a_silenced_rule_is_not_counted_as_watching(self, db, repo, metrics):
         rule = await metrics.create_rule(
@@ -195,6 +251,62 @@ class TestTheOverviewCanTellAllWellFromNotWatched:
         summary = await self._summary(db, repo, metrics)
         assert summary["metrics"]["rules_enabled"] == 0
         assert summary["metrics"]["rules_watching_nothing"] == 0
+
+
+class TestTheOverviewReadsWhatTheEvaluatorStamped:
+    """Release 3.7.0 dev walk: right after the upgrade started, the Overview said
+    the freshly seeded "Host went dark" rule watched no host while the dev agent
+    was enrolled and connected.
+
+    The rule had simply not been evaluated yet (the evaluator's first pass comes
+    a minute after boot), and the summary counted ``hosts_matched IS NULL`` as
+    zero - while Settings -> Monitoring, reading the same row, said "not
+    evaluated yet". Unknown is not "watching nothing". These read the summary
+    the way the dashboard route does (``build_summary`` over a repository), and
+    the post-evaluation reads go through a SECOND connection to the same file, so
+    a coverage stamp left uncommitted would read as missing too."""
+
+    async def test_a_rule_not_evaluated_yet_is_not_said_to_watch_nothing(self, repo, metrics):
+        from homepilot.dashboard.service import build_summary
+
+        assert await seed_default_alert_rules(repo, metrics) == ALL_DEFAULTS
+
+        summary = await build_summary(repo)
+        assert summary["metrics"]["rules_enabled"] == ALL_DEFAULTS
+        assert summary["metrics"]["rules_watching_nothing"] == 0
+        assert summary["metrics"]["nodata_rules_watching_nothing"] == 0
+
+    async def test_after_one_evaluation_a_fresh_reader_sees_what_it_matched(
+        self, tmp_path, db, repo, metrics
+    ):
+        import time
+
+        from homepilot.dashboard.service import build_summary
+        from homepilot.metrics.alerts import AlertEvaluator
+
+        await seed_default_alert_rules(repo, metrics)
+        # An enrolled host whose agent was just heard (registering links it into
+        # the inventory, as the hub does).
+        await repo.upsert_agent("agent-dev01", "dev01")
+
+        result = await AlertEvaluator(metrics, repo=repo, now=time.time).run()
+        assert result.details["watching_nothing"] == 2  # no samples yet for the floors
+
+        reader = Database(db.db_path)
+        await reader.connect()
+        try:
+            fresh = MetricsRepository(reader)
+            rules = {r["name"]: r for r in await fresh.list_rules()}
+            dark = rules[HOST_WENT_DARK_RULE["name"]]
+            assert dark["last_eval_at"] is not None, "the coverage stamp was never committed"
+            assert dark["hosts_matched"] == 1
+            summary = await build_summary(Repository(reader))
+        finally:
+            await reader.close()
+        assert summary["metrics"]["nodata_rules_watching_nothing"] == 0
+        # The two threshold floors were evaluated and match no reporting host: those
+        # ARE watching nothing, and still say so.
+        assert summary["metrics"]["rules_watching_nothing"] == 2
 
 
 class TestTheSelfCheckNamesAlerts:

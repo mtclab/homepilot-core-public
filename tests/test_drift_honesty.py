@@ -160,6 +160,20 @@ class TestTheStateIsStored:
         assert row["state"] == "unknown"
 
 
+async def _active_artifact_row(repo: Repository, artifact_id: str) -> None:
+    """The artifact a verdict belongs to: the summary counts only the verdicts
+    of ACTIVE artifacts (a revoked one's frozen row is not the fleet's state)."""
+    await repo.upsert_artifact(
+        id=artifact_id,
+        kind="proxmox-api-sequence",
+        intent="test",
+        status="applied",
+        hash="h",
+        produced_by_json="{}",
+        file_path=f"{artifact_id}.md",
+    )
+
+
 class TestTheDashboardDoesNotCountUncheckedAsHealthy:
     @pytest.fixture
     async def api(self, tmp_path: Path):
@@ -186,6 +200,8 @@ class TestTheDashboardDoesNotCountUncheckedAsHealthy:
         # The honest number is 50% (of what was checked). The old formula,
         # (total - drifted) / total, reports 90% - it counts the eight unknowns
         # as healthy, which is the entire defect.
+        for aid in ("a", "b", *(f"u{n}" for n in range(8))):
+            await _active_artifact_row(repo, aid)
         await repo.upsert_drift_check("a", drifted=False, state="in_spec")
         await repo.upsert_drift_check("b", drifted=True, state="drifted")
         for n in range(8):
@@ -203,6 +219,8 @@ class TestTheDashboardDoesNotCountUncheckedAsHealthy:
 
     async def test_a_drifted_artifact_still_lowers_it(self, api):
         client, repo = api
+        await _active_artifact_row(repo, "a")
+        await _active_artifact_row(repo, "b")
         await repo.upsert_drift_check("a", drifted=False, state="in_spec")
         await repo.upsert_drift_check("b", drifted=True, state="drifted")
 

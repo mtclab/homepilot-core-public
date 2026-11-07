@@ -1039,6 +1039,103 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running')"
         ),
     ],
+    35: [
+        # "Nobody was told" (#660, lane A2 of the 2026-11 review).
+        #
+        # 1. What KIND of condition a rule is. Every rule so far is a threshold
+        #    on a metric; `nodata` fires when an enrolled host stops reporting
+        #    at all, which no threshold can express (a silent host drops out of
+        #    every threshold rule's candidate set by design). Existing rows are
+        #    thresholds, which is exactly what the default says.
+        (
+            "ALTER TABLE alert_rules ADD COLUMN kind TEXT NOT NULL DEFAULT 'threshold'",
+            "alert_rules",
+            "kind",
+        ),
+        # 2. Alert HISTORY. `alert_state` is a latch - `firing_since` is nulled
+        #    on recovery - so an alert that fired and resolved overnight left no
+        #    record anywhere. One append-only row per transition (not per
+        #    evaluation). The rule's name and metric are copied in, so the
+        #    history of a rule still reads after the rule is deleted. Pruned on
+        #    the operational-history horizon (`retention_days`), not the
+        #    metrics one: this is history, not a time series.
+        """CREATE TABLE IF NOT EXISTS alert_events (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id          TEXT NOT NULL,
+            rule_name        TEXT NOT NULL,
+            rule_kind        TEXT NOT NULL DEFAULT 'threshold',
+            metric           TEXT NOT NULL,
+            hostname         TEXT NOT NULL,
+            event            TEXT NOT NULL CHECK(event IN ('firing', 'resolved')),
+            value            REAL,
+            since            TEXT,
+            duration_seconds INTEGER,
+            reason           TEXT,
+            delivered_to     TEXT,
+            at               TEXT NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_alert_events_at ON alert_events(at)",
+        "CREATE INDEX IF NOT EXISTS idx_alert_events_host ON alert_events(hostname, at)",
+        # 3. Native notification channels (ntfy first). The target URL is NOT
+        #    stored here: an ntfy topic URL is a capability - whoever holds it
+        #    can read and post the topic - so it lives in the vault under
+        #    `secret_ref`, like every other credential. This row holds only
+        #    what may be shown: the kind, a name, the endpoint as
+        #    scheme://host[:port], and the outcome of the last delivery, which
+        #    is what makes "is anyone being told?" answerable.
+        """CREATE TABLE IF NOT EXISTS notification_channels (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind             TEXT NOT NULL CHECK(kind IN ('ntfy')),
+            name             TEXT NOT NULL,
+            endpoint         TEXT NOT NULL,
+            secret_ref       TEXT NOT NULL,
+            has_token        INTEGER NOT NULL DEFAULT 0,
+            enabled          INTEGER NOT NULL DEFAULT 1,
+            created_at       TEXT NOT NULL,
+            last_attempt_at  TEXT,
+            last_result      TEXT CHECK(last_result IN ('ok', 'failed')),
+            last_ok_at       TEXT,
+            last_error       TEXT,
+            last_error_at    TEXT
+        )""",
+    ],
+    36: [
+        # Agents that knock and are turned away (lane A3, review 05/3).
+        #
+        # A host refused at the hub - no enrolment window open, a wrong token -
+        # was visible only in the host's journal and the audit trail, and
+        # `record_agent_error` rightly writes nothing for a hostname the fleet
+        # has never seen. So the one host an operator is waiting for was the one
+        # host no page showed. One row per claimed hostname + peer address,
+        # UPDATED per attempt (never appended), bounded in code (row cap + age
+        # out, agent_hub/join_requests.py) so a token-guessing flood cannot grow
+        # it. No token column: what a refused peer presented is never stored.
+        """CREATE TABLE IF NOT EXISTS enrolment_attempts (
+            hostname     TEXT NOT NULL,
+            peer         TEXT NOT NULL,
+            reason_code  TEXT NOT NULL,
+            reason       TEXT NOT NULL,
+            agent_id     TEXT,
+            first_seen   TEXT NOT NULL,
+            last_seen    TEXT NOT NULL,
+            attempts     INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (hostname, peer)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_enrolment_attempts_last_seen "
+        "ON enrolment_attempts(last_seen)",
+        # Pending bootstrap tokens become listable: when each was minted and by
+        # whom, beside the expiry the table already had. Still hash-only.
+        (
+            "ALTER TABLE bootstrap_tokens ADD COLUMN created_at REAL",
+            "bootstrap_tokens",
+            "created_at",
+        ),
+        (
+            "ALTER TABLE bootstrap_tokens ADD COLUMN minted_by TEXT",
+            "bootstrap_tokens",
+            "minted_by",
+        ),
+    ],
 }
 
 

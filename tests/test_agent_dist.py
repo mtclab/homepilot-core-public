@@ -43,10 +43,13 @@ def payload_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def client(payload_dir: Path) -> TestClient:
+    from homepilot.agent_hub.router import dist_router as agents_dist_router
     from homepilot.agent_hub.router import router as agents_router
 
     app = FastAPI()
     app.include_router(agents_router)
+    # Mounted as main.py mounts it: without require_token (3.7.0-rc2).
+    app.include_router(agents_dist_router)
 
     class _Hub:
         auth_token = AGENT_TOKEN

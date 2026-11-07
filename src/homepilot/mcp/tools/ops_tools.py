@@ -81,8 +81,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_dashboard_summary",
         "description": (
             "The operator overview, computed from the estate itself: inventory counts "
-            "and coverage, drift (in-spec, drifted, and how many were never checked), "
-            "artifacts and tasks by status, agents known vs connected, firing alert "
+            "and coverage, drift over ACTIVE artifacts (in-spec, drifted, how many were "
+            "never established and why: no agent / check failed / no Proxmox / by "
+            "design / other), artifacts and tasks by status, agents known vs connected "
+            "(and, when none is connected, since when and whether that has outlasted "
+            "the grace period - `offline_alarm`), firing alert "
             "count and metrics retention, plus the first-run onboarding checklist and "
             "whether it is complete. Current-state aggregates only - use "
             "get_host_metrics_series for history. Read-only."

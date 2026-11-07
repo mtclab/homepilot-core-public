@@ -16,10 +16,19 @@ from typing import Any
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 from homepilot.metrics.repository import (
     AGENT_METRICS,
+    KIND_THRESHOLD,
     MAX_SERIES_POINTS,
+    NODATA_METRIC,
+    RULE_KINDS,
     VALID_COMPARISONS,
 )
-from homepilot.metrics.router import MAX_WINDOW_HOURS
+from homepilot.metrics.router import (
+    MAX_HISTORY_HOURS,
+    MAX_HISTORY_ITEMS,
+    MAX_WINDOW_HOURS,
+    alert_history,
+    rule_kind_problem,
+)
 
 # Named in every description that has to give an example, so a caller is never
 # invited to ask for a metric this fleet does not have. The list used to say
@@ -29,6 +38,50 @@ from homepilot.metrics.router import MAX_WINDOW_HOURS
 _METRIC_EXAMPLES = ", ".join(AGENT_METRICS)
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "get_alert_events",
+        "description": (
+            "The alert HISTORY: every time a rule started firing or resolved, newest "
+            "first, within the last `hours` (default 24). Each item has rule_name, "
+            "rule_kind (threshold or nodata), hostname, event (firing/resolved), value, "
+            "since, duration_seconds (resolved only), reason (why a nodata alert "
+            "resolved without the host speaking, e.g. the guest was stopped), and "
+            "delivered_to (the notification channels that accepted it; [] = none did, "
+            "null = not yet known). `channels` says where alerts are sent and whether "
+            "the last delivery worked. Use this to answer 'did anything fire last "
+            "night?' - get_monitoring_alerts only knows what is firing NOW. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hours": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": MAX_HISTORY_HOURS,
+                    "description": "Window to look back over (default 24)",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Only this host's events (its name); omit for every host",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_HISTORY_ITEMS,
+                    "description": "Most events to return (default 200)",
+                },
+            },
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "object"}},
+                "total": {"type": "integer"},
+                "channels": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["items", "total", "channels"],
+        },
+    },
     {
         "name": "list_alert_rules",
         "description": (
@@ -154,7 +207,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "only.\n\nA rule can only ever fire on a metric hosts actually report "
             f"({_METRIC_EXAMPLES}) - any other name is accepted and then never "
             "matches anything. Check `hosts_matched` with list_alert_rules after the "
-            "next evaluation to confirm the rule is watching what you meant."
+            "next evaluation to confirm the rule is watching what you meant.\n\n"
+            "`kind: nodata` instead fires when an ENROLLED host (one with an agent) has "
+            "reported nothing at all for `for_seconds` (at least 120) - 'host went dark'. "
+            "It takes no metric, comparison or threshold, and does not fire for a guest "
+            "the hypervisor reports stopped."
         ),
         "inputSchema": {
             "type": "object",
@@ -164,6 +221,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "minLength": 1,
                     "maxLength": 120,
                     "description": "Human-readable rule name",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": list(RULE_KINDS),
+                    "description": (
+                        "threshold (default): metric vs threshold. nodata: an enrolled "
+                        "host silent for for_seconds; pass no metric/comparison/threshold."
+                    ),
                 },
                 "metric": {
                     "type": "string",
@@ -194,7 +259,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "enabled": {"type": "boolean", "description": "Default true"},
             },
-            "required": ["name", "metric", "comparison", "threshold"],
+            "required": ["name"],
         },
         "outputSchema": {"type": "object", "properties": {"id": {"type": "string"}}},
     },
@@ -343,19 +408,45 @@ async def handle_get_host_metrics_series(
 async def handle_create_alert_rule(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    comparison = str(arguments["comparison"])
+    # The SAME refusal the POST /monitoring/rules route makes, so the two
+    # surfaces cannot disagree about what a nodata rule may carry.
+    kind = str(arguments.get("kind") or KIND_THRESHOLD)
+    problem = rule_kind_problem(kind, set(arguments))
+    if problem:
+        raise ValueError(problem)
+    comparison = str(arguments.get("comparison", "gt"))
     if comparison not in VALID_COMPARISONS:
         raise ValueError(f"comparison must be one of {', '.join(VALID_COMPARISONS)}")
     result: dict[str, Any] = await _repo(ctx).create_rule(
         name=str(arguments["name"]),
-        metric=str(arguments["metric"]),
+        metric=str(arguments.get("metric", NODATA_METRIC)),
         comparison=comparison,
-        threshold=float(arguments["threshold"]),
+        threshold=float(arguments.get("threshold", 0.0)),
         for_seconds=int(arguments.get("for_seconds", 300)),
         host_filter=str(arguments.get("host_filter") or "*"),
         enabled=bool(arguments.get("enabled", True)),
+        kind=kind,
     )
     return result
+
+
+async def handle_get_alert_events(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
+    raw_hours = arguments.get("hours")
+    hours = 24.0 if raw_hours is None else float(raw_hours)
+    if hours <= 0 or hours > MAX_HISTORY_HOURS:
+        raise ValueError(f"hours must be greater than 0 and at most {MAX_HISTORY_HOURS}")
+    raw_limit = arguments.get("limit")
+    limit = 200 if raw_limit is None else int(raw_limit)
+    if limit < 1 or limit > MAX_HISTORY_ITEMS:
+        raise ValueError(f"limit must be between 1 and {MAX_HISTORY_ITEMS}")
+    hostname = arguments.get("host")
+    return await alert_history(
+        _repo(ctx),
+        ctx.get("notifier"),
+        hours=hours,
+        hostname=str(hostname) if hostname else None,
+        limit=limit,
+    )
 
 
 async def handle_update_alert_rule(

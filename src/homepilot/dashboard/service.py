@@ -8,10 +8,64 @@ counts for the same estate.
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from typing import Any
 
 from ..app_settings import effective
 from ..config import get_settings
+
+# The statuses whose reality can disagree with the artifact - the drift
+# universe. MUST equal ACTIVE_STATUSES in web/src/lib/drift.ts: the Overview's
+# drift line links to the page built from that list, and the two may not count
+# different sets.
+ACTIVE_DRIFT_STATUSES = ("applied", "approved")
+
+# How long the whole fleet may be without a connected agent before the Overview
+# raises it. Long enough that a hub restart or a reconnect storm is not an
+# incident, short enough that a dark week is not a warning line nobody reads.
+FLEET_OFFLINE_GRACE_SECONDS = 300
+
+# Every `unknown` drift verdict lands in exactly one of these, by what the
+# operator does next. Reasons are the `details_json.reason` values written by
+# reconciler/verify.py and reconciler/drift.py.
+UNKNOWN_REASON_BUCKETS = ("no_agent", "check_failed", "no_proxmox", "by_design", "other")
+_REASON_TO_BUCKET: dict[str, str] = {
+    "no_agent": "no_agent",
+    "check_failed": "check_failed",
+    "probe_failed": "check_failed",
+    "survey_failed": "check_failed",
+    "nothing_read": "check_failed",
+    "items_unanswered": "check_failed",
+    "no_executor": "no_proxmox",
+    "no_proxmox": "no_proxmox",
+    # Nothing a check could compare: describe/read-only steps, or a kind that
+    # has no drift check. True and expected, not a fault.
+    "nothing_evaluated": "by_design",
+    "shell_script_unverifiable": "by_design",
+    "ansible_unverifiable": "by_design",
+    "kb_note_skipped": "by_design",
+}
+
+
+def unknown_reason_bucket(details_json: str | None) -> str:
+    """The bucket an `unknown` drift row belongs to; `other` when unrecorded."""
+    try:
+        details = json.loads(details_json) if details_json else {}
+    except (ValueError, TypeError):
+        details = {}
+    reason = details.get("reason") if isinstance(details, dict) else None
+    return _REASON_TO_BUCKET.get(str(reason or ""), "other")
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 async def build_summary(repo: Any) -> dict[str, Any]:
@@ -46,13 +100,20 @@ async def build_summary(repo: Any) -> dict[str, Any]:
     coverage_pct = round(100 * managed / hosts_total) if hosts_total else 0
 
     # ── Drift ────────────────────────────────────────────────────────────────
-    drift_total = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks"))["c"]
-    drifted = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks WHERE state = 'drifted'"))[
-        "c"
-    ]
-    in_spec = (await db.fetchone("SELECT COUNT(*) c FROM drift_checks WHERE state = 'in_spec'"))[
-        "c"
-    ]
+    # Only ACTIVE artifacts' verdicts count. A drift row outlives its artifact's
+    # status: the loop re-checks `applied` only, so a revoked or superseded
+    # artifact kept its last verdict forever, and the Overview said "2 artifacts
+    # disagree" while the drift page it links to - which filters to the same
+    # ACTIVE_DRIFT_STATUSES (web/src/lib/drift.ts) - listed one.
+    drift_rows = await db.fetchall(
+        "SELECT d.state, d.details_json FROM drift_checks d "
+        "JOIN artifacts a ON a.id = d.artifact_id "
+        f"WHERE a.status IN ({', '.join('?' for _ in ACTIVE_DRIFT_STATUSES)})",  # nosec B608
+        ACTIVE_DRIFT_STATUSES,
+    )
+    drift_total = len(drift_rows)
+    drifted = sum(1 for r in drift_rows if r["state"] == "drifted")
+    in_spec = sum(1 for r in drift_rows if r["state"] == "in_spec")
     # Percentage of what was actually CHECKED (#425). It used to be
     # (total - drifted) / total, which counted every unverifiable and errored
     # artifact as healthy - the headline number on the operator's first screen,
@@ -60,6 +121,14 @@ async def build_summary(repo: Any) -> dict[str, Any]:
     checked = in_spec + drifted
     unknown = drift_total - checked
     in_spec_pct = round(100 * in_spec / checked) if checked else 100
+    # WHY nothing was established, by what the operator does next: "no agent on
+    # the host" and "the check failed" are work; "describe-only" is the
+    # artifact's nature and is fine. One number hid all three (16/17 on prod).
+    unknown_by_reason = {bucket: 0 for bucket in UNKNOWN_REASON_BUCKETS}
+    for r in drift_rows:
+        if r["state"] in ("drifted", "in_spec"):
+            continue
+        unknown_by_reason[unknown_reason_bucket(r["details_json"])] += 1
 
     # ── Pipeline ───────────────────────────────────────────────────────────────
     artifacts_by_status = await grouped("SELECT status, COUNT(*) FROM artifacts GROUP BY status")
@@ -79,9 +148,47 @@ async def build_summary(repo: Any) -> dict[str, Any]:
 
     registry = get_agent_registry()
     live_ids = {a["agent_id"] for a in registry.list_connected()} if registry else set()
-    known_ids = {row["agent_id"] for row in await repo.list_agents()}
+    agent_rows = await repo.list_agents()
+    known_ids = {row["agent_id"] for row in agent_rows}
     agents_known = len(known_ids | live_ids)
     agents_connected = len(live_ids)
+
+    # "Every agent is gone" is ONE fact, not N warning lines (#660 class): prod
+    # sat a week with no agent connected and said so only as one quiet line per
+    # host. `enrolled` leaves out agents whose credential was revoked - nobody
+    # expects those back. `offline_since` is the last time ANY enrolled agent was
+    # heard from (null when none ever was), and `offline_alarm` says the outage
+    # has outlived FLEET_OFFLINE_GRACE_SECONDS - measured also from when this hub
+    # started listening, so a backend restart does not raise it before the
+    # agents have had their chance to dial back in.
+    enrolled_rows = [r for r in agent_rows if not r.get("revoked_at")]
+    agents_enrolled = len({r["agent_id"] for r in enrolled_rows} | live_ids)
+    offline_since: str | None = None
+    offline_alarm = False
+    if agents_enrolled > 0 and agents_connected == 0:
+        contacts = [
+            ts
+            for r in enrolled_rows
+            for ts in (
+                _parse_ts(r.get("disconnected_at")),
+                _parse_ts(r.get("last_heartbeat")),
+                _parse_ts(r.get("connected_at")),
+            )
+            if ts is not None
+        ]
+        last_contact = max(contacts) if contacts else None
+        if last_contact is not None:
+            offline_since = last_contact.strftime("%Y-%m-%dT%H:%M:%SZ")
+        started = getattr(registry, "started_at", None) if registry else None
+        listening_since = started if isinstance(started, datetime) else None
+        quiet_from = max(
+            (t for t in (last_contact, listening_since) if t is not None),
+            default=None,
+        )
+        offline_alarm = (
+            quiet_from is None
+            or (datetime.now(UTC) - quiet_from).total_seconds() >= FLEET_OFFLINE_GRACE_SECONDS
+        )
 
     # ── First-run path (#445 A7) ──────────────────────────────────────────────
     # Derived entirely from values this endpoint already computed: no extra
@@ -147,10 +254,18 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             "unknown": unknown,
             "checked": checked,
             "in_spec_pct": in_spec_pct,
+            # Sums to `unknown`; see UNKNOWN_REASON_BUCKETS.
+            "unknown_by_reason": unknown_by_reason,
         },
         "artifacts": artifacts_by_status,
         "tasks": tasks_by_status,
-        "agents": {"known": agents_known, "connected": agents_connected},
+        "agents": {
+            "known": agents_known,
+            "connected": agents_connected,
+            "enrolled": agents_enrolled,
+            "offline_since": offline_since,
+            "offline_alarm": offline_alarm,
+        },
         # Deliberately NOT counting metric rows or distinct series here: the
         # metrics table is the one table that grows without an operator doing
         # anything, and a COUNT(DISTINCT ...) over it would put a full scan on
@@ -174,10 +289,28 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             "rules_enabled": (
                 await db.fetchone("SELECT COUNT(*) c FROM alert_rules WHERE enabled = 1")
             )["c"],
+            # A rule the evaluator has not looked at yet (`last_eval_at` NULL -
+            # created or seeded since boot; the first pass comes a minute after
+            # it) is not known to watch nothing. Settings already says "not
+            # evaluated yet" for it; counting it here put a false "watches no
+            # host" line on the Overview after every upgrade that seeds a rule.
             "rules_watching_nothing": (
                 await db.fetchone(
                     "SELECT COUNT(*) c FROM alert_rules "
-                    "WHERE enabled = 1 AND COALESCE(hosts_matched, 0) = 0"
+                    "WHERE enabled = 1 AND last_eval_at IS NOT NULL "
+                    "AND COALESCE(hosts_matched, 0) = 0"
+                )
+            )["c"],
+            # The `nodata` share of the above (#660). Its candidates are enrolled
+            # hosts, not hosts with samples, so "matches no host" has a different
+            # cause and a different fix - no matching host has an agent - and the
+            # Overview must not tell the operator to check a metric name it has
+            # not got.
+            "nodata_rules_watching_nothing": (
+                await db.fetchone(
+                    "SELECT COUNT(*) c FROM alert_rules "
+                    "WHERE enabled = 1 AND last_eval_at IS NOT NULL "
+                    "AND COALESCE(hosts_matched, 0) = 0 AND kind = 'nodata'"
                 )
             )["c"],
             # Resolved, not read off boot Settings: the number the overview

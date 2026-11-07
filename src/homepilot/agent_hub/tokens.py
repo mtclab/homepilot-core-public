@@ -64,7 +64,9 @@ class BootstrapTokenStore:
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS bootstrap_tokens (
                 token_hash TEXT PRIMARY KEY,
-                expires_at REAL NOT NULL
+                expires_at REAL NOT NULL,
+                created_at REAL,
+                minted_by  TEXT
             )""",
         )
         await self._db.conn.commit()
@@ -122,14 +124,20 @@ class BootstrapTokenStore:
         self._tokens[token_hash] = (token_hash, expires_at)
         return token
 
-    async def create(self) -> str:
-        """Generate a bootstrap token and persist it to DB."""
+    async def create(self, minted_by: str = "") -> str:
+        """Generate a bootstrap token and persist it to DB.
+
+        ``minted_by`` says who or what asked for it (an operator's label, or the
+        zero-touch install naming its host), so a token minted and never used
+        can be listed as pending with a reason a human recognises. Only the
+        token's hash is stored, as before."""
         token = self.create_sync()
         if self._db is not None:
             token_hash, expires_at = self._tokens[hash_token(token)]
             await self._db.execute(
-                "INSERT INTO bootstrap_tokens (token_hash, expires_at) VALUES (?, ?)",
-                (token_hash, expires_at),
+                "INSERT INTO bootstrap_tokens (token_hash, expires_at, created_at, minted_by) "
+                "VALUES (?, ?, ?, ?)",
+                (token_hash, expires_at, time.time(), (minted_by or "")[:200] or None),
             )
             await self._db.conn.commit()
         return token

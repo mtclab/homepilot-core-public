@@ -30,6 +30,7 @@
 	import { base } from '$app/paths';
 	import Sparkline from '$lib/components/Sparkline.svelte';
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
+	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
 	import { formatMetricValue, metricLabel } from '$lib/sparkline';
 	import { queryTabs, activeQueryTab } from '$lib/tabs';
@@ -519,6 +520,11 @@
 						<p class="prose-note text-sm">Nothing needs you on this host.</p>
 					{/if}
 				</div>
+				<!-- This host's alerts, firing and recently resolved (#660). Only a
+				     host with an agent can raise one, so a bare host shows none. -->
+				{#if host.agent_id}
+					<AlertsPanel hostname={host.hostname} />
+				{/if}
 				<!-- ── Facts: ONE definition-list pattern, left-anchored ──────────── -->
 				<div class="card p-4">
 					<dl class="grid gap-x-8 gap-y-1.5 text-sm" style="grid-template-columns: max-content 1fr;">

@@ -59,6 +59,10 @@ class AgentRegistry:
     def __init__(self, repo: Any = None, metrics_repo: Any = None) -> None:
         self._agents: dict[str, ConnectedAgent] = {}
         self._hostname_index: dict[str, str] = {}
+        # When this process began accepting agents. "No agent connected for 5
+        # minutes" may only be said once agents have HAD 5 minutes to dial back
+        # in after a restart (dashboard/service.py).
+        self.started_at: datetime = datetime.now(UTC)
         self.hub_server: AgentHubServer | None = None
         # Share the persistence repo with the audit log so the fleet-root command
         # trail is durable + attributable (#381), not just an in-memory deque.

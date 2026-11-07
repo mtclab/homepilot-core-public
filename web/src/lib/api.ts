@@ -206,6 +206,61 @@ export interface EnrolmentWindow {
 	fleet_empty: boolean;
 }
 
+// The paste-ready install one-liner the server builds for a token (lane A3).
+// `install_source` is "control_plane" normally - the installer AND the binary
+// come from this HomePilot, so the agent is this hub's version - or "github",
+// the fallback pinned to this version, with `install_fallback_reason` saying
+// why. `install_command` is null when the hub address is not safe to put in a
+// root shell command.
+export interface InstallCommand {
+	install_command: string | null;
+	install_source: 'control_plane' | 'github' | null;
+	install_version: string | null;
+	install_fallback_reason: string | null;
+}
+
+export interface HubEndpoint extends InstallCommand {
+	hub_host: string;
+	hub_port: number;
+	hub_tls: boolean;
+	hub_cert_sha256: string;
+}
+
+// A host that knocked on the hub and was turned away (one per hostname + peer).
+export interface EnrolmentAttempt {
+	hostname: string;
+	peer: string;
+	reason_code: string;
+	reason: string;
+	agent_id: string | null;
+	first_seen: string;
+	last_seen: string;
+	attempts: number;
+	// Holds a genuine token, refused only because no enrolment window is open.
+	wants_to_join: boolean;
+}
+
+export interface PendingBootstrapToken {
+	id: string;
+	minted_by: string | null;
+	created_at: string | null;
+	expires_at: string | null;
+	expired: boolean;
+	seconds_remaining: number;
+}
+
+export interface EnrolmentRequests {
+	attempts: EnrolmentAttempt[];
+	pending_tokens: PendingBootstrapToken[];
+	window: EnrolmentWindow;
+	summary: {
+		wants_to_join: number;
+		refused: number;
+		pending_tokens: number;
+		expired_unused_tokens: number;
+	};
+}
+
 export interface OnboardingStep {
 	key: string;
 	title: string;
@@ -213,6 +268,9 @@ export interface OnboardingStep {
 	href: string;
 	done: boolean;
 }
+
+/** The buckets `drift.unknown_by_reason` sorts unestablished verdicts into. */
+export type UnknownDriftReason = 'no_agent' | 'check_failed' | 'no_proxmox' | 'by_design' | 'other';
 
 export interface DashboardSummary {
 	/**
@@ -238,16 +296,33 @@ export interface DashboardSummary {
 		unknown: number;
 		checked: number;
 		in_spec_pct: number;
+		/**
+		 * WHY `unknown` is unknown, by what the operator does next; sums to
+		 * `unknown`. Absent on an older backend.
+		 */
+		unknown_by_reason?: Partial<Record<UnknownDriftReason, number>>;
 	};
 	artifacts: Record<string, number>;
 	tasks: Record<string, number>;
-	agents: { known: number; connected: number };
+	agents: {
+		known: number;
+		connected: number;
+		/** Known agents whose credential is not revoked - the ones expected back. */
+		enrolled?: number;
+		/** With none connected: when any enrolled agent was last heard from. */
+		offline_since?: string | null;
+		/** None connected, and for longer than the server's grace period. */
+		offline_alarm?: boolean;
+	};
 	metrics: {
 		firing_alerts: number;
 		retention_days: number;
 		// firing_alerts alone cannot tell "all well" from "nothing is watched".
 		rules_enabled: number;
 		rules_watching_nothing: number;
+		/** The `nodata` ("went dark") share of rules_watching_nothing: those match
+		 *  no host because no matching host has an agent, not over a metric name. */
+		nodata_rules_watching_nothing?: number;
 	};
 }
 
@@ -276,9 +351,15 @@ export interface LatestMetric {
 
 export type AlertComparison = 'gt' | 'gte' | 'lt' | 'lte';
 
+// `threshold`: a metric crossing a value. `nodata` (#660): an enrolled host
+// that has reported nothing for for_seconds - "host went dark". A nodata rule
+// carries placeholder metric/comparison/threshold that mean nothing.
+export type AlertRuleKind = 'threshold' | 'nodata';
+
 export interface AlertRule {
 	id: string;
 	name: string;
+	kind: AlertRuleKind;
 	host_filter: string;
 	metric: string;
 	comparison: AlertComparison;
@@ -307,6 +388,58 @@ export interface FiringAlert {
 	comparison: AlertComparison;
 	threshold: number;
 	for_seconds: number;
+	kind: AlertRuleKind;
+}
+
+// One transition in the alert history (#660): a rule started firing on a host,
+// or stopped. Append-only; a resolved row carries how long it fired.
+export interface AlertEvent {
+	id: number;
+	rule_id: string;
+	rule_name: string;
+	rule_kind: AlertRuleKind;
+	metric: string;
+	hostname: string;
+	event: 'firing' | 'resolved';
+	value: number | null;
+	since: string | null;
+	duration_seconds: number | null;
+	/** Why a nodata alert resolved without the host speaking (e.g. stopped). */
+	reason: string | null;
+	/** Channels that accepted it; [] = none did, null = not known yet. */
+	delivered_to: string[] | null;
+	at: string;
+}
+
+export type ChannelState = 'ok' | 'failing' | 'untested' | 'disabled';
+
+/** Where alerts go, as any read token may see it: no endpoint, no URL. */
+export interface ChannelSummary {
+	id: number;
+	kind: 'ntfy';
+	name: string;
+	enabled: boolean;
+	state: ChannelState;
+	last_ok_at: string | null;
+	last_error_at: string | null;
+}
+
+export interface AlertHistory {
+	items: AlertEvent[];
+	total: number;
+	since: string;
+	hours: number;
+	hostname: string | null;
+	channels: ChannelSummary[];
+}
+
+/** A notification channel as an admin sees it: endpoint is scheme://host only. */
+export interface NotificationChannel extends ChannelSummary {
+	endpoint: string;
+	has_token: boolean;
+	created_at: string | null;
+	last_attempt_at: string | null;
+	last_error: string | null;
 }
 
 export interface HealthInfo {
@@ -490,6 +623,8 @@ export interface Host {
 	/** The agent enrolled on this machine (#514 S1) - the live channel. */
 	agent_id?: string | null;
 	agent_connected?: boolean;
+	/** While the agent is not connected: since when (its goodbye, else its last heartbeat). */
+	agent_offline_since?: string | null;
 	agent_version?: string | null;
 	/**
 	 * Is this host's agent OLDER than the control plane? The server decides it,
@@ -953,13 +1088,13 @@ export const api = {
 		});
 	},
 	getBootstrapToken() {
-		return req<{
-			bootstrap_token: string;
-			hub_host: string;
-			hub_port: number;
-			hub_tls: boolean;
-			hub_cert_sha256: string;
-		}>('/agents/bootstrap', { method: 'POST' });
+		return req<HubEndpoint & { bootstrap_token: string }>('/agents/bootstrap', {
+			method: 'POST',
+		});
+	},
+	// Who is knocking and being refused, and bootstrap tokens not yet used.
+	getEnrolmentRequests() {
+		return req<EnrolmentRequests>('/agents/enrolment-requests');
 	},
 	// The enrolment window (#537): while it is closed, the shared hub token
 	// cannot enrol a host this install has never seen.
@@ -976,13 +1111,7 @@ export const api = {
 		return req<EnrolmentWindow>('/agents/enrolment-window', { method: 'DELETE' });
 	},
 	getHubToken() {
-		return req<{
-			auth_token: string;
-			hub_host: string;
-			hub_port: number;
-			hub_tls: boolean;
-			hub_cert_sha256: string;
-		}>('/agents/token');
+		return req<HubEndpoint & { auth_token: string }>('/agents/token');
 	},
 	// Whether HomePilot can install the agent into this guest over
 	// qemu-guest-agent, and when it cannot, the reason to show instead of the
@@ -1029,9 +1158,11 @@ export const api = {
 	},
 	createAlertRule(rule: {
 		name: string;
-		metric: string;
-		comparison: AlertComparison;
-		threshold: number;
+		kind?: AlertRuleKind;
+		// Required for a threshold rule; a nodata rule must send none of them.
+		metric?: string;
+		comparison?: AlertComparison;
+		threshold?: number;
 		for_seconds?: number;
 		host_filter?: string;
 	}) {
@@ -1087,6 +1218,38 @@ export const api = {
 	},
 	listFiringAlerts() {
 		return req<{ items: FiringAlert[]; total: number }>('/monitoring/alerts');
+	},
+	// Alert history (#660): every fire and recovery in the window, newest first.
+	listAlertEvents(hours: number, hostname?: string) {
+		return req<AlertHistory>('/monitoring/alert-events' + qs({ hours, hostname }));
+	},
+	// --- Notification channels (#660): admin. The topic URL goes in once and is
+	// never returned; `endpoint` is scheme://host only.
+	listNotificationChannels() {
+		return req<{ items: NotificationChannel[]; total: number }>('/admin/notifications/channels');
+	},
+	createNotificationChannel(body: { kind: 'ntfy'; name: string; url: string; token?: string }) {
+		return req<NotificationChannel>('/admin/notifications/channels', {
+			method: 'POST',
+			body: JSON.stringify(body),
+		});
+	},
+	setNotificationChannelEnabled(id: number, enabled: boolean) {
+		return req<NotificationChannel>(`/admin/notifications/channels/${id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ enabled }),
+		});
+	},
+	deleteNotificationChannel(id: number) {
+		return req<{ id: number; deleted: boolean }>(`/admin/notifications/channels/${id}`, {
+			method: 'DELETE',
+		});
+	},
+	testNotificationChannel(id: number) {
+		return req<{ id: number; endpoint: string; delivered: boolean; error: string | null; channel: NotificationChannel }>(
+			`/admin/notifications/channels/${id}/test`,
+			{ method: 'POST' },
+		);
 	},
 
 	// --- Guests (#442 G3) ---

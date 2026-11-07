@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import re
 from dataclasses import dataclass, field
@@ -322,6 +323,10 @@ async def _verify_proxmox_api(
     # `unknown / nothing_evaluated` - it could never be in spec.
     in_spec_steps: list[str] = []
     skipped_steps: list[str] = []
+    # The subset of skipped_steps whose precheck was ASKED and got no answer.
+    # "Nothing to compare" is the artifact's nature; "could not ask" is a fault,
+    # and only this list tells the two apart in the verdict.
+    unanswered_steps: list[str] = []
 
     for step in steps:
         step_id = step.get("id", "unknown")
@@ -369,12 +374,15 @@ async def _verify_proxmox_api(
                     continue
             except _PROBE_FAILED:
                 skipped_steps.append(step_id)
+                unanswered_steps.append(step_id)
                 continue
         else:
             skipped_steps.append(step_id)
             continue
 
-    return _sequence_verdict(artifact_id, drifted_steps, in_spec_steps, skipped_steps)
+    return _sequence_verdict(
+        artifact_id, drifted_steps, in_spec_steps, skipped_steps, unanswered_steps
+    )
 
 
 def _sequence_verdict(
@@ -382,6 +390,7 @@ def _sequence_verdict(
     drifted_steps: list[str],
     in_spec_steps: list[str],
     skipped_steps: list[str],
+    unanswered_steps: list[str] | None = None,
 ) -> VerifyResult:
     """The verdict for a step sequence, from what each step ESTABLISHED.
 
@@ -391,7 +400,11 @@ def _sequence_verdict(
                fully converged artifact could never read in spec);
     unknown  - nothing was compared at all: every step was skipped because it
                has no precheck, its precheck is not a GET, or asking it failed.
-               "Every step was skipped" is not "in spec" (#425).
+               "Every step was skipped" is not "in spec" (#425). The reason is
+               `probe_failed` when any precheck was asked and went unanswered,
+               and `nothing_evaluated` only when there was nothing to ask - the
+               Overview calls the second one "describe-only (fine)", so it must
+               never cover a failed probe.
     """
     verification_log = (
         f"drifted_steps={drifted_steps}, in_spec_steps={in_spec_steps}, "
@@ -407,11 +420,14 @@ def _sequence_verdict(
     elif in_spec_steps:
         state = DriftState.IN_SPEC
     else:
+        reason = "probe_failed" if unanswered_steps else "nothing_evaluated"
+        if unanswered_steps:
+            details["unanswered_steps"] = list(unanswered_steps)
         return VerifyResult(
             artifact_id=artifact_id,
             state=DriftState.UNKNOWN,
             verification_log=verification_log[:2000],
-            details={"reason": "nothing_evaluated", **details},
+            details={"reason": reason, **details},
         )
     return VerifyResult(
         artifact_id=artifact_id,
@@ -457,6 +473,7 @@ async def _verify_http_sequence(
     drifted_steps: list[str] = []
     in_spec_steps: list[str] = []
     skipped_steps: list[str] = []
+    unanswered_steps: list[str] = []  # asked, no usable answer (see _sequence_verdict)
 
     try:
         for step in steps:
@@ -491,6 +508,7 @@ async def _verify_http_sequence(
                     pre_cred = await _resolve_credential(pre_cred_name, executor.vault)
                 except ExecutorError:
                     skipped_steps.append(step_id)
+                    unanswered_steps.append(step_id)
                     continue
 
                 base_url = pre_cred.get("base_url", "").rstrip("/")
@@ -513,6 +531,7 @@ async def _verify_http_sequence(
                         # A 5xx says nothing about the resource - the same line
                         # the executor draws (#712).
                         skipped_steps.append(step_id)
+                        unanswered_steps.append(step_id)
                         continue
                     proxy = make_response_proxy(resp)
                     if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
@@ -523,6 +542,7 @@ async def _verify_http_sequence(
                         continue
                 except (httpx.HTTPError, SkipIfUndecided):
                     skipped_steps.append(step_id)
+                    unanswered_steps.append(step_id)
                     continue
 
             # No precheck: report unknown rather than probing. A verify pass must
@@ -540,7 +560,25 @@ async def _verify_http_sequence(
             with contextlib.suppress(Exception):
                 await c.aclose()
 
-    return _sequence_verdict(artifact_id, drifted_steps, in_spec_steps, skipped_steps)
+    return _sequence_verdict(
+        artifact_id, drifted_steps, in_spec_steps, skipped_steps, unanswered_steps
+    )
+
+
+async def _agent_absent(adapter: Any, host: str) -> bool:
+    """True only when the adapter positively says no agent serves `host`.
+
+    Anything that cannot answer the question (an adapter without
+    `test_connection`, a test double) is not taken as "absent": the probe then
+    runs and reports what it could and could not read, as before.
+    """
+    ask = getattr(adapter, "test_connection", None)
+    if not callable(ask):
+        return False
+    answer = ask(host)
+    if inspect.isawaitable(answer):
+        answer = await answer
+    return answer is False
 
 
 async def _verify_host_provision(
@@ -587,22 +625,37 @@ async def _verify_host_provision(
             details={"reason": "forbidden_host"},
         )
 
-    result = await check_drift(executor.host_adapter, host, spec)
+    # The host's agent is the only way to read it. Without one every item is
+    # unanswered, and saying WHY - no agent - is what turns "unknown" into
+    # something an operator can act on (install or reconnect the agent) rather
+    # than a reason they have to dig out of a probe log.
+    adapter = executor.host_adapter
+    if await _agent_absent(adapter, host):
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=f"no agent is connected for {host}, so nothing on it could be read",
+            details={"reason": "no_agent", "host": host},
+        )
+
+    result = await check_drift(adapter, host, spec)
     drifted_items: list[str] = result["drifted_items"]
     unknown_items: list[str] = result.get("unknown_items") or []
+    details: dict[str, Any] = {"drifted_items": drifted_items, "unknown_items": unknown_items}
     if result["drifted"]:
         state = DriftState.DRIFTED
     elif unknown_items:
         # Nothing said it had drifted, but something never answered. "I looked
         # and it matches" and "I could not look" are different answers (#425).
         state = DriftState.UNKNOWN
+        details["reason"] = "items_unanswered"
     else:
         state = DriftState.IN_SPEC
     return VerifyResult(
         artifact_id=artifact_id,
         state=state,
         verification_log=(result["log"] or "all items in desired state")[:2000],
-        details={"drifted_items": drifted_items, "unknown_items": unknown_items},
+        details=details,
     )
 
 

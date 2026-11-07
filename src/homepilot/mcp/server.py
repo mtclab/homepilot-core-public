@@ -28,6 +28,7 @@ from .tools.agent_tools import (
     handle_forget_agent,
     handle_get_agent,
     handle_get_agent_audit,
+    handle_get_enrolment_requests,
     handle_get_enrolment_window,
     handle_list_agents,
     handle_migrate_agents_tls,
@@ -108,11 +109,19 @@ from .tools.monitoring_tools import (
 from .tools.monitoring_tools import (
     handle_create_alert_rule,
     handle_delete_alert_rule,
+    handle_get_alert_events,
     handle_get_host_metrics,
     handle_get_host_metrics_series,
     handle_get_monitoring_alerts,
     handle_list_alert_rules,
     handle_update_alert_rule,
+)
+from .tools.notification_tools import (
+    TOOL_DEFINITIONS as NOTIFICATION_TOOL_DEFS,
+)
+from .tools.notification_tools import (
+    handle_list_notification_channels,
+    handle_test_notification_channel,
 )
 from .tools.ops_tools import (
     TOOL_DEFINITIONS as OPS_TOOL_DEFS,
@@ -177,6 +186,7 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + OPS_TOOL_DEFS
     + SETTINGS_TOOL_DEFS
     + WEBHOOK_TOOL_DEFS
+    + NOTIFICATION_TOOL_DEFS
 )
 
 # Every tool's inputSchema by name - the contract `_handle_tool` holds calls to.
@@ -284,6 +294,11 @@ _ADMIN_TOOLS = frozenset(
         # included - are sent. Create and delete are deliberately not tools.
         "list_webhooks",
         "test_webhook",
+        # Notification channels (#660). GET /admin/notifications/channels and its
+        # /test are API admin. Create, disable and delete are deliberately not
+        # tools: creating takes the topic URL (a credential) as input.
+        "list_notification_channels",
+        "test_notification_channel",
     }
 )
 
@@ -326,8 +341,10 @@ _READ_ONLY_TOOLS = frozenset(
         "get_agent",
         "get_agent_audit",
         "get_enrolment_window",
+        "get_enrolment_requests",
         "list_alert_rules",
         "get_monitoring_alerts",
+        "get_alert_events",
         "get_host_metrics",
         "get_host_metrics_series",
         "get_host",
@@ -508,6 +525,9 @@ async def _bootstrap() -> dict[str, Any]:
         # reports read. Both contexts (this one and main.py's HTTP one) must
         # carry them or the same tool answers differently per transport.
         "metrics_repo": state.metrics_repo,
+        # Native alert channels (#660), for get_alert_events' channel summary
+        # and the admin channel tools.
+        "notifier": state.notifier,
         "app_state": state,
     }
 
@@ -550,8 +570,10 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "get_agent": handle_get_agent,
     "get_agent_audit": handle_get_agent_audit,
     "get_enrolment_window": handle_get_enrolment_window,
+    "get_enrolment_requests": handle_get_enrolment_requests,
     "list_alert_rules": handle_list_alert_rules,
     "get_monitoring_alerts": handle_get_monitoring_alerts,
+    "get_alert_events": handle_get_alert_events,
     "get_host_metrics": handle_get_host_metrics,
     "get_host_metrics_series": handle_get_host_metrics_series,
     "get_host": handle_get_host,
@@ -611,6 +633,8 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     # Webhooks (#700): the SAME webhooks.service calls /admin/webhooks makes.
     "list_webhooks": handle_list_webhooks,
     "test_webhook": handle_test_webhook,
+    "list_notification_channels": handle_list_notification_channels,
+    "test_notification_channel": handle_test_notification_channel,
 }
 
 

@@ -4,6 +4,7 @@
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
+	import JoinRequests from '$lib/components/JoinRequests.svelte';
 	import RowMenu from '$lib/components/RowMenu.svelte';
 	import { pruneSelection } from '$lib/selection';
 	import { debounce } from '$lib/debounce';
@@ -53,6 +54,8 @@
 	let selectedIds: Set<string> = new Set();
 	// Enrolment panels, folded in from the retired Agents tab (#514 S4).
 	let enrollShow: 'bootstrap' | 'hub' | null = null;
+	// Hosts knocking on the hub and refused, and unused bootstrap tokens (A3).
+	let joinRequests: JoinRequests | null = null;
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
@@ -181,6 +184,7 @@
 	async function load() {
 		loading = true;
 		loadError = '';
+		void joinRequests?.load();
 		try {
 			const res = await api.listInventory({
 				role: filterRole || undefined,
@@ -540,6 +544,12 @@
 			{/if}
 		</span>
 	</div>
+
+	<JoinRequests
+		bind:this={joinRequests}
+		{canWrite}
+		on:enrolWithBootstrap={() => (enrollShow = 'bootstrap')}
+	/>
 
 	<EnrollAgent show={enrollShow} />
 

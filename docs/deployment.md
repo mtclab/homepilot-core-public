@@ -773,13 +773,29 @@ mismatched certificate).
 
 ### Enroll a managed host
 
-Open **Agents** in the UI and copy the generated one-liner - it already carries
-the hub address, the token, and the certificate pin. Run it as root on the host:
+Open **Hosts → Enroll agent** in the UI, generate a bootstrap token, and copy the
+one-liner - it already carries the hub address, the token, and the certificate
+pin. Run it as root on the host:
 
 ```bash
-curl -fsSL https://github.com/mtclab/homepilot-core-public/releases/latest/download/install-agent.sh \
-  | bash -s -- --hub <homepilot-host>:8443 --token <token> --tls --tls-pin sha256:<fingerprint>
+( f="$(mktemp)" && trap 'rm -f "$f"' EXIT && \
+  curl -fsSL -H 'x-hp-agent-token: <token>' http://<homepilot-host>:8000/agents/dist/install-agent.sh -o "$f" && \
+  bash "$f" --hp-api http://<homepilot-host>:8000 --hub <homepilot-host>:8443 \
+      --token <token> --tls-pin sha256:<fingerprint> ) \
+  || { echo 'HomePilot agent install FAILED - see the error above' >&2; false; }
 ```
+
+It downloads the installer to a file and runs it, rather than piping `curl` into
+`bash`: in a pipe a refused download ran bash on nothing and reported success.
+Any failed step ends the command non-zero with that last line.
+
+Both the installer and the agent binary come from this control plane, so the
+host needs no internet access and the agent it installs is the control plane's
+own version. The hub address is `host:port` with no scheme: the hub is a raw TCP
+listener, not a web server. Only when the control plane cannot serve the payload
+(a source checkout with no built binaries) does the UI fall back to the public
+GitHub release - pinned to the control plane's version, never `latest` - and it
+says so beside the command.
 
 `--tls-pin` is what lets the agent verify a self-signed hub; without it the
 agent falls back to the system trust store and the connection fails. The
@@ -1204,7 +1220,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.25` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.7.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |

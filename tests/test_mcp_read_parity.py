@@ -85,10 +85,13 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # Webhook configs (#700): an API-admin read (the endpoints are where the
     # approval codes go), so an admin-tier tool. URLs come back redacted.
     "/admin/webhooks": "list_webhooks",
+    # Notification channels (#660): API admin, endpoints redacted, never the URL.
+    "/admin/notifications/channels": "list_notification_channels",
     # Agent fleet
     "/agents/": "list_agents",
     "/agents/audit": "get_agent_audit",
     "/agents/enrolment-window": "get_enrolment_window",
+    "/agents/enrolment-requests": "get_enrolment_requests",
     "/agents/{agent_id}": "get_agent",
     # get_agent takes agent_id OR hostname, which is exactly what this route is.
     "/agents/hostname/{hostname}": "get_agent",
@@ -121,6 +124,7 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # Monitoring
     "/monitoring/rules": "list_alert_rules",
     "/monitoring/alerts": "get_monitoring_alerts",
+    "/monitoring/alert-events": "get_alert_events",
     "/monitoring/hosts/{hostname}/latest": "get_host_metrics",
     "/monitoring/hosts/{hostname}/series": "get_host_metrics_series",
     # Tasks
@@ -290,6 +294,8 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     ("POST", "/admin/settings/overrides/{key}/probe"): "probe_setting_override",
     # #700: one test delivery to a configured webhook. API admin -> admin tier.
     ("POST", "/admin/webhooks/{webhook_id}/test"): "test_webhook",
+    # #660: one test message to a notification channel. API admin -> admin tier.
+    ("POST", "/admin/notifications/channels/{channel_id}/test"): "test_notification_channel",
     ("DELETE", "/auth/tokens/{prefix}"): "delete_auth_token",
     # Artifacts
     ("POST", "/artifacts"): "propose_artifact",
@@ -350,6 +356,20 @@ EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
     ("DELETE", "/admin/webhooks/{webhook_id}"): (
         "removing an endpoint silences the channel that tells the operator a change "
         "awaits approval; an operator action at the console or `hp webhook delete`."
+    ),
+    # ── Who is woken up (#660). ──
+    ("POST", "/admin/notifications/channels"): (
+        "creating a channel takes the ntfy topic URL as input - a credential that "
+        "would land in the assistant's transcript (the same rule that keeps "
+        "set_proxmox_settings out)"
+    ),
+    ("PATCH", "/admin/notifications/channels/{channel_id}"): (
+        "disabling a channel silences what wakes the operator for an alert; an "
+        "operator action at the console, like deleting a webhook"
+    ),
+    ("DELETE", "/admin/notifications/channels/{channel_id}"): (
+        "deleting a channel silences what wakes the operator for an alert; an "
+        "operator action at the console, like deleting a webhook"
     ),
     # ── Secret/credential configuration - kept OUT of MCP by owner secret rules. ─
     ("PUT", "/admin/settings/proxmox"): (
@@ -1015,6 +1035,13 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
         # One agent is enrolled, so the "first host enrols anyway" case is off.
         assert tool["fleet_empty"] is False
 
+    async def test_get_enrolment_requests(self, api, ctx) -> None:
+        route = await _get(api, "/agents/enrolment-requests")
+        tool = await _handle_tool("get_enrolment_requests", {}, ctx)
+        assert tool == route
+        assert tool["summary"]["wants_to_join"] == 0
+        assert tool["window"]["fleet_empty"] is False
+
     async def test_get_host(self, api, ctx, estate) -> None:
         route = await _get(api, f"/inventory/{estate.host_id}")
         tool = await _handle_tool("get_host", {"host_id": estate.host_id}, ctx)
@@ -1047,7 +1074,13 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
         tool = await _handle_tool("get_dashboard_summary", {}, ctx)
         assert tool == route
         assert tool["inventory"]["total"] == 1
-        assert tool["agents"] == {"known": 1, "connected": 1}
+        assert tool["agents"] == {
+            "known": 1,
+            "connected": 1,
+            "enrolled": 1,
+            "offline_since": None,
+            "offline_alarm": False,
+        }
         assert [s["key"] for s in tool["onboarding"]["steps"]] == [
             "inventory",
             "adopt",
@@ -1258,6 +1291,7 @@ class TestReadOnlyScopeCanCallEveryReadTool:
             ("get_agent", {"agent_id": AGENT_ID}),
             ("get_agent_audit", {}),
             ("get_enrolment_window", {}),
+            ("get_enrolment_requests", {}),
             ("list_alert_rules", {}),
             ("get_monitoring_alerts", {}),
             ("get_host_metrics", {"host": HOSTNAME}),

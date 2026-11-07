@@ -41,6 +41,29 @@ AGENT_METRICS: tuple[str, ...] = (
 
 VALID_COMPARISONS = ("gt", "gte", "lt", "lte")
 
+# What kind of condition a rule is (#660).
+#
+# * ``threshold`` - a metric crossing a value for ``for_seconds``. A host that
+#   stops reporting drops out of its candidate set by design: no data is not a
+#   breach.
+# * ``nodata`` - an ENROLLED host that has reported nothing at all for
+#   ``for_seconds``. Its candidate set is the inventory's enrolled hosts, not
+#   the metrics table, which is the only way silence can be noticed. It has no
+#   metric, comparison or threshold of its own; they are stored as the fixed
+#   placeholders below so the columns stay NOT NULL and nothing can mistake
+#   them for a real condition.
+KIND_THRESHOLD = "threshold"
+KIND_NODATA = "nodata"
+RULE_KINDS = (KIND_THRESHOLD, KIND_NODATA)
+NODATA_METRIC = "*"
+_NODATA_COMPARISON = "gt"
+_NODATA_THRESHOLD = 0.0
+
+# The shortest silence a nodata rule may wait for. The agent reports every 60 s
+# by default; anything under two cadences would fire on one late frame, and an
+# alert that cries wolf on a jittery link is the alert people mute.
+NODATA_MIN_SECONDS = 120
+
 # Comparison name -> SQL operator. A fixed table, never interpolated from caller
 # input: the name is looked up here and a miss raises, so no rule can put text
 # into a query.
@@ -214,7 +237,19 @@ class MetricsRepository:
         for_seconds: int = 300,
         host_filter: str = "*",
         enabled: bool = True,
+        kind: str = KIND_THRESHOLD,
     ) -> dict[str, Any]:
+        if kind not in RULE_KINDS:
+            raise ValueError(f"Invalid rule kind {kind!r}. Must be one of {RULE_KINDS}")
+        if kind == KIND_NODATA:
+            if for_seconds < NODATA_MIN_SECONDS:
+                raise ValueError(
+                    f"a nodata rule must wait at least {NODATA_MIN_SECONDS} seconds: the "
+                    "agent reports once a minute, so anything shorter fires on one late frame"
+                )
+            metric = NODATA_METRIC
+            comparison = _NODATA_COMPARISON
+            threshold = _NODATA_THRESHOLD
         if comparison not in VALID_COMPARISONS:
             raise ValueError(
                 f"Invalid comparison {comparison!r}. Must be one of {VALID_COMPARISONS}"
@@ -226,8 +261,8 @@ class MetricsRepository:
         await self.db.execute(
             """INSERT INTO alert_rules
                  (id, name, host_filter, metric, comparison, threshold, for_seconds,
-                  enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  enabled, created_at, updated_at, kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rule_id,
                 name,
@@ -239,6 +274,7 @@ class MetricsRepository:
                 int(enabled),
                 ts,
                 ts,
+                kind,
             ),
         )
         await self.db.conn.commit()
@@ -304,6 +340,22 @@ class MetricsRepository:
 
         if not fields:
             return await self.get_rule(rule_id)
+
+        current = await self.get_rule(rule_id)
+        if current is None:
+            return None
+        if str(current.get("kind") or KIND_THRESHOLD) == KIND_NODATA:
+            # A nodata rule has no metric, comparison or threshold: accepting
+            # one would store a condition that is never evaluated - the exact
+            # "listed, enabled, guarding nothing" shape #648 removed.
+            meaningless = sorted(set(fields) & {"metric", "comparison", "threshold"})
+            if meaningless:
+                raise ValueError(
+                    f"a nodata rule has no {', '.join(meaningless)}: it fires when a host "
+                    "reports nothing at all; change its duration or host filter instead"
+                )
+            if "for_seconds" in fields and int(fields["for_seconds"]) < NODATA_MIN_SECONDS:
+                raise ValueError(f"a nodata rule must wait at least {NODATA_MIN_SECONDS} seconds")
 
         # Coerce to the stored column types so a JSON int threshold or a bool
         # enabled land the same way create_rule writes them.
@@ -432,8 +484,121 @@ class MetricsRepository:
         """Every alert currently firing, joined to the rule that raised it."""
         return await self.db.fetchall(
             """SELECT s.rule_id, s.hostname, s.firing_since, s.last_value, s.last_eval,
-                      r.name, r.metric, r.comparison, r.threshold, r.for_seconds
+                      r.name, r.metric, r.comparison, r.threshold, r.for_seconds, r.kind
                  FROM alert_state s JOIN alert_rules r ON r.id = s.rule_id
                 WHERE s.firing_since IS NOT NULL AND r.enabled = 1
                 ORDER BY s.firing_since"""
         )
+
+    async def firing_for_rule(self, rule_id: str) -> list[dict[str, Any]]:
+        """This rule's latched (firing) rows, whatever host they are for."""
+        return await self.db.fetchall(
+            "SELECT hostname, firing_since, last_value FROM alert_state "
+            "WHERE rule_id = ? AND firing_since IS NOT NULL",
+            (rule_id,),
+        )
+
+    # ── Enrolled hosts (the nodata candidate set) ────────────────────────────
+    async def enrolled_hosts(self) -> list[dict[str, Any]]:
+        """Every host with an enrolled, unrevoked agent, and when it was last heard.
+
+        The candidate set of a ``nodata`` rule (#660). Deliberately NOT "hosts
+        that reported recently" - that is the threshold rules' candidate set, and
+        it is precisely why a silent host could never alert: it had left the set
+        before anyone looked.
+
+        Joined through ``hosts.agent_id`` (the inventory's link to the agent it
+        believes is that machine), so a reinstalled agent's stale row does not
+        count twice and a host that never had an agent is not here at all: that
+        is a coverage gap, not an outage. ``last_heartbeat`` moves on every
+        heartbeat AND every metrics frame, so it is "last heard from" whether
+        or not this agent samples metrics. ``pve_status`` lets the evaluator tell
+        a VM somebody stopped from a VM that went dark."""
+        rows = await self.db.fetchall(
+            """SELECT a.hostname AS hostname, a.agent_id AS agent_id,
+                      a.last_heartbeat AS last_heartbeat, a.connected_at AS connected_at,
+                      a.first_seen AS first_seen, h.pve_status AS pve_status
+                 FROM agents a JOIN hosts h ON h.agent_id = a.agent_id
+                WHERE a.revoked_at IS NULL AND a.hostname IS NOT NULL AND a.hostname != ''
+                ORDER BY a.hostname"""
+        )
+        return [dict(r) for r in rows]
+
+    # ── Alert history (#660) ─────────────────────────────────────────────────
+    async def record_alert_event(
+        self,
+        *,
+        rule: dict[str, Any],
+        hostname: str,
+        event: str,
+        value: float | None,
+        since: str | None,
+        at: str,
+        duration_seconds: int | None = None,
+        reason: str | None = None,
+    ) -> int:
+        """Append one transition to the history; returns its id.
+
+        Called on the two transitions the evaluator already notifies on - never
+        per evaluation - so it costs one insert per fire and one per recovery."""
+        if event not in ("firing", "resolved"):
+            raise ValueError(f"unknown alert event {event!r}")
+        cursor = await self.db.execute(
+            """INSERT INTO alert_events
+                 (rule_id, rule_name, rule_kind, metric, hostname, event, value, since,
+                  duration_seconds, reason, at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(rule["id"]),
+                str(rule["name"]),
+                str(rule.get("kind") or KIND_THRESHOLD),
+                str(rule["metric"]),
+                hostname,
+                event,
+                value,
+                since,
+                duration_seconds,
+                reason,
+                at,
+            ),
+        )
+        await self.db.conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def set_alert_event_delivery(self, event_id: int, delivered_to: list[str]) -> None:
+        """Record which channels accepted this event (empty list = none did)."""
+        import json
+
+        await self.db.execute(
+            "UPDATE alert_events SET delivered_to = ? WHERE id = ?",
+            (json.dumps(sorted(delivered_to)), event_id),
+        )
+        await self.db.conn.commit()
+
+    async def list_alert_events(
+        self, since: str, hostname: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Transitions at or after ``since`` (ISO), newest first."""
+        import json
+
+        sql = "SELECT * FROM alert_events WHERE at >= ?"
+        params: list[Any] = [since]
+        if hostname:
+            sql += " AND hostname = ?"
+            params.append(hostname)
+        # Insertion order, not `at`: the table is append-only so the id IS the
+        # order things happened in, while `at` is a wall-clock reading that an
+        # NTP step can move backwards between a fire and its recovery.
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        rows = await self.db.fetchall(sql, tuple(params))
+        out = []
+        for r in rows:
+            item = dict(r)
+            raw = item.get("delivered_to")
+            try:
+                item["delivered_to"] = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                item["delivered_to"] = None
+            out.append(item)
+        return out

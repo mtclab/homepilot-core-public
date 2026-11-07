@@ -299,6 +299,102 @@ class TestNativeMetricsJourney:
             assert "hub connection lost" in log, log
 
 
+@_needs_go
+class TestAHostThatGoesDarkReachesAPhone:
+    """#660 on the shipped path: the REAL agent binary stops, the seeded
+    "Host went dark" rule fires, the Alerts list shows it, an ntfy request is
+    made (the server stood in for at the httpx transport), and when a real
+    agent comes back the rule resolves with its duration and a second push."""
+
+    async def test_a_silent_agent_fires_pushes_and_resolves(
+        self, agent_binary: str, hp_dir: str, tmp_path: Path
+    ):
+        import httpx
+
+        from homepilot.metrics.alerts import AlertEvaluator
+        from homepilot.metrics.defaults import seed_default_alert_rules
+
+        sent: list[dict[str, Any]] = []
+
+        def ntfy(request: httpx.Request) -> httpx.Response:
+            sent.append(json.loads(request.content))
+            return httpx.Response(200, json={"id": "x"})
+
+        state, settings = await _hub_on(hp_dir)
+        proc = None
+        try:
+            # A default install seeds the dark rule; nobody types it in.
+            await seed_default_alert_rules(state.repo, state.metrics_repo)
+            assert any(r["kind"] == "nodata" for r in await state.metrics_repo.list_rules())
+
+            notifier = state.notifier
+            notifier._transport = httpx.MockTransport(ntfy)
+            notifier._retry_delays = ()
+            await notifier.create_channel(
+                kind="ntfy", name="phone", url="https://ntfy.example.com/hp-journey", token=None
+            )
+
+            pin = "sha256:" + state.agent_hub.cert_fingerprint
+            conf = tmp_path / "host-dark"
+            proc = _spawn_agent(agent_binary, conf, settings, pin)
+            rows = await _wait_for_samples(state, timeout=40)
+            assert rows, "the agent never reported"
+            hostname = rows[0]["hostname"]
+
+            clock = [time.time()]
+            evaluator = AlertEvaluator(
+                state.metrics_repo, repo=state.repo, now=lambda: clock[0], notifier=notifier
+            )
+            assert (await evaluator.run()).details["fired"] == 0, "a live agent was called dark"
+
+            # The agent dies. Six minutes pass on the evaluator's clock.
+            proc.terminate()
+            proc.communicate(timeout=10)
+            proc = None
+            clock[0] = time.time() + 360
+            result = await evaluator.run()
+            await notifier.drain()
+            assert result.details["fired"] >= 1, result.details
+
+            client = _series_client(state)
+            client.app.state.notifier = notifier
+            history = client.get("/monitoring/alert-events?hours=24").json()
+            dark = [e for e in history["items"] if e["rule_kind"] == "nodata"]
+            assert [(e["hostname"], e["event"]) for e in dark] == [(hostname, "firing")]
+            assert dark[0]["delivered_to"] == ["phone"]
+            assert any(m["title"] == f"Alert: Host went dark on {hostname}" for m in sent), sent
+
+            # The same agent (same identity files) comes back.
+            proc = _spawn_agent(agent_binary, conf, settings, pin)
+            before = (
+                await state.database.fetchone(
+                    "SELECT last_heartbeat FROM agents WHERE hostname = ?", (hostname,)
+                )
+            )["last_heartbeat"]
+            deadline = asyncio.get_running_loop().time() + 40
+            while asyncio.get_running_loop().time() < deadline:
+                row = await state.database.fetchone(
+                    "SELECT last_heartbeat, connected FROM agents WHERE hostname = ?",
+                    (hostname,),
+                )
+                if row["connected"] and row["last_heartbeat"] != before:
+                    break
+                await asyncio.sleep(0.5)
+            clock[0] = time.time()
+            result = await evaluator.run()
+            await notifier.drain()
+            assert result.details["resolved"] >= 1, result.details
+
+            history = client.get("/monitoring/alert-events?hours=24").json()
+            dark = [e for e in history["items"] if e["rule_kind"] == "nodata"]
+            assert [e["event"] for e in dark] == ["resolved", "firing"]
+            assert dark[0]["duration_seconds"] is not None
+            assert any(m["title"] == f"Resolved: Host went dark on {hostname}" for m in sent)
+        finally:
+            await notifier.drain()
+            await _shutdown(state, proc)
+
+
 def test_ui_series_fixture_stays_in_sync_with_the_api_contract():
     """The fixture is a contract, so it may not drift into something the API
     could never return (a missing key, a point without a timestamp)."""

@@ -43,6 +43,18 @@ Two guards, and both are needed:
   tuned rules did not ask for two more, and their absence is not the failure
   this exists to fix. An install with rules that are all inert is a different
   problem, and ``hosts_matched`` is what says so.
+
+## "Host went dark" is seeded onto EVERY install, once (#660)
+
+The ``nodata`` rule kind did not exist before, so no existing alerting policy
+can have chosen to go without it - an operator with five tuned threshold rules
+did not decide against being told a machine went silent; they could not express
+it. That is why the second guard above does not apply to it: it is added once
+to every install that has no ``nodata`` rule yet, under its own marker, so
+deleting it keeps it deleted exactly like the threshold defaults.
+
+Five minutes: the agent reports every minute, so five missed reports is not a
+blip, and it is the duration review 03 and #660 named.
 """
 
 from __future__ import annotations
@@ -55,6 +67,17 @@ logger = logging.getLogger(__name__)
 # Bump the suffix only to deliberately re-seed an existing fleet; existing
 # installs then get the new set once, and never again.
 SEED_MARKER_KEY = "default_alert_rules_seeded_v1"
+NODATA_SEED_MARKER_KEY = "default_alert_rules_seeded_v2_nodata"
+
+HOST_WENT_DARK_RULE: dict[str, Any] = {
+    "name": "Host went dark",
+    "kind": "nodata",
+    "metric": "*",
+    "comparison": "gt",
+    "threshold": 0.0,
+    "for_seconds": 300,
+    "host_filter": "*",
+}
 
 DEFAULT_ALERT_RULES: tuple[dict[str, Any], ...] = (
     {
@@ -82,6 +105,33 @@ async def seed_default_alert_rules(repo: Any, metrics_repo: Any) -> int:
     Never raises into startup: a fleet that cannot write a default rule must
     still boot. It logs, and the next boot tries again because the marker is
     only written after the rules are."""
+    created = await _seed_threshold_defaults(repo, metrics_repo)
+    created += await _seed_host_went_dark(repo, metrics_repo)
+    return created
+
+
+async def _seed_host_went_dark(repo: Any, metrics_repo: Any) -> int:
+    """Add "Host went dark" once, unless a nodata rule already exists."""
+    try:
+        if await repo.get_setting(NODATA_SEED_MARKER_KEY) is not None:
+            return 0
+        rules = await metrics_repo.list_rules()
+        if any(str(r.get("kind") or "") == "nodata" for r in rules):
+            await repo.set_setting(NODATA_SEED_MARKER_KEY, "1")
+            return 0
+        await metrics_repo.create_rule(**HOST_WENT_DARK_RULE)
+        await repo.set_setting(NODATA_SEED_MARKER_KEY, "1")
+        logger.info(
+            "seeded the 'Host went dark' alert rule (an enrolled host silent for 5 min "
+            "fires); retune or delete it in Settings -> Monitoring"
+        )
+        return 1
+    except Exception:
+        logger.warning("could not seed the 'Host went dark' alert rule", exc_info=True)
+        return 0
+
+
+async def _seed_threshold_defaults(repo: Any, metrics_repo: Any) -> int:
     try:
         if await repo.get_setting(SEED_MARKER_KEY) is not None:
             return 0
