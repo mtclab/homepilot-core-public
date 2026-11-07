@@ -48,6 +48,11 @@
 	// it silently dropped every drift line and this page read clean (#648
 	// tranche 7) - the same rule Overview's "In spec" card already keeps at P6.
 	let driftUnread = false;
+	// A read that FAILED is not a read that found nothing (#701). Each of these
+	// holds the reason a section could not be read, '' when it was.
+	let metricsError = '';
+	let activityError = '';
+	let docError = '';
 	let loading = true;
 	let loadError = '';
 	let hours = 1;
@@ -107,7 +112,9 @@
 				api.getDriftStatus({ drifted: true, limit: 200 }),
 			]);
 			doc = docRes.status === 'fulfilled' ? docRes.value : null;
+			docError = docRes.status === 'rejected' ? reason(docRes.reason) : '';
 			activity = actRes.status === 'fulfilled' ? actRes.value.items : [];
+			activityError = actRes.status === 'rejected' ? reason(actRes.reason) : '';
 			driftUnread = driftRes.status === 'rejected';
 			driftedIds =
 				driftRes.status === 'fulfilled'
@@ -121,11 +128,32 @@
 		}
 	}
 
+	function reason(e: unknown): string {
+		return e instanceof Error ? e.message : String(e);
+	}
+
+	/** Why a doc section could not be read, or '' when it was (#701). The doc
+	 *  records each half's outcome in `sources`; a failed doc read fails all. */
+	function unreadReason(
+		d: HostDoc | null,
+		failed: string,
+		key: 'artifact_history' | 'knowledge_base'
+	): string {
+		if (failed) return failed;
+		const src = d?.sources?.[key];
+		if (src && src.read === false) return src.error || 'no reason given';
+		return '';
+	}
+
+	$: historyUnread = unreadReason(doc, docError, 'artifact_history');
+	$: notesUnread = unreadReason(doc, docError, 'knowledge_base');
+
 	async function loadMetrics() {
 		if (!host?.agent_id || !host.hostname) return;
 		try {
 			const latestRes = await api.getHostLatest(host.hostname);
 			latest = latestRes.metrics;
+			metricsError = '';
 			const wanted = latest.map((m) => m.metric);
 			const results = await Promise.allSettled(
 				wanted.map((m) => api.getHostSeries(host!.hostname, m, hours))
@@ -135,11 +163,12 @@
 				if (r.status === 'fulfilled') next[wanted[i]] = r.value.points;
 			});
 			series = next;
-		} catch {
-			// The metrics grid renders its own empty state; a fetch error here
-			// must not take down the identity header.
+		} catch (e) {
+			// A fetch error must not take down the identity header - but it is
+			// also not "the agent has not reported yet" (#701).
 			latest = [];
 			series = {};
+			metricsError = reason(e);
 		}
 	}
 
@@ -291,6 +320,7 @@
 
 	$: agentTabHref = tabs.find((t) => t.id === 'agent')?.href ?? '';
 	$: metricsTabHref = tabs.find((t) => t.id === 'metrics')?.href ?? '';
+	$: changesTabHref = tabs.find((t) => t.id === 'changes')?.href ?? '';
 
 	$: attention = ((): Attention[] => {
 		if (!host) return [];
@@ -334,6 +364,22 @@
 				label: 'refused',
 				text: agent.last_error,
 				href: agentTabHref,
+			});
+		}
+		if (historyUnread) {
+			out.push({
+				severity: 'warning',
+				label: 'changes unread',
+				text: `Could not read this host\u2019s changes (${historyUnread}), so drift on them cannot be shown here`,
+				href: changesTabHref,
+			});
+		}
+		if (notesUnread && notesUnread !== 'no KB service is wired into this instance') {
+			out.push({
+				severity: 'notice',
+				label: 'notes unread',
+				text: `Could not read the notes for this host (${notesUnread})`,
+				href: '',
 			});
 		}
 		if (driftUnread && (doc?.artifact_history?.length ?? 0) > 0) {
@@ -589,6 +635,11 @@
 							No agent on this host, so nothing reports metrics. Enroll one from the
 							<a class="text-accent" href="{base}/agents">fleet page</a> to see load, memory and disk here.
 						</p>
+					{:else if metricsError}
+						<p class="text-danger text-sm">
+							Could not read this host's metrics: {metricsError}
+							<button class="text-accent text-xs ml-1" on:click={() => void loadMetrics()}>Retry</button>
+						</p>
 					{:else if !latest.length}
 						<p class="text-muted text-sm">
 							The agent has not reported metrics yet. They arrive with its next report cycle.
@@ -612,7 +663,12 @@
 				<!-- ── Changes: what HomePilot has done to this machine ────────────── -->
 				<div class="card p-4 space-y-2">
 					<h2 class="section-title">Changes</h2>
-					{#if doc?.artifact_history?.length}
+					{#if historyUnread}
+						<p class="text-danger text-sm">
+							Could not read this host's changes: {historyUnread}
+							<button class="text-accent text-xs ml-1" on:click={() => void load()}>Retry</button>
+						</p>
+					{:else if doc?.artifact_history?.length}
 						<table class="w-full text-sm">
 							<thead>
 								<tr class="text-left text-muted text-xs">
@@ -654,6 +710,11 @@
 								</li>
 							{/each}
 						</ul>
+					{:else if activityError}
+						<p class="text-danger text-sm">
+							Could not read the journal for this host: {activityError}
+							<button class="text-accent text-xs ml-1" on:click={() => void load()}>Retry</button>
+						</p>
 					{:else}
 						<p class="text-muted text-sm">Nothing in the journal names this host yet.</p>
 					{/if}

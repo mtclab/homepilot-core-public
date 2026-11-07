@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +9,9 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from ..admin.router import ProxmoxConfigIn, save_proxmox_settings, test_proxmox_settings
+from ..auth.audit import ACTION_CLAIMED, ACTION_MINTED, audit_credential_event
 from ..auth.tokens import generate_api_token
-from ..common import SlidingWindowLimiter
+from ..common import SlidingWindowLimiter, write_private
 from ..config import get_settings
 from ..db.repository import Repository
 from .repository import ClaimRepository
@@ -119,9 +121,17 @@ async def _store_local_cli_token(request: Request, db: Repository, user_id: str)
         )
         path = _data_dir(request) / "api-token"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(full_token + "\n", encoding="utf-8")
-        path.chmod(0o600)
+        write_private(path, full_token + "\n")
         logger.info("Local CLI admin token autocreated (prefix=%s) at %s", prefix, path)
+        await audit_credential_event(
+            db,
+            action=ACTION_MINTED,
+            actor="claim",
+            source="claim",
+            prefix=prefix,
+            label=_LOCAL_CLI_LABEL,
+            scope=_ADMIN_SCOPE,
+        )
     except Exception as exc:  # never fail the claim over this
         logger.warning("Could not autocreate the local CLI admin token: %s", exc)
 
@@ -255,6 +265,24 @@ async def claim_instance(request: Request, body: ClaimRequest) -> dict[str, Any]
         raise
 
     clear_claim_code(_data_dir(request))
+    # The one action that creates the first fleet-root credential (#686): the
+    # claim itself, and the mint it made, both on the durable trail. After the
+    # claim is final, so a failing audit write is logged loudly but cannot
+    # swallow the only copy of the token the operator is about to receive.
+    try:
+        for action in (ACTION_CLAIMED, ACTION_MINTED):
+            await audit_credential_event(
+                db,
+                action=action,
+                actor="claim",
+                source="claim",
+                prefix=prefix,
+                label=body.label,
+                scope=_ADMIN_SCOPE,
+                client=client_ip,
+            )
+    except sqlite3.Error:
+        logger.exception("Claim succeeded but its audit rows could not be written")
     logger.warning(
         "Instance CLAIMED from %s (local=%s, code_presented=%s, token prefix=%s, "
         "proxmox_configured=%s) - the claim path is now closed permanently",

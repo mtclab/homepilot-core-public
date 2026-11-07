@@ -951,6 +951,30 @@ class Repository:
         )
         return dict(row) if row is not None else None
 
+    async def list_hosts_by_proxmox_id(self, proxmox_id: int) -> list[dict[str, Any]]:
+        """Every row that has ever held this VMID, newest first (#706).
+
+        For the refresh, which has to find the row that IS the machine PVE now
+        reports - by name - among the rows of earlier occupants.
+        """
+        rows = await self.db.fetchall(
+            "SELECT * FROM hosts WHERE proxmox_id = ? ORDER BY created_at DESC, id DESC",
+            (proxmox_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def proxmox_ids_ever_held(self, low: int, high: int) -> set[int]:
+        """Every VMID in ``low..high`` that any `hosts` row has ever held (#718).
+
+        The rows of destroyed guests stay (#648, #706), so this is the set of
+        ids the provisioner must never hand out again inside its range.
+        """
+        rows = await self.db.fetchall(
+            "SELECT DISTINCT proxmox_id FROM hosts WHERE proxmox_id BETWEEN ? AND ?",
+            (low, high),
+        )
+        return {int(r["proxmox_id"]) for r in rows}
+
     async def update_host(self, host_id: str, **kwargs: Any) -> None:
         if not kwargs:
             return
@@ -997,6 +1021,21 @@ class Repository:
         except (ValueError, TypeError):
             return set()
         return {str(v) for v in values} if isinstance(values, list) else set()
+
+    async def retire_host(self, host_id: str) -> None:
+        """Mark a host row as no longer being any machine on the hypervisor (#706).
+
+        For a row whose VMID now belongs to a different machine: stamped absent
+        (once - an existing date is kept) with its live status blanked, exactly
+        as the absent sweep does, so nothing reads it as running and no guest
+        can power it.
+        """
+        await self.db.execute(
+            "UPDATE hosts SET absent_since = COALESCE(absent_since, ?), updated_at = ?, "
+            "status = 'unknown', pve_status = 'unknown' WHERE id = ?",
+            (now(), now(), host_id),
+        )
+        await self.db.conn.commit()
 
     async def update_host_from_automation(self, host_id: str, **kwargs: Any) -> list[str]:
         """Update a host from a sync/enrich pass, LEAVING pinned fields alone.
@@ -1064,13 +1103,20 @@ class Repository:
         await self.db.conn.commit()
 
     async def mark_hosts_absent(self, seen_ids: set[str], sources: tuple[str, ...]) -> int:
+        """`mark_hosts_absent_ids`, counted."""
+        return len(await self.mark_hosts_absent_ids(seen_ids, sources))
+
+    async def mark_hosts_absent_ids(
+        self, seen_ids: set[str], sources: tuple[str, ...]
+    ) -> list[str]:
         """Stamp hosts the hypervisor no longer reports, clear the ones it does.
 
         Only hosts whose ``source`` is in ``sources`` are considered: Proxmox has
         no opinion about a machine an operator added by hand, so a manual host
         must never be marked absent by a sync that never looked for it (#445 A5).
 
-        Returns the number newly marked. ``absent_since`` is set ONCE - a host
+        Returns the ids NEWLY marked - the only honest thing to journal as
+        "went absent this cycle" (#712). ``absent_since`` is set ONCE - a host
         that has been gone for a week must keep the date it went missing, not be
         restamped every cycle - and cleared the moment it is seen again.
         """
@@ -1092,10 +1138,11 @@ class Repository:
         cursor = await self.db.execute(
             f"UPDATE hosts SET absent_since = ?, updated_at = ?, "
             f"status = 'unknown', pve_status = 'unknown' "
-            f"WHERE source IN ({placeholders}) AND absent_since IS NULL{seen_clause}",
+            f"WHERE source IN ({placeholders}) AND absent_since IS NULL{seen_clause} "
+            f"RETURNING id",
             [now(), now(), *params],
         )
-        newly_absent = cursor.rowcount
+        newly_absent = [str(row["id"]) for row in await cursor.fetchall()]
         if seen:
             await self.db.execute(
                 f"UPDATE hosts SET absent_since = NULL, updated_at = ? "
@@ -1687,6 +1734,26 @@ class Repository:
                  code=excluded.code,
                  failed_attempts=0,
                  locked=0,
+                 updated_at=excluded.updated_at""",
+            (artifact_id, code, ts, ts),
+        )
+        await self.db.conn.commit()
+
+    async def rotate_approval_code(self, artifact_id: str, code: str) -> None:
+        """Replace an artifact's code because its CONTENT changed (#652).
+
+        A code a human read while reviewing the old content must not approve
+        the new content. Unlike `set_approval_code`, a lock survives: a locked
+        artifact still needs an operator to look at it.
+        """
+        ts = now()
+        await self.db.execute(
+            """INSERT INTO artifact_approval_codes
+               (artifact_id, code, failed_attempts, locked, created_at, updated_at)
+               VALUES (?, ?, 0, 0, ?, ?)
+               ON CONFLICT(artifact_id) DO UPDATE SET
+                 code=excluded.code,
+                 failed_attempts=0,
                  updated_at=excluded.updated_at""",
             (artifact_id, code, ts, ts),
         )

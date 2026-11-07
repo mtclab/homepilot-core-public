@@ -157,9 +157,13 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         # the page every operator opens first. alert_state has one row per
         # (rule, host) and is cheap.
         "metrics": {
+            # The SAME predicate `list_firing` uses (#714): the count on the
+            # Overview and the list behind it must not disagree about what is
+            # firing, and a disabled rule's alert is not firing.
             "firing_alerts": (
                 await db.fetchone(
-                    "SELECT COUNT(*) c FROM alert_state WHERE firing_since IS NOT NULL"
+                    "SELECT COUNT(*) c FROM alert_state s JOIN alert_rules r "
+                    "ON r.id = s.rule_id WHERE s.firing_since IS NOT NULL AND r.enabled = 1"
                 )
             )["c"],
             # firing_alerts on its own is the #642 shape: on an install with no

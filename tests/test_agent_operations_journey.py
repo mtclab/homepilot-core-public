@@ -34,8 +34,10 @@ from typing import Any
 
 import pytest
 
-_GO = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
-_needs_go = pytest.mark.skipif(not _GO, reason="Go toolchain not available")
+from .go_toolchain import GO as _GO
+from .go_toolchain import GO_SKIP_REASON
+
+_needs_go = pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON)
 
 
 @pytest.fixture
@@ -111,6 +113,16 @@ async def _wait_connected(state: Any, timeout: float = 30.0) -> str:
     raise AssertionError("the real agent never reached the hub")
 
 
+async def _wait_for_file(path: Path, timeout: float = 15.0) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if path.exists() and path.read_text().strip():
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
 async def _wait_gone(state: Any, agent_id: str, timeout: float = 20.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -155,7 +167,15 @@ class TestAgentOperationsJourney:
             # a steady-state fleet runs in.
             procs.append(_spawn_agent(agent_binary, conf, state, writable))
             first_id = await _wait_connected(state)
-            assert (conf / "agent.token").exists(), "the agent never persisted its credential"
+            # The hub registers the agent BEFORE the agent has read its ack and
+            # written the credential, so wait for the file rather than assert at
+            # the instant of registration (a race that failed this journey under
+            # load). It matters: killing the agent before it persisted the
+            # credential leaves a host that holds a live credential on the hub
+            # and none on disk, which the shared token may not re-enrol (#683).
+            assert await _wait_for_file(conf / "agent.token"), (
+                "the agent never persisted its credential"
+            )
             procs[0].terminate()
             procs[0].wait(timeout=10)
             await _wait_gone(state, first_id)
@@ -184,11 +204,23 @@ class TestAgentOperationsJourney:
             # "success" is the audit answering a question it never asked.
             assert hub.registry.audit_log.query()[-1]["result"] == "blocked"
 
-            # 3. read_file: a small file under a read prefix comes back whole.
-            small = Path(hp_dir) / "small.txt"
+            # 3. read_file: a small file HomePilot may read (the write prefix -
+            #    what HomePilot wrote it must be able to read back) comes back whole.
+            small = writable / "small.txt"
             small.write_text("hello from the host\n")
             read = await hub.send_read_file(agent_id, str(small), timeout=10)
             assert read["content"] == "hello from the host\n"
+
+            # 3b. read_file is default-deny (#691): the same file one directory
+            #     up, outside every allowlisted prefix, is refused by the agent,
+            #     and so is `cat` of it (#682: cat is the same gate).
+            outside = Path(hp_dir) / "outside.txt"
+            outside.write_text("not for the read tier\n")
+            with pytest.raises(AgentCommandError, match="read allowlist"):
+                await hub.send_read_file(agent_id, str(outside), timeout=10)
+            refused_cat = await hub.send_command(agent_id, f"cat {outside}", timeout=10)
+            assert refused_cat["exit_code"] != 0
+            assert "not for the read tier" not in refused_cat["stdout"]
 
             # 4. read_file over the payload budget: a REFUSAL WITH A REASON, and
             #    the agent is still there afterwards.
@@ -198,7 +230,7 @@ class TestAgentOperationsJourney:
             #    replay-protected connection the hub closes the socket, so this
             #    assertion flips from AgentCommandError to ConnectionError and
             #    the registry check below goes None.
-            big = Path(hp_dir) / "big.log"
+            big = writable / "big.log"
             big.write_text("x" * (MAX_MESSAGE_SIZE + 4096))
             with pytest.raises(AgentCommandError) as refusal:
                 await hub.send_read_file(agent_id, str(big), timeout=20)

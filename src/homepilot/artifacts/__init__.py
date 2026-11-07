@@ -4,6 +4,7 @@ from .file_store import ArtifactFileStore
 from .lifecycle import ArtifactLifecycle
 from .models import (
     ApprovedBy,
+    ArtifactBusyError,
     ArtifactFrontmatter,
     ArtifactKind,
     ArtifactStatus,
@@ -24,6 +25,7 @@ from .validators import validate_artifact_expressions, validate_jinja2_template,
 
 __all__ = [
     "ApprovedBy",
+    "ArtifactBusyError",
     "ArtifactFileStore",
     "ArtifactFrontmatter",
     "ArtifactKind",

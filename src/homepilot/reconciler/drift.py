@@ -57,9 +57,17 @@ class DriftReconciler(Reconciler):
                     "(Proxmox client unavailable)",
                     skipped_no_executor,
                 )
+                # Nothing was checked, so no artifact may keep a verdict from a
+                # time when something was (#712).
+                for fm in checkable:
+                    await self._record_unknown(
+                        str(fm.get("id", "")), "no_executor", "no executor configured"
+                    )
+                # NOT a success: a drift loop that can check nothing is not a
+                # healthy one, and the self-check reads this flag (#712).
                 return ReconcilerResult(
                     name="drift",
-                    success=True,
+                    success=False,
                     details={
                         "checked": 0,
                         "drifted": 0,
@@ -92,6 +100,10 @@ class DriftReconciler(Reconciler):
                 except Exception as exc:
                     errors += 1
                     logger.warning("Drift check failed for %s: %s", artifact_id, exc)
+                    # The previous verdict must not stand as if it were current:
+                    # nothing was established this cycle, and "unknown" is the
+                    # word for that (#712).
+                    await self._record_unknown(artifact_id, "check_failed", str(exc))
                     drift_details.append(
                         {
                             "artifact_id": artifact_id,
@@ -123,7 +135,12 @@ class DriftReconciler(Reconciler):
                 logger.exception("DriftReconciler audit log failed")
                 details["audit_log_error"] = True
 
-            return ReconcilerResult(name="drift", success=True, details=details)
+            # A cycle in which every check errored established NOTHING, and
+            # reporting it as a success kept the self-check's reconciler line
+            # green for a loop that had not checked anything in days (#712).
+            return ReconcilerResult(
+                name="drift", success=errors == 0 or checked > 0, details=details
+            )
 
         except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
             logger.exception("DriftReconciler failed")
@@ -176,6 +193,20 @@ class DriftReconciler(Reconciler):
         except Exception:  # re-raises after logging — intentional broad catch
             logger.exception("Single drift check failed for %s", artifact_id)
             raise
+
+    async def _record_unknown(self, artifact_id: str, reason: str, error: str) -> None:
+        """Overwrite an artifact's stored verdict with UNKNOWN, best-effort."""
+        if not artifact_id:
+            return
+        try:
+            await self.repo.upsert_drift_check(
+                artifact_id=artifact_id,
+                drifted=False,
+                details_json=json.dumps({"reason": reason, "error": error[:500]}),
+                state="unknown",
+            )
+        except Exception:  # best-effort: the cycle's own result still says it failed
+            logger.warning("Could not record unknown drift for %s", artifact_id, exc_info=True)
 
     async def _emit_drift_event(self, artifact_id: str, result: VerifyResult) -> None:
         """Emit an ``artifact_drifted`` event, best-effort.

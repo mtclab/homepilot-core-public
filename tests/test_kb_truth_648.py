@@ -1,7 +1,7 @@
 """The knowledge base tells the truth about what it holds (#648 tranche 6).
 
 Every assertion here was written against a behaviour reproduced live on the
-shipped 3.6.17 image, either on dev (10.0.0.1) or in a scratch container
+shipped 3.6.17 image, either on dev or in a scratch container
 running the same image with a real embedding service attached.
 
 The class the review was looking for is #642's: a claim produced from a read or
@@ -65,7 +65,10 @@ async def kb(repo, store):
     lifecycle = ArtifactLifecycle(store, repo)
     service = KBService(repo=repo, store=store, lifecycle=lifecycle)
     lifecycle._kb_service = service
-    return service
+    yield service
+    # A lifecycle transition starts a BACKGROUND reindex; finish it before the
+    # database closes (#622).
+    await service.drain()
 
 
 def _vector(seed: float) -> list[float]:

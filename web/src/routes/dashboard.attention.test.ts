@@ -461,3 +461,95 @@ describe('Overview: a read that did not come back', () => {
 		expect(screen.queryByText(/could not read/i)).not.toBeInTheDocument();
 	});
 });
+
+/**
+ * Claims the Overview made about sets it had only partly read (#704).
+ *
+ * "agent offline" was computed from the first 100 hosts and "failed"/"stuck"
+ * from the 50 most recent tasks, with nothing on the page saying so; "stuck"
+ * looked at `running` only, so a task that never left `pending` was invisible;
+ * and a journal action with no chip was coloured as a pending review.
+ *
+ * Teeth: drop the `partial:*` pushes in `load()` and the first test fails;
+ * drop `pending` from the stuck filter and the second fails; put the
+ * `badge-proposed` fallback back and the third fails.
+ */
+describe('Overview: says how much it read', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser */
+		}
+	});
+
+	it('marks the host and task lines partial when the set is bigger than the page read', async () => {
+		seed({ hosts: [HEALTHY_HOST], tasks: [] });
+		listInventory.mockResolvedValue({ items: [HEALTHY_HOST], total: 240 });
+		listTasks.mockResolvedValue({ items: [], total: 900 });
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(zone.getByText(/checked here for 1 of 240 hosts/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/hosts',
+		);
+		expect(zone.getByText(/0 most recent of 900/i).closest('a')).toHaveAttribute(
+			'href',
+			'/ui/records/tasks',
+		);
+		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
+	});
+
+	it('calls a task that never left pending stuck', async () => {
+		const queued = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+		seed({
+			tasks: [
+				{
+					...FAILED_TASK,
+					id: 'task-pending-1',
+					status: 'pending',
+					error: null,
+					created_at: queued,
+					finished_at: null,
+				},
+			],
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(zone.getByText(/nginx-conf is still pending/i)).toBeInTheDocument();
+	});
+
+	it('gives a journal action it has no chip for a neutral chip, not the review colour', async () => {
+		seed({
+			audit: [
+				{
+					id: 9,
+					timestamp: '2026-08-24T11:00:00Z',
+					user_id: 'operator',
+					source: 'api',
+					action: 'token_minted',
+					artifact_id: null,
+					target_host: null,
+					target_service: null,
+					command: null,
+					exit_code: null,
+					snapshot_id: null,
+					duration_ms: null,
+					details_json: null,
+				},
+			],
+		});
+
+		render(Overview);
+		const heading = await screen.findByRole('heading', { name: /recent movement/i });
+		const chip = within(heading.closest('section') as HTMLElement).getByText('token_minted');
+
+		expect(chip).toHaveClass('badge-neutral');
+		expect(chip).not.toHaveClass('badge-proposed');
+	});
+});

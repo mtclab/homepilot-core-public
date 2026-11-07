@@ -23,7 +23,7 @@ class TestReadPathAllowlist:
 
     def test_path_outside_allowlist_rejected(self):
         with pytest.raises(ValueError, match="not under an allowed read prefix"):
-            _check_guest_read_path("/root/secret.txt")
+            _check_guest_read_path("/srv/app/secret.txt")
 
     def test_parent_traversal_rejected(self):
         with pytest.raises(ValueError, match="parent traversal"):
@@ -68,7 +68,7 @@ class TestReadSecretDenylist:
         sits at the READ tier, read it straight off a managed host instead.
         `/etc/` is an allowed prefix and nothing on the denylist matched it.
 
-        TEETH: remove either path from _DENIED_READ_PATHS and this fails.
+        TEETH: remove either path from deny_exact in readonly_policy.json and this fails.
         """
         with pytest.raises(ValueError, match="denied"):
             _check_guest_read_path("/etc/homepilot/agent.env")

@@ -17,6 +17,7 @@ import pytest
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -117,7 +118,7 @@ class TestApplyWithoutAnExecutorTellsTheTruth:
         _repo, store, lifecycle, db = mirror
         a = "2026-08-27-mirror-truthful-apply-f0e1d2"
         await lifecycle.propose(_spec(a, "truthful apply"))
-        await lifecycle.approve(a, user="admin")
+        await lifecycle.approve(a, Principal.operator("admin"))
 
         runner = TaskRunner(
             repo=TaskRepository(db),

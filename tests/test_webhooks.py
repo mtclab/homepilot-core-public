@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
+from homepilot.auth.principal import Principal
 from homepilot.config import Settings
 from homepilot.webhooks.send import build_artifact_payload, send_webhook, sign_payload
 
@@ -284,7 +285,7 @@ class TestLifecycleHooksEmitEvents:
             lc._transitions = mock_transitions
             store.read.return_value = (fm, "body")
 
-            await lc.approve("2025-01-01-wh-approve-abc123", "admin")
+            await lc.approve("2025-01-01-wh-approve-abc123", Principal.operator("admin"))
 
         mock_emit.assert_called_once()
         assert mock_emit.call_args[0][0] == "artifact_approved"
@@ -464,7 +465,7 @@ class TestLifecycleHooksEmitEvents:
             lc._transitions = mock_transitions
             store.read.return_value = (fm, "body")
 
-            await lc.approve("2025-01-01-wh-approve-abc123", "admin")
+            await lc.approve("2025-01-01-wh-approve-abc123", Principal.operator("admin"))
 
     async def test_store_read_failure_does_not_crash_lifecycle(self):
         import homepilot.artifacts.lifecycle as lifecycle_mod
@@ -480,4 +481,4 @@ class TestLifecycleHooksEmitEvents:
             lc._transitions = mock_transitions
             store.read.side_effect = FileNotFoundError("gone")
 
-            await lc.approve("2025-01-01-wh-approve-abc123", "admin")
+            await lc.approve("2025-01-01-wh-approve-abc123", Principal.operator("admin"))

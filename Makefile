@@ -13,7 +13,7 @@
 # The local suite runs against the venv and cannot catch a build-resolution drift
 # (see #399); only building the real image can.
 
-VENV := .venv/bin
+VENV ?= .venv/bin
 
 # The Go toolchain comes from PATH. Point GO_BIN at a specific one when it is
 # installed outside the system path, e.g.
@@ -23,7 +23,18 @@ VENV := .venv/bin
 # layout. The leak canary on that repo rejects exactly this, and it caught this
 # line rather than any of our own checks.
 GO_BIN ?= go
-GOCACHE ?= /tmp/gocache
+# Resolved to an absolute path and handed to pytest as HP_GO_BIN (#726). The
+# real-binary journeys used to look for `go` on PATH by themselves, so
+# `make gate GO_BIN=...` ran gate-go with that toolchain while gate-py skipped all
+# fourteen shipped-binary journeys and still passed. Empty when GO_BIN does not
+# resolve; under HP_GATE=1 the suite then REFUSES to run (tests/go_toolchain.py)
+# unless HP_GATE_ALLOW_NO_GO=1 names the skip on purpose.
+HP_GO_BIN := $(shell command -v $(GO_BIN) 2>/dev/null)
+# A per-user build cache, not a fixed /tmp path (#726): a fixed name in a shared
+# world-writable directory is clobbered by - or pre-created for - every other
+# checkout and user on the box. Go's cache is safe for concurrent use by
+# design, so one persistent cache per user stays warm without colliding.
+GOCACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/homepilot-gate/go-build
 GO_ENV := GOCACHE=$(GOCACHE)
 
 .PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security
@@ -37,16 +48,36 @@ gate-security:
 	# detect-secrets findings kept surfacing only after the ~15 min
 	# scrub+mirror+CI round-trip, e.g. #547 and the 3.6.6 B608).
 	$(VENV)/bandit -r src/homepilot/ -c pyproject.toml -b .bandit_baseline.json -q
-	@$(VENV)/detect-secrets scan --all-files --force-use-all-plugins src/ > /tmp/hp-secrets-report.json; \
-	FINDINGS=$$($(VENV)/python -c "import json;print(sum(len(v) for v in json.load(open('/tmp/hp-secrets-report.json'))['results'].values()))"); \
+	# A private temp file per run (#726): the fixed /tmp/hp-secrets-report.json
+	# was shared by every concurrent run and worktree, so one run could read
+	# another's report and pass or fail on the wrong tree.
+	@REPORT=$$(mktemp -t hp-secrets-report.XXXXXX) || exit 1; \
+	trap 'rm -f "$$REPORT"' EXIT; \
+	$(VENV)/detect-secrets scan --all-files --force-use-all-plugins src/ > "$$REPORT" || exit 1; \
+	FINDINGS=$$($(VENV)/python -c "import json,sys;print(sum(len(v) for v in json.load(open(sys.argv[1]))['results'].values()))" "$$REPORT"); \
 	if [ "$$FINDINGS" != "0" ]; then \
 		echo "gate-security: detect-secrets found $$FINDINGS potential secrets:"; \
-		$(VENV)/python -c "import json;d=json.load(open('/tmp/hp-secrets-report.json'))['results'];[print(f'  {f}:{i[\"line_number\"]} {i[\"type\"]}') for f,its in d.items() for i in its]"; \
+		$(VENV)/python -c "import json,sys;d=json.load(open(sys.argv[1]))['results'];[print(f'  {f}:{i[\"line_number\"]} {i[\"type\"]}') for f,its in d.items() for i in its]" "$$REPORT"; \
 		exit 1; \
 	fi
-	@echo "gate-security: bandit + detect-secrets clean"
+	# The dependency audit mirror CI runs (#726): without it here, a vulnerable
+	# pin surfaces only after the scrub+mirror round-trip. Needs network (PyPI/OSV).
+	$(VENV)/pip-audit --desc
+	@echo "gate-security: bandit + detect-secrets + pip-audit clean"
 
+# THIS tree's src/ first on the path (#653). The shared venv's editable install
+# points at whichever checkout ran `pip install -e .`, so without this a
+# worktree lane (`make gate-py VENV=<shared>/.venv/bin`) imports the OTHER
+# checkout's source and reports green over code that holds none of its changes.
+# PYTHONPATH entries precede the `.pth`-added ones on sys.path. The check below
+# then PROVES which source is under test instead of assuming it.
+gate-py: export PYTHONPATH := $(CURDIR)/src
+# HP_GATE=1 turns "no Go toolchain" from a silent skip into a refusal (#726).
+gate-py: export HP_GATE := 1
+gate-py: export HP_GO_BIN := $(HP_GO_BIN)
+gate-py: export GOCACHE := $(GOCACHE)
 gate-py:
+	$(VENV)/python scripts/check_gate_source.py "$(CURDIR)/src"
 	$(VENV)/ruff check src tests scripts
 	$(VENV)/ruff format --check src tests
 	$(VENV)/mypy src

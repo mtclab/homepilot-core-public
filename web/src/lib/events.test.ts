@@ -50,3 +50,57 @@ describe('streamUrl', () => {
 		expect(streamUrl('https://api.example')).toBe('https://api.example/artifacts/events/stream');
 	});
 });
+
+/**
+ * A reconnect resyncs (#701).
+ *
+ * `onopen` only set the "connected" badge. After a gap of up to 30 s the badge
+ * cleared while every page had missed whatever happened in the gap - the stream
+ * does not replay, and the server drops events for a subscriber whose queue is
+ * full. On every REconnect the bus now tells every subscriber to re-read
+ * (`resync`), so a page that missed events fetches the truth instead of showing
+ * a stale state under a green badge.
+ *
+ * Teeth: drop the resync dispatch from `onopen` and the reconnect test fails;
+ * dispatch it on the FIRST open too and the first-open test fails.
+ */
+describe('reconnect resync', () => {
+	class FakeES {
+		static last: FakeES | null = null;
+		onopen: (() => void) | null = null;
+		onerror: (() => void) | null = null;
+		closed = false;
+		constructor() {
+			FakeES.last = this;
+		}
+		addEventListener() {}
+		close() {
+			this.closed = true;
+		}
+	}
+
+	it('tells every subscriber to re-read after a reconnect, not after the first open', async () => {
+		const { vi } = await import('vitest');
+		vi.useFakeTimers();
+		vi.stubGlobal('EventSource', FakeES);
+		vi.resetModules();
+		const events = await import('./events');
+		const seen: string[] = [];
+		const unsub = events.onArtifactEvent((e) => seen.push(e.type));
+		try {
+			events.startEventStream();
+			FakeES.last!.onopen!();
+			expect(seen).toEqual([]);
+
+			FakeES.last!.onerror!();
+			await vi.advanceTimersByTimeAsync(1000);
+			FakeES.last!.onopen!();
+			expect(seen).toEqual(['resync']);
+		} finally {
+			unsub();
+			events.stopEventStream();
+			vi.unstubAllGlobals();
+			vi.useRealTimers();
+		}
+	});
+});

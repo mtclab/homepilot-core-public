@@ -6,8 +6,6 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
 from homepilot.executor.orchestrator import ArtifactExecutor, ExecutorError, TamperError
@@ -25,6 +23,9 @@ class ApplyResult:
     snapshot_id: str | None = None
     failure_reason: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # The PVE task still running when the run stopped following it (#774): the
+    # outcome is unknown, which the task runner must not record as failed.
+    unsettled_task: dict[str, Any] | None = None
 
 
 class ApplyReconciler(Reconciler):
@@ -39,6 +40,11 @@ class ApplyReconciler(Reconciler):
         self.repo = repo
         self.executor = executor
         self._auto_apply_enabled_override = auto_apply_enabled
+        # The backend's TaskRunner, set once both exist (main.py builds this
+        # first and hands it to the runner). Auto-apply claims each artifact's
+        # run slot through it (#710); without one, `_task_runner()` builds a
+        # runner over this reconciler's own database - the gate is the DB row.
+        self.task_runner: Any | None = None
 
     def _is_auto_apply_enabled(self) -> bool:
         if self._auto_apply_enabled_override is not None:
@@ -64,26 +70,35 @@ class ApplyReconciler(Reconciler):
                 details={"skipped": True, "reason": "no_approved_artifacts"},
             )
 
+        from homepilot.artifacts.models import ArtifactBusyError
+
+        runner = self._task_runner()
         results: list[dict[str, Any]] = []
         success_count = 0
         failure_count = 0
+        busy_count = 0
+        unknown_count = 0
         for artifact_id in approved:
+            # Through the task gate (#710): an artifact whose apply is still
+            # running stays `approved`, and calling the executor straight
+            # dispatched it a second time on every tick.
             try:
-                result = await self.apply_single(artifact_id, approved_by="auto-apply")
-                if result.success:
-                    success_count += 1
-                else:
-                    failure_count += 1
+                task = await runner.run_apply_now(artifact_id, "auto-apply")
+            except ArtifactBusyError as busy:
+                busy_count += 1
                 results.append(
                     {
                         "artifact_id": artifact_id,
-                        "success": result.success,
-                        "details": result.details,
+                        "success": None,
+                        "details": {"skipped": "busy", "task_id": busy.task_id},
                     }
                 )
-            except (ExecutorError, TamperError, OSError, ValueError, httpx.HTTPError):
+                continue
+            except Exception:
+                # One artifact's failure to even START must not cost every
+                # later artifact in this tick its turn.
                 failure_count += 1
-                logger.exception("Auto-apply failed for %s", artifact_id)
+                logger.exception("Auto-apply could not start for %s", artifact_id)
                 results.append(
                     {
                         "artifact_id": artifact_id,
@@ -91,6 +106,21 @@ class ApplyReconciler(Reconciler):
                         "details": {"error": "exception"},
                     }
                 )
+                continue
+            status = task.get("status")
+            ok = status == "succeeded"
+            if status == "unknown":
+                # Still running on PVE: not a failure, not yet a success (#774).
+                # The runner recorded it so, and settles it from PVE later.
+                unknown_count += 1
+            elif ok:
+                success_count += 1
+            else:
+                failure_count += 1
+            details: dict[str, Any] = {"task_id": task.get("id")}
+            if not ok and task.get("error"):
+                details["error"] = task["error"]
+            results.append({"artifact_id": artifact_id, "success": ok, "details": details})
 
         return ReconcilerResult(
             name="apply",
@@ -98,10 +128,27 @@ class ApplyReconciler(Reconciler):
             details={
                 "applied": success_count,
                 "failed": failure_count,
+                "busy": busy_count,
+                "unknown": unknown_count,
                 "total": len(approved),
                 "results": results,
             },
         )
+
+    def _task_runner(self) -> Any:
+        if self.task_runner is not None:
+            return self.task_runner
+        from homepilot.tasks.repository import TaskRepository
+        from homepilot.tasks.runner import TaskRunner
+
+        self.task_runner = TaskRunner(
+            repo=TaskRepository(self.repo.db),
+            lifecycle=self.executor.lifecycle,
+            executor=self.executor,
+            apply_reconciler=self,
+            store=self.store,
+        )
+        return self.task_runner
 
     def _get_approved_artifacts(self) -> list[str]:
         approved = self.store.list(status="approved")
@@ -142,6 +189,7 @@ class ApplyReconciler(Reconciler):
             snapshot_id=result.snapshot_id,
             failure_reason=result.failure_reason,
             details=details,
+            unsettled_task=result.unsettled_task,
         )
 
     async def _log_audit(

@@ -104,7 +104,7 @@ YAML. Keys are stable; do not rename without a version bump.
 
 | Field | Type | Set when |
 |---|---|---|
-| `approved_by` | object | `{ user: str, at: ISO8601, reason: str? }`. Set on approve transition. |
+| `approved_by` | object | `{ user: str, at: ISO8601, authority: "operator" \| "relayed-code", reason: str? }`. Set on approve transition. `user` is the authenticated credential (token label and prefix, `cli`, or the MCP caller), never a name from a request body; `authority` says where the human decision came from (#681). |
 | `applied_at` | ISO8601 | Set when status moves to `applied`. |
 | `failed_at` | ISO8601 | Set when status moves to `failed`. |
 | `failure_reason` | string | Set when `failed`. |
@@ -371,7 +371,10 @@ steps:
     path: <relative-path>
     skip_if: <python expression evaluated in {response, target} context>
   on_error: halt | continue      # default halt
+  timeout_s: <seconds>           # optional; how long to follow the PVE task this step spawns
 ```
+
+**Waiting on PVE tasks (#774).** A call PVE answers with a UPID has only been *accepted*; the executor follows the task until it stops. How long it follows it: the step's `timeout_s` if set (a number, above 0, at most 86400); otherwise a per-operation default - 6 h for `/vzdump` and for restores (a create whose body names an `archive`, or `restore`), 2 h for `clone`, `move_disk`, `move_volume`, `migrate`, `template` and `download-url`, 600 s for everything else. A task that is **still running** when that wait ends is NOT a failure: the sequence stops (the next step would race it), the artifact keeps its status and records `unsettled_task` (node, UPID, step, steps not run), and the task reads `unknown`. The next apply/replay of that artifact, or reading the task, asks PVE how the task ended and settles it: `applied` when it finished OK and nothing else is outstanding, `failed` (naming what) otherwise. It never re-runs the steps over a task still in flight.
 
 For `target.kind: cluster` artifacts (datacenter-level config), the executor picks any one healthy PVE node from inventory and sends the call there; pmxcfs replicates. Paths in this case use `/access/...`, `/cluster/...`, etc., which don't have a `{{ target.node }}` segment.
 
@@ -767,6 +770,8 @@ Approving a composite cascades: every referenced sub-artifact in `proposed` stat
 
 Editing `applied` / `superseded` / `revoked` / `rejected` artifacts is rejected. Those are historical; create a new artifact instead.
 
+**An edit is validated exactly like a propose (#652).** Before anything is written, the edited frontmatter and body go through the same content checks propose runs (§11: kind, target, idempotence, intent, `produced_by`, the kind's own spec block, composite step references, the `rollback` / `requires_snapshot` claims, vault references, literal credentials, `skip_if` and `{{ ... }}` expressions). A refused edit writes nothing and names the reason. Any accepted edit also replaces the artifact's approval code, so a code read off the old content cannot approve the new content.
+
 **Manual git edits outside `hp artifacts edit` (per D7):** HomePilot reads the working tree on every operation, no locking. If you `vim` an artifact file directly:
 - For a `proposed` artifact: HomePilot recomputes the hash on next read and logs `audit: hash-recomputed`. No status change.
 - For an `approved` artifact: the hash mismatch is caught at apply time (§10) and apply is refused. The user must `hp artifacts approve` again (which re-verifies hash) or revert the manual edit.
@@ -900,7 +905,7 @@ Function calls (including `.get()`, `.json()`) and private/dunder attributes are
 **Decision:** embeddings live in SQLite (sqlite-vec) only. The artifact file contains the human-readable Markdown body; embeddings are computed on `apply` and on `hp kb reindex`.
 **Why:** keeps artifact files portable (someone with `git clone` and no embedding model can still read them); embeddings are model-dependent and regenerating from text is fast.
 **Reindex path:** `hp kb reindex` walks every applied `kb-note` artifact and upserts it, embedding anything whose text changed or that has no vector. Run after restoring from a backup, after changing the embedding model, or after migrating to a different host. It never deletes the index to rebuild it: a rebuild that starts by emptying the table loses every document it then fails to restore, and it reassigns the ids every other KB surface hands out.
-**After a model change:** re-embedding is keyed on the TEXT changing, so an unchanged document keeps the vector it has - right on every ordinary rebuild, wrong once the embedding MODEL changes. `hp kb reindex --force-embeddings` (or `reindex_kb(force_embeddings=true)`) drops every stored vector and recomputes.
+**After a model change:** re-embedding is keyed on the TEXT changing, so an unchanged document keeps the vector it has - right on every ordinary rebuild, wrong once the embedding MODEL changes. `hp kb reindex --force-embeddings` (or `reindex_kb(force_embeddings=true)`) drops every stored vector and recomputes. The vector index's dimension follows the model (#777): an empty index takes the size of the first vector stored; an index holding vectors of another size refuses the new ones (naming both sizes, counted as embedding failures, never as success), and a reindex with embedding work to do - forced, or any document without a vector - asks the model for one vector and rebuilds the index for its size, reporting `vector_index_rebuilt` (from, to, vectors dropped). A reindex in which any embedding could not be stored ends `completed_with_errors` with `embedding_first_failure`.
 **Consequence:** `hp export` does NOT include embeddings. The export README points at `hp kb reindex` as the post-restore step.
 
 ### D6. Audit log is SQLite-only

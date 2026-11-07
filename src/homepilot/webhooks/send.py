@@ -9,7 +9,30 @@ from typing import Any
 
 import httpx
 
+from ..common import redact_endpoint
+
 logger = logging.getLogger(__name__)
+
+
+def describe_failure(exc: BaseException, url: str) -> str:
+    """A delivery failure, fit for a log line: the webhook URL reduced to its host.
+
+    A Slack or Discord webhook URL IS the credential - anyone holding it can
+    post into the channel - and the failure paths logged it whole, including
+    through tracebacks whose exception text can carry it (#690). Logs get
+    scheme://host[:port] (see `redact_endpoint`), and the URL, or its path, is
+    cut out of the exception text too.
+    """
+    text = str(exc)
+    if url:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(url)
+        path_and_query = parts.path + (f"?{parts.query}" if parts.query else "")
+        for fragment in (url, url.rstrip("/"), path_and_query, parts.path):
+            if fragment and len(fragment) > 1:
+                text = text.replace(fragment, "/...")
+    return f"{type(exc).__name__}: {text}"
 
 
 def sign_payload(payload_bytes: bytes, secret: str) -> str:
@@ -86,15 +109,15 @@ async def send_webhook(
             resp = await client.post(url, content=payload_bytes, headers=headers)
             if resp.status_code >= 400:
                 logger.warning(
-                    "Webhook returned status=%d for event=%s url=%s",
+                    "Webhook returned status=%d for event=%s endpoint=%s",
                     resp.status_code,
                     event_type,
-                    url,
+                    redact_endpoint(url),
                 )
     except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError) as exc:
         logger.warning(
-            "Webhook delivery failed for event=%s url=%s: %s",
+            "Webhook delivery failed for event=%s endpoint=%s: %s",
             event_type,
-            url,
-            exc,
+            redact_endpoint(url),
+            describe_failure(exc, url),
         )

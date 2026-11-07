@@ -80,6 +80,26 @@ type Config struct {
 	// persisted token does: it is the newer instruction, delivered over the
 	// authenticated channel by the hub this agent belongs to.
 	TransportFile string
+	// EnvFile is the installer-written environment file that carries the
+	// enrolment token (HP_AGENT_AUTH_TOKEN). Once a per-agent credential is
+	// persisted the agent removes that token from it (#683), so a host stops
+	// holding a fleet-wide enrolment secret it no longer needs. Empty = nothing
+	// to scrub (no token file means no credential could be persisted either).
+	EnvFile string
+}
+
+// envFilePath locates the installer's environment file: HP_AGENT_ENV_FILE when
+// set, else "agent.env" beside the token file - the installer writes both into
+// one directory. With no token file there is no persisted credential, and so
+// nothing that could replace the enrolment token: return "" and scrub nothing.
+func envFilePath(envFile, tokenFile string) string {
+	if envFile != "" {
+		return envFile
+	}
+	if tokenFile != "" {
+		return filepath.Join(filepath.Dir(tokenFile), "agent.env")
+	}
+	return ""
 }
 
 // transportFilePath decides where a hub-pushed transport is persisted:
@@ -118,6 +138,16 @@ func readTransportFile(path string) (persistedTransport, bool) {
 	if err := json.Unmarshal(raw, &stored); err != nil {
 		log.Printf("warning: ignoring malformed transport file %s: %v", path, err)
 		return persistedTransport{}, false
+	}
+	// The pin is validated here, not only when the hub pushes it: a stored pin
+	// that cannot be parsed makes tlsConfig fail on every connect, so applying
+	// it would take the agent off the one channel that could correct it (#723).
+	// Unusable = absent: the agent comes up on its env transport instead.
+	if stored.TLS {
+		if _, err := parsePin(stored.Pin); err != nil {
+			log.Printf("warning: ignoring transport file %s with an unusable pin: %v", path, err)
+			return persistedTransport{}, false
+		}
 	}
 	return stored, true
 }
@@ -329,6 +359,7 @@ func ConfigFromEnv() Config {
 		TransportFile: transportFilePath(
 			os.Getenv("HP_AGENT_TRANSPORT_FILE"), os.Getenv("HP_AGENT_TOKEN_FILE"),
 		),
+		EnvFile: envFilePath(os.Getenv("HP_AGENT_ENV_FILE"), os.Getenv("HP_AGENT_TOKEN_FILE")),
 	}
 
 	// A transport the hub pushed is the NEWER instruction and wins over the env

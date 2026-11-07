@@ -116,10 +116,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "hours": {
                     "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": MAX_WINDOW_HOURS,
                     "description": f"Window size in hours (default 1, max {MAX_WINDOW_HOURS})",
                 },
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_SERIES_POINTS,
                     "description": f"Maximum points to return (max {MAX_SERIES_POINTS})",
                 },
             },
@@ -155,15 +159,29 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Human-readable rule name"},
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120,
+                    "description": "Human-readable rule name",
+                },
                 "metric": {
                     "type": "string",
+                    # A rule on any other name is accepted, enabled and never
+                    # evaluated - refused at the door rather than reported later.
+                    "enum": list(AGENT_METRICS),
                     "description": f"Metric key. Hosts report: {_METRIC_EXAMPLES}",
                 },
-                "comparison": {"type": "string", "description": "One of gt, gte, lt, lte"},
+                "comparison": {
+                    "type": "string",
+                    "enum": list(VALID_COMPARISONS),
+                    "description": "One of gt, gte, lt, lte",
+                },
                 "threshold": {"type": "number"},
                 "for_seconds": {
                     "type": "integer",
+                    "minimum": 0,
+                    "maximum": 86400,
                     "description": "Seconds the condition must hold (0-86400, default 300)",
                 },
                 "host_filter": {
@@ -195,15 +213,29 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "rule_id": {"type": "string", "description": "The rule's id"},
-                "name": {"type": "string", "description": "Human-readable rule name"},
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120,
+                    "description": "Human-readable rule name",
+                },
                 "metric": {
                     "type": "string",
+                    # A rule on any other name is accepted, enabled and never
+                    # evaluated - refused at the door rather than reported later.
+                    "enum": list(AGENT_METRICS),
                     "description": f"Metric key. Hosts report: {_METRIC_EXAMPLES}",
                 },
-                "comparison": {"type": "string", "description": "One of gt, gte, lt, lte"},
+                "comparison": {
+                    "type": "string",
+                    "enum": list(VALID_COMPARISONS),
+                    "description": "One of gt, gte, lt, lte",
+                },
                 "threshold": {"type": "number"},
                 "for_seconds": {
                     "type": "integer",
+                    "minimum": 0,
+                    "maximum": 86400,
                     "description": "Seconds the condition must hold (0-86400)",
                 },
                 "host_filter": {

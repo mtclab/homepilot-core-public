@@ -50,14 +50,39 @@ DEADLINE_SECONDS = 45
 REFUSED_WHILE_BACKEND_RUNS = [
     pytest.param(["token", "create"], id="token-create"),
     pytest.param(["init", "--non-interactive"], id="init"),
+]
+
+# The commands that, with a backend holding the data directory, go through its
+# API instead of the database (#700) - they used to be in the list above, and
+# that refusal was the whole of what they could do on a live install. Here no
+# backend answers on the port (only its lock is held), so each must say the
+# API could not be reached - and still EXIT.
+THROUGH_THE_API_WHILE_BACKEND_RUNS = [
     pytest.param(
-        ["invite", "create", "--cn", "someone", "--template", "9000", "--node", "pve1"],
+        [
+            "invite",
+            "create",
+            "--cn",
+            "someone",
+            "--template",
+            "9000",
+            "--node",
+            "pve1",
+            "--cores",
+            "1",
+            "--ram",
+            "512",
+            "--disk",
+            "8",
+        ],
         id="invite-create",
     ),
     pytest.param(["invite", "list"], id="invite-list"),
     pytest.param(["inventory", "list"], id="inventory-list"),
     pytest.param(["inventory", "show", "somehost"], id="inventory-show"),
     pytest.param(["webhook", "list"], id="webhook-list"),
+    pytest.param(["quota", "list"], id="quota-list"),
+    pytest.param(["agent", "revoke", "some-agent"], id="agent-revoke"),
 ]
 
 
@@ -123,6 +148,27 @@ def test_refusing_a_live_install_still_exits(args: list[str], held_data_dir: Pat
         f"`hp {' '.join(args)}` refused without saying a backend holds the data "
         f"directory. Output was:\n{combined}"
     )
+
+
+@pytest.mark.parametrize("args", THROUGH_THE_API_WHILE_BACKEND_RUNS)
+def test_api_commands_against_an_unreachable_backend_say_so_and_exit(
+    args: list[str], held_data_dir: Path
+) -> None:
+    try:
+        result = _run(args, held_data_dir)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"`hp {' '.join(args)}` did not exit within {DEADLINE_SECONDS}s: {exc.stdout!r}"
+        )
+
+    # Whitespace-normalised: rich wraps long lines at the terminal width.
+    combined = " ".join((result.stdout + result.stderr).split())
+    assert result.returncode != 0, combined
+    assert "not reachable" in combined.lower(), (
+        f"`hp {' '.join(args)}` did not say the backend's API could not be reached:\n{combined}"
+    )
+    # Not the dead end it used to be: the schema refusal is not the answer.
+    assert "would migrate the schema" not in combined
 
 
 def test_the_refusal_names_the_command_the_operator_ran(held_data_dir: Path) -> None:

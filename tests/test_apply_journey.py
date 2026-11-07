@@ -23,6 +23,7 @@ import pytest
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactStatus
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -88,7 +89,7 @@ class TestApplyJourney:
         """
         runner, _task_repo, store, lifecycle = journey
         artifact_id = await lifecycle.propose(_spec())
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
 
         started = await runner.start_apply(artifact_id, approved_by="operator")
         task = await runner.await_task(started["task_id"], timeout=10.0)
@@ -104,7 +105,7 @@ class TestApplyJourney:
     async def test_a_failed_apply_reports_failure(self, journey):
         runner, _task_repo, store, lifecycle = journey
         artifact_id = await lifecycle.propose(_spec("2026-08-20-journey-fails-d4e5f6"))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
         runner.executor._dispatch = AsyncMock(
             return_value=ExecutionResult(
                 success=False, execution_log="", failure_reason="host refused"
@@ -127,7 +128,7 @@ class TestApplyJourney:
         """
         runner, _task_repo, _store, lifecycle = journey
         artifact_id = await lifecycle.propose(_spec("2026-08-20-journey-audit-778899"))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
 
         started = await runner.start_apply(artifact_id, approved_by="operator")
         await runner.await_task(started["task_id"], timeout=10.0)
@@ -161,7 +162,7 @@ class TestTheExecutionLogSurvivesTheTask:
     async def test_a_successful_apply_keeps_its_output(self, journey):
         runner, task_repo, _store, lifecycle = journey
         artifact_id = await lifecycle.propose(_spec("2026-08-21-log-success-aa11bb"))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
 
         started = await runner.start_apply(artifact_id, approved_by="operator")
         await runner.await_task(started["task_id"], timeout=10.0)
@@ -183,7 +184,7 @@ class TestTheExecutionLogSurvivesTheTask:
             )
         )
         artifact_id = await lifecycle.propose(_spec("2026-08-21-log-failure-cc22dd"))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
 
         started = await runner.start_apply(artifact_id, approved_by="operator")
         await runner.await_task(started["task_id"], timeout=10.0)
@@ -210,7 +211,7 @@ class TestTheExecutionLogSurvivesTheTask:
             )
         )
         artifact_id = await lifecycle.propose(_spec("2026-08-21-log-long-ee33ff"))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
 
         started = await runner.start_apply(artifact_id, approved_by="operator")
         await runner.await_task(started["task_id"], timeout=10.0)

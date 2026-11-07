@@ -79,9 +79,27 @@ curl -X DELETE http://localhost:8000/auth/tokens/hp_0123456789abc \
 
 ## Cookie Secure Flag
 
-Set `HP_COOKIE_SECURE=true` in your environment or `.env` file to mark session cookies with the `Secure` attribute. This is required when serving HomePilot over HTTPS.
+`HP_COOKIE_SECURE` defaults to `true`. With it on, `hp_token` and `hp_csrf` are
+marked `Secure` whenever the browser's connection is, or may be, TLS (#685):
 
-Default: `false` (homelab deployments commonly use HTTP).
+* the backend itself was reached over HTTPS;
+* the request carries `X-Forwarded-Proto: https` - the shipped nginx config sets
+  it, so a TLS proxy on a separate host gets `Secure` cookies even though the
+  backend sees plain HTTP. From any peer: the header can only make the cookie
+  stricter;
+* the peer is listed in `HP_TRUSTED_PROXIES` and did not say `http` (a proxy
+  that names no scheme is assumed to terminate TLS).
+
+A direct plain-HTTP connection - the first-run path, `http://<host>:8000/ui`
+from the LAN - gets cookies without `Secure`, because a browser drops a
+`Secure` cookie set over plain HTTP and nobody could log in. Behind a TLS proxy,
+keep the backend port off the network so that path is not reachable.
+
+`HP_COOKIE_SECURE=false` turns `Secure` off in every case; it is only for
+development setups that must not get `Secure` cookies at all. Uvicorn's own
+`FORWARDED_ALLOW_IPS` is deliberately not used for this: it would rewrite the
+client address in front of HomePilot's own `HP_TRUSTED_PROXIES` resolver, and
+two resolvers are how the first-hop spoof in #705 happened.
 
 ## CSRF
 

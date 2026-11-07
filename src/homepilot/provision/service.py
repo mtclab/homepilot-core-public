@@ -31,6 +31,8 @@ from .guest_network import (
 )
 from .ip_allocation import AllocatedAddress, allocate_address
 from .models import ProvisionRequest
+from .pve_tasks import stop_inflight
+from .reservations import GuestReservations
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +212,43 @@ HOST_TYPE = "qemu"
 _GUEST_DESTROYED = "the half-made guest was destroyed"
 _BREACHER_DESTROYED = "the guest was stopped and destroyed"
 
+# How many vmids one provision will try when PVE answers "that id is taken"
+# (#719). Each refusal means somebody else took the id between our read and our
+# clone; a handful of fresh ids is plenty, and a bound keeps a cluster that
+# refuses EVERY id from spinning forever.
+_CLONE_ATTEMPTS = 5
+
+# PVE's words for a vmid that is already somebody's: "unable to create VM 105:
+# config file already exists" from the clone's config lock, "VM 105 already
+# exists on node 'pve2'" from the cluster-wide check.
+_VMID_TAKEN_RE = re.compile(r"already exists", re.IGNORECASE)
+
+# PVE's words for a guest config that is not there at all.
+_NO_SUCH_GUEST_RE = re.compile(r"does not exist|no such", re.IGNORECASE)
+
+
+def clone_marker(task_id: str) -> str:
+    """The description a provision's clone carries, naming the run that made it.
+
+    Written by PVE itself as part of the clone, so "this run created the guest
+    at vmid N" can be READ back from the cluster instead of inferred from the
+    fact that a request was sent (#719).
+    """
+    return f"Created by HomePilot provision task {task_id}"
+
+
+def _pve_refused(exc: ProxmoxError) -> bool:
+    """PVE answered, and the answer was no - so the request never ran.
+
+    PVE checks and locks BEFORE it forks the worker that does the work, and the
+    worker's UPID is the success answer: any error PVE itself returns (4xx, or
+    the 500 its API handler dies with) means no worker was started and nothing
+    was created. A transport failure (status 0), a proxy's 502/503/504 and
+    pveproxy's own 595/596 are NOT answers from the API handler; after those
+    the request's fate is unknown and only the cluster can say.
+    """
+    return 400 <= exc.status_code <= 500
+
 
 class TailnetOutcome(StrEnum):
     """What a tailnet join ESTABLISHED, which is not the same as what it wanted.
@@ -282,8 +321,13 @@ class ProvisionService:
         fence_probe_timeout_s: float = 60.0,
         fence_probe_retries: int = 5,
         fence_probe_retry_s: float = 5.0,
+        reservations: GuestReservations | None = None,
     ):
         self.proxmox = proxmox
+        # The vmids and guest addresses this process has picked but the cluster
+        # does not show yet (#719). Shared with the template builder when the
+        # app wires one in, so neither can be handed an id the other just took.
+        self.reservations = reservations or GuestReservations()
         # Where the provisioning defaults are read from at RUN time (#553 C3):
         # an app state, a resolver, or None for the process-wide one. Never a
         # snapshot - the settings are hot-reloadable and a cached copy would
@@ -558,6 +602,16 @@ class ProvisionService:
         # await, so the unwind is driven by these rather than by `step` alone.
         vmid: int | None = None
         clone_issued = False
+        # What is KNOWN about whether this run created the guest at `vmid`
+        # (#719): True once PVE accepted the clone (its UPID is the evidence),
+        # False once PVE refused it, None while the answer is unknown (a
+        # transport failure, or a cancel landing mid-request) - in which case
+        # the unwind reads the guest's config for this run's marker before it
+        # touches anything. "We sent a clone" is NEVER evidence on its own: a
+        # clone PVE refused because vmid N was already taken used to send the
+        # stop and the purge at whoever held N.
+        created: bool | None = False
+        reserved_address: str | None = None
         inflight_upid: str | None = None
         # Set once a path has already taken the guest back (today: the fence
         # failure below, which destroys the unfenced guest and raises). The
@@ -605,42 +659,77 @@ class ProvisionService:
             # without it cannot be fenced afterwards without a second write.
             fence = await self._resolve_fence(defaults)
 
-            step = "allocate_ip"
-            allocation = await self._allocate_address(defaults, fence, request.ipconfig0)
+            # The address and the vmid are read AND reserved under one lock
+            # (#719). Neither the cluster scan nor /cluster/nextid reserves
+            # anything, so two provisions reading a moment apart were handed
+            # the same id and the same address. The reservations are held until
+            # the guest's config is on the cluster, which is when the cluster's
+            # own answer starts to include them.
+            async with self.reservations.lock:
+                step = "allocate_ip"
+                allocation = await self._allocate_address(defaults, fence, request.ipconfig0)
+                if allocation is not None:
+                    self.reservations.reserve_address(allocation.address)
+                    reserved_address = allocation.address
 
-            step = "next_vmid"
-            vmid = await self._next_vmid(request.node, defaults)
+                step = "next_vmid"
+                vmid = await self._next_vmid(request.node, defaults)
+                self.reservations.reserve_vmid(vmid)
 
             step = "clone"
-            # Set BEFORE the call, not after: if a cancel lands while the clone
-            # request is in flight we cannot know whether PVE took it, and an
-            # attempted destroy of a VM that was never created is a cheap,
-            # reported failure - a leaked guest is not.
-            clone_issued = True
-            try:
-                upid = await proxmox.clone_vm(
-                    node=request.node,
-                    template_vmid=request.template_vmid,
-                    new_vmid=vmid,
-                    name=request.name,
-                    full=request.full,
-                    pool=request.pool,
-                    # None means "inherit the template's storage" all the way down
-                    # to the PVE body, which then carries no storage key at all.
-                    storage=request.storage,
-                )
-            except ProxmoxError as exc:
-                # PVE authorises BEFORE it acts, so a refused request is one
-                # that never ran: nothing was created and there is nothing to
-                # take back. Every other failure - a timeout, a 500, a dropped
-                # connection - leaves the clone's fate genuinely unknown, which
-                # is the case `clone_issued = True` above exists for. Collapsing
-                # the two made a stale write token (401, the #625 shape) look
-                # like a guest that might be stranded, so the friend's invite
-                # stayed burned for a request PVE had refused outright.
-                if exc.status_code in (401, 403):
-                    clone_issued = False
-                raise
+            refused_vmids: set[int] = set()
+            attempts = 0
+            while True:
+                attempts += 1
+                # Set BEFORE the call: if a cancel lands while the request is in
+                # flight, whether PVE took it is unknown - and "unknown" is
+                # settled by reading the cluster, never by destroying vmid N on
+                # the chance that it is ours.
+                clone_issued = True
+                created = None
+                try:
+                    upid = await proxmox.clone_vm(
+                        node=request.node,
+                        template_vmid=request.template_vmid,
+                        new_vmid=vmid,
+                        name=request.name,
+                        full=request.full,
+                        pool=request.pool,
+                        # None means "inherit the template's storage" all the way
+                        # down to the PVE body, which then carries no storage key.
+                        storage=request.storage,
+                        description=clone_marker(task_id),
+                    )
+                except ProxmoxError as exc:
+                    if not _pve_refused(exc):
+                        # A timeout, a dropped connection, a proxy error: PVE
+                        # may or may not have taken it. `created` stays None and
+                        # the unwind asks the cluster.
+                        raise
+                    # PVE refused, so nothing was created and there is nothing
+                    # to take back - whatever holds vmid N is not ours. That
+                    # covers a stale write token (401, the #625 shape) and, the
+                    # #719 case, an id somebody else took between our read and
+                    # our clone.
+                    created = False
+                    if _VMID_TAKEN_RE.search(exc.body or "") and attempts < _CLONE_ATTEMPTS:
+                        logger.warning(
+                            "vmid %s was taken before the clone reached PVE (%s); "
+                            "retrying with a fresh id",
+                            vmid,
+                            exc.body[:200],
+                        )
+                        refused_vmids.add(vmid)
+                        async with self.reservations.lock:
+                            self.reservations.release_vmid(vmid)
+                            step = "next_vmid"
+                            vmid = await self._next_vmid(request.node, defaults, refused_vmids)
+                            self.reservations.reserve_vmid(vmid)
+                        step = "clone"
+                        continue
+                    raise
+                created = True
+                break
             inflight_upid = upid
             await proxmox.wait_for_task(
                 request.node, upid, timeout_s=self.task_timeout_s, poll_interval=self.poll_interval
@@ -650,7 +739,28 @@ class ProvisionService:
             step = "configure"
             config = self._build_config(request, defaults, fence is not None, allocation)
             if config:
-                await proxmox.set_vm_config(request.node, vmid, config)
+                # POST .../config is PVE's ASYNCHRONOUS config write: it answers
+                # with the UPID of a qmconfig worker, and a worker that dies
+                # leaves the template's NIC and cloud-init on the guest. Moving
+                # on at the acceptance booted guests on the wrong network while
+                # the task said "succeeded" (#711) - the same acceptance-is-not-
+                # completion mistake as #626 and #628, one call earlier.
+                written = await proxmox.set_vm_config(request.node, vmid, config)
+                config_upid = ProxmoxClient.upid_of(written)
+                if config_upid is not None:
+                    inflight_upid = config_upid
+                    await proxmox.wait_for_task(
+                        request.node,
+                        config_upid,
+                        timeout_s=self.task_timeout_s,
+                        poll_interval=self.poll_interval,
+                    )
+                    inflight_upid = None
+            # The guest's config now holds both claims itself, so the cluster's
+            # own answer covers them from here on.
+            self.reservations.release_vmid(vmid)
+            self.reservations.release_address(reserved_address)
+            reserved_address = None
 
             # The fence goes on BEFORE the guest boots. A guest that comes up on
             # the guest vnet with no rules is on the operator's LAN for as long
@@ -800,7 +910,7 @@ class ProvisionService:
             # this run put on Proxmox, and say so on the record.
             cleanup = asyncio.create_task(
                 self._cleanup_after_cancel(
-                    task_id, request, actor, vmid, clone_issued, inflight_upid
+                    task_id, request, actor, vmid, clone_issued, inflight_upid, created
                 )
             )
             # Tracked (so a shutdown drains it instead of orphaning a half-run
@@ -833,11 +943,34 @@ class ProvisionService:
             # portal could not tell whether a failed build had left a machine
             # behind (#648 tranche 9, and what makes #625 safe).
             failure_outcome: dict[str, Any] = {"failed": True, "step": step}
+            ours: bool | None = False
             if clone_issued and vmid is not None and not guest_unwound:
+                # Only a guest this run is SHOWN to have created is destroyed
+                # (#719). A refusal created nothing; an unknown is read back
+                # from the cluster.
+                ours = created
+                if ours is None:
+                    ours = await self._clone_evidence(request.node, vmid, task_id)
+            if ours is True and vmid is not None:
                 failure_outcome["vmid"] = vmid
+                if inflight_upid is not None:
+                    # A PVE task of ours may still be RUNNING - a clone that
+                    # outlived task_timeout_s holds the guest's lock, PVE
+                    # refuses the destroy ("VM is locked (clone)"), and the
+                    # clone then finishes into an orphan nobody removes (#711).
+                    # Stop it and wait until it lets go before destroying.
+                    stopped = await self._stop_inflight(
+                        request.node, inflight_upid, check_first=True
+                    )
+                    if stopped != "not_needed":
+                        failure_outcome["stop_task"] = stopped
                 cleanup_state, note = await self._destroy_after_failure(request, vmid)
                 failure_outcome["cleanup"] = cleanup_state
                 error = f"{error}; {note}"
+            elif ours is None and vmid is not None:
+                failure_outcome["vmid"] = vmid
+                failure_outcome["cleanup"] = "unverified"
+                error = f"{error}; {self._unverified_note(request.node, vmid)}"
             elif guest_unwound:
                 failure_outcome["vmid"] = vmid
                 failure_outcome["cleanup"] = unwind_cleanup or "failed"
@@ -854,6 +987,45 @@ class ProvisionService:
                 logger.error("Could not mark provision task %s failed", task_id, exc_info=True)
         finally:
             self._inflight_names.discard(request.name)
+            self.reservations.release_vmid(vmid)
+            self.reservations.release_address(reserved_address)
+
+    async def _clone_evidence(self, node: str, vmid: int, task_id: str) -> bool | None:
+        """Did THIS run create the guest at `vmid`? Read from the cluster (#719).
+
+        True  - the guest's config carries this run's clone marker.
+        False - PVE says there is no guest at that vmid, so nothing was made.
+        None  - something is there and nothing shows it is ours (it may be
+                somebody else's machine, or a clone of ours PVE has only just
+                started), or the cluster could not be asked. Never destroyed.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return None
+        try:
+            config = await proxmox.get_vm_config(node, vmid)
+        except Exception as exc:
+            if (
+                isinstance(exc, ProxmoxError)
+                and _pve_refused(exc)
+                and _NO_SUCH_GUEST_RE.search(exc.body or "")
+            ):
+                return False
+            logger.warning("Could not read vmid %s to see whether this run made it: %s", vmid, exc)
+            return None
+        if not isinstance(config, dict):
+            return None
+        if clone_marker(task_id) in str(config.get("description") or ""):
+            return True
+        return None
+
+    @staticmethod
+    def _unverified_note(node: str, vmid: int) -> str:
+        return (
+            f"vmid {vmid} on {node} was NOT touched: nothing shows this run created the "
+            "guest there (PVE may have refused the clone because the id was taken, or the "
+            "request's fate is unknown). Check that vmid before reusing it."
+        )
 
     async def _cleanup_after_cancel(
         self,
@@ -863,6 +1035,7 @@ class ProvisionService:
         vmid: int | None,
         clone_issued: bool,
         inflight_upid: str | None,
+        created: bool | None = True,
     ) -> None:
         """Unwind a cancelled provision and record what actually happened (#452).
 
@@ -876,20 +1049,22 @@ class ProvisionService:
         outcome: dict[str, Any] = {"cancelled": True}
         error: str | None = None
 
-        if not clone_issued or self.proxmox is None:
+        if clone_issued and vmid is not None and created is None:
+            # The cancel landed while the clone request was in flight: read the
+            # cluster before touching anything (#719).
+            created = await self._clone_evidence(node, vmid, task_id)
+        if not clone_issued or self.proxmox is None or created is False:
             outcome["cleanup"] = "nothing_created"
+        elif created is None and vmid is not None:
+            outcome["vmid"] = vmid
+            outcome["cleanup"] = "unverified"
+            error = f"cancelled; {self._unverified_note(node, vmid)}"
         else:
-            proxmox = self.proxmox
             outcome["vmid"] = vmid
             if inflight_upid is not None:
-                try:
-                    await proxmox.stop_task(node, inflight_upid)
-                    outcome["stop_task"] = "stopped"
-                except Exception as exc:
-                    # A PVE task that cannot be stopped (or already finished)
-                    # does not stop us destroying what it made.
-                    logger.warning("Could not stop PVE task %s: %s", inflight_upid, exc)
-                    outcome["stop_task"] = "failed"
+                # A PVE task that cannot be stopped (or already finished) does
+                # not stop us destroying what it made.
+                outcome["stop_task"] = await self._stop_inflight(node, inflight_upid)
             else:
                 outcome["stop_task"] = "not_needed"
 
@@ -952,7 +1127,9 @@ class ProvisionService:
             return None
         if fence is None:
             return None
-        return await allocate_address(self.proxmox, fence, defaults.nameserver)
+        return await allocate_address(
+            self.proxmox, fence, defaults.nameserver, reserved=self.reservations.addresses
+        )
 
     async def _resolve_fence(self, defaults: ProvisioningDefaults) -> DesiredGuestNetwork | None:
         """The guest network this provision must fence against, or None.
@@ -1024,6 +1201,17 @@ class ProvisionService:
             applied[final_pos] = body
         return applied
 
+    async def _stop_inflight(self, node: str, upid: str, check_first: bool = False) -> str:
+        """Stop a task of ours and wait until it lets go of the guest (#711)."""
+        return await stop_inflight(
+            self.proxmox,
+            node,
+            upid,
+            timeout_s=self.task_timeout_s,
+            poll_interval=self.poll_interval,
+            check_first=check_first,
+        )
+
     async def _stop_then_destroy(self, node: str, vmid: int) -> None:
         """Stop a guest if it is running, then destroy it, waiting on both tasks.
 
@@ -1069,7 +1257,12 @@ class ProvisionService:
                 poll_interval=self.poll_interval,
             )
 
-    async def _next_vmid(self, node: str, defaults: ProvisioningDefaults) -> int:
+    async def _next_vmid(
+        self,
+        node: str,
+        defaults: ProvisioningDefaults,
+        refused: set[int] | None = None,
+    ) -> int:
         """The VMID for a new guest - never one that has been used before.
 
         PVE's `/cluster/nextid` hands back the LOWEST free id, so destroying a
@@ -1080,29 +1273,61 @@ class ProvisionService:
 
         With a range configured, ids are taken HIGHEST-FIRST inside it, so a
         guest's number is never reused and can never be one of the operator's
-        own machines. Without one, this is exactly the previous behaviour.
+        own machines. Without one, PVE's own next free id is used.
+
+        Either way the answer skips every id this process has RESERVED but not
+        yet cloned (#719) and every id PVE has already refused this run: the
+        cluster cannot see the first kind, and PVE's `/cluster/nextid` would
+        hand the second straight back. The caller holds the reservations lock.
         """
         proxmox = self.proxmox
         if proxmox is None:  # pragma: no cover - the caller checked
             raise RuntimeError("Proxmox not configured")
+        avoid = set(self.reservations.vmids) | set(refused or ())
         span = (defaults.vmid_range or "").strip()
         if not span:
-            return int(await proxmox.next_vmid(node))
+            candidate = int(await proxmox.next_vmid(node))
+            if candidate not in avoid:
+                return candidate
+            # PVE's "lowest free" is somebody's in-flight claim. Walk up from
+            # it past everything the cluster holds AND everything we hold.
+            taken = set(await proxmox.cluster_vmids()) | avoid
+            while candidate in taken:
+                candidate += 1
+            return candidate
         low_s, _, high_s = span.partition("-")
         low, high = int(low_s), int(high_s)
-        taken = await proxmox.cluster_vmids()
+        taken = set(await proxmox.cluster_vmids()) | avoid
         used = [v for v in taken if low <= v <= high]
         candidate = (max(used) + 1) if used else low
-        if candidate > high:
-            # REFUSE, loudly. Falling back to lowest-free here would quietly
-            # reintroduce the reuse this range exists to prevent, on the day
-            # the range fills - which is the worst day to discover it.
-            raise RuntimeError(
-                f"the guest VMID range {span} is full: {len(used)} id(s) in use and the "
-                f"highest is {max(used)}. Widen provision_vmid_range before provisioning "
-                "another guest."
-            )
-        return candidate
+        if candidate <= high:
+            return candidate
+        # The TOP of the range is taken - which is not the same as the range
+        # being full (#718: one id in use at 8999 was refused as "full"). An
+        # id below the top may still be handed out if NO guest has ever held
+        # it: no machine on the cluster now and no `hosts` row from one that
+        # is gone. That keeps #648's guarantee - a freed number is never
+        # reused - while not refusing a range that is almost empty. Highest
+        # first, so allocation keeps walking away from the operator's own ids.
+        held = await self.repo.proxmox_ids_ever_held(low, high)
+        blocked = {v for v in taken | held if low <= v <= high}
+        candidate = high
+        for v in sorted(blocked, reverse=True):
+            if v == candidate:
+                candidate -= 1
+            elif v < candidate:
+                break
+        if candidate >= low:
+            return candidate
+        # REFUSE, loudly. Falling back to lowest-free here would quietly
+        # reintroduce the reuse this range exists to prevent, on the day the
+        # range fills - which is the worst day to discover it.
+        gone = len(held - set(used))
+        raise RuntimeError(
+            f"the guest VMID range {span} is full: {len(used)} id(s) in use"
+            + (f" and {gone} held earlier by guests that are gone (never reused)" if gone else "")
+            + ". Widen provision_vmid_range before provisioning another guest."
+        )
 
     async def _resize_disk(self, request: ProvisionRequest, vmid: int) -> None:
         """Grow the clone's disk to the requested size, and WAIT to find out.
@@ -1139,7 +1364,10 @@ class ProvisionService:
             )
             return
         result = await proxmox.resize_disk(request.node, vmid, request.disk, f"{request.disk_gb}G")
-        upid = proxmox.upid_of(result)
+        # On the CLASS: a fixed rule for reading a PVE answer, not behaviour a
+        # test double may replace - an auto-mocked `upid_of` handed back a
+        # MagicMock "UPID" that the wait below then polled (#711).
+        upid = ProxmoxClient.upid_of(result)
         if upid:
             await proxmox.wait_for_task(
                 request.node,
@@ -1190,8 +1418,26 @@ class ProvisionService:
             await self._stop_then_destroy(node, vmid)
         except Exception as exc:
             logger.error("Could not destroy the orphaned guest %s on %s: %s", vmid, node, exc)
+            # Look again before saying what is left (#711): a destroy that
+            # errored may still have happened, and "may remain" when the guest
+            # is gone - or when it is certainly there - is a guess either way.
+            if await self._guest_gone(node, vmid):
+                return "deleted", f"destroyed guest vmid {vmid} (confirmed gone on re-check)"
             return "failed", f"cleanup FAILED ({exc}), vmid {vmid} may remain on node {node}"
         return "deleted", f"destroyed guest vmid {vmid}"
+
+    async def _guest_gone(self, node: str, vmid: int) -> bool:
+        """True only when PVE says there is no guest at `vmid` on `node`."""
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return False
+        try:
+            await proxmox.get_vm_config(node, vmid)
+        except ProxmoxError as exc:
+            return _pve_refused(exc) and bool(_NO_SUCH_GUEST_RE.search(exc.body or ""))
+        except Exception:
+            return False
+        return False
 
     async def _destroy_unfenced(self, request: ProvisionRequest, vmid: int) -> str:
         """Take back a guest whose fence could not be written.

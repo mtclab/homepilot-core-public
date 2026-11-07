@@ -168,4 +168,7 @@ class TestItDoesNotOverwriteWhatWasSupplied:
     async def test_a_non_object_spec_is_refused_clearly(self, api):
         client, _store = api
         resp = await client.post("/artifacts", json=["not", "a", "spec"])
-        assert resp.status_code == 400
+        # The body is a declared dict since #703, so FastAPI refuses it as a 422
+        # naming the body - still a client error, never a 500.
+        assert resp.status_code == 422
+        assert "body" in resp.text

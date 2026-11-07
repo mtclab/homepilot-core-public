@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -15,35 +14,16 @@ from pyrage import decrypt as age_decrypt
 from pyrage import encrypt as age_encrypt
 from pyrage import x25519
 
+from ..common import write_private
+
 
 class VaultError(Exception):
     pass
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write `data` to `path` atomically, never leaving a partial file (#431).
-
-    `store_secret` and `rotate_passphrase` both wrote in place and chmod'd
-    AFTERWARDS, so there were two windows: a crash mid-write truncated the only
-    copy of a secret (or of the master identity), and the file existed at 0644
-    until the chmod landed.
-
-    Written to a temp file in the SAME directory - `os.replace` is only atomic
-    within a filesystem - created 0600 from the start, fsync'd before the
-    rename so the rename cannot expose a file whose contents are still in cache.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(tmp), str(path))
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+# Atomic, 0600-from-creation writes (#431). One implementation, shared with
+# every other secret file the backend writes (#690).
+_atomic_write = write_private
 
 
 class VaultManager:
@@ -71,6 +51,12 @@ class VaultManager:
         # EVERY decrypt()/get_secret(); caching the unwrapped identity means we
         # pay it at most once per process (#387).
         self._master_identity_data: bytes | None = None
+        # A FAILED unwrap, remembered against the identity file it was tried on
+        # (#687): (mtime_ns, size, message). A wrong passphrase stays wrong until
+        # the file changes (a restore) or the process restarts with another
+        # passphrase, so repeating the 600k-round PBKDF2 on every health probe
+        # only burns CPU.
+        self._failed_unwrap: tuple[int, int, str] | None = None
 
     def _derive_wrapping_key(self, salt: bytes) -> bytes:
         import hashlib
@@ -115,7 +101,16 @@ class VaultManager:
         protected_file = self._identities_dir / "master.protected"
         if not protected_file.exists():
             raise VaultError("No master identity found")
-        identity_data = self._unprotect_identity(protected_file.read_bytes())
+        st = protected_file.stat()
+        failed = self._failed_unwrap
+        if failed is not None and failed[:2] == (st.st_mtime_ns, st.st_size):
+            raise VaultError(failed[2])
+        try:
+            identity_data = self._unprotect_identity(protected_file.read_bytes())
+        except VaultError as exc:
+            self._failed_unwrap = (st.st_mtime_ns, st.st_size, str(exc))
+            raise
+        self._failed_unwrap = None
         self._master_identity_data = identity_data
         return identity_data
 
@@ -127,7 +122,9 @@ class VaultManager:
         protected_file = self._identities_dir / "master.protected"
 
         if protected_file.exists():
-            identity_data = self._load_master_identity_data()
+            # Off the event loop: the cold unwrap is PBKDF2 at 600k rounds, and
+            # the agent hub and every request share this loop (#687).
+            identity_data = await asyncio.to_thread(self._load_master_identity_data)
             self._master_identity = self._parse_public_key(identity_data)
             return self._master_identity
 
@@ -136,8 +133,7 @@ class VaultManager:
             self._master_identity = self._parse_public_key(identity_data)
             salt = os.urandom(16)
             protected_data = self._protect_identity(identity_data, salt)
-            protected_file.write_bytes(protected_data)
-            os.chmod(str(protected_file), 0o600)
+            _atomic_write(protected_file, protected_data)
             identity_file.unlink()
             self._master_identity_data = identity_data
             return self._master_identity
@@ -145,8 +141,7 @@ class VaultManager:
         identity_data = self._generate_identity()
         salt = os.urandom(16)
         protected_data = self._protect_identity(identity_data, salt)
-        protected_file.write_bytes(protected_data)
-        os.chmod(str(protected_file), 0o600)
+        _atomic_write(protected_file, protected_data)
         self._master_identity = self._parse_public_key(identity_data)
         self._master_identity_data = identity_data
         return self._master_identity
@@ -227,11 +222,15 @@ class VaultManager:
         result: dict[str, Any] = json.loads(decrypted)
         return result
 
-    async def delete_secret(self, name: str) -> None:
+    async def delete_secret(self, name: str) -> bool:
+        """Delete a secret. True if it existed, False if there was nothing to delete."""
         self._validate_secret_name(name)
         secret_file = self._secrets_dir / f"{name}.age"
-        if secret_file.exists():
+        try:
             secret_file.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
     async def list_secrets(self) -> list[str]:
         return [f.stem for f in self._secrets_dir.glob("*.age")]
@@ -252,15 +251,13 @@ class VaultManager:
         # every secret in the vault became unrecoverable. There is no second
         # chance at this file.
         backup = old_protected.with_suffix(".protected.bak")
-        backup.write_bytes(old_protected.read_bytes())
-        os.chmod(str(backup), 0o600)
+        _atomic_write(backup, old_protected.read_bytes())
         try:
             _atomic_write(old_protected, new_protected_data)
         except Exception:
             # Put the old wrapping back before re-raising: a half-written
             # identity is the one state from which nothing can be recovered.
-            old_protected.write_bytes(backup.read_bytes())
-            os.chmod(str(old_protected), 0o600)
+            _atomic_write(old_protected, backup.read_bytes())
             raise
         finally:
             backup.unlink(missing_ok=True)

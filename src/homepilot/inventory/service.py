@@ -171,6 +171,45 @@ async def verify_connectivity(host: str, port: int = 22, timeout: float = 3.0) -
 _HYPERVISOR_SOURCES: tuple[str, ...] = ("discovered", "hp_created", "imported")
 
 
+# The target fields that NAME a machine, service or network. `kind` and
+# numeric ids are not names and never match a target string.
+_TARGET_NAME_FIELDS = ("host", "hostname", "node", "service", "network", "name")
+
+
+def _target_names(target_json: str | None, target: str) -> bool:
+    """Whether an artifact's target names ``target`` as a whole (case-insensitive)."""
+    if not target_json:
+        return False
+    try:
+        parsed = json.loads(target_json)
+    except ValueError:
+        return False
+    wanted = target.strip().lower()
+    targets = parsed if isinstance(parsed, list) else [parsed]
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+        for field in _TARGET_NAME_FIELDS:
+            value = t.get(field)
+            if isinstance(value, str) and value.strip().lower() == wanted:
+                return True
+    return False
+
+
+def same_guest(row: dict[str, Any], pve_name: Any) -> bool:
+    """Is the row for this VMID the machine PVE now reports under it? (#706)
+
+    Identity is the VMID AND the guest's name. The name is what HomePilot gave a
+    guest it provisioned and what it recorded for one it discovered, so a
+    different name at the same number is a different machine - most often a
+    VMID PVE reused. (A guest renamed in PVE reads as a new machine too; that
+    errs towards nobody being handed a machine that is not theirs.)
+    """
+    recorded = str(row.get("hostname") or "").strip().lower()
+    reported = str(pve_name or "").strip().lower()
+    return bool(recorded) and recorded == reported
+
+
 class InventoryService:
     def __init__(
         self,
@@ -370,6 +409,16 @@ class InventoryService:
         # does while it reboots - used to be enough to mark every live guest on
         # it absent (#642).
         listings_complete = True
+        # Rows retired this sweep because their VMID now belongs to another
+        # machine (#706). They went absent THIS cycle just as surely as the ones
+        # the absent sweep marks, but the sweep never sees them - they already
+        # carry absent_since by the time it runs - so they are counted here.
+        retired_ids: list[str] = []
+        # "full" (and an empty string) is the word the MCP schema advertises for
+        # "everything"; as a node name it would silently match nothing (#692).
+        if scope is not None and scope.strip().lower() in ("", "full"):
+            scope = None
+        matched_scope = False
 
         if self.proxmox is None:
             # Nothing was asked, so nothing was established. Reported complete,
@@ -397,6 +446,7 @@ class InventoryService:
                     continue
                 if scope and scope != node_name:
                     continue
+                matched_scope = True
 
                 node_ip = (
                     node_info.get("ip", "")
@@ -454,10 +504,43 @@ class InventoryService:
                             g_description = await self._get_guest_description(
                                 node_name, guest_type, vmid
                             )
-                            g_existing = await self.repo.get_host_by_proxmox_id(vmid)
+                            # The row that IS this machine: the one with its
+                            # name, whatever order the rows of earlier
+                            # occupants sort in. Failing that, the newest row
+                            # still claiming the VMID is somebody else's.
+                            g_rows = await self.repo.list_hosts_by_proxmox_id(vmid)
+                            g_existing = next(
+                                (r for r in g_rows if same_guest(r, g_hostname)), None
+                            ) or next((r for r in g_rows if not r.get("absent_since")), None)
+                            if g_existing and not same_guest(g_existing, g_hostname):
+                                # A VMID is not an identity (#706). PVE hands
+                                # a destroyed guest's number to the next VM
+                                # created ANYWHERE - the operator's own
+                                # included - and matching on the number alone
+                                # folded that machine into the previous
+                                # occupant's row: a friend's portal listed the
+                                # operator's VM as theirs, could power it, and
+                                # counted it in their quota. A different name
+                                # at the same VMID is a different machine: the
+                                # old row is retired (absent, never updated
+                                # again) and the new one is discovered fresh.
+                                await self.repo.retire_host(g_existing["id"])
+                                retired_ids.append(str(g_existing["id"]))
+                                logger.warning(
+                                    "vmid %s is now %r, not %r: retired the old row and "
+                                    "recorded the new occupant as discovered",
+                                    vmid,
+                                    g_hostname,
+                                    g_existing.get("hostname"),
+                                )
+                                g_existing = None
                             if g_existing:
                                 data = {
                                     "host_type": guest_type,
+                                    # Where the guest IS now: a migrated guest
+                                    # kept its old node, so every node-addressed
+                                    # call went to the wrong node (#706).
+                                    "node": node_name,
                                     "pve_status": g_status,
                                     "status": derive_status(g_status, g_existing.get("ip_address")),
                                     "description": (
@@ -509,19 +592,39 @@ class InventoryService:
             # action (#642). The scoped case above is the same hazard, already
             # guarded; this is the other half of it.
             if scope is None and listings_complete:
-                refreshed["absent"] = await self.repo.mark_hosts_absent(
+                marked = await self.repo.mark_hosts_absent_ids(
                     set(refreshed["proxmox_host_ids"]), _HYPERVISOR_SOURCES
                 )
+                # WHICH ones, so the journal can name the hosts that actually
+                # went absent this cycle rather than every host the hypervisor
+                # does not report - a manual host, a long-gone one (#712) - and
+                # the occupants retired by a reused VMID among them (#706).
+                went_absent = list(dict.fromkeys([*marked, *retired_ids]))
+                refreshed["absent"] = len(went_absent)
+                refreshed["absent_host_ids"] = went_absent
             elif scope is None:
-                refreshed["absent_skipped"] = "a guest listing failed; nothing marked absent"
+                refreshed["absent_skipped"] = (
+                    "a guest listing failed; nothing marked absent by the sweep"
+                )
                 logger.warning(
                     "Skipping the absent sweep: a guest listing failed, so the set of "
                     "guests actually seen is incomplete"
                 )
+            if retired_ids and "absent_host_ids" not in refreshed:
+                # A retirement is a write that already happened, whatever the
+                # sweep decided: say so on every path, not only a full one.
+                refreshed["absent"] = len(retired_ids)
+                refreshed["absent_host_ids"] = list(retired_ids)
             # A scoped sweep deliberately looks at one node, so it is complete
             # for what it promised; a full one is complete only if every listing
             # answered.
             refreshed["complete"] = listings_complete
+            if scope and not matched_scope and listings_complete:
+                # A scope that names no node refreshed NOTHING. Answering that
+                # as a complete, successful sweep is the #692 lie in another
+                # shape: the caller believes the inventory was re-pulled.
+                refreshed["complete"] = False
+                refreshed["error"] = f"no Proxmox node named {scope!r}"
         except Exception as e:
             # The sweep stopped part-way. `proxmox_host_ids` now holds whatever
             # was reached before the failure, which is not "everything the
@@ -732,9 +835,10 @@ class InventoryService:
         }
 
         try:
+            # The WHOLE name (#701): a substring match put web10 on web1's page.
             hosts = await self.repo.db.fetchall(
-                "SELECT * FROM hosts WHERE hostname LIKE ? ESCAPE '\\' OR node LIKE ? ESCAPE '\\'",
-                [f"%{escape_like(target)}%", f"%{escape_like(target)}%"],
+                "SELECT * FROM hosts WHERE hostname = ? COLLATE NOCASE OR node = ? COLLATE NOCASE",
+                [target, target],
             )
             for host in hosts:
                 host_dict = dict(host)
@@ -762,12 +866,22 @@ class InventoryService:
             }
 
         try:
-            artifacts = await self.repo.db.fetchall(
-                "SELECT id, kind, intent, status, created_at FROM artifacts "
-                "WHERE target_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT 20",
+            # LIKE only narrows the candidates; the match is decided on the
+            # PARSED target, field by field, as a whole name (#701). A substring
+            # on the JSON text listed web10's artifacts on web1's page.
+            candidates = await self.repo.db.fetchall(
+                "SELECT id, kind, intent, status, created_at, target_json FROM artifacts "
+                "WHERE target_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC",
                 [f"%{escape_like(target)}%"],
             )
-            doc["artifact_history"] = [dict(a) for a in artifacts]
+            history: list[dict[str, Any]] = []
+            for row in candidates:
+                entry = dict(row)
+                if _target_names(entry.pop("target_json", None), target):
+                    history.append(entry)
+                    if len(history) >= 20:
+                        break
+            doc["artifact_history"] = history
             doc["sources"]["artifact_history"] = {"read": True}
         except Exception as e:
             logger.warning("Artifact history read failed for %s: %s", target, e)

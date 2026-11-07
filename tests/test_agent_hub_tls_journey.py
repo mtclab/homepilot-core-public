@@ -25,11 +25,13 @@ from pathlib import Path
 
 import pytest
 
+from .go_toolchain import GO as _GO
+from .go_toolchain import GO_SKIP_REASON
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_SRC = REPO_ROOT / "agent" / "go"
 
-_GO = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
-pytestmark = pytest.mark.skipif(not _GO, reason="Go toolchain not available")
+pytestmark = pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON)
 
 
 # The binary is built ONCE per session by the shared `hp_agent_binary` fixture

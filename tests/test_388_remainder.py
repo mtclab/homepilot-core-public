@@ -141,7 +141,10 @@ class TestTheWebhookCliDoesNotLeakOrLie:
 
         assert result.exit_code == 0, result.output
         assert "super-secret-hmac-key" not in result.output
-        assert "***" in result.output
+        # Signed is said without the key (#388); the path is not shown either,
+        # since endpoints carry their own credential there (#700).
+        assert '"has_secret": true' in result.output
+        assert "/hook" not in result.output
         assert "example.test" in result.output, "redaction ate the useful part too"
 
     def test_test_exits_non_zero_when_delivery_failed(self):
@@ -189,4 +192,6 @@ class TestKbReindexUsesACredentialTheRouteAccepts:
         assert "X-HP-Admin-Secret" not in code, (
             "the reindex call still sends a credential the route does not accept"
         )
-        assert "Authorization" in code and "_mint_token_via_api" in code
+        # Minted through _ephemeral_token since #699: the same admin-authorised
+        # mint, with an expiry, deleted again afterwards.
+        assert "Authorization" in code and "_ephemeral_token" in code

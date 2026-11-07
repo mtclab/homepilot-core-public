@@ -91,14 +91,14 @@ func TestUnackedBatchStaysBuffered(t *testing.T) {
 	// is still in the buffer, so the next connection re-sends it.
 	b := newMetricBuffer(maxSamplesPerFrame)
 	b.add([]metricSample{{Metric: "load.1m", Value: 1, Clock: 1}})
-	batch := b.peek(maxSamplesPerFrame)
+	batch, start := b.take(maxSamplesPerFrame)
 	if len(batch) != 1 {
-		t.Fatalf("peek returned %d samples, want 1", len(batch))
+		t.Fatalf("take returned %d samples, want 1", len(batch))
 	}
 	if b.len() != 1 {
-		t.Fatalf("peek removed samples from the buffer (len=%d)", b.len())
+		t.Fatalf("take removed samples from the buffer (len=%d)", b.len())
 	}
-	b.dropFront(len(batch))
+	b.ack(start, len(batch))
 	if b.len() != 0 {
 		t.Errorf("acked batch was not dropped (len=%d)", b.len())
 	}

@@ -8,34 +8,23 @@ import (
 	"strings"
 )
 
-// Mirrors hp_agent.file_ops, hardened per audit #378.
+// Mirrors hp_agent.file_ops, hardened per audit #378 and #691.
 //
-// Both read_file and write_file are now restricted:
+// Both read_file and write_file are restricted:
 //   - write_file may only land inside the write-allowed prefixes.
-//   - read_file may only read inside the read-allowed prefixes (which include
-//     the write prefixes) AND is subject to a denylist that always blocks
-//     sensitive files even when they sit inside an allowed prefix.
+//   - read_file is DEFAULT-DENY under the shared read policy (readpolicy.go,
+//     readonly_policy.json): a path must be an allowlisted file or sit under an
+//     allowlisted prefix (logs, unit files) or a write prefix, and it is refused
+//     by the policy's deny rules and the agent's own credential checks below
+//     even when an allowlist entry - or an operator's HP_AGENT_READ_PREFIXES -
+//     covers it. The old default opened all of /etc, /opt, /srv and /home, which
+//     served host SSH keys, PVE secrets and service credentials at the READ tier.
 //
 // Paths are resolved through symlinks (EvalSymlinks) BEFORE the allowlist and
 // denylist checks so a symlink cannot smuggle a target past either gate.
-
-// defaultWritePrefixes is the built-in write allowlist. Overridable for tests
-// (and constrained deployments) via HP_AGENT_WRITE_PREFIXES (colon-separated).
-var defaultWritePrefixes = []string{
-	"/etc/homepilot/", "/opt/homepilot/", "/tmp/homepilot/",
-	"/etc/systemd/system/", "/etc/docker/", "/etc/nginx/",
-}
-
-// defaultReadPrefixes is the built-in read allowlist base. The effective read
-// allowlist is this (or HP_AGENT_READ_PREFIXES) PLUS the write prefixes.
-var defaultReadPrefixes = []string{
-	"/etc", "/var/log", "/opt", "/srv", "/usr/local/etc", "/home",
-}
+// defaultWritePrefixes comes from the shared policy (readpolicy.go).
 
 var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+/environ$`)
-
-// privateKeyBaseRe matches base names that look like private keys.
-var privateKeyBaseRe = regexp.MustCompile(`^(id_rsa|id_ed25519|id_ecdsa|id_dsa)$`)
 
 // agentSecretBases are the agent's OWN credential files. The agent must never
 // hand back the material that lets something else become an agent.
@@ -86,12 +75,15 @@ func writeAllowedPrefixes() []string {
 	return defaultWritePrefixes
 }
 
+// readAllowedPrefixes is the policy's read prefixes (or an operator's
+// HP_AGENT_READ_PREFIXES in their place) plus the write prefixes. The policy's
+// deny rules still apply to everything under them.
 func readAllowedPrefixes() []string {
 	var base []string
 	if v := os.Getenv("HP_AGENT_READ_PREFIXES"); v != "" {
 		base = splitPrefixes(v)
 	} else {
-		base = append([]string(nil), defaultReadPrefixes...)
+		base = append([]string(nil), readPolicy.allowPrefixes...)
 	}
 	return append(base, writeAllowedPrefixes()...)
 }
@@ -132,15 +124,10 @@ func resolvePath(path string) (string, error) {
 // isDenied returns true (with a reason) for paths that must never be read even
 // when they sit inside an allowed prefix. The argument must already be resolved.
 func isDenied(resolved string) (bool, string) {
-	switch resolved {
-	case "/etc/shadow", "/etc/gshadow":
-		return true, "access to sensitive file forbidden: " + resolved
+	if policyDenies(resolved) {
+		return true, "access to a credential or private key forbidden: " + resolved
 	}
 	base := filepath.Base(resolved)
-	if privateKeyBaseRe.MatchString(base) ||
-		strings.HasSuffix(base, ".key") || strings.HasSuffix(base, ".pem") {
-		return true, "access to private key/credential forbidden: " + resolved
-	}
 	if tf := os.Getenv("HP_AGENT_TOKEN_FILE"); tf != "" {
 		tfResolved := tf
 		if r, err := filepath.EvalSymlinks(tf); err == nil {
@@ -165,15 +152,9 @@ func isDenied(resolved string) (bool, string) {
 }
 
 func readFile(path string) (string, error) {
-	resolved, err := resolvePath(path)
+	resolved, err := checkReadPath(path)
 	if err != nil {
 		return "", err
-	}
-	if denied, reason := isDenied(resolved); denied {
-		return "", fmt.Errorf("%s", reason)
-	}
-	if !underAnyPrefix(resolved, readAllowedPrefixes()) {
-		return "", fmt.Errorf("path not in allowed read prefixes: %s", path)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
@@ -235,7 +216,74 @@ func resolveWritePath(path string) (resolved, resolvedDir string, err error) {
 		return "", "", fmt.Errorf("path not in allowed write prefixes (%s): %s",
 			strings.Join(writeAllowedPrefixes(), ", "), path)
 	}
+	if isAgentStateFile(resolved) {
+		return "", "", fmt.Errorf("refusing to overwrite the agent's own state file "+
+			"(identity, credential, transport or environment): %s", path)
+	}
 	return resolved, resolvedDir, nil
+}
+
+// agentStateNames are the files the agent keeps in its configuration directory:
+// its identity, its credential, the hub-pushed transport and the installer's
+// environment file.
+var agentStateNames = []string{"agent.id", "agent.token", "agent.transport", "agent.env"}
+
+// agentStateFiles lists where THIS agent keeps its state: the default names in
+// its config directory and beside its token file, plus wherever the env moved
+// the id, transport or environment file. Every entry has its directory resolved
+// through symlinks, so it compares equal to a resolved write target.
+func agentStateFiles() []string {
+	tokenFile := os.Getenv("HP_AGENT_TOKEN_FILE")
+	paths := []string{
+		agentIDFilePath(os.Getenv("HP_AGENT_ID_FILE"), tokenFile),
+		transportFilePath(os.Getenv("HP_AGENT_TRANSPORT_FILE"), tokenFile),
+	}
+	if tokenFile != "" {
+		paths = append(paths, tokenFile)
+	}
+	if envFile := os.Getenv("HP_AGENT_ENV_FILE"); envFile != "" {
+		paths = append(paths, envFile)
+	}
+	dirs := []string{agentConfigDir()}
+	if tokenFile != "" {
+		dirs = append(dirs, filepath.Dir(tokenFile))
+	}
+	for _, dir := range dirs {
+		for _, name := range agentStateNames {
+			paths = append(paths, filepath.Join(dir, name))
+		}
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		dir := filepath.Dir(abs)
+		if r, err := filepath.EvalSymlinks(dir); err == nil {
+			dir = r
+		}
+		out = append(out, filepath.Join(dir, filepath.Base(abs)))
+	}
+	return out
+}
+
+// isAgentStateFile reports whether a resolved write target is one of the
+// agent's own state files (#723).
+//
+// /etc/homepilot/ is a write prefix on every grant, because artifacts put their
+// own files there - and so, with no check, the hub's write_file could replace
+// the agent's transport (an unparseable pin there fails every later connect,
+// with no channel left to fix it), its credential or id (orphaning it), or
+// agent.env (widening HP_AGENT_READ_PREFIXES for the next start). The agent
+// writes these itself, through writeAgentStateFile; nothing else may.
+func isAgentStateFile(resolved string) bool {
+	for _, p := range agentStateFiles() {
+		if p == resolved {
+			return true
+		}
+	}
+	return false
 }
 
 // writeFileMode resolves the destination directory through symlinks, re-checks

@@ -114,9 +114,12 @@ class TestCommandInjectionRejected:
     def test_unsafe_subshell(self):
         assert AgentAdapter._validate_readonly_command("$(cat /etc/shadow)") is False
 
-    def test_newline_injection_known_gap(self):
-        result = AgentAdapter._validate_readonly_command("ls\nrm -rf /")
-        assert result is True
+    def test_newline_injection_rejected(self):
+        # Formerly a "known gap" (accepted). The agent never runs a shell, but a
+        # command that is two lines is not one read-only command either (#682).
+        assert AgentAdapter._validate_readonly_command("ls\nrm -rf /") is False
+        assert AgentAdapter._validate_readonly_command("hostname\r") is True  # stripped
+        assert AgentAdapter._validate_readonly_command("ls /var/log\rid") is False
 
     def test_extra_cat_args_rejected(self):
         assert AgentAdapter._validate_readonly_command("cat -n /etc/hostname") is False

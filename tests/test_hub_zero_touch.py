@@ -326,8 +326,11 @@ class TestFailClosedGuardIntact:
         test used to get wrong by asserting create_app_state raised."""
         settings = _settings(hp_dir, agent_hub_tls=False)
         state = await create_app_state(settings)
-        assert state.agent_hub is None, "plaintext on a routable bind must not serve"
-        assert "refusing to start" in state.agent_hub_disabled_reason
+        try:
+            assert state.agent_hub is None, "plaintext on a routable bind must not serve"
+            assert "refusing to start" in state.agent_hub_disabled_reason
+        finally:
+            await _shutdown(state)
 
 
 class TestHubRefusalNeverKillsTheControlPlane:
@@ -352,11 +355,13 @@ class TestHubRefusalNeverKillsTheControlPlane:
         object whose database was never opened, so the database is exercised."""
         settings = _settings(hp_dir, agent_hub_tls=False)
         state = await create_app_state(settings)
-
-        assert state.agent_hub is None
-        assert state.repo is not None
-        row = await state.database.fetchone("SELECT COUNT(*) c FROM hosts")
-        assert row["c"] == 0, "the control plane's database must be live and queryable"
+        try:
+            assert state.agent_hub is None
+            assert state.repo is not None
+            row = await state.database.fetchone("SELECT COUNT(*) c FROM hosts")
+            assert row["c"] == 0, "the control plane's database must be live and queryable"
+        finally:
+            await _shutdown(state)
 
     async def test_the_refusal_names_the_setting_to_change(self, hp_dir: str):
         """A dark subsystem must say WHY, in the operator's words (S6).
@@ -368,8 +373,10 @@ class TestHubRefusalNeverKillsTheControlPlane:
 
         settings = _settings(hp_dir, agent_hub_tls=False)
         state = await create_app_state(settings)
-
-        report = await selfcheck.selfcheck_report(state, settings)
+        try:
+            report = await selfcheck.selfcheck_report(state, settings)
+        finally:
+            await _shutdown(state)
         hub = next(s for s in report["subsystems"] if s["name"] == "agent_hub")
 
         assert hub["state"] != "ok"

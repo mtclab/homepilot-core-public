@@ -1,10 +1,36 @@
 services:
   # ═══════════════════════════════════════════════════════════════════════
+  #  HomePilot v2 — data-dir ownership (runs once per `up`, then exits)
+  # ═══════════════════════════════════════════════════════════════════════
+  # The backend runs as the image's `homepilot` user, but Docker creates a
+  # missing bind-mount source (./data/hp) as root:root - so on a fresh host the
+  # backend could not create its database and crash-looped (`unable to open
+  # database file`, docs/bugs-found.md Bug 8, #721). This one-shot step hands
+  # the data dir to `homepilot` before the backend starts, touching only what
+  # is not already owned by it, so the README's `docker compose up -d` needs no
+  # chown on a fresh host and changes nothing on an existing one. It uses the
+  # backend's own image, so the uid is the image's, never a guessed number.
+  hp-data-init:
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.6.25}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - find /home/homepilot/.hp \( ! -user homepilot -o ! -group homepilot \) -exec chown -h homepilot:homepilot {} +
+    volumes:
+      - ./data/hp:/home/homepilot/.hp
+    network_mode: none
+    restart: "no"
+
+  # ═══════════════════════════════════════════════════════════════════════
   #  HomePilot v2 — core backend
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.6.24}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.6.25}
     build:
       context: .
       dockerfile: Dockerfile
@@ -13,8 +39,15 @@ services:
       - "${HP_AGENT_HUB_PORT:-8443}:8443"
     volumes:
       - ./data/hp:/home/homepilot/.hp
+    depends_on:
+      hp-data-init:
+        condition: service_completed_successfully
+    # Optional (#721): a stock install needs no `.env` at all - the vault
+    # passphrase, secret key and database generate themselves on first boot.
+    # `.env.example` documents what can be set. (Compose >= 2.24.)
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       HP_AGENT_HUB_ENABLED: ${HP_AGENT_HUB_ENABLED:-true}
       HP_AGENT_HUB_PORT: "8443"
@@ -34,6 +67,14 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
 
   # ── n8n (workflow automation) ────────────────────────────────────────────
+  # The owner account is managed from the environment (#775). n8n 1.0 removed
+  # basic auth, so a fresh instance with no owner hands the owner account - and
+  # every credential stored in n8n - to the first visitor of its UI. With
+  # N8N_INSTANCE_OWNER_MANAGED_BY_ENV n8n sets the owner from the two variables
+  # below at EVERY start, and refuses to start while either is empty: the
+  # instance is never up without an owner. Set them in .env (see .env.example).
+  # No port is published. To reach the UI, publish it on loopback only
+  # ("127.0.0.1:5678:5678") and use an SSH tunnel - never on 0.0.0.0.
   n8n:
     image: n8nio/n8n:2.35.3
     profiles: ["agents"]
@@ -43,9 +84,9 @@ services:
       WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
       GENERIC_TIMEZONE: ${TZ:-Etc/UTC}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_INSTANCE_OWNER_MANAGED_BY_ENV: "true"
+      N8N_INSTANCE_OWNER_EMAIL: ${N8N_INSTANCE_OWNER_EMAIL:-}
+      N8N_INSTANCE_OWNER_PASSWORD_HASH: ${N8N_INSTANCE_OWNER_PASSWORD_HASH:-}
       HP_MCP_URL: http://backend:8000/mcp
       HP_MCP_TOKEN: ${HP_MCP_TOKEN:-}
       HP_MCP_TOKEN_RW: ${HP_MCP_TOKEN_RW:-}
@@ -131,19 +172,34 @@ services:
       - homepilot
 
   # ── Piper (text-to-speech) ─────────────────────────────────────────────
+  # wyoming-piper takes its settings as command-line flags only (#776): it
+  # exits with "--voice is required for the piper backend" without one, and
+  # reads no PIPER_* environment variables. The image's entrypoint already
+  # passes --uri tcp://0.0.0.0:10200 --data-dir /data; these are appended.
+  # Port 10200 speaks the Wyoming protocol (JSON lines over TCP), not HTTP,
+  # so the healthcheck asks it to describe itself and expects "info" back.
   piper:
     image: rhasspy/wyoming-piper:2.4.2
     profiles: ["agents"]
     container_name: piper
-    environment:
-      PIPER_VOICE: en_US-lessac-medium
-      PIPER_LENGTH_SCALE: 1.0
-      PIPER_NOISE_SCALE: 0.667
-      PIPER_NOISE_W: 0.333
+    command:
+      - --voice
+      - ${PIPER_VOICE:-en_US-lessac-medium}
+      - --length-scale
+      - ${PIPER_LENGTH_SCALE:-1.0}
+      - --noise-scale
+      - ${PIPER_NOISE_SCALE:-0.667}
+      - --noise-w-scale
+      - ${PIPER_NOISE_W:-0.333}
     volumes:
-      - ./agent/data/piper:/voices
+      # The image downloads voices into its --data-dir, /data.
+      - ./agent/data/piper:/data
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:10200/')\" || exit 1"]
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import socket; s = socket.create_connection(('127.0.0.1', 10200), 5); s.sendall(b'{\"type\": \"describe\"}\\n'); assert b'\"info\"' in s.makefile('rb').readline()"
       interval: 30s
       timeout: 10s
       retries: 5

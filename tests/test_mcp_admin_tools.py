@@ -115,10 +115,10 @@ class TestAlertRuleAdmin:
     async def test_create_rule_writes_and_returns_it(self, ctx, estate) -> None:
         out = await _handle_tool(
             "create_alert_rule",
-            {"name": "cpu", "metric": "cpu.percent", "comparison": "gt", "threshold": 90},
+            {"name": "load", "metric": "load.1m", "comparison": "gt", "threshold": 90},
             ctx,
         )
-        assert out["metric"] == "cpu.percent"
+        assert out["metric"] == "load.1m"
         stored = await estate.metrics_repo.get_rule(out["id"])
         assert stored is not None and stored["threshold"] == 90.0
 

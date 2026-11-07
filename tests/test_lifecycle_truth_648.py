@@ -20,6 +20,7 @@ import pytest
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle, LifecycleError
 from homepilot.artifacts.models import ArtifactStatus
+from homepilot.auth.principal import Principal
 from homepilot.reconciler.verify import DriftState, VerifyResult, _verify_composite
 
 
@@ -73,7 +74,7 @@ class TestApprovingACompositeApprovesItsSteps:
         sub = await lc.propose(_spec())
         comp = await lc.propose(_composite_spec(sub))
 
-        await lc.approve(comp, user="olli", reason="ship it")
+        await lc.approve(comp, Principal.operator("olli"), reason="ship it")
 
         sub_fm, _ = mock_store.read(sub)
         assert sub_fm["status"] == ArtifactStatus.APPROVED.value, (
@@ -91,7 +92,7 @@ class TestApprovingACompositeApprovesItsSteps:
         inner = await lc.propose(_composite_spec(leaf, id="2026-08-29-t3-inner", intent="inner"))
         outer = await lc.propose(_composite_spec(inner, id="2026-08-29-t3-outer", intent="outer"))
 
-        await lc.approve(outer, user="olli")
+        await lc.approve(outer, Principal.operator("olli"))
 
         for aid in (inner, leaf):
             fm, _ = mock_store.read(aid)
@@ -105,7 +106,7 @@ class TestApprovingACompositeApprovesItsSteps:
         comp = await lc.propose(_composite_spec(ok_sub, "2026-08-29-t3-missing"))
 
         with pytest.raises(LifecycleError, match="does not exist"):
-            await lc.approve(comp, user="olli")
+            await lc.approve(comp, Principal.operator("olli"))
 
         comp_fm, _ = mock_store.read(comp)
         ok_fm, _ = mock_store.read(ok_sub)
@@ -117,10 +118,10 @@ class TestApprovingACompositeApprovesItsSteps:
     async def test_an_already_approved_sub_is_left_alone(self, mock_store: MagicMock) -> None:
         lc = ArtifactLifecycle(store=mock_store)
         sub = await lc.propose(_spec())
-        await lc.approve(sub, user="someone-else", reason="direct")
+        await lc.approve(sub, Principal.operator("someone-else"), reason="direct")
         comp = await lc.propose(_composite_spec(sub))
 
-        await lc.approve(comp, user="olli")
+        await lc.approve(comp, Principal.operator("olli"))
 
         fm, _ = mock_store.read(sub)
         assert fm["approved_by"]["reason"] == "direct"

@@ -60,7 +60,11 @@ async def kb_service(repo, artifact_store):
     svc = KBService(repo=repo, store=artifact_store, lifecycle=lc)
     # Wire the back-reference so revoke() triggers a reindex, as app_state does.
     lc._kb_service = svc
-    return svc
+    yield svc
+    # revoke() starts a BACKGROUND reindex. Let it finish before `real_db`
+    # closes, exactly as the lifespan does (#622) - an undrained rebuild was the
+    # writer that outlived its loop and failed a neighbouring test at random.
+    await svc.drain()
 
 
 @pytest.fixture

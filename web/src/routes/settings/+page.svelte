@@ -11,6 +11,7 @@
 	// because the server's env > db > default precedence is only honest if the
 	// operator can see which of the three is in force.
 	import AlertRules from '$lib/components/AlertRules.svelte';
+	import WebhooksPanel from '$lib/components/WebhooksPanel.svelte';
 	import SettingFields from '$lib/components/SettingFields.svelte';
 	import GuestNetworkCard from '$lib/components/GuestNetworkCard.svelte';
 	import GuestsPanel from '$lib/components/GuestsPanel.svelte';
@@ -697,6 +698,17 @@
 			<div class="card space-y-3 max-w-3xl">
 				<h2 class="section-title">Monitoring</h2>
 				<AlertRules />
+			</div>
+			<div class="card space-y-3 max-w-3xl mt-4">
+				<h2 class="section-title">Webhooks</h2>
+				{#if sessionIsAdmin}
+					<WebhooksPanel />
+				{:else}
+					<p class="prose-note text-xs">
+						Webhooks decide where events - approval codes included - are sent, so
+						they need an admin session.
+					</p>
+				{/if}
 			</div>
 		{:else if activeTab === 'tokens'}
 			<div class="card space-y-3">

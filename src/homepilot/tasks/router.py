@@ -23,6 +23,10 @@ async def get_task(request: Request, task_id: str) -> Any:
     task = await repo.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    # An 'unknown' apply is settled from PVE when it is read (#774).
+    runner = getattr(request.app.state, "task_runner", None)
+    if runner is not None and task.get("status") == "unknown":
+        task = await runner.settle(task)
     return task
 
 

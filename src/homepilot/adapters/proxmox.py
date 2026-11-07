@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+import signal as _signal
 import time
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -20,6 +22,35 @@ GUEST_TYPES = ("qemu", "lxc")
 TARGET_KIND_GUEST_TYPES = {"vm": "qemu", "qemu": "qemu", "lxc": "lxc"}
 
 
+# PVE's own verdict for a task that SUCCEEDED but logged warnings: pve-common's
+# upid_status_is_error() treats exactly "OK" and "WARNINGS: <n>" as success. A
+# VM start that warned about its config, a snapshot that warned about a volume -
+# those guests are up and those snapshots exist; failing the run over it
+# destroyed a working guest.
+_WARNINGS_RE = re.compile(r"^WARNINGS: (\d+)$")
+
+
+def task_warnings(exitstatus: Any) -> int | None:
+    """How many warnings a finished PVE task logged, or None if it did not succeed.
+
+    0 for a clean "OK", n for "WARNINGS: n", None for anything else - which is
+    a failure.
+    """
+    if exitstatus == "OK":
+        return 0
+    match = _WARNINGS_RE.match(str(exitstatus or ""))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return _signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
 class ProxmoxError(Exception):
     def __init__(
         self, method: str, path: str, status_code: int, body: str, hint: str | None = None
@@ -35,6 +66,29 @@ class ProxmoxError(Exception):
         super().__init__(message)
 
 
+class ProxmoxTaskStillRunningError(ProxmoxError):
+    """The wait on a PVE task ran out while PVE still reports it RUNNING (#774).
+
+    That is not a failure: a vzdump of three guests took 13 minutes, outlived a
+    600 s wait, was reported failed - and finished `OK` with every archive on
+    disk. The outcome of a task we stopped watching is UNKNOWN, and a caller
+    must say so rather than pick a side. It stays a ProxmoxError so every caller
+    that does not yet tell the two apart keeps treating it as "not succeeded",
+    never as success.
+    """
+
+    def __init__(self, path: str, node: str, upid: str, waited_s: float):
+        self.node = node
+        self.upid = upid
+        self.waited_s = waited_s
+        super().__init__(
+            method="GET",
+            path=path,
+            status_code=0,
+            body=f"PVE task {upid} did not finish within {waited_s}s and is still running",
+        )
+
+
 class ProxmoxClient:
     def __init__(
         self,
@@ -45,6 +99,19 @@ class ProxmoxClient:
     ):
         self._base_url = base_url.rstrip("/")
         self._token = token
+        # The same rule the resolver and the SDN/firewall gateway apply (#715):
+        # a write "token" that is not a PVE token is never sent. It used to be
+        # sent for every clone/destroy/config write (401) while the gateway
+        # quietly used the read token - so SDN writes worked and guest writes
+        # failed, off one stored value.
+        from ..proxmox_config import is_pve_token
+
+        if write_token and not is_pve_token(write_token):
+            logger.warning(
+                "The configured PVE write token is not a token - using the read token "
+                "for writes; re-save Proxmox settings to repair it"
+            )
+            write_token = None
         self._write_token = write_token or token
         self._has_separate_write = write_token is not None and write_token != token
         self._verify_ssl = verify_ssl
@@ -97,6 +164,11 @@ class ProxmoxClient:
         method_upper = method.upper()
         is_mutation = method_upper in ("POST", "PUT", "PATCH", "DELETE")
         client = self._write_client if is_mutation else self._client
+        if is_mutation:
+            # THE wire for every HomePilot write to PVE, so the firewall
+            # lockout guard runs here and nowhere upstream (#707): an artifact
+            # step, a provisioning write and anything added later all pass it.
+            await self._guard_firewall_options_write(method_upper, path, body, query)
         try:
             response = await client.request(
                 method=method_upper,
@@ -125,6 +197,50 @@ class ProxmoxClient:
                 path=path,
                 status_code=0,
                 body=str(exc),
+            ) from exc
+
+    async def _guard_firewall_options_write(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None,
+        query: dict[str, Any] | None,
+    ) -> None:
+        """Refuse, before sending, a firewall-options write that could lock out management.
+
+        #600's guard covered the guest-network path only; a proxmox-api-sequence
+        step ``PUT /cluster/firewall/options {enable: 1}`` reached the wire with
+        PVE's default DROP input policy - the #600 lockout, through another door
+        (#707). Every parameter source PVE reads is merged (the path's own query
+        string, ``query``, the body) so none of them is a way round it.
+        """
+        from .pve_firewall_guard import (
+            PveFirewallLockoutError,
+            check_firewall_options_write,
+            firewall_options_scope,
+            management_source,
+            query_params,
+        )
+
+        try:
+            scope = firewall_options_scope(path)
+            if scope is None:
+                return
+            write = {**query_params(path), **(query or {}), **(body or {})}
+            await check_firewall_options_write(
+                scope,
+                write,
+                _ClientFirewallReader(self),
+                ports=(22, self.api_port),
+                source=await management_source(self.api_host, self.api_port),
+            )
+        except PveFirewallLockoutError as exc:
+            raise ProxmoxError(
+                method=method,
+                path=path,
+                status_code=0,
+                body=f"REFUSED by HomePilot before sending: {exc}",
+                hint="firewall lockout guard (#600, #707)",
             ) from exc
 
     @property
@@ -243,8 +359,14 @@ class ProxmoxClient:
         full: bool = True,
         pool: str | None = None,
         storage: str | None = None,
+        description: str | None = None,
     ) -> str:
         """Clone a template into a new VM. Returns the UPID of the clone task.
+
+        ``description`` is written into the new guest's config by the clone
+        itself. Provisioning puts its own run marker there (#719), so "did THIS
+        run create the VM at that vmid" can be answered from the cluster rather
+        than assumed from the fact that a request was sent.
 
         ``storage`` targets the clone's disks at a storage other than the
         template's (#618). It is sent ONLY when given: PVE's own behaviour for
@@ -264,6 +386,8 @@ class ProxmoxClient:
             body["pool"] = pool
         if storage:
             body["storage"] = storage
+        if description:
+            body["description"] = description
         result = await self.call("POST", f"/nodes/{node}/qemu/{template_vmid}/clone", body=body)
         return str(result.get("data", ""))
 
@@ -290,9 +414,40 @@ class ProxmoxClient:
     ) -> dict[str, Any]:
         """Block until a PVE task reaches status 'stopped'; return its status dict.
 
-        Raises ProxmoxError if the task ends with a non-OK exitstatus, or if the
-        timeout elapses first — a caller must never mistake "still running" or
-        "failed" for success.
+        Raises ProxmoxError if the task ends in failure, or if the timeout
+        elapses first - a caller must never mistake "still running" or "failed"
+        for success. Success is what PVE itself calls success: "OK", and
+        "WARNINGS: <n>" (#711). The returned dict carries `warnings` (the count)
+        so a caller can put it on its record.
+        """
+        path = f"/nodes/{node}/tasks/{quote(upid, safe='')}/status"
+        data = await self.wait_until_stopped(node, upid, timeout_s, poll_interval)
+        exitstatus = data.get("exitstatus")
+        warnings = task_warnings(exitstatus)
+        if warnings is None:
+            raise ProxmoxError(
+                method="GET",
+                path=path,
+                status_code=0,
+                body=f"PVE task {upid} finished with exitstatus {exitstatus!r}",
+            )
+        if warnings:
+            logger.warning("PVE task %s succeeded with %d warning(s)", upid, warnings)
+        return {**data, "warnings": warnings}
+
+    async def wait_until_stopped(
+        self,
+        node: str,
+        upid: str,
+        timeout_s: float = 600.0,
+        poll_interval: float = 2.0,
+    ) -> dict[str, Any]:
+        """Block until a PVE task has STOPPED, whatever its outcome; return its status.
+
+        For the unwind: after `stop_task`, the thing to know is that the task no
+        longer holds the guest's lock, not whether it "succeeded" - a task that
+        was stopped ends with an error status by definition. Raises ProxmoxError
+        only when the task is still running at the deadline.
         """
         # A UPID contains ':' separators, which are path-illegal unescaped.
         path = f"/nodes/{node}/tasks/{quote(upid, safe='')}/status"
@@ -301,22 +456,11 @@ class ProxmoxClient:
             result = await self.read(path)
             data = result.get("data", result)
             if isinstance(data, dict) and data.get("status") == "stopped":
-                exitstatus = data.get("exitstatus")
-                if exitstatus != "OK":
-                    raise ProxmoxError(
-                        method="GET",
-                        path=path,
-                        status_code=0,
-                        body=f"PVE task {upid} finished with exitstatus {exitstatus!r}",
-                    )
                 return data
             if time.monotonic() >= deadline:
-                raise ProxmoxError(
-                    method="GET",
-                    path=path,
-                    status_code=0,
-                    body=f"PVE task {upid} did not finish within {timeout_s}s",
-                )
+                # Still running is not failed (#774): the caller decides what a
+                # task it stopped watching means, and it must be able to tell.
+                raise ProxmoxTaskStillRunningError(path, node, upid, timeout_s)
             await asyncio.sleep(poll_interval)
 
     async def stop_task(self, node: str, upid: str) -> dict[str, Any]:
@@ -525,14 +669,38 @@ class ProxmoxClient:
             status = await self.agent_exec_status(node, vmid, pid)
             data = status.get("data", status)
             if isinstance(data, dict) and data.get("exited"):
-                return (
-                    int(data.get("exitcode") or 0),
-                    ProxmoxClient._exec_text(data.get("out-data")),
-                    ProxmoxClient._exec_text(data.get("err-data")),
-                )
+                return ProxmoxClient._exec_result(data)
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"the guest command did not finish within {timeout_s:.0f}s")
             await asyncio.sleep(poll_interval)
+
+    @staticmethod
+    def _exec_result(data: dict[str, Any]) -> tuple[int, str, str]:
+        """(rc, out, err) for a finished guest-exec, honest about how it ended.
+
+        qemu-guest-agent reports a process that EXITED with `exitcode`, and one
+        that was KILLED with `signal` and no exitcode at all. Reading a missing
+        exitcode as 0 turned an OOM-killed `tailscale up` into "joined" (#711).
+        A killed process gets the shell's own convention, 128 + signal, and the
+        signal is named in `err`; one that reports neither is not a success
+        either, because nothing says it succeeded.
+        """
+        out = ProxmoxClient._exec_text(data.get("out-data"))
+        err = ProxmoxClient._exec_text(data.get("err-data"))
+        signum = data.get("signal")
+        if signum is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                number = int(signum)
+                said = f"the command was killed by {_signal_name(number)} ({number})"
+                return 128 + number, out, f"{err}\n{said}".strip()
+        exitcode = data.get("exitcode")
+        if exitcode is None:
+            said = "the guest agent reported the command finished but gave no exit code"
+            return 255, out, f"{err}\n{said}".strip()
+        try:
+            return int(exitcode), out, err
+        except (TypeError, ValueError):
+            return 255, out, f"{err}\nthe guest agent reported exit code {exitcode!r}".strip()
 
     async def agent_write_file(
         self, node: str, vmid: int, path: str, content: str
@@ -690,3 +858,36 @@ class ProxmoxClient:
         await self._client.aclose()
         if self._has_separate_write:
             await self._write_client.aclose()
+
+
+def _pve_data(payload: Any) -> Any:
+    return payload.get("data") if isinstance(payload, dict) else payload
+
+
+class _ClientFirewallReader:
+    """The lockout guard's reads, made with the same client that is about to write."""
+
+    def __init__(self, client: ProxmoxClient) -> None:
+        self._client = client
+
+    async def cluster_firewall_options(self) -> dict[str, Any]:
+        data = _pve_data(await self._client.read("cluster/firewall/options"))
+        return data if isinstance(data, dict) else {}
+
+    async def cluster_firewall_rules(self) -> list[dict[str, Any]]:
+        data = _pve_data(await self._client.read("cluster/firewall/rules"))
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+    async def node_firewall_options(self, node: str) -> dict[str, Any]:
+        data = _pve_data(await self._client.read(f"nodes/{quote(node, safe='')}/firewall/options"))
+        return data if isinstance(data, dict) else {}
+
+    async def node_firewall_rules(self, node: str) -> list[dict[str, Any]]:
+        data = _pve_data(await self._client.read(f"nodes/{quote(node, safe='')}/firewall/rules"))
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+    async def node_names(self) -> list[str]:
+        data = _pve_data(await self._client.read("nodes"))
+        if not isinstance(data, list):
+            raise ProxmoxError("GET", "nodes", 0, "the node list was not a list")
+        return [str(r["node"]) for r in data if isinstance(r, dict) and r.get("node")]

@@ -146,6 +146,14 @@ from .tools.system_tools import (
     handle_proxmox_api_read,
     handle_read_file_on_guest,
 )
+from .tools.webhook_tools import (
+    TOOL_DEFINITIONS as WEBHOOK_TOOL_DEFS,
+)
+from .tools.webhook_tools import (
+    handle_list_webhooks,
+    handle_test_webhook,
+)
+from .validation import domain_error_text, is_domain_error, validate_arguments
 
 _mcp_token_scope_var: ContextVar[str] = ContextVar("_mcp_token_scope_var", default="full")
 _mcp_caller_id_var: ContextVar[str] = ContextVar("_mcp_caller_id_var", default="mcp-stdio")
@@ -168,7 +176,11 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + MONITORING_TOOL_DEFS
     + OPS_TOOL_DEFS
     + SETTINGS_TOOL_DEFS
+    + WEBHOOK_TOOL_DEFS
 )
+
+# Every tool's inputSchema by name - the contract `_handle_tool` holds calls to.
+_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {t["name"]: t["inputSchema"] for t in _TOOL_DEFINITIONS}
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -267,6 +279,11 @@ _ADMIN_TOOLS = frozenset(
         "set_setting_override",
         "clear_setting_override",
         "probe_setting_override",
+        # Webhooks (#700). GET /admin/webhooks and its /test are API admin: an
+        # endpoint list names where the platform's events - approval codes
+        # included - are sent. Create and delete are deliberately not tools.
+        "list_webhooks",
+        "test_webhook",
     }
 )
 
@@ -416,6 +433,7 @@ async def _bootstrap() -> dict[str, Any]:
     # builds. The runner and provision service are constructed exactly as main.py
     # does (apply_reconciler is built only when an executor exists), so an apply
     # over MCP runs through the one engine, not a weaker second path.
+    from homepilot.provision.reservations import GuestReservations
     from homepilot.provision.service import ProvisionService
     from homepilot.provision.template import GuestTemplateService
     from homepilot.reconciler.apply import ApplyReconciler
@@ -433,15 +451,19 @@ async def _bootstrap() -> dict[str, Any]:
         apply_reconciler=apply_reconciler,
         store=state.artifact_store,
     )
+    # One reservation book for both guest creators (#719).
+    guest_reservations = GuestReservations()
     provision_service = ProvisionService(
         proxmox=proxmox,
         task_repo=task_repo,
         repo=state.repo,
+        reservations=guest_reservations,
     )
     guest_template_service = GuestTemplateService(
         proxmox=proxmox,
         task_repo=task_repo,
         repo=state.repo,
+        reservations=guest_reservations,
     )
 
     return {
@@ -586,6 +608,9 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "set_setting_override": handle_set_setting_override,
     "clear_setting_override": handle_clear_setting_override,
     "probe_setting_override": handle_probe_setting_override,
+    # Webhooks (#700): the SAME webhooks.service calls /admin/webhooks makes.
+    "list_webhooks": handle_list_webhooks,
+    "test_webhook": handle_test_webhook,
 }
 
 
@@ -629,6 +654,13 @@ async def _handle_tool(
     handler = _TOOL_HANDLERS.get(name)
     if handler is None:
         raise ValueError(f"Unknown tool: {name}")
+    # The low-level mcp Server does no input validation, so without this a
+    # missing or wrong-typed argument reached the handler and came back to the
+    # caller as "Internal server error" (#696). The published schema is the
+    # contract; hold every call to it before any handler runs.
+    schema = _TOOL_SCHEMAS.get(name)
+    if schema is not None:
+        validate_arguments(name, schema, arguments)
     result = await handler(arguments, ctx)
     return result
 
@@ -677,19 +709,21 @@ async def _on_call_tool(_ctx: Any, params: Any) -> CallToolResult:
     from homepilot.agent_hub.audit import set_audit_caller
 
     set_audit_caller(_mcp_caller_id_var.get() or None)
-    from homepilot.adapters.agent import AgentAdapterError
-    from homepilot.agent_hub.server import AgentCommandError
-
     try:
         result = await _handle_tool(name, arguments, ctx)
-    except (ValueError, AgentAdapterError, AgentCommandError) as exc:
-        # These are DOMAIN answers, not crashes: "no agent connected for web01",
-        # "path not in allowed read prefixes", "file is 30395000 bytes; the agent
-        # hub accepts at most 524288 per reply". Letting them fall through to the
-        # transport's generic handler turned every one into "Internal server
-        # error" - the product knew exactly what had happened and told the
-        # operator nothing.
-        return CallToolResult(content=[TextContent(type="text", text=str(exc))], is_error=True)
+    except Exception as exc:
+        # DOMAIN answers, not crashes: "no agent connected for web01", "Proxmox
+        # not configured", "Secret 'x' not found", an argument that breaks the
+        # tool's schema. Letting them fall through to the transport's generic
+        # handler turned every one into "Internal server error" - the product
+        # knew exactly what had happened and told the operator nothing (#635,
+        # #696). Anything else is a genuine defect: re-raised, so it is logged
+        # and the fuzz gate sees it.
+        if not is_domain_error(exc):
+            raise
+        return CallToolResult(
+            content=[TextContent(type="text", text=domain_error_text(exc))], is_error=True
+        )
     if isinstance(result, dict):
         return CallToolResult(
             content=[TextContent(type="text", text=json.dumps(result))],
@@ -759,8 +793,61 @@ class _ServerContext:
 
 _server_context = _ServerContext()
 
+# The data-directory lock a standalone MCP server holds for its lifetime (#698).
+_standalone_lock: Any = None
+
+
+def _claim_data_dir() -> None:
+    """Refuse to run next to a backend; otherwise BE the one control plane.
+
+    A standalone `hp mcp-serve` (stdio, or its own HTTP port) builds a whole
+    control plane from `create_app_state`: it migrates the live database, runs
+    its own task runner, executor, SSE bus and agent hub. Next to a running
+    backend that is a second control plane on the same data - agents are
+    connected to the backend, so every host operation here answered "no agent
+    connected", applies ran inside this process where the UI never saw them and
+    died with the client, and the #431 migration guard did not cover it (#698).
+
+    So: while a backend holds the instance lock, refuse and point at the
+    backend's own /mcp endpoint. With no backend running, take the lock for the
+    life of this process, so a backend started meanwhile refuses instead of
+    becoming the second control plane the other way round.
+    """
+    global _standalone_lock
+    from homepilot.instance_lock import InstanceLock, InstanceLockError
+
+    settings = get_settings()
+    lock = InstanceLock(settings.data_dir)
+    try:
+        lock.acquire()
+    except InstanceLockError:
+        port = getattr(settings, "daemon_port", 8000)
+        raise InstanceLockError(
+            f"a HomePilot backend is already running on {settings.data_dir}. A standalone "
+            "MCP server would be a second control plane beside it (its own migrations, "
+            "task runner and agent hub, with no agents connected to it). Point the MCP "
+            f"client at the backend's own endpoint instead: http://<backend-host>:{port}/mcp "
+            "with an API token from Settings -> Tokens."
+        ) from None
+    _standalone_lock = lock
+
+
+def _release_data_dir() -> None:
+    global _standalone_lock
+    if _standalone_lock is not None:
+        _standalone_lock.release()
+        _standalone_lock = None
+
 
 async def run_server() -> None:
+    _claim_data_dir()
+    try:
+        await _run_stdio()
+    finally:
+        _release_data_dir()
+
+
+async def _run_stdio() -> None:
     ctx = await _bootstrap()
     await _server_context.async_update(ctx)
 
@@ -816,8 +903,9 @@ _TIER_SCOPE = "hp:tier:"
 def _caller_of(user: Any) -> str:
     """Who the audit trail should name for this request.
 
-    The verifier records it on the AccessToken - "mcp-api:<prefix>" for an API
-    token, so an audited action names the credential that took it. Starlette's
+    The verifier records it on the AccessToken - the credential's `label
+    (prefix)`, as every surface names it - so an audited action names the
+    credential that took it. Starlette's
     SimpleUser has no client_id of its own, which is why reading it off the user
     directly (as this used to) always fell back to the generic name.
     """
@@ -874,7 +962,11 @@ async def resolve_api_token_tier(raw_token: str) -> tuple[str, str] | None:
         return None
     with contextlib.suppress(Exception):
         await repo.touch_token_last_used(row["id"])
-    return tier, f"mcp-api:{row.get('prefix', '')}"
+    # The same name the REST surface and the token audit give this credential
+    # (`label (prefix)`); the transport is in the audit row's `source`.
+    from ..auth.principal import audit_actor
+
+    return tier, audit_actor(row)
 
 
 async def resolve_mcp_credential(
@@ -1034,15 +1126,19 @@ async def run_server_http(host: str = "0.0.0.0", port: int = 8000) -> None:
     # the transport on API tokens alone - and TestHttpTransportNeverUnauthenticated
     # holds the invariant that replaced the guard.
 
-    ctx = await _bootstrap()
-    await _server_context.async_update(ctx)
-    srv = create_server()
+    _claim_data_dir()
+    try:
+        ctx = await _bootstrap()
+        await _server_context.async_update(ctx)
+        srv = create_server()
 
-    app = create_http_app(srv)
+        app = create_http_app(srv)
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
-    server_instance = uvicorn.Server(config)
-    await server_instance.serve()
+        config = uvicorn.Config(app, host=host, port=port, log_level="info")
+        server_instance = uvicorn.Server(config)
+        await server_instance.serve()
+    finally:
+        _release_data_dir()
 
 
 def main_http(host: str = "0.0.0.0", port: int = 8000) -> None:

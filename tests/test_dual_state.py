@@ -2,6 +2,7 @@ import sqlite3
 from unittest.mock import AsyncMock
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
+from homepilot.auth.principal import Principal
 
 
 def _make_spec(**overrides):
@@ -26,7 +27,7 @@ class TestDualStateApprove:
         aid = await lc.propose(_make_spec())
         db.upsert_artifact.reset_mock()
 
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
 
         fm, _ = mock_store.read(aid)
         assert fm["status"] == "approved"
@@ -56,7 +57,7 @@ class TestDualStateApprove:
         db.upsert_artifact = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         db.upsert_artifact.reset_mock()
 
         await lc.mark_applied(aid, execution_log="done")
@@ -72,7 +73,7 @@ class TestDualStateApprove:
         db.upsert_artifact = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         db.upsert_artifact.reset_mock()
 
         await lc.mark_failed(aid, reason="timeout")
@@ -88,7 +89,7 @@ class TestDualStateApprove:
         db.upsert_artifact = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         await lc.mark_applied(aid, execution_log="done")
         db.upsert_artifact.reset_mock()
 
@@ -105,7 +106,7 @@ class TestDualStateApprove:
         db.upsert_artifact = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         db.upsert_artifact.reset_mock()
 
         await lc.revoke(aid, user="admin", reason="obsolete")
@@ -140,7 +141,7 @@ class TestDualStateDBFailureIsolation:
         db.upsert_artifact.reset_mock()
         db.upsert_artifact.side_effect = sqlite3.OperationalError("DB down")
 
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
 
         fm, _ = mock_store.read(aid)
         assert fm["status"] == "approved"
@@ -161,7 +162,7 @@ class TestDualStateDBFailureIsolation:
         db = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         db.upsert_artifact.side_effect = sqlite3.OperationalError("DB down")
 
         await lc.mark_applied(aid, execution_log="done")
@@ -173,7 +174,7 @@ class TestDualStateDBFailureIsolation:
         db = AsyncMock()
         lc = ArtifactLifecycle(store=mock_store, repository=db)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         db.upsert_artifact.side_effect = sqlite3.OperationalError("DB down")
 
         await lc.revoke(aid, user="admin")
@@ -196,7 +197,7 @@ class TestDualStateNoDB:
     async def test_approve_works_without_db(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store, repository=None)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         fm, _ = mock_store.read(aid)
         assert fm["status"] == "approved"
 

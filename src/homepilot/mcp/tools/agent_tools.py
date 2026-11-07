@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from homepilot.agent_hub.enrolment_window import MAX_WINDOW_MINUTES
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -87,6 +88,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
                     "description": "How many entries to return (1-1000, default 100)",
                 },
                 "agent_id": {"type": ["string", "null"], "description": "Only this agent's trail"},
@@ -140,6 +143,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "minutes": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WINDOW_MINUTES,
                     "description": "How long the window stays open (1-1440, default 15)",
                 },
             },
@@ -250,7 +255,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 **host_properties("Managed host's name"),
                 "command": {"type": "string", "description": "Command to run"},
-                "timeout": {"type": "integer", "description": "Seconds (default 30)"},
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 600,
+                    "description": "Seconds (default 30, at most 600)",
+                },
             },
             "required": ["host", "command"],
         },

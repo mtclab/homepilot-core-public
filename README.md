@@ -9,9 +9,12 @@ Manage your homelab through structured artifacts — proposed by AI, reviewed by
 ```bash
 git clone https://github.com/mtclab/homepilot-core-public.git
 cd homepilot-core-public
-cp .env.example .env
 docker compose up -d
 ```
+
+No `.env` is needed: copy `.env.example` to `.env` only to change a default.
+The data directory (`./data/hp`) is created and handed to the container's user
+automatically, so there is no `chown` step either.
 
 Then open **http://localhost:8000/ui** (or `http://<host>:8000/ui` from another
 machine on the same network) and **claim the instance**: the first-run screen
@@ -46,11 +49,13 @@ longer the way in.
 ## Pull from ghcr (no build required)
 
 ```bash
-HP_IMAGE_TAG=3.2.0 docker compose pull
+HP_IMAGE_TAG=<version> docker compose pull
 docker compose up -d
 ```
 
-Available tags: `latest`, `3.2.0`, `3.2`, `3` — see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
+Tags: `latest`, and for every release its full version plus its `<major>.<minor>`
+and `<major>` aliases (the compose default is the version this checkout ships) —
+see [Releases](https://github.com/mtclab/homepilot-core-public/releases).
 
 ## Services
 
@@ -62,7 +67,7 @@ Available tags: `latest`, `3.2.0`, `3.2`, `3` — see [Releases](https://github.
 | searxng | 8080 | Meta-search engine (private, for agent web search) |
 | radicale | 5232 | CalDAV/CardDAV server (calendar + contacts) |
 | whisper | 8000 | Speech-to-text (CPU, for voice commands) |
-| piper | 5000 | Text-to-speech (CPU, for voice replies) |
+| piper | 10200 | Text-to-speech (CPU, Wyoming protocol over TCP, for voice replies) |
 
 ## Configuration
 
@@ -445,7 +450,12 @@ An MCP client signs in with an API token like any other client - mint it in Sett
 
 `HP_MCP_TOKEN` still works as the legacy static fallback, at `HP_MCP_TOKEN_SCOPE`.
 
-**stdio** (local, Claude Code / opencode on the same machine):
+**With the backend running** the backend itself serves MCP at `/mcp` - use the
+HTTP config below with its address. That is the endpoint that sees the
+backend's agents and tasks.
+
+**Standalone stdio** (no backend running on this machine; `hp mcp-serve` then is
+the control plane, and it refuses to start while a backend is running):
 
 ```bash
 hp mcp-serve
@@ -463,11 +473,7 @@ hp mcp-serve
 }
 ```
 
-**HTTP** (remote server — recommended when AI client runs elsewhere, e.g. Kasm workspace):
-
-```bash
-hp mcp-serve --transport http --host 0.0.0.0 --port 8000
-```
+**HTTP** (the backend's own `/mcp`; recommended, and the way to reach it from another machine):
 
 ```json
 {
@@ -493,9 +499,13 @@ HP_VAULT_PASSPHRASE_FILE=/run/secrets/hp_vault_passphrase
 ## Releases
 
 Releases are cut **on the public mirror** (`mtclab/homepilot-core-public`), which
-is where the release workflows carry their triggers — the copies in this private
-repo are `workflow_dispatch`-only by design, so nothing here spends billed
-private-repo Actions minutes.
+owns the release workflows: the mirror's `.github/` is canonical. The
+`workflow_dispatch`-only copies in this private repo are a stale fork of them
+and are **never exported** - exporting them used to revert fixes made on the
+mirror (#725). The scrub drops `.github/` from every export, and
+`scripts/sync_export_to_mirror.py` makes the mirror equal to the export
+(deleting what was removed here) without touching the mirror's `.git/` or
+`.github/`. Nothing here spends billed private-repo Actions minutes.
 
 The chain is a version bump, not a tag: sync the reviewed change to the mirror's
 `main`, and the push fires `auto-tag.yml` there. If `pyproject.toml`'s version has
@@ -886,7 +896,7 @@ the reported `total` counts the search, so the pager never offers empty pages.
 
 ## Events & Webhooks
 
-HomePilot emits SSE events for artifact lifecycle changes (proposed, approved, applied, etc.) and drift detection. Events stream to connected clients at `/events` and can trigger outbound webhooks. See [`docs/EVENTS.md`](docs/EVENTS.md) for the event schema and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the webhook delivery system.
+HomePilot emits SSE events for artifact lifecycle changes (proposed, approved, applied, etc.) and drift detection. Events stream to connected clients at `GET /artifacts/events/stream` (read scope) and can trigger outbound webhooks. See [`docs/EVENTS.md`](docs/EVENTS.md) for the event schema and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the webhook delivery system.
 
 All state transitions write an append-only audit log stored in SQLite. Use `hp status` or the API to query it.
 

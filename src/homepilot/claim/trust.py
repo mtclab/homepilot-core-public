@@ -3,6 +3,8 @@ from __future__ import annotations
 import ipaddress
 from collections.abc import Mapping
 
+from ..client_ip import forwarded_client, is_trusted_proxy
+
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 _Address = ipaddress.IPv4Address | ipaddress.IPv6Address
 
@@ -64,40 +66,26 @@ def claim_source(
       unlisted relay would be judged by the relay's private address.
     * A trusted proxy that forwarded NO client address is also untrusted: the
       real client cannot be evaluated, and the proxy's own address is not it.
-    * Anything unparseable is untrusted.
+    * Anything unparseable is untrusted - including a hop in the forwarded
+      chain, since nothing to the left of it can be believed.
+
+    RFC 7239's ``Forwarded`` is deliberately not parsed: a half-understood
+    parse of a security decision is worse than declining to make it.
     """
     peer_address = peer or ""
     forwarded_header = next((h for h in _FORWARD_HEADERS if headers.get(h)), None)
-    peer_parsed = _parse(peer_address)
-    peer_is_trusted_proxy = peer_parsed is not None and any(
-        peer_parsed in network for network in trusted_proxies
-    )
+    peer_is_trusted_proxy = is_trusted_proxy(peer_address, trusted_proxies)
 
     if forwarded_header is not None and not peer_is_trusted_proxy:
         return False, peer_address
 
     if peer_is_trusted_proxy:
-        client = _forwarded_client(headers)
+        # The shared resolver (#705): X-Forwarded-For walked from the RIGHT,
+        # skipping our own proxies. The first hop is the one the client wrote,
+        # and taking it let a remote client claim to be local.
+        client = forwarded_client(headers, trusted_proxies)
         if client is None:
             return False, peer_address
         return is_local_address(client), client
 
     return is_local_address(peer_address), peer_address
-
-
-def _forwarded_client(headers: Mapping[str, str]) -> str | None:
-    """The client address a trusted proxy asserts, or None if it asserted none.
-
-    Only the two headers whose format is unambiguous are read. RFC 7239's
-    ``Forwarded`` is deliberately not parsed here: a half-understood parse of a
-    security decision is worse than declining to make it, and declining means
-    'untrusted'.
-    """
-    xff = headers.get("x-forwarded-for", "")
-    if xff:
-        first = xff.split(",")[0].strip()
-        return first if _parse(first) is not None else None
-    real_ip = headers.get("x-real-ip", "").strip()
-    if real_ip:
-        return real_ip if _parse(real_ip) is not None else None
-    return None

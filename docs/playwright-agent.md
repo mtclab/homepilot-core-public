@@ -9,7 +9,7 @@ Interactive web UI testing using the project venv. Reference for AI agents writi
 All Playwright tooling lives in the project venv. Never use a global install.
 
 ```bash
-cd $HOME/repot/homepilot-v2
+cd <your homepilot-v2 checkout>
 
 # Run a script
 .venv/bin/python my_script.py
@@ -329,7 +329,7 @@ resp = page.request.post(
 ## Running Tests
 
 ```bash
-cd $HOME/repot/homepilot-v2
+cd <your homepilot-v2 checkout>
 
 # All e2e tests
 HP_TEST_TOKEN=hp_REDACTED_TEST_TOKEN \

@@ -39,10 +39,12 @@ from homepilot.agent_hub.migrate_tls import (
 from homepilot.agent_hub.tls_mode import MODE_LEGACY_PLAINTEXT, MODE_TLS, SETTING_KEY
 from homepilot.db.repository import Repository
 
-_GO = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
+from .go_toolchain import GO as _GO
+from .go_toolchain import GO_SKIP_REASON
+
 pytestmark = [
     pytest.mark.asyncio,
-    pytest.mark.skipif(not _GO, reason="Go toolchain not available"),
+    pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON),
 ]
 
 

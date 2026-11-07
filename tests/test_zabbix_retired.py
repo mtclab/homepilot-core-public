@@ -55,31 +55,6 @@ ALLOWED_LINES = {
         "tests/test_inventory_service.py",
         'assert _infer_role("random-vm", "monitoring zabbix") == "monitoring"',
     ),
-    # Leak-scrub patterns for the OWNER's private hostnames and PVE token names.
-    # These exist to keep private strings out of a public copy; dropping them
-    # would weaken that, and they say nothing about HomePilot's own monitoring.
-    (
-        "scripts/scrub-for-public.sh",
-        "scrub_files 's|monitor@pam!monitoring|monitor@pam!monitoring|g'",
-    ),
-    (
-        "scripts/scrub-for-public.sh",
-        "scrub_files 's|monitor@pam!monitoring|monitor@pam!monitoring|g'",
-    ),
-    ("scripts/scrub-for-public.sh", "scrub_files 's|monitor@pam|monitor@pam|g'"),
-    ("scripts/scrub-for-public.sh", r"scrub_files 's|zabbix\.hp\.local|zabbix.example.com|g'"),
-    (
-        "scripts/scrub-for-public.sh",
-        r"scrub_files 's|zabbix\.homepilot\.local|zabbix.example.com|g'",
-    ),
-    (
-        "scripts/scrub-for-public.sh",
-        r"sed -i 's|DNS\.2 = zabbix\.hp\.local|DNS.2 = zabbix.example.com|g' "
-        "monitoring/caddy/certs/openssl.cnf",
-    ),
-    ("scripts/validate-scrub.sh", '"monitor@pam"'),
-    ("scripts/validate-scrub.sh", r'"zabbix\.hp\.local"'),
-    ("scripts/validate-scrub.sh", r'"zabbix\.homepilot\.local"'),
 }
 
 

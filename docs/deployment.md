@@ -17,16 +17,22 @@ Step-by-step production deployment using Docker Compose.
 ```bash
 git clone https://github.com/mtclab/homepilot-core-public.git
 cd homepilot-core-public
-cp .env.example .env
+docker compose up -d
 ```
 
-HomePilot uses a **zero-secrets `.env`** — no HomePilot secrets in the environment file. The vault passphrase is auto-generated on first start.
+Then open `http://<host>:8000/ui` and **claim the instance**: the first-run
+screen creates the admin credential and takes your Proxmox address and API token
+in the same step. That is the whole install - the vault passphrase, secret key
+and database generate themselves on first boot, and the data directory
+(`./data/hp`) is handed to the container's user by the one-shot `hp-data-init`
+service, so there is no `chown` and no `.env` to write.
 
-### Minimum `.env` (zero secrets)
+`.env` is optional (Compose >= 2.24 reads it only if present). Copy
+`.env.example` to `.env` only to change a default; it carries no HomePilot
+secrets.
 
 ```env
 HP_DAEMON_PORT=8000
-HP_PROXMOX_HOST=pve.example.local
 HP_PROXMOX_VERIFY_SSL=false
 ```
 
@@ -34,20 +40,18 @@ All secrets (API signing key, admin secret, PVE token, etc.) are stored in the e
 
 The `.env` examples use `10.0.0.1` as placeholder IPs — replace with your actual host IPs.
 
-### Bootstrap with `hp init` (recommended)
+### Scripted bootstrap with `hp init` (instead of the claim screen)
+
+For an unattended install, `hp init --non-interactive` reads `PVE_API_TOKEN` /
+`HP_ADMIN_SECRET` / `HP_VAULT_PASSPHRASE` from the environment, sets the vault
+secrets and creates an admin API token. Use it INSTEAD of the claim, not after
+it:
 
 ```bash
-# 1. Start the stack — passphrase auto-generates, persisted to {data_dir}/.vault_passphrase
 docker compose up -d
-
-# 2. Initialize vault secrets and create admin token
-docker compose exec backend hp init
-
-# 3. Verify
+docker compose exec backend hp init --non-interactive
 docker compose exec backend hp vault list
 ```
-
-`hp init` sets all 4 vault secrets and creates an admin API token in one step.
 
 ### Manual bootstrap (advanced)
 
@@ -80,6 +84,26 @@ Piper) are gated behind the `agents` profile so a stale extras image can never
 block a core backend update.
 
 ### With agent services (n8n, SearXNG, Radicale, Whisper, Piper)
+
+n8n's owner account comes from `.env`, and n8n refuses to start until it is set
+(#775). n8n 1.0 removed basic auth, so an instance without an owner would hand
+the owner account - and every credential stored in n8n - to whoever reached its
+UI first. Before the first start, set both:
+
+```bash
+htpasswd -nBC 10 "" | tr -d ':\n'   # prompts for the password, prints its bcrypt hash
+```
+
+```env
+N8N_INSTANCE_OWNER_EMAIL=admin@example.com
+# Single quotes: Compose expands `$` in an unquoted value.
+N8N_INSTANCE_OWNER_PASSWORD_HASH='$2y$10$...'
+```
+
+n8n re-applies them at every start, so a password changed in the n8n UI reverts
+on the next restart - change it here. No n8n port is published; to use its UI,
+add `"127.0.0.1:5678:5678"` under the `n8n` service's `ports:` and reach it over
+an SSH tunnel. Never publish it on all interfaces.
 
 ```bash
 docker compose --profile agents up -d
@@ -416,17 +440,29 @@ is enabled. So applying a `guest-network` artifact that fences something
 of the SAME approved apply, and only ever the safe way: `enable=1` together with
 `policy_in=ACCEPT` in one options write, so the host INPUT chain stays open. The
 `enforcement` field in the guest-network report says which state you are in -
-*enforced*, or *configured but not enforced because the switch is off*.
+*enforced* (switch on AND the firewall service seen running on the node),
+*configured but not enforced* (switch off, or service stopped - e.g. after a
+`pve-firewall stop` recovery), or *unverified* (switch on, service state could
+not be read). The survey also reads back every guest carrying HomePilot's fence
+rules and plans an in-order rewrite of any fence that differs from the current
+one - a pre-#599 reversed fence included - without touching other rules (#713).
 
 > **Never enable a PVE firewall with a DROP input policy and no management-allow
 > rule.** Live incident, 2026-08-27 (dev pve1): a bare datacenter-firewall enable
 > compiled a default INPUT-DROP that severed SSH (22) and the API (8006) to the
 > node until IPMI console recovery (`pve-firewall stop && pvesh set
 > /cluster/firewall/options --enable 0`). PVE does not auto-allow SSH; a bare
-> enable is a self-lockout. HomePilot never issues one: it enables only at
-> `policy_in=ACCEPT`, refuses any enable that is not lockout-safe, and offers no
-> raw firewall-enable endpoint at all - the capability is reached only through
-> the approved guest-network artifact (#600).
+> enable is a self-lockout. HomePilot never issues one: the guest-network apply
+> enables at `policy_in=ACCEPT`, and EVERY write HomePilot makes to
+> `/cluster/firewall/options` or `/nodes/<node>/firewall/options` - whatever
+> artifact kind asked for it - passes one guard on the wire (#707). A write that
+> would leave a firewall enabled at DROP or REJECT (unset counts as DROP) is sent
+> only when an enabled `in` ACCEPT rule for tcp 22 and the API port, matching
+> HomePilot's own management source, is verified on the cluster's and every
+> node's rules with nothing that may drop that traffic ahead of it. An input
+> policy an operator staged on a disabled firewall is kept, never overwritten.
+> HomePilot never adds or loosens a rule to make a write pass - it refuses and
+> says why. `http-sequence` artifacts may not write firewall options at all.
 
 Each one is **checked against the live cluster before it is stored**. A value
 the cluster refutes comes back `422` with the cluster's own answer - *"no bridge
@@ -867,68 +903,51 @@ docker compose exec backend hp vault list
 
 ## 8. MCP Server
 
-### stdio (local — Claude Code on the same machine)
+### With the backend running (the normal case)
 
-Install HomePilot locally and point Claude Code at it:
+The backend serves MCP itself at `/mcp`, over the same port and auth as the
+API. Mint an API token in Settings -> Tokens (its scope picks the tool tier)
+and point the client at it:
 
-```bash
-pip install homepilot
+```json
+{
+  "mcpServers": {
+    "homepilot": {
+      "url": "http://<homelab-ip>:8000/mcp",
+      "headers": { "Authorization": "Bearer <api token>" }
+    }
+  }
+}
 ```
 
-`.claude/mcp_servers.json`:
+This is the only MCP endpoint that sees the backend's agents, task runner and
+live UI updates.
+
+### Standalone (`hp mcp-serve`, no backend running)
+
+`hp mcp-serve` (stdio, or `--transport http`) builds its OWN control plane from
+the data directory: its own migrations, task runner and agent hub. It is for a
+machine where the backend is not running, and it holds the instance lock while
+it runs. While a backend is running on the same data directory it refuses to
+start and points at `/mcp` above - beside a backend it would be a second
+control plane with no agents connected to it (#698). For the same reason a
+backend refuses to start while a standalone MCP server holds the lock.
 
 ```json
 {
   "mcpServers": {
     "homepilot": {
       "command": "hp",
-      "args": ["mcp-serve"]
+      "args": ["mcp-serve"],
+      "env": { "HP_MCP_TOKEN": "<api token>" }
     }
   }
 }
-```
-
-### HTTP (remote — AI client runs on a different host)
-
-Start an HTTP MCP endpoint alongside the backend:
-
-```bash
-hp mcp-serve --transport http --host 0.0.0.0 --port 9000
 ```
 
 The client authenticates with an API token minted in Settings -> Tokens; the
 token's scope picks its tool tier. `HP_MCP_TOKEN=<secret>` still works as the
 legacy static credential.
-
-Or add it as a service in `docker-compose.override.yml`:
-
-```yaml
-services:
-  mcp:
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-latest}
-    command: ["hp", "mcp-serve", "--transport", "http", "--host", "0.0.0.0", "--port", "9000"]
-    ports:
-      - "9000:9000"
-    volumes:
-      - hp-data:/home/homepilot/.hp
-    env_file:
-      - .env
-    environment:
-      HP_MCP_TOKEN: ${HP_MCP_TOKEN}
-```
-
-Client config (e.g. in a Kasm workspace):
-
-```json
-{
-  "mcpServers": {
-    "homepilot": {
-      "url": "http://<homelab-ip>:9000/mcp",
-      "headers": { "Authorization": "Bearer <HP_MCP_TOKEN>" }
-    }
-  }
-}
-```
 
 ---
 
@@ -1007,6 +1026,13 @@ tarball without secrets cannot bring a host back on its own.
 | `secrets/.env` (only when a `.env` sits *inside* the data dir) | **no** | yes |
 | `secrets/api-token` | **no** | yes |
 | `secrets/ssh/` (managed-host SSH keys) | **no** | yes |
+| `secrets/hub/hub-cert.pem`, `secrets/hub/hub-key.pem` (the agent hub's TLS identity, which every agent pins) | **no** | yes |
+| `secrets/.agent_hub_token` (the fleet's shared hub token, when auto-generated) | **no** | yes |
+
+Without the hub's certificate and token a restored host mints new ones, and
+every enrolled agent refuses it: agents pin the hub certificate by fingerprint
+and an env-pinned agent cannot be re-pinned remotely, so the whole fleet would
+need re-enrolling by hand (#722). Restore them with `--restore-secrets`.
 
 Never in a tarball: `homepilot.db-wal` / `homepilot.db-shm` (a stale journal
 replayed onto a restored database corrupts it), and KB embeddings — run
@@ -1178,7 +1204,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.6.24` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.6.25` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1209,7 +1235,7 @@ forward.
 | `HP_GUEST_NETWORK_DHCP` | `1` | `1` runs dnsmasq on the zone; needs the `dnsmasq` package on the node |
 | `HP_GUEST_NETWORK_DHCP_RANGE` | — | Addresses DHCP may hand out, as `<start>-<end>` |
 | `HP_GUEST_NETWORK_DHCP_DNS_SERVER` | — | Resolver handed to guests; empty means the gateway resolves for them |
-| `HP_GUEST_NETWORK_ISOLATE_CIDRS` | `10.0.0.1/24` | The networks a guest must never reach. This is the fence; empty means no fence and no per-VM firewall rules |
+| `HP_GUEST_NETWORK_ISOLATE_CIDRS` | — | The networks a guest must never reach, as comma-separated CIDRs, e.g. `192.0.2.0/24`. This is the fence; empty means no fence and no per-VM firewall rules |
 | `HP_AGENT_HUB_ENABLED` | `true` | Enable Agent Hub for managed host connectivity |
 | `HP_AGENT_HUB_PORT` | `8443` | Agent Hub TCP port |
 | `HP_AGENT_HUB_ADVERTISE_HOST` | — | Host (optionally `host:port`) agents dial to reach the hub behind a proxy |
@@ -1226,8 +1252,8 @@ forward.
 | `HP_MCP_TOKEN` | — | Legacy static credential for the MCP transports. An MCP client normally authenticates with an API token from Settings -> Tokens; this value still works, at `HP_MCP_TOKEN_SCOPE` |
 | `HP_RATE_LIMIT` | `60` | Max requests per IP per minute |
 | `HP_CORS_ORIGINS` | `http://localhost:5173,http://localhost:4173,http://127.0.0.1:5173,http://127.0.0.1:4173` | Comma-separated allowed CORS origins (the four localhost dev origins by default) |
-| `HP_COOKIE_SECURE` | `true` | Set `false` only for plain-HTTP local dev |
-| `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs trusted for `X-Forwarded-For` |
+| `HP_COOKIE_SECURE` | `true` | Session cookies are `Secure` whenever the client leg is or may be TLS: backend https, `X-Forwarded-Proto: https`, or a `HP_TRUSTED_PROXIES` peer that did not say `http`. A direct plain-HTTP connection (the first-run LAN path) gets non-`Secure` cookies so login works. `false` turns `Secure` off everywhere (plain-HTTP dev only) |
+| `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` / `X-Real-IP`. From a trusted peer the client is found by walking `X-Forwarded-For` right to left past every trusted proxy (the leftmost hop is client-written and never believed); from any other peer the headers are ignored. One resolver feeds the first-run claim, the rate limits, the SSE cap and the token-mint limit |
 | `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
@@ -1252,7 +1278,8 @@ forward.
 | `HP_LOG_LEVEL` | `info` | Log verbosity: `debug` \| `info` \| `warning` \| `error` |
 | `HP_VAULT_DIR` | `<HP_DATA_DIR>/vault` | Vault directory |
 | `HP_ARTIFACTS_DIR` | `<HP_DATA_DIR>/artifacts` | Artifact working directory |
-| `HP_ALLOWED_HTTP_DOMAINS` | — | Comma-separated allowlist for `http_call_read` (SSRF guard) |
+| `HP_ALLOWED_HTTP_DOMAINS` | — | Comma-separated allowlist for `http_call_read` (SSRF guard). Names resolve with the system resolver; the service's vault-registered host may be on the LAN (RFC 1918, CGNAT, ULA), loopback/link-local/metadata are always refused |
+| `HP_ARTIFACT_VAULT_ALLOWLIST` | — (any) | Comma-separated vault entries an artifact may reference as `{{ vault.<name> }}` or as an http-sequence step credential. Empty = any entry except HomePilot's own platform credentials (`admin-secret`, the pve tokens, the hub token, ...), which are refused whatever this says, at propose and at execute. Redaction of resolved values in logs is best-effort; this list is the boundary |
 | `HP_AUTH_RATE_LIMIT` | `120` | Max authentication requests per IP per minute |
 | `HP_RATE_LIMIT_BACKEND` | `memory` | Rate-limit store. Only `memory` is implemented; other values log a warning and fall back |
 | `HP_BUSY_TIMEOUT` | `10000` | SQLite busy timeout in milliseconds |

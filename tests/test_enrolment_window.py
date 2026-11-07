@@ -234,6 +234,86 @@ class TestSharedTokenEnrolment:
         assert ack.get("error") == GENERIC_AUTH_ERROR, ack
 
 
+class TestSharedTokenCannotTakeOverAKnownHost:
+    """#683: the shared token must not re-enrol a hostname that still holds a live
+    per-agent credential.
+
+    The attack, reproduced on the real hub socket: fleet member ``db-host`` holds
+    its own credential, its agent is offline, the window is shut. A register as a
+    NEW ``agent_id`` claiming ``hostname=db-host`` with the shared token used to
+    be let through by the known-hostname exemption: it got a register_ack and a
+    freshly minted credential, the hub routed ``db-host`` to it - every exec,
+    write_file (vault-resolved config included), drift and fence probe for that
+    host - and the real agent, reconnecting with its perfectly valid credential,
+    was turned away as "identity already claimed by a live connection".
+
+    Revert-check: delete the live-credential refusal in ``_enrolment_allowed``
+    and ``test_impostor_is_refused_and_real_agent_keeps_the_host`` fails on the
+    first assertion (the impostor is acked and handed a credential).
+    """
+
+    async def test_impostor_is_refused_and_real_agent_keeps_the_host(self, hub: _Hub):
+        real_token = await _seed_fleet_member(hub.repo, "db-host")
+
+        impostor = await hub.register("impostor-id", "db-host", AUTH)
+
+        assert impostor.get("action") != "register_ack", impostor
+        assert "auth_token" not in impostor, "the impostor was handed a credential"
+        assert "auth" not in str(impostor.get("error", "")).lower(), (
+            "the refusal must not read as an auth error: the Go agent treats that as "
+            "'try the other credential', and no credential it holds would help"
+        )
+        assert (await hub.repo.get_agent_credential("impostor-id")) is None
+        assert hub.server.registry.get("impostor-id") is None
+        assert hub.server.registry.get_by_hostname("db-host") is None
+
+        # The real agent comes back and gets its host, not "identity already
+        # claimed by a live connection".
+        real = await hub.register("incumbent", "db-host", real_token)
+        assert real.get("action") == "register_ack", real
+        routed = hub.server.registry.get_by_hostname("db-host")
+        assert routed is not None and routed.agent_id == "incumbent"
+
+        await asyncio.sleep(0.1)  # the audit mirror is fire-and-forget
+        rows = await hub.repo.query_agent_audit(action="register_rejected")
+        assert rows, "the refused takeover left no audit row"
+        assert "db-host" in (rows[0]["target"] or ""), rows[0]
+
+    async def test_an_open_window_does_not_open_a_known_host(self, hub: _Hub):
+        """The window admits STRANGERS. A host that already holds a credential is
+        not a stranger, so opening the window must not re-open the takeover."""
+        await _seed_fleet_member(hub.repo, "db-host")
+        await enrolment_window.open_window(hub.repo, minutes=15)
+
+        impostor = await hub.register("impostor-id", "db-host", AUTH)
+
+        assert impostor.get("action") != "register_ack", impostor
+        assert (await hub.repo.get_agent_credential("impostor-id")) is None
+
+    async def test_revoking_the_credential_is_the_operator_re_enrol_path(self, hub: _Hub):
+        """Recovery still exists: once an operator revokes the old credential the
+        host is known but holds nothing live, and the shared token re-enrols it
+        (the documented reinstall path)."""
+        await _seed_fleet_member(hub.repo, "db-host")
+        assert await hub.repo.revoke_agent_credential("incumbent")
+
+        ack = await hub.register("reinstalled-id", "db-host", AUTH)
+
+        assert ack.get("action") == "register_ack", ack
+        assert ack.get("auth_token"), "the re-enrolled host must be handed a new credential"
+
+    async def test_a_bootstrap_token_still_re_enrols_a_known_host(self, hub: _Hub):
+        """An operator-minted, single-use bootstrap token is the other sanctioned
+        way back for a host that lost its credential file."""
+        await _seed_fleet_member(hub.repo, "db-host")
+        bootstrap = await hub.server._token_store.create()
+
+        ack = await hub.register("reinstalled-id", "db-host", bootstrap)
+
+        assert ack.get("action") == "register_ack", ack
+        assert ack.get("auth_token")
+
+
 class TestWindowState:
     async def test_status_is_truthful_across_open_expire_close(self, tmp_path: Path, monkeypatch):
         db = Database(str(tmp_path / "w.db"))

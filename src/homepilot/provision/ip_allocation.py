@@ -28,6 +28,7 @@ Two decisions carry the design:
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import logging
 import re
@@ -217,9 +218,18 @@ async def allocate_address(
     proxmox: Any,
     network: DesiredGuestNetwork,
     nameserver: str = "",
+    reserved: frozenset[str] | set[str] = frozenset(),
 ) -> AllocatedAddress:
-    """Pick this guest's address out of the guest subnet. Raises, never guesses."""
+    """Pick this guest's address out of the guest subnet. Raises, never guesses.
+
+    `reserved` is what other provisions in this process have already picked but
+    not yet written into a guest config (#719): the cluster scan cannot see
+    those, so without them two concurrent provisions are handed one address.
+    """
     claimed = await claimed_addresses(proxmox, network.vnet)
+    for held in reserved:
+        with contextlib.suppress(ipaddress.AddressValueError):
+            claimed.add(ipaddress.IPv4Address(held))
     chosen = pick_address(network, claimed)
     prefixlen = ipaddress.IPv4Network(network.subnet_cidr).prefixlen
     logger.info(

@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
+from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError, ProxmoxTaskStillRunningError
 from homepilot.executor.jinja_utils import (
     InterpolationError,
     _eval_skip_if,
@@ -30,11 +30,78 @@ _ROLLBACK_FENCE = "proxmox-api-rollback"
 # 500 fell straight through to its step, and the log did not even mention it.
 _PRECHECK_ANSWERS_BELOW = 500
 
-# A clone or a destroy of a large disk is minutes of real work, so the wait has
-# to outlast it; the poll matches ProvisionService so one cluster sees one
+# How long a step FOLLOWS the PVE task it spawned before it stops watching
+# (#774). One flat 600 s was the whole policy, and a vzdump of three guests
+# (~13 min) outlived it: the artifact was marked failed while PVE went on to
+# finish `OK` with every archive on disk. So the wait is per operation - the
+# kinds of work that routinely run long get a long one - and a step may name its
+# own with `timeout_s`. Whatever the wait, running out of it is NOT a failure:
+# the step reports the task as still running and the run's outcome as unknown
+# (see `execute`). The poll matches ProvisionService so one cluster sees one
 # polling cadence.
 DEFAULT_TASK_TIMEOUT_S = 600.0
 DEFAULT_POLL_INTERVAL_S = 2.0
+# The ceiling a step's own `timeout_s` may ask for. A day is longer than any
+# single PVE task an artifact has a business waiting on; past that the step has
+# stopped being "wait for this" and become "leave a worker blocked forever".
+MAX_TASK_TIMEOUT_S = 24 * 3600.0
+# Backups and restores move whole disks through a storage; hours are normal.
+_BACKUP_TASK_TIMEOUT_S = 6 * 3600.0
+# Copying or relocating a disk (clone, move, migrate, template, download).
+_DISK_TASK_TIMEOUT_S = 2 * 3600.0
+_OPERATION_TASK_TIMEOUTS: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"/vzdump$"), _BACKUP_TASK_TIMEOUT_S),
+    (
+        re.compile(r"/(clone|move_disk|move_volume|migrate|template|download-url)$"),
+        _DISK_TASK_TIMEOUT_S,
+    ),
+)
+
+
+def step_timeout_error(value: Any) -> str | None:
+    """Why a step's `timeout_s` is not acceptable, or None when it is (or absent).
+
+    Shared by propose-time validation and the executor, so an artifact refused
+    at apply is one that could not have been proposed either.
+    """
+    if value is None:
+        return None
+    # bool is an int in Python; `timeout_s: true` is a typo, not a duration.
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return f"timeout_s must be a number of seconds, got {value!r}"
+    if not 0 < value <= MAX_TASK_TIMEOUT_S:
+        return (
+            f"timeout_s must be above 0 and at most {MAX_TASK_TIMEOUT_S:.0f} seconds, got {value}"
+        )
+    return None
+
+
+def task_timeout_for(
+    step: dict[str, Any],
+    method: str,
+    path: str,
+    body: Any,
+    override: float | None = None,
+) -> float:
+    """How long this step follows its PVE task (#774).
+
+    The step's own `timeout_s` wins; then a caller's override for the whole run;
+    then the operation's default; then the general default.
+    """
+    declared = step.get("timeout_s")
+    if declared is not None:
+        return float(declared)
+    if override is not None:
+        return override
+    bare = path.split("?", 1)[0].rstrip("/")
+    for pattern, seconds in _OPERATION_TASK_TIMEOUTS:
+        if pattern.search(bare):
+            return seconds
+    # A restore is a POST that creates a guest FROM an archive: same path as a
+    # plain create, told apart by its body (`archive` for qemu, `restore` for lxc).
+    if method == "POST" and isinstance(body, dict) and ("archive" in body or body.get("restore")):
+        return _BACKUP_TASK_TIMEOUT_S
+    return DEFAULT_TASK_TIMEOUT_S
 
 
 def _node_for_task(context: dict[str, Any], upid: str) -> str | None:
@@ -60,7 +127,9 @@ async def _await_pve_task(
     """Block until the task this step spawned finishes; raise if it failed.
 
     Returns the text to append to the step log, or "" when the call was
-    synchronous and there was nothing to wait for.
+    synchronous and there was nothing to wait for. A task still running when
+    `timeout_s` runs out raises ProxmoxTaskStillRunningError, which `execute` reports
+    as an unknown outcome - never as a failure (#774).
     """
     upid = ProxmoxClient.upid_of(resp)
     if not upid:
@@ -94,9 +163,19 @@ async def execute(
     proxmox: ProxmoxClient,
     vault: Any | None = None,
     rollback: bool = False,
-    task_timeout_s: float = DEFAULT_TASK_TIMEOUT_S,
+    task_timeout_s: float | None = None,
     poll_interval: float = DEFAULT_POLL_INTERVAL_S,
 ) -> dict[str, Any]:
+    """Run a proxmox-api-spec (or its rollback) step by step.
+
+    `task_timeout_s` overrides the per-operation wait for every step that does
+    not name its own `timeout_s`; None (the default) means "per operation".
+
+    Three outcomes, not two (#774): `success` True; `success` False with a
+    `failure_reason`; or `success` False with `unsettled_task` set - a PVE task
+    this run spawned was STILL RUNNING when its wait ran out, so whether the
+    change happened is unknown. That last one must never be recorded as failed.
+    """
     tag = _ROLLBACK_FENCE if rollback else _SPEC_FENCE
     steps = _extract_steps(body, tag)
     if steps is None:
@@ -105,6 +184,18 @@ async def execute(
             "execution_log": f"No ```yaml {tag}``` block found",
             "failure_reason": "missing spec",
         }
+    # Every step's wait is checked BEFORE the first one runs: refusing step 3 for
+    # a bad `timeout_s` after steps 1-2 changed the cluster would leave it half
+    # done for a reason that was knowable up front.
+    for step in steps:
+        bad_timeout = step_timeout_error(step.get("timeout_s"))
+        if bad_timeout:
+            step_id = step.get("id", "unknown")
+            return {
+                "success": False,
+                "execution_log": f"[{step_id}] -> REFUSED: {bad_timeout}",
+                "failure_reason": f"step {step_id}: {bad_timeout}",
+            }
 
     context = interpolation_context(target, frontmatter)
 
@@ -121,7 +212,7 @@ async def execute(
     # lie this review exists to remove (#642 B5).
     unfinished: list[str] = []
 
-    for step in steps:
+    for index, step in enumerate(steps):
         step_id = step.get("id", "unknown")
         step_log = f"[{step_id}]"
         on_error = step.get("on_error", "halt")
@@ -218,9 +309,44 @@ async def execute(
             # leaving the guest on the node (seen live on dev, #629/#626). It
             # also hid outright failure: a task that dies asynchronously was
             # still logged as OK. Wait for the task and report what it did.
-            waited = await _await_pve_task(proxmox, context, resp, task_timeout_s, poll_interval)
+            wait_s = task_timeout_for(step, method, path, do_body, task_timeout_s)
+            waited = await _await_pve_task(proxmox, context, resp, wait_s, poll_interval)
             if waited:
                 step_log += waited
+        except ProxmoxTaskStillRunningError as e:
+            # The cluster ACCEPTED the work and is still doing it. That is not a
+            # failure (#774: a vzdump reported failed at 600 s finished OK with
+            # every archive written), and it is not a success either. Stop here
+            # whatever `on_error` says - the next step would race a task that
+            # still holds the guest (#629) - and hand back WHICH task, so the
+            # outcome can be settled from PVE once it ends.
+            step_log += f" (task STILL RUNNING after {e.waited_s:.0f}s: {e.upid}; outcome unknown)"
+            log_lines.append(step_log)
+            elapsed = time.monotonic() - start
+            log_lines.append(f"duration={elapsed:.1f}s")
+            not_run = [str(later.get("id", "unknown")) for later in steps[index + 1 :]]
+            reason = (
+                f"outcome unknown: step {step_id}'s PVE task {e.upid} was still running "
+                f"when the wait ended after {e.waited_s:.0f}s"
+            )
+            if not_run:
+                reason += "; not run yet: " + ", ".join(not_run)
+            return {
+                "success": False,
+                "execution_log": "\n".join(log_lines),
+                "failure_reason": reason,
+                "unsettled_task": {
+                    "node": e.node,
+                    "upid": e.upid,
+                    "step": str(step_id),
+                    "waited_s": e.waited_s,
+                    "steps_not_run": not_run,
+                    # Steps that already did not complete under on_error:
+                    # continue. However the task ends, they keep the verdict
+                    # from being "applied".
+                    "steps_unfinished": list(unfinished),
+                },
+            }
         except ProxmoxError as e:
             step_log += f" {method} {path} -> ERROR {e.status_code}: {e.body[:200]}"
             if on_error == "halt":

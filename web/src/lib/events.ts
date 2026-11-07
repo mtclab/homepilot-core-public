@@ -24,8 +24,17 @@ export const ARTIFACT_EVENT_TYPES = [
 
 export type ArtifactEventType = (typeof ARTIFACT_EVENT_TYPES)[number];
 
+/**
+ * Synthetic, client-side: "you may have missed events - re-read" (#701). Sent
+ * to every subscriber when the stream REconnects. The stream does not replay
+ * what happened while it was down, and the server drops events for a
+ * subscriber that falls behind (it then closes that stream, which lands here
+ * too), so after any gap the only honest move is to fetch the truth again.
+ */
+export const RESYNC_EVENT = 'resync' as const;
+
 export interface ArtifactEvent {
-	type: ArtifactEventType;
+	type: ArtifactEventType | typeof RESYNC_EVENT;
 	data: Record<string, unknown>;
 	at: number;
 }
@@ -79,8 +88,11 @@ let es: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let attempt = 0;
 let started = false;
+// Whether this session has had the stream open before: the FIRST open is the
+// page's own initial load, every later one is a reconnect after a gap.
+let everOpened = false;
 
-function dispatch(type: ArtifactEventType, raw: string): void {
+function dispatch(type: ArtifactEvent['type'], raw: string): void {
 	let data: Record<string, unknown> = {};
 	try {
 		data = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
@@ -130,6 +142,11 @@ function open(): void {
 	es.onopen = () => {
 		attempt = 0;
 		streamConnected.set(true);
+		// The badge going green must not claim the page is current: whatever
+		// happened during the gap was never delivered, so every subscriber
+		// re-reads (#701).
+		if (everOpened) dispatch(RESYNC_EVENT, '');
+		everOpened = true;
 	};
 	for (const t of ARTIFACT_EVENT_TYPES) {
 		es.addEventListener(t, (ev) => dispatch(t, (ev as MessageEvent).data));
@@ -159,6 +176,7 @@ export function startEventStream(): void {
 // Closes the stream and cancels any pending reconnect. Call on logout.
 export function stopEventStream(): void {
 	started = false;
+	everOpened = false;
 	streamConnected.set(false);
 	clearReconnect();
 	if (es) {

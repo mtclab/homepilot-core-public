@@ -21,6 +21,7 @@ from ..app_settings import (
 )
 from ..auth.deps import require_scope
 from ..config import get_settings
+from ..proxmox_config import ProxmoxTokens, resolve_proxmox_tokens
 from ..selfcheck import selfcheck_report
 
 logger = logging.getLogger(__name__)
@@ -67,48 +68,23 @@ async def _resolve_proxmox_config(state: Any) -> tuple[str, int, bool]:
     )
 
 
-async def _resolve_proxmox_token(state: Any) -> tuple[str, str]:
-    token = ""
-    source = ""
-    vault = getattr(state, "vault", None)
-    if vault is not None:
-        from ..vault import VaultError
+async def _resolve_proxmox_tokens(state: Any) -> ProxmoxTokens:
+    """The tokens in force, from the ONE resolver the client is built from (#715).
 
-        try:
-            pve_secret = await vault.get_secret("pve-token")
-            token = pve_secret.get("token", "")
-            if token:
-                source = "vault"
-        except (VaultError, OSError):
-            pass
-    if not token:
-        env_token = os.environ.get("PVE_API_TOKEN", "")
-        if env_token:
-            token = env_token
-            source = "env"
-    return token, source
+    This used to be its own copy, without validation: a rejected token was
+    reported as `token_source: vault` while the running client ignored it.
+    """
+    return await resolve_proxmox_tokens(getattr(state, "vault", None))
+
+
+async def _resolve_proxmox_token(state: Any) -> tuple[str, str]:
+    tokens = await _resolve_proxmox_tokens(state)
+    return tokens.token, tokens.token_source
 
 
 async def _resolve_proxmox_write_token(state: Any) -> tuple[str, str]:
-    write_token = ""
-    source = ""
-    vault = getattr(state, "vault", None)
-    if vault is not None:
-        from ..vault import VaultError
-
-        try:
-            secret = await vault.get_secret("pve-write-token")
-            write_token = secret.get("token", "")
-            if write_token:
-                source = "vault"
-        except (VaultError, OSError):
-            pass
-    if not write_token:
-        read_token, _ = await _resolve_proxmox_token(state)
-        if read_token:
-            write_token = read_token
-            source = "read_token"
-    return write_token, source
+    tokens = await _resolve_proxmox_tokens(state)
+    return tokens.write_token, tokens.write_source
 
 
 @router.get("/selfcheck")
@@ -142,8 +118,9 @@ async def proxmox_settings_report(state: Any) -> dict[str, Any]:
     absent from the serialized result.
     """
     host, port, verify_ssl = await _resolve_proxmox_config(state)
-    token, source = await _resolve_proxmox_token(state)
-    write_token, write_source = await _resolve_proxmox_write_token(state)
+    tokens = await _resolve_proxmox_tokens(state)
+    token, source = tokens.token, tokens.token_source
+    write_token, write_source = tokens.write_token, tokens.write_source
     proxmox = getattr(state, "proxmox", None)
     # Each token's own verdict. `connection_status: ok` beside
     # `write_token_configured: true` used to be read as "writes will work" - it
@@ -179,6 +156,9 @@ async def proxmox_settings_report(state: Any) -> dict[str, Any]:
         # claims and only one of them was ever checked. Empty when the cluster
         # could not be asked at all - which is not the same as either answer.
         "token_auth": token_status,
+        # Stored values that are NOT tokens and so are not used by anything
+        # (#715) - named so "configured" is never claimed for them.
+        "tokens_rejected": list(tokens.rejected),
     }
 
 
@@ -287,12 +267,27 @@ async def probe_proxmox_connection(state: Any, config: ProxmoxConfigIn) -> dict[
     )
     try:
         version_info = await client.read("/version")
-        await client.close()
-        return {"status": "ok", "message": "Connection successful", "version": version_info}
     except Exception as exc:
         with contextlib.suppress(Exception):
             await client.close()
         return {"status": "error", "message": f"Connection failed: {exc}"}
+    # The READ token answered. That says nothing about the write token, which
+    # every clone, config write and power action uses - a stale one stayed
+    # invisible here until a redeemer's first provision 401ed (#624). Ask PVE,
+    # as the write token, what it may do: a read, so a probe may make it.
+    # `status` stays the read connection's verdict (the claim flow keys on it);
+    # the write verdict is its own field and is in the message.
+    from ..adapters.pve_access import probe_write_privileges
+
+    write = await probe_write_privileges(client.credentials())
+    with contextlib.suppress(Exception):
+        await client.close()
+    message = (
+        "Connection successful"
+        if write["status"] == "ok"
+        else f"Connection successful for reads - but {write['detail']}"
+    )
+    return {"status": "ok", "message": message, "version": version_info, "write_token": write}
 
 
 @router.post("/settings/proxmox/test", dependencies=[Depends(require_scope("admin"))])

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-import posixpath
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 from mcp.types import TextContent
 
 from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient
+from homepilot.adapters.readonly_policy import read_path_refusal
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 from homepilot.mcp.tools.ssrf_guard import SSRFError, _PinnedTransport, validate_url
 from homepilot.vault import VaultManager
@@ -29,76 +30,76 @@ _proxmox_read_prefixes = (
 )
 
 
-def _proxmox_path_allowed(path: str) -> bool:
-    p = path.lstrip("/")
+# Path segments the read-tier passthrough never forwards, wherever they sit.
+#
+# `agent` is the QEMU guest-agent namespace (/nodes/<n>/qemu/<vmid>/agent/...).
+# It is not a read of the hypervisor: `agent/file-read` returns a file from
+# INSIDE the guest - /etc/homepilot/agent.env, which holds the fleet enrolment
+# token and which read_file_on_guest refuses by name - and `agent/exec-status`
+# returns the output of a command someone else ran. It sits under the allowed
+# /nodes/ prefix, so before #716 this tool relayed it unchanged. The product's
+# own guest-agent reads (inventory's network-get-interfaces) go through the
+# ProxmoxClient directly and are unaffected.
+_PROXMOX_DENIED_SEGMENTS = frozenset({"agent"})
+
+# How many rounds of percent-decoding a path may need before it is stable. A
+# path still changing after this many rounds is refused rather than guessed at.
+_MAX_PATH_DECODE_ROUNDS = 4
+
+
+def _proxmox_path_refusal(path: str) -> str | None:
+    """Why ``path`` may not be sent to the Proxmox API, or ``None`` if it may.
+
+    The checks run on the DECODED path split into segments, not on the raw
+    string: a percent-encoded, doubled or dotted segment (``%61gent``,
+    ``agent%2Ffile-read``, ``//agent``, ``status/../agent``) must not reach a
+    namespace the literal spelling is refused for.
+    """
+    decoded = path
+    for _ in range(_MAX_PATH_DECODE_ROUNDS):
+        step = unquote(decoded)
+        if step == decoded:
+            break
+        decoded = step
+    else:
+        return f"path '{path}' is encoded too many times to check"
+    if "?" in decoded or "#" in decoded:
+        return f"path '{path}' carries a query or fragment; pass the query separately"
+    segments = [seg for seg in decoded.split("/") if seg]
+    if any(seg in (".", "..") for seg in segments):
+        return f"path '{path}' contains a relative segment"
+    if any(seg.lower() in _PROXMOX_DENIED_SEGMENTS for seg in segments):
+        return (
+            f"path '{path}' reaches the guest agent API, which reads inside the "
+            "guest rather than the hypervisor"
+        )
+    joined = "/".join(segments)
     for prefix in _proxmox_read_prefixes:
         pre = prefix.lstrip("/").rstrip("/")
-        if p == pre or p.startswith(pre + "/"):
-            return True
-    return False
+        if joined == pre or joined.startswith(pre + "/"):
+            return None
+    return f"path '{path}' not in read allowlist"
 
 
-# Defense-in-depth allowlist for guest file reads at the MCP boundary. The host
-# agent (hp_agent.file_ops) is the real enforcement point; this mirrors its read
-# prefixes and adds a hard secret denylist so the control plane cannot even ask an
-# agent to hand back the sensitive files the agent itself refuses.
-_ALLOWED_READ_PREFIXES = (
-    "/var/log/",
-    "/etc/",
-    "/opt/homepilot/",
-    "/proc/",
-    "/sys/",
-    "/tmp/homepilot/",
-    "/home/",
-    "/usr/local/bin/",
-)
-
-# Secrets that are blocked regardless of prefix (some, like /etc/shadow, live
-# under an allowed prefix).
-#
-# The agent's own credential files are here because they are the one secret this
-# tool could be used to turn INTO another agent: /etc/homepilot/agent.env is what
-# scripts/install-agent.sh writes, and it carries HP_AGENT_AUTH_TOKEN - the
-# shared fleet enrolment token - plus the hub address and certificate pin. The
-# MCP surface refuses to serve that token through GET /agents/token or the
-# installer one-liner by name ("a credential that provisions machines must not
-# appear in an MCP transcript"); reading it back off a managed host is the same
-# disclosure by another route, and this tool sits at the READ tier. Found live on
-# dev, review #648. agent/go/fileops.go denies the same two files - that is the
-# real enforcement point; this is the control plane declining to ask.
-_DENIED_READ_PATHS = (
-    "/etc/shadow",
-    "/etc/gshadow",
-    "/etc/homepilot/agent.env",
-    "/etc/homepilot/agent.token",
-)
-_DENIED_READ_BASENAMES = ("id_rsa", "id_ed25519")
-_DENIED_READ_SUFFIXES = (".key", ".pem")
+def _proxmox_path_allowed(path: str) -> bool:
+    return _proxmox_path_refusal(path) is None
 
 
 def _check_guest_read_path(path: str) -> None:
-    """Raise ``ValueError`` if a guest file-read path is outside the read
-    allowlist or hits the secret denylist (private keys, shadow files, process
-    environments). Mirrors the Go/Python host agent's protections."""
-    if ".." in path.split("/"):
-        raise ValueError(f"path '{path}' contains parent traversal")
-    norm = posixpath.normpath(path)
-    if not norm.startswith("/"):
-        raise ValueError(f"path '{path}' must be an absolute path")
+    """Raise ``ValueError`` if the READ tier may not read ``path`` off a guest.
 
-    # Secret denylist — enforced regardless of the allowed prefix.
-    base = posixpath.basename(norm)
-    if norm in _DENIED_READ_PATHS:
-        raise ValueError(f"path '{path}' is denied (sensitive file)")
-    if base in _DENIED_READ_BASENAMES or norm.endswith(_DENIED_READ_SUFFIXES):
-        raise ValueError(f"path '{path}' is denied (private key material)")
-    parts = norm.split("/")
-    if len(parts) >= 4 and parts[1] == "proc" and parts[-1] == "environ":
-        raise ValueError(f"path '{path}' is denied (process environment)")
-
-    if not norm.startswith(_ALLOWED_READ_PREFIXES):
-        allowed = ", ".join(_ALLOWED_READ_PREFIXES)
-        raise ValueError(f"path '{path}' not under an allowed read prefix ({allowed})")
+    Default-deny under the policy shared with the host agent
+    (adapters/readonly_policy.json, #691): logs, unit files, a few identity
+    files and what HomePilot itself wrote are readable; private keys, shadow
+    files, PVE and HomePilot credentials, /root, process environments and
+    dotfile credential stores are denied even under an allowed prefix. The agent
+    re-checks the symlink-resolved path and is the enforcement point; this is
+    the control plane declining to ask. ``cat`` through exec_on_guest_readonly
+    passes through the same check.
+    """
+    refusal = read_path_refusal(path)
+    if refusal is not None:
+        raise ValueError(refusal)
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -106,7 +107,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "proxmox_api_read",
         "description": (
             "GET-only Proxmox REST API call. Used to read configs, list resources, "
-            "check status. Vault-resolved token. Cannot mutate state."
+            "check status. Vault-resolved token. Cannot mutate state. The guest "
+            "agent namespace (/nodes/<node>/qemu/<vmid>/agent/...) is refused: it "
+            "reads inside the guest, not the hypervisor."
         ),
         "inputSchema": {
             "type": "object",
@@ -150,7 +153,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "read_file_on_guest",
-        "description": "Read a file from a guest host via the connected hp-agent (agent hub).",
+        "description": (
+            "Read a file from a guest host via the connected hp-agent (agent hub). "
+            "Default-deny: logs (/var/log), systemd unit files, a few identity files "
+            "(os-release, hostname, hosts, resolv.conf, /proc/meminfo...) and what "
+            "HomePilot wrote (/etc/homepilot, /opt/homepilot, ...). Keys, shadow "
+            "files, PVE/HomePilot credentials and /root are always refused."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -168,8 +177,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Execute an allowlisted read-only command on a guest via the connected "
             "hp-agent (agent hub). "
-            "Allowed commands: ls, ps, systemctl status, journalctl, "
-            "dpkg, ip, ss, hostname, uname, df, free, uptime. "
+            "Positive-only allowlist shared with the agent: hostname, uptime, uname, "
+            "free, df, ls, ps (no 'e' environment flag), ip <object> [show|list|get], "
+            "ss (no -K/-D/-F/-N), systemctl status|is-active|is-enabled|is-failed, "
+            "journalctl with read flags only (no -f, no flush/rotate/vacuum), "
+            "dpkg -l|-s|-S|-L, cat of a path read_file_on_guest would serve. "
             "For file reading, use read_file_on_guest instead (logs access)."
         ),
         "inputSchema": {
@@ -229,8 +241,9 @@ async def handle_proxmox_api_read(
     if proxmox is None:
         raise RuntimeError("Proxmox not configured")
     path = arguments["path"]
-    if not _proxmox_path_allowed(path):
-        raise ValueError(f"path '{path}' not in read allowlist")
+    refusal = _proxmox_path_refusal(path)
+    if refusal is not None:
+        raise ValueError(refusal)
     if any(tok in path for tok in ("execute", "vnc", "term", "upload")):
         raise ValueError(f"path '{path}' contains forbidden token")
     query_str = arguments.get("query")
@@ -266,6 +279,13 @@ async def handle_http_call_read(
         raise ValueError(f"invalid base_url for '{service_name}'")
 
     full_url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+    # The caller supplies only the path; the host is the one the operator
+    # registered in the vault. A path that would move the request to another
+    # host or port is refused before anything is resolved.
+    registered = urlparse(base_url)
+    target = urlparse(full_url)
+    if (target.hostname, target.port) != (registered.hostname, registered.port):
+        raise ValueError(f"path for '{service_name}' must stay on the registered host")
     from homepilot.config import get_settings
 
     settings = get_settings()
@@ -273,7 +293,15 @@ async def handle_http_call_read(
         d.strip() for d in settings.allowed_http_domains.split(",") if d.strip()
     ] or None
     try:
-        _, resolved_ips = await validate_url(full_url, allowed_domains=allowed_domains)
+        # #688: the registered host may live on the LAN - that is what the
+        # tool advertises (adopted services) - so its LAN addresses are
+        # accepted; any other host, and loopback/metadata for every host,
+        # stay refused.
+        _, resolved_ips = await validate_url(
+            full_url,
+            allowed_domains=allowed_domains,
+            private_host=registered.hostname,
+        )
     except SSRFError as exc:
         raise ValueError(f"SSRF protection: {exc}") from exc
 

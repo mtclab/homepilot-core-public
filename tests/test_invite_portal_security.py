@@ -9,6 +9,7 @@ written so that removing the corresponding check turns it red.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -293,6 +294,32 @@ class TestRedemptionRateLimit:
         assert len(task_rows(portal_db.db_path)) == 1
 
 
+def leaks(value: str, page: str) -> bool:
+    """Does *page* carry *value* as a whole token? (#718)
+
+    A bare substring test failed at random: the template vmid `9000` turned up
+    inside a random hex value on the page (a CSRF token, a nonce), which is not
+    a leak. A leak is the value standing on its own - not glued to other
+    letters or digits on either side.
+    """
+    return re.search(rf"(?<![0-9A-Za-z]){re.escape(value)}(?![0-9A-Za-z])", page) is not None
+
+
+class TestLeakMatchesWholeTokens:
+    """Teeth for `leaks`: the flake is gone AND a real leak is still caught."""
+
+    @pytest.mark.parametrize("page", ["csrf=ab9000cd", "x19000", "90001", "nonce-f3a9000e1"])
+    def test_a_value_inside_a_random_token_is_not_a_leak(self, page: str) -> None:
+        assert not leaks("9000", page)
+
+    @pytest.mark.parametrize(
+        "page", ["template 9000", "<td>9000</td>", "vmid=9000&", '"9000"', "9000", "node pve1."]
+    )
+    def test_the_value_standing_alone_is_a_leak(self, page: str) -> None:
+        value = "pve1" if "pve1" in page else "9000"
+        assert leaks(value, page)
+
+
 class TestPagesCarryNoAdminData:
     async def test_the_form_shows_caps_but_no_operator_facts(self, portal_app: FastAPI, portal_db):
         invite_id, token = await mint(portal_db)
@@ -303,7 +330,7 @@ class TestPagesCarryNoAdminData:
 
         assert form.status_code == 200
         for leak in (row["token_hash"], row["created_by"], row["node"], str(row["template_vmid"])):
-            assert leak not in form.text, f"portal page leaked {leak!r}"
+            assert not leaks(leak, form.text), f"portal page leaked {leak!r}"
 
     async def test_the_status_page_shows_only_this_invites_machine(
         self, portal_app: FastAPI, portal_db
@@ -316,8 +343,8 @@ class TestPagesCarryNoAdminData:
         assert "Ready" in status.text
         # Task ids, host ids and node names are the operator's view, not theirs.
         row = task_rows(portal_db.db_path)[0]
-        assert row["id"] not in status.text
-        assert "pve1" not in status.text
+        assert not leaks(row["id"], status.text)
+        assert not leaks("pve1", status.text)
 
 
 class TestDistinguishedNameParsing:

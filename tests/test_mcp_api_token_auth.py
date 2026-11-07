@@ -293,7 +293,9 @@ class TestApiTokenJourneys:
                 await session.call_tool(_READ_TOOL)
 
         assert seen["tier"] == "admin"
-        assert seen["caller"] == f"mcp-api:{admin[:16]}"
+        # `label (prefix)`, exactly as the REST surface and the token audit name
+        # it - one spelling of one credential across the trail.
+        assert seen["caller"] == f"mcp-admin ({admin[:16]})"
 
     async def test_garbage_is_refused(self, tmp_path):
         async with _transport(tmp_path, {"HP_MCP_TOKEN": "legacy-secret"}) as (_repo, client):

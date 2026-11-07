@@ -52,6 +52,9 @@ from .test_guest_network import FakeCluster, converged_cluster, desired
 
 pytestmark = pytest.mark.asyncio
 
+# The legacy firewall daemon, running: what a node enforcing its rules reports.
+_RUNNING = [{"service": "pve-firewall", "state": "running"}]
+
 
 # ── A fake MultiClient at the boundary proxmox_mcp owns ──────────────────────
 # The gateway reads /cluster/firewall/options and writes it back; this models
@@ -158,11 +161,15 @@ class TestTheSafeEnablePrimitive:
         assert safe_datacenter_firewall_enable({"enable": 1, "policy_in": "ACCEPT"}) is None
         assert safe_datacenter_firewall_enable({"enable": 1, "policy_in": "DROP"}) is None
         assert safe_datacenter_firewall_enable({"enable": 1}) is None
-        # Only a DISABLED firewall is ever turned on, and only at ACCEPT.
-        assert safe_datacenter_firewall_enable({"enable": 0, "policy_in": "DROP"}) == {
+        # Only a DISABLED firewall is ever turned on: at ACCEPT when nobody set a
+        # policy, and at the operator's STAGED policy otherwise - never by
+        # overwriting it (#707). That write is lockout-shaped, so it is sent only
+        # through the guard (tests/test_firewall_lockout_any_path.py).
+        assert safe_datacenter_firewall_enable({"enable": 0}) == {
             "enable": 1,
             "policy_in": "ACCEPT",
         }
+        assert safe_datacenter_firewall_enable({"enable": 0, "policy_in": "DROP"}) == {"enable": 1}
 
 
 class TestTheLockoutGuard:
@@ -223,8 +230,10 @@ class TestTheReportSurfacesTheTruth:
         assert "OFF" in note
 
     async def test_the_report_says_enforced_when_the_switch_is_on_and_safe(self) -> None:
+        # ENFORCED needs the firewall service SEEN running, not just the switch (#713).
         current = await survey(
-            FakeCluster(dc_fw_options={"enable": 1, "policy_in": "ACCEPT"}), desired()
+            FakeCluster(dc_fw_options={"enable": 1, "policy_in": "ACCEPT"}, services=_RUNNING),
+            desired(),
         )
         assert current.datacenter_firewall_enabled is True
         assert current.datacenter_firewall_policy_in == "ACCEPT"
@@ -246,7 +255,7 @@ class TestTheReportSurfacesTheTruth:
             options = {"enable": 1}
             if policy:
                 options["policy_in"] = policy
-            current = await survey(FakeCluster(dc_fw_options=options), desired())
+            current = await survey(FakeCluster(dc_fw_options=options, services=_RUNNING), desired())
             note = enforcement_note(current)
 
             assert "lockout" not in note.lower(), f"policy_in={policy} still reported as a lockout"
@@ -258,7 +267,8 @@ class TestTheReportSurfacesTheTruth:
 
     async def test_the_survey_dict_carries_the_enforcement_fields(self) -> None:
         current = await survey(
-            FakeCluster(dc_fw_options={"enable": 1, "policy_in": "ACCEPT"}), desired()
+            FakeCluster(dc_fw_options={"enable": 1, "policy_in": "ACCEPT"}, services=_RUNNING),
+            desired(),
         )
         d = current.to_dict()
         assert d["datacenter_firewall_enabled"] is True

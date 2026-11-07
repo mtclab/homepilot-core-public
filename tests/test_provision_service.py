@@ -57,8 +57,15 @@ def proxmox() -> AsyncMock:
     px.next_vmid = AsyncMock(return_value=105)
     px.clone_vm = AsyncMock(return_value="UPID:pve1:clone:")
     px.wait_for_task = AsyncMock(return_value={"status": "stopped", "exitstatus": "OK"})
-    px.set_vm_config = AsyncMock(return_value={"data": None})
+    px.wait_until_stopped = AsyncMock(return_value={"status": "stopped", "exitstatus": "OK"})
+    # PVE's REAL shape (#711): POST .../config is the asynchronous config write
+    # and answers with a qmconfig UPID. A fake answering `null` modelled it as
+    # synchronous, which is how a never-awaited config task stayed invisible.
+    px.set_vm_config = AsyncMock(return_value={"data": "UPID:pve1:qmconfig:105:"})
     px.resize_disk = AsyncMock(return_value={"data": None})
+    # The static reading rule, not an auto-mock of it: `AsyncMock(spec=...)`
+    # made `upid_of` return a MagicMock "UPID" that the resize then waited on.
+    px.upid_of = ProxmoxClient.upid_of
     px.start_vm = AsyncMock(return_value="UPID:pve1:start:")
     px.get_vm_agent_network = AsyncMock(return_value=AGENT_OK)
     # The guest EXISTS and is running. Modelled explicitly because the join now
@@ -1029,6 +1036,37 @@ class TestGuestVmidsAreNeverReused:
         with pytest.raises(RuntimeError, match="full"):
             await service._next_vmid("pve1", self._defaults("8000-8002"))
         proxmox.next_vmid.assert_not_awaited()
+
+    async def test_a_taken_top_is_not_a_full_range(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """#718: only 8999 in use was refused as 'full: 1 id(s) in use'.
+
+        Teeth: restore the bare `candidate > high` refusal and this raises.
+        """
+        proxmox.cluster_vmids = AsyncMock(return_value={100, 8999})
+
+        assert await service._next_vmid("pve1", self._defaults("8000-8999")) == 8998
+
+    async def test_below_the_top_an_id_a_gone_guest_held_is_still_never_reused(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        """The fallback below a taken top keeps #648: a freed id stays retired."""
+        proxmox.cluster_vmids = AsyncMock(return_value={8999})
+        await service.repo.create_host(hostname="gone-guest", host_type="vm", proxmox_id=8998)
+
+        assert await service._next_vmid("pve1", self._defaults("8000-8999")) == 8997
+
+    async def test_a_range_full_of_live_and_retired_ids_says_both(
+        self, service: ProvisionService, proxmox: AsyncMock
+    ):
+        proxmox.cluster_vmids = AsyncMock(return_value={8000, 8002})
+        await service.repo.create_host(hostname="gone-guest", host_type="vm", proxmox_id=8001)
+
+        with pytest.raises(RuntimeError) as err:
+            await service._next_vmid("pve1", self._defaults("8000-8002"))
+        message = str(err.value)
+        assert "full: 2 id(s) in use and 1 held earlier by guests that are gone" in message
 
 
 @pytest.mark.asyncio

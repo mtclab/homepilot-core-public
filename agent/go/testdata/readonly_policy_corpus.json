@@ -1,0 +1,89 @@
+{
+  "_doc": [
+    "Shared corpus for the read-only policy (#682, #691). BOTH layers run it:",
+    "agent/go/readonly_policy_test.go (the agent) and tests/test_readonly_policy.py",
+    "(the adapter's exec_readonly and the MCP read_file_on_guest check).",
+    "refuse_everywhere: refused by the MCP read tier AND by the agent in every mode, privileged included.",
+    "refuse_read_tier: refused by the MCP read tier and the unprivileged agent (a privileged agent may run them for an admin).",
+    "agent_only: the unprivileged agent runs them; the MCP read tier does not offer them.",
+    "Add to this file whenever a new verb or path class is found: both layers pick it up."
+  ],
+  "commands": {
+    "allow": [
+      "hostname", "uptime", "uname -a", "free -m", "df -h", "df -h /",
+      "ls", "ls -la /var/log", "ls /etc /var", "ls -lh /opt/homepilot",
+      "ps", "ps aux", "ps auxf", "ps auxww", "ps -ef", "ps -e", "ps -eF", "ps -eo pid,comm,%cpu",
+      "ps -p 1", "ps -u root", "ps --forest", "ps aux --sort=-%mem",
+      "ip addr", "ip a", "ip addr show", "ip -4 addr show dev eth0", "ip link", "ip link show eth0",
+      "ip route", "ip r", "ip route show table all", "ip route get 192.0.2.53", "ip neigh", "ip neigh show",
+      "ip -s link", "ip -br addr", "ip -j route show", "ip rule list",
+      "ss -tln", "ss -tlnp", "ss -s", "ss -tan state established", "ss -tn dst 192.0.2.1",
+      "systemctl status nginx", "systemctl status nginx.service", "systemctl is-active nginx",
+      "systemctl is-enabled nginx.service", "systemctl is-failed nginx", "systemctl status getty@tty1.service",
+      "journalctl", "journalctl -u nginx", "journalctl -u nginx -n 50", "journalctl -xeu nginx",
+      "journalctl --since=today --no-pager", "journalctl -b", "journalctl -b -1", "journalctl -n100",
+      "journalctl -p err -b", "journalctl -S -1h", "journalctl -k", "journalctl -o json -n 20",
+      "dpkg -l", "dpkg -l nginx", "dpkg -s nginx", "dpkg -S /usr/bin/ls", "dpkg -L nginx",
+      "cat /etc/os-release", "cat /etc/hostname", "cat /var/log/syslog", "cat /proc/meminfo",
+      "cat /etc/homepilot/some-artifact.conf", "cat /etc/systemd/system/foo.service",
+      "cat /opt/homepilot/bootstrap.sh"
+    ],
+    "agent_only": ["docker ps", "docker images", "docker version"],
+    "refuse_read_tier": [
+      "systemctl daemon-reload", "systemctl restart nginx", "systemctl stop nginx",
+      "systemctl enable nginx", "mkdir -p /opt/homepilot/x", "docker pull nginx"
+    ],
+    "refuse_everywhere": [
+      "", "rm -rf /tmp/x", "bash -c id", "sh -c id", "curl http://example.com",
+      "ip link set eth0 down", "ip link set dev eth0 down", "ip l set eth0 down", "ip link del eth0",
+      "ip link delete eth0", "ip route del default", "ip r del default", "ip route add default via 192.0.2.1",
+      "ip route replace default via 192.0.2.1", "ip route flush table main", "ip addr flush dev eth0",
+      "ip a flush dev eth0", "ip addr add 192.0.2.5/24 dev eth0", "ip addr del 192.0.2.5/24 dev eth0",
+      "ip neigh flush all", "ip -b /tmp/homepilot/cmds", "ip -batch /tmp/homepilot/cmds",
+      "ip -force -b /tmp/homepilot/cmds", "ip netns exec other id", "ip monitor",
+      "ss -K", "ss -K dst 192.0.2.1", "ss -tK dst 192.0.2.1", "ss -Kt", "ss --kill", "ss --kill dst 192.0.2.1",
+      "ss -t dst 192.0.2.1 -K", "ss -D /tmp/homepilot/dump", "ss --diag=/tmp/homepilot/dump",
+      "ss -F /etc/shadow", "ss -N other", "ss -E",
+      "journalctl --flush", "journalctl --rotate", "journalctl --sync", "journalctl --vacuum-time=1s",
+      "journalctl --vacuum-size=1K", "journalctl --vacuum-files=1", "journalctl -x --flush",
+      "journalctl -u --flush", "journalctl -n --rotate", "journalctl --relinquish-var",
+      "journalctl --smart-relinquish-var", "journalctl --setup-keys", "journalctl --update-catalog",
+      "journalctl -f", "journalctl -xef", "journalctl -D /root", "journalctl --file=/root/x.journal",
+      "journalctl --directory=/root", "journalctl -b --flush",
+      "ps e", "ps auxe", "ps eww", "ps aux e", "ps axe", "ps -auxe", "ps -xe", "ps -aux", "ps -ey",
+      "dpkg -i x.deb", "dpkg --purge nginx", "dpkg -l --purge nginx", "dpkg -r nginx",
+      "cat /etc/homepilot/agent.env", "cat /etc/homepilot/agent.token", "cat /opt/homepilot/.env",
+      "cat /etc/shadow", "cat /etc/ssh/ssh_host_ed25519_key", "cat /etc/pve/priv/token.cfg",
+      "cat /root/.bashrc", "cat /etc/passwd", "cat /var/log/../../etc/shadow", "cat -A /var/log/syslog",
+      "cat /var/log/syslog /etc/shadow", "cat",
+      "hostname; id", "ls | sh", "cat /var/log/syslog > /tmp/x", "echo $PATH", "uptime && id",
+      "sudo ip link set eth0 down"
+    ]
+  },
+  "read_paths": {
+    "allow": [
+      "/var/log/syslog", "/var/log/nginx/access.log", "/etc/hostname", "/etc/os-release", "/etc/hosts",
+      "/etc/systemd/system/foo.service", "/etc/systemd/journald.conf", "/usr/lib/systemd/system/ssh.service",
+      "/etc/homepilot/some-artifact.conf", "/opt/homepilot/config.yaml", "/opt/homepilot/bootstrap.sh",
+      "/tmp/homepilot/staged.txt", "/etc/nginx/nginx.conf", "/etc/docker/daemon.json",
+      "/proc/meminfo", "/proc/cpuinfo", "/etc/apt/sources.list"
+    ],
+    "refuse": [
+      "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_ecdsa_key",
+      "/etc/pve/priv/token.cfg", "/etc/pve/priv/shadow.cfg", "/etc/pve/priv/authkey.key",
+      "/etc/wireguard/wg0.conf", "/etc/ceph/ceph.client.admin.keyring", "/etc/corosync/authkey",
+      "/home/user/.docker/config.json", "/home/user/.kube/config", "/home/user/.ssh/id_ed25519",
+      "/home/user/.aws/credentials", "/home/user/.netrc",
+      "/opt/homepilot/.env", "/opt/homepilot/app/.env", "/opt/homepilot/data/vault/master.protected",
+      "/etc/homepilot/agent.env", "/etc/homepilot/agent.token",
+      "/etc/shadow", "/etc/gshadow", "/etc/shadow-", "/etc/gshadow-",
+      "/root", "/root/.bashrc", "/root/.ssh/id_rsa", "/proc/1/environ", "/proc/self/environ", "/proc/1/cmdline",
+      "/etc/passwd", "/etc/sudoers", "/etc/ssl/private/server.key", "/etc/ssl/certs/server.pem",
+      "/etc/nginx/ssl/site.key", "/etc/nginx/.htpasswd", "/etc/docker/key.json",
+      "/etc/systemd/system/../../shadow", "/var/log/../../etc/shadow", "relative/path", "",
+      "/srv/app/config.yml", "/usr/local/bin/tool", "/sys/class/net/eth0/address", "/home/user/notes.txt",
+      "/etc/credstore/db-password",
+      "/var/log/id_ecdsa", "/var/log/id_dsa", "/etc/homepilot/id_ecdsa_sk"
+    ]
+  }
+}

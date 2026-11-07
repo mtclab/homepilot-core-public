@@ -313,8 +313,14 @@ async def _verify_proxmox_api(
             context["target"]["node"] = pve_node
 
     from homepilot.executor.jinja_utils import _eval_skip_if, _interpolate
+    from homepilot.executor.proxmox_api import _PRECHECK_ANSWERS_BELOW
 
     drifted_steps: list[str] = []
+    # Steps whose precheck was ASKED and said "already converged" (#712). They
+    # used to be filed under skipped_steps, next to the ones nobody could ask,
+    # so a fully converged artifact had every step "skipped" and read
+    # `unknown / nothing_evaluated` - it could never be in spec.
+    in_spec_steps: list[str] = []
     skipped_steps: list[str] = []
 
     for step in steps:
@@ -341,12 +347,22 @@ async def _verify_proxmox_api(
 
             try:
                 pre_path = _interpolate(precheck.get("path", ""), context)
-                resp = await executor.proxmox.call(pre_method, pre_path)
-                # The same binding the executor uses, so drift and apply cannot
-                # disagree about what a precheck means (#642).
-                proxy = make_pve_response_proxy(200, resp)
+                try:
+                    resp = await executor.proxmox.call(pre_method, pre_path)
+                    # The same binding the executor uses, so drift and apply
+                    # cannot disagree about what a precheck means (#642).
+                    proxy = make_pve_response_proxy(200, resp)
+                except ProxmoxError as exc:
+                    # A 4xx IS an answer about the resource - a 404 is "it is
+                    # gone" - exactly as the executor reads it (#712). Treating
+                    # it as a failed probe made a deleted resource read
+                    # `unknown` while apply would re-create it: real drift,
+                    # invisible. Only a 5xx or no answer at all is a failed probe.
+                    if not exc.status_code or exc.status_code >= _PRECHECK_ANSWERS_BELOW:
+                        raise
+                    proxy = make_pve_response_proxy(exc.status_code, {"data": None})
                 if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
-                    skipped_steps.append(step_id)
+                    in_spec_steps.append(step_id)
                     continue
                 else:
                     drifted_steps.append(step_id)
@@ -358,40 +374,51 @@ async def _verify_proxmox_api(
             skipped_steps.append(step_id)
             continue
 
-    drifted = len(drifted_steps) > 0
-    verification_log = f"drifted_steps={drifted_steps}, skipped_steps={skipped_steps}"
-    # "every step was skipped" is not "in spec" (#425). Steps are skipped when
-    # they carry no precheck, when the precheck is not a GET, and when the call
-    # to it FAILED - so an unreachable target produced a clean green tick with
-    # nothing checked at all.
-    if not drifted and not _evaluated(drifted_steps, skipped_steps, steps):
+    return _sequence_verdict(artifact_id, drifted_steps, in_spec_steps, skipped_steps)
+
+
+def _sequence_verdict(
+    artifact_id: str,
+    drifted_steps: list[str],
+    in_spec_steps: list[str],
+    skipped_steps: list[str],
+) -> VerifyResult:
+    """The verdict for a step sequence, from what each step ESTABLISHED.
+
+    drifted  - at least one precheck was asked and said "not converged";
+    in_spec  - none drifted and at least one precheck was asked and said
+               "converged" (#712: these used to be counted as skipped, so a
+               fully converged artifact could never read in spec);
+    unknown  - nothing was compared at all: every step was skipped because it
+               has no precheck, its precheck is not a GET, or asking it failed.
+               "Every step was skipped" is not "in spec" (#425).
+    """
+    verification_log = (
+        f"drifted_steps={drifted_steps}, in_spec_steps={in_spec_steps}, "
+        f"skipped_steps={skipped_steps}"
+    )
+    details: dict[str, Any] = {
+        "drifted_steps": drifted_steps,
+        "in_spec_steps": in_spec_steps,
+        "skipped_steps": skipped_steps,
+    }
+    if drifted_steps:
+        state = DriftState.DRIFTED
+    elif in_spec_steps:
+        state = DriftState.IN_SPEC
+    else:
         return VerifyResult(
             artifact_id=artifact_id,
             state=DriftState.UNKNOWN,
             verification_log=verification_log[:2000],
-            details={
-                "reason": "nothing_evaluated",
-                "drifted_steps": drifted_steps,
-                "skipped_steps": skipped_steps,
-            },
+            details={"reason": "nothing_evaluated", **details},
         )
     return VerifyResult(
         artifact_id=artifact_id,
-        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
+        state=state,
         verification_log=verification_log[:2000],
-        details={"drifted_steps": drifted_steps, "skipped_steps": skipped_steps},
+        details=details,
     )
-
-
-def _evaluated(
-    drifted_steps: list[str], skipped_steps: list[str], steps: list[dict[str, Any]]
-) -> bool:
-    """Did any step actually get compared against the target?
-
-    A verifier that skipped everything knows nothing. Reporting that as "in spec"
-    is the same false green the boolean verdict produced everywhere else (#425).
-    """
-    return len(drifted_steps) > 0 or len(skipped_steps) < len(steps)
 
 
 async def _verify_http_sequence(
@@ -424,8 +451,11 @@ async def _verify_http_sequence(
     target: dict[str, Any] = fm.get("target", {})
     context = interpolation_context(target, fm)
 
+    from homepilot.executor.http_sequence import _PRECHECK_ANSWERS_BELOW
+
     client_cache: dict[str, httpx.AsyncClient] = {}
     drifted_steps: list[str] = []
+    in_spec_steps: list[str] = []
     skipped_steps: list[str] = []
 
     try:
@@ -479,14 +509,19 @@ async def _verify_http_sequence(
 
                 try:
                     resp = await pre_client.request(method=pre_method, url=pre_path)
+                    if resp.status_code >= _PRECHECK_ANSWERS_BELOW:
+                        # A 5xx says nothing about the resource - the same line
+                        # the executor draws (#712).
+                        skipped_steps.append(step_id)
+                        continue
                     proxy = make_response_proxy(resp)
                     if _eval_skip_if(skip_if_expr, proxy, context.get("target", {})):
-                        skipped_steps.append(step_id)
+                        in_spec_steps.append(step_id)
                         continue
                     else:
                         drifted_steps.append(step_id)
                         continue
-                except httpx.HTTPError:
+                except (httpx.HTTPError, SkipIfUndecided):
                     skipped_steps.append(step_id)
                     continue
 
@@ -505,29 +540,7 @@ async def _verify_http_sequence(
             with contextlib.suppress(Exception):
                 await c.aclose()
 
-    drifted = len(drifted_steps) > 0
-    verification_log = f"drifted_steps={drifted_steps}, skipped_steps={skipped_steps}"
-    # "every step was skipped" is not "in spec" (#425). Steps are skipped when
-    # they carry no precheck, when the precheck is not a GET, and when the call
-    # to it FAILED - so an unreachable target produced a clean green tick with
-    # nothing checked at all.
-    if not drifted and not _evaluated(drifted_steps, skipped_steps, steps):
-        return VerifyResult(
-            artifact_id=artifact_id,
-            state=DriftState.UNKNOWN,
-            verification_log=verification_log[:2000],
-            details={
-                "reason": "nothing_evaluated",
-                "drifted_steps": drifted_steps,
-                "skipped_steps": skipped_steps,
-            },
-        )
-    return VerifyResult(
-        artifact_id=artifact_id,
-        state=DriftState.DRIFTED if drifted else DriftState.IN_SPEC,
-        verification_log=verification_log[:2000],
-        details={"drifted_steps": drifted_steps, "skipped_steps": skipped_steps},
-    )
+    return _sequence_verdict(artifact_id, drifted_steps, in_spec_steps, skipped_steps)
 
 
 async def _verify_host_provision(
@@ -737,7 +750,7 @@ async def _verify_composite(
         f"drifted_subs={drifted_subs}, unknown_subs={unknown_subs}, skipped_subs={skipped_subs}"
     )
     # Both sibling verifiers already refuse to call "nothing established" green
-    # (`_evaluated`, #425). This one tested `sub_result.drifted`, a BOOLEAN that
+    # (`_sequence_verdict`, #425). This one tested `sub_result.drifted`, a BOOLEAN that
     # is False for UNKNOWN as well as for IN_SPEC - so a composite of ansible
     # sub-artifacts, every one of which reports "not checked", reported in spec.
     # Confirmed live on dev 3.6.14: sub state `unknown`, composite `in_spec`.

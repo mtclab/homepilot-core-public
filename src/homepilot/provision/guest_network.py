@@ -223,6 +223,27 @@ def parse_range(raw: str) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]
 # one that lets traffic through.
 
 
+# The fence's comments ARE its marker: they are how HomePilot tells the rules it
+# owns from an operator's on the same vnet or guest, so convergence reorders
+# and prunes only these and never touches a foreign rule (#713). Unchanged since
+# the fence first shipped (#553), so a pre-#599 fence written in reverse is
+# recognised too - which is what lets it be corrected at all.
+FENCE_COMMENT_DHCP = "DHCP from the guest subnet's own dnsmasq"
+FENCE_COMMENT_DNS = "DNS to the guest subnet's own resolver"
+FENCE_COMMENT_ISOLATE_PREFIX = "guests never reach "
+FENCE_COMMENT_GATEWAY = "the gateway is a router for guests, not a host they talk to"
+
+
+def is_fence_rule(rule: dict[str, Any]) -> bool:
+    """Is this firewall rule one of HomePilot's guest-fence rules (by its comment)?"""
+    comment = str(rule.get("comment", "") or "").strip()
+    return comment in (
+        FENCE_COMMENT_DHCP,
+        FENCE_COMMENT_DNS,
+        FENCE_COMMENT_GATEWAY,
+    ) or comment.startswith(FENCE_COMMENT_ISOLATE_PREFIX)
+
+
 def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, Any]]:
     """The ordered rule set that isolates a guest from the operator's LAN.
 
@@ -241,7 +262,7 @@ def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, 
                 "dport": "67:68",
                 "dest": gateway,
                 "enable": 1,
-                "comment": "DHCP from the guest subnet's own dnsmasq",
+                "comment": FENCE_COMMENT_DHCP,
             }
         )
     for proto in ("udp", "tcp"):
@@ -253,7 +274,7 @@ def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, 
                 "dport": "53",
                 "dest": gateway,
                 "enable": 1,
-                "comment": "DNS to the guest subnet's own resolver",
+                "comment": FENCE_COMMENT_DNS,
             }
         )
     for cidr in desired.isolate_cidrs:
@@ -263,7 +284,7 @@ def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, 
                 "action": "DROP",
                 "dest": cidr,
                 "enable": 1,
-                "comment": f"guests never reach {cidr}",
+                "comment": f"{FENCE_COMMENT_ISOLATE_PREFIX}{cidr}",
             }
         )
     rules.append(
@@ -272,7 +293,7 @@ def fence_rules(desired: DesiredGuestNetwork, direction: str) -> list[dict[str, 
             "action": "DROP",
             "dest": f"{desired.gateway}/32",
             "enable": 1,
-            "comment": "the gateway is a router for guests, not a host they talk to",
+            "comment": FENCE_COMMENT_GATEWAY,
         }
     )
     return rules
@@ -320,6 +341,103 @@ def _rule_identity(rule: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _fence_key(rule: dict[str, Any]) -> tuple[Any, ...]:
+    """A fence rule as convergence compares it: what it matches AND whether it is on."""
+    return (*_rule_identity(rule), _flag(rule.get("enable", 0)))
+
+
+def _positioned(rules: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Rules with the position PVE holds them at, in chain order.
+
+    PVE answers a rule listing with each rule's ``pos``; a row without one sits
+    where the listing put it.
+    """
+    out: list[tuple[int, dict[str, Any]]] = []
+    for index, rule in enumerate(rules):
+        try:
+            pos = int(rule.get("pos", index))
+        except (TypeError, ValueError):
+            pos = index
+        out.append((pos, rule))
+    return sorted(out, key=lambda pair: pair[0])
+
+
+def managed_fence(rules: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """HomePilot's own fence rules on a chain, with their positions, in chain order."""
+    return [(pos, rule) for pos, rule in _positioned(rules) if is_fence_rule(rule)]
+
+
+def fence_matches(rules: list[dict[str, Any]], want: list[dict[str, Any]]) -> bool:
+    """Is the fence HomePilot owns on this chain exactly ``want``, in ``want``'s order?
+
+    The WHOLE ordered list, not "each wanted rule is somewhere": a pre-#599
+    fence with its DROPs above the DNS/DHCP ACCEPTs, or a DROP left behind for
+    an isolate CIDR that was removed, holds every wanted rule and is still
+    wrong (#713). Foreign rules are not part of the comparison.
+    """
+    return [_fence_key(r) for _, r in managed_fence(rules)] == [_fence_key(w) for w in want]
+
+
+def _fence_convergence_steps(
+    have: list[dict[str, Any]],
+    want: list[dict[str, Any]],
+    *,
+    id_prefix: str,
+    where: str,
+    create_op: str,
+    delete_op: str,
+    target: dict[str, Any],
+) -> list[Step]:
+    """Rewrite HomePilot's fence on one chain to ``want``, touching no foreign rule.
+
+    Nothing to do when the owned rules already equal ``want`` in order.
+    Otherwise the correct fence is written FIRST - POSTed bottom-first at
+    ``pos=0`` so it lands on top in ``want`` order (#599) - and only then are
+    the superseded owned rules removed, highest position first, each at the
+    place it was pushed down to. Correct-first means first-match already
+    follows the right fence before anything is deleted, so there is no moment
+    with less fence than before. Every delete names the rule it expects; the
+    gateway refuses to delete anything else, so a list that changed under the
+    plan can never cost an operator's rule.
+    """
+    owned = managed_fence(have)
+    if [_fence_key(r) for _, r in owned] == [_fence_key(w) for w in want]:
+        return []
+    steps: list[Step] = []
+    for final_pos in range(len(want) - 1, -1, -1):
+        rule = {**want[final_pos], "pos": 0}
+        steps.append(
+            Step(
+                id=f"{id_prefix}-rule-{final_pos}",
+                description=(
+                    f"{where} rule {final_pos}: {rule['action']} "
+                    f"{rule.get('proto', 'any')} -> {rule.get('dest', 'any')}"
+                ),
+                op=create_op,
+                params={**target, **rule},
+            )
+        )
+    pushed_down = len(want)
+    for pos, rule in sorted(owned, key=lambda pair: pair[0], reverse=True):
+        expect = {
+            key: rule[key]
+            for key in ("type", "action", "proto", "dport", "dest", "comment")
+            if rule.get(key) not in (None, "")
+        }
+        steps.append(
+            Step(
+                id=f"{id_prefix}-remove-{pos}",
+                description=(
+                    f"{where}: remove the superseded HomePilot fence rule that was at "
+                    f"position {pos} ({rule.get('action')} -> {rule.get('dest', 'any')})"
+                ),
+                op=delete_op,
+                params={**target, "pos": pos + pushed_down, "expect": expect},
+            )
+        )
+    return steps
+
+
 # ── Survey ───────────────────────────────────────────────────────────────────
 
 
@@ -342,6 +460,16 @@ class GuestNetworkSurvey:
     datacenter_firewall_read: bool = False
     node: str = ""
     nftables: bool | None = None
+    # Is the firewall SERVICE that compiles the rules running on the node? The
+    # master switch is a config value; after a `pve-firewall stop` (the #600
+    # console recovery) it still reads enable=1 while nothing enforces it
+    # (#713). None = could not be established from what the node reported.
+    firewall_service_running: bool | None = None
+    # The per-VM guest fences on the cluster: every qemu guest carrying
+    # HomePilot's fence rules, keyed "node/vmid", with its FULL rule list as the
+    # cluster holds it - read back so a fence written in the pre-#599 order, or
+    # one that lost or kept a rule, is seen and corrected (#713).
+    vm_fences: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -389,12 +517,26 @@ class GuestNetworkSurvey:
 
     @property
     def fence_enforced(self) -> bool:
-        """Does the per-VM guest fence actually enforce right now? (#600)
+        """Does the per-VM guest fence actually enforce right now? (#600, #713)
 
-        True only when the datacenter firewall is on: the tap rules are enforced
-        by both firewall stacks, but ONLY once the master switch is enabled.
+        True only when the datacenter firewall is on AND the firewall service
+        that compiles the rules is SEEN running on the node. The switch alone
+        is a stored setting: after `pve-firewall stop` it still reads enable=1
+        while nothing is enforced, and claiming ENFORCED off it was the #713
+        defect.
         """
-        return self.datacenter_firewall_enabled
+        return self.datacenter_firewall_enabled and self.firewall_service_running is True
+
+    @property
+    def enforcement(self) -> str:
+        """What is ESTABLISHED about the fence: enforced, configured, unverified or unknown."""
+        if not self.datacenter_firewall_read:
+            return "unknown"
+        if not self.datacenter_firewall_enabled or self.firewall_service_running is False:
+            return "configured"
+        if self.firewall_service_running is None:
+            return "unverified"
+        return "enforced"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -406,6 +548,9 @@ class GuestNetworkSurvey:
             "datacenter_firewall_options": self.datacenter_firewall_options,
             "datacenter_firewall_enabled": self.datacenter_firewall_enabled,
             "fence_enforced": self.fence_enforced,
+            "enforcement": self.enforcement,
+            "firewall_service_running": self.firewall_service_running,
+            "vm_fences": self.vm_fences,
             "node": self.node,
             "firewall_stack": self.firewall_stack,
             "pending": self.pending,
@@ -455,6 +600,8 @@ async def survey(
     pending: list[str] = []
     errors: list[str] = []
     nftables: bool | None = None
+    firewall_running: bool | None = None
+    vm_fences: dict[str, dict[str, Any]] = {}
 
     try:
         zones = await gateway.list_zones()
@@ -523,11 +670,50 @@ async def survey(
                 nftables = _flag(options.get("nftables", 0))
         except Exception as exc:
             errors.append(f"could not read the firewall options of node {resolved_node}: {exc}")
+        # The services are read whatever the options said: besides naming the
+        # stack, they are the evidence that anything ENFORCES at all (#713).
+        services: list[dict[str, Any]] | None = None
+        services_error = ""
+        try:
+            services = list(await gateway.node_services(resolved_node))
+        except Exception as exc:
+            services_error = f"could not read the services of node {resolved_node}: {exc}"
         if nftables is None:
+            if services is None:
+                errors.append(services_error)
+            else:
+                nftables = _nftables_from_services(services)
+        if services is not None:
+            firewall_running = _firewall_service_running(services, nftables)
+
+    if desired.isolate_cidrs:
+        # Every per-VM fence on the cluster, read back (#713). Only guests that
+        # carry HomePilot's own fence rules are kept: a VM without them is not
+        # one HomePilot fenced, and its firewall is none of this plan's business.
+        try:
+            guests = await gateway.list_guest_vms()
+        except Exception as exc:
+            errors.append(f"could not list the cluster's guests to check their fences: {exc}")
+            guests = []
+        for guest in guests:
+            if str(guest.get("type", "qemu")) != "qemu" or _flag(guest.get("template", 0)):
+                continue
+            g_node, g_vmid = str(guest.get("node", "")), guest.get("vmid")
+            if not g_node or g_vmid is None:
+                continue
             try:
-                nftables = _nftables_from_services(await gateway.node_services(resolved_node))
+                rules = await gateway.vm_firewall_rules(g_node, int(g_vmid))
             except Exception as exc:
-                errors.append(f"could not read the services of node {resolved_node}: {exc}")
+                errors.append(f"could not read the firewall rules of guest {g_vmid}: {exc}")
+                continue
+            if rules is None:
+                continue  # gone between the listing and the read: nothing to fence
+            if any(is_fence_rule(r) for r in rules):
+                vm_fences[f"{g_node}/{g_vmid}"] = {
+                    "node": g_node,
+                    "vmid": int(g_vmid),
+                    "rules": list(rules),
+                }
 
     return GuestNetworkSurvey(
         zones=zones,
@@ -539,6 +725,8 @@ async def survey(
         datacenter_firewall_read=dc_fw_read,
         node=resolved_node,
         nftables=nftables,
+        firewall_service_running=firewall_running,
+        vm_fences=vm_fences,
         pending=pending,
         errors=errors,
     )
@@ -794,6 +982,8 @@ def plan(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> Plan:
             )
         )
     steps.extend(firewall_steps)
+    if not blockers:
+        steps.extend(_vm_fence_steps(desired, current))
     # LAST: flip the datacenter firewall master switch on (safely) so the fence
     # actually enforces. Ordered after the fence rules exist, and only when a
     # fence is intended - see _datacenter_firewall_steps.
@@ -865,23 +1055,54 @@ def _firewall_steps(
         )
 
     have_rules = current.vnet_firewall_rules if vnet_exists else []
-    existing = {_rule_identity(r) for r in have_rules}
-    # POST in reverse, each pinned to pos=0: PVE prepends every create, so this
-    # is what lands the fence in fence_rules() order in the compiled chain rather
-    # than reversed (#599). The step id names the rule's FINAL position, so the
-    # plan reads by outcome even though the writes run bottom-first.
-    for final_pos, rule in fence_rule_writes(desired, "forward"):
-        if _rule_identity(rule) in existing:
-            continue
-        steps.append(
-            Step(
-                id=f"vnet-firewall-rule-{final_pos}",
-                description=(
-                    f"vnet {desired.vnet} forward rule {final_pos}: {rule['action']} "
-                    f"{rule.get('proto', 'any')} -> {rule.get('dest', 'any')}"
-                ),
-                op="create_vnet_firewall_rule",
-                params={"vnet": desired.vnet, **rule},
+    # The WHOLE ordered fence HomePilot owns on the vnet, compared against
+    # fence_rules(): "each wanted rule is present somewhere" read a pre-#599
+    # reversed fence and a fence carrying a DROP for a removed isolate CIDR as
+    # converged (#713). On any difference the fence is rewritten - correct
+    # rules on top first, superseded owned rules removed after - and rules an
+    # operator put on the vnet are never touched. The step ids name each new
+    # rule's FINAL position, so the plan reads by outcome even though the
+    # writes run bottom-first (#599).
+    steps.extend(
+        _fence_convergence_steps(
+            list(have_rules),
+            fence_rules(desired, "forward"),
+            id_prefix="vnet-firewall",
+            where=f"vnet {desired.vnet} forward",
+            create_op="create_vnet_firewall_rule",
+            delete_op="delete_vnet_firewall_rule",
+            target={"vnet": desired.vnet},
+        )
+    )
+    return steps
+
+
+def _vm_fence_steps(desired: DesiredGuestNetwork, current: GuestNetworkSurvey) -> list[Step]:
+    """Correct every per-VM guest fence that is not the current fence, in order (#713).
+
+    The per-VM fence is the one that HOLDS on the legacy stack, and it was
+    written once at provision and never read again - so a guest provisioned
+    before #599 kept its DROPs above the DNS/DHCP ACCEPTs forever, and a guest
+    fenced before an isolate CIDR was added never got the new DROP. Each guest
+    carrying HomePilot's fence rules is brought to ``fence_rules(desired,
+    "out")`` with the same correct-first rewrite as the vnet; its other rules
+    are never touched.
+    """
+    if not desired.isolate_cidrs:
+        return []
+    want = fence_rules(desired, "out")
+    steps: list[Step] = []
+    for key in sorted(current.vm_fences, key=lambda k: (current.vm_fences[k]["vmid"], k)):
+        fence = current.vm_fences[key]
+        steps.extend(
+            _fence_convergence_steps(
+                list(fence["rules"]),
+                want,
+                id_prefix=f"vm-{fence['vmid']}-fence",
+                where=f"guest {fence['vmid']} on {fence['node']} fence",
+                create_op="create_vm_firewall_rule",
+                delete_op="delete_vm_firewall_rule",
+                target={"node": fence["node"], "vmid": fence["vmid"]},
             )
         )
     return steps
@@ -919,15 +1140,27 @@ def _datacenter_firewall_steps(
         # off evidence it never had. enforcement_note already says the state is
         # unknown; the plan now agrees with it instead of acting.
         return []
-    if safe_datacenter_firewall_enable(current.datacenter_firewall_options) is None:
+    write = safe_datacenter_firewall_enable(current.datacenter_firewall_options)
+    if write is None:
         return []
+    if "policy_in" in write:
+        description = (
+            "ensure datacenter firewall enabled (policy_in=ACCEPT) so the per-VM fence "
+            "enforces - host INPUT stays open, no lockout"
+        )
+    else:
+        # The operator STAGED a DROP/REJECT input policy on the disabled
+        # firewall. It is kept, not overwritten (#707); the enable is sent only
+        # if the lockout guard verifies a management-allow at apply time.
+        description = (
+            "ensure datacenter firewall enabled at the operator's staged policy_in="
+            f"{current.datacenter_firewall_policy_in} - sent only if a management-allow "
+            "for SSH and the API is verified on the cluster's rules, refused otherwise"
+        )
     return [
         Step(
             id="ensure-datacenter-firewall",
-            description=(
-                "ensure datacenter firewall enabled (policy_in=ACCEPT) so the per-VM fence "
-                "enforces - host INPUT stays open, no lockout"
-            ),
+            description=description,
             op="ensure_datacenter_firewall_enabled",
             params={},
         )
@@ -1163,11 +1396,21 @@ def enforcement_note(current: GuestNetworkSurvey) -> str:
             f"see, so applying the artifact changes nothing about it. {stack_note}"
         )
     if not current.datacenter_firewall_enabled:
+        if current.datacenter_firewall_policy_in in ("DROP", "REJECT"):
+            how = (
+                "Applying the guest-network artifact enables it at the input policy the operator "
+                f"staged ({current.datacenter_firewall_policy_in}) only if a management-allow for "
+                "SSH and the API is verified on the cluster's rules, and refuses otherwise."
+            )
+        else:
+            how = (
+                "Applying the guest-network artifact enables it safely (enable=1, "
+                "policy_in=ACCEPT: the host INPUT chain stays open, so no management lockout)."
+            )
         return (
             "The PVE datacenter firewall is OFF, so the guest fence is CONFIGURED but NOT "
             "ENFORCED - the per-VM tap rules are stored but inert until the master switch is on. "
-            "Applying the guest-network artifact enables it safely (enable=1, policy_in=ACCEPT: "
-            f"the host INPUT chain stays open, so no management lockout). {stack_note}"
+            f"{how} {stack_note}"
         )
     # NOTHING about the host input policy is reported here any more.
     #
@@ -1188,9 +1431,26 @@ def enforcement_note(current: GuestNetworkSurvey) -> str:
         f" Its input policy is {current.datacenter_firewall_policy_in}, which is the operator's "
         "to set - HomePilot writes nothing to a firewall that is already on."
     )
+    # ON is a stored setting, not enforcement: the rules are compiled by a
+    # service, and after `pve-firewall stop` the switch still reads enable=1
+    # while nothing is enforced (#713). ENFORCED is said only when that service
+    # was SEEN running.
+    node = current.node or "the node"
+    if current.firewall_service_running is False:
+        return (
+            "The PVE datacenter firewall is switched ON, but the firewall service is NOT RUNNING "
+            f"on {node}, so the per-VM guest fence is CONFIGURED but NOT ENFORCED. Start the "
+            f"firewall service on the node to enforce it.{policy_note} {stack_note}"
+        )
+    if current.firewall_service_running is None:
+        return (
+            "The PVE datacenter firewall is switched ON and the per-VM guest fence is CONFIGURED, "
+            "but whether it is ENFORCED is UNVERIFIED: the firewall service on "
+            f"{node} could not be confirmed running.{policy_note} {stack_note}"
+        )
     return (
-        "The PVE datacenter firewall is ON, so the per-VM guest fence is ENFORCED."
-        f"{policy_note} {stack_note}"
+        f"The PVE datacenter firewall is ON and its firewall service is running on {node}, so "
+        f"the per-VM guest fence is ENFORCED.{policy_note} {stack_note}"
     )
 
 
@@ -1211,6 +1471,32 @@ def _nftables_from_services(services: list[dict[str, Any]]) -> bool | None:
     if "proxmox-firewall" in running:
         return True
     if "pve-firewall" in running:
+        return False
+    return None
+
+
+def _firewall_service_running(services: list[dict[str, Any]], nftables: bool | None) -> bool | None:
+    """Is the daemon that compiles this node's firewall rules running? (#713)
+
+    The nftables stack is enforced by ``proxmox-firewall``, the legacy one by
+    ``pve-firewall``; with the stack unknown, either counts. False when the
+    relevant service is listed but not running (the state a `pve-firewall
+    stop` recovery leaves), None when the listing does not mention it at all -
+    which is not evidence either way.
+    """
+    states = {
+        str(svc.get("service") or svc.get("name") or ""): str(svc.get("state") or "").lower()
+        for svc in services
+    }
+    if nftables is True:
+        relevant: tuple[str, ...] = ("proxmox-firewall",)
+    elif nftables is False:
+        relevant = ("pve-firewall",)
+    else:
+        relevant = ("proxmox-firewall", "pve-firewall")
+    if any(states.get(name) == "running" for name in relevant):
+        return True
+    if any(name in states for name in relevant):
         return False
     return None
 

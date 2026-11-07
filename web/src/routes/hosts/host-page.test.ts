@@ -44,7 +44,7 @@ const HOST = {
 	os_info: 'Linux 7.0.0-30-generic',
 	cpu_cores: 20,
 	memory_mb: 58961,
-	ip_address: '10.0.0.1',
+	ip_address: '10.0.0.13',
 	agent_id: 'agent-74ab',
 	services: [],
 	agent: {

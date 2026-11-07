@@ -1,0 +1,132 @@
+{
+  "_doc": [
+    "The ONE read-only policy shared by the Go agent and the Python control plane (#682, #691).",
+    "agent/go embeds this file; src/homepilot/adapters/readonly_policy.json must be a byte-identical copy",
+    "(tests/test_readonly_policy.py and agent/go/readonly_policy_test.go both fail on any drift).",
+    "Commands are POSITIVE-ONLY: a command is allowed only if its whole text matches its pattern.",
+    "Patterns use the syntax shared by Go RE2 and Python re, carry no anchors, and are matched against",
+    "the WHOLE command (Go wraps them in ^(?:...)$, Python uses fullmatch).",
+    "read_tier=false keeps a command out of the MCP read tier (exec_on_guest_readonly) while the agent",
+    "still accepts it from an admin caller. path_checked=true routes the argument through read_paths,",
+    "exactly like read_file.",
+    "read_paths is DEFAULT-DENY: a path must be in allow_exact or under allow_prefixes (or a write prefix),",
+    "and must not hit any deny rule. Deny rules always win, including over an operator's",
+    "HP_AGENT_READ_PREFIXES / HP_AGENT_WRITE_PREFIXES."
+  ],
+  "version": 1,
+  "shell_metachars": "|;&`$<>!#(){}[]'\"\\\n\r",
+  "commands": {
+    "hostname": {"read_tier": true, "pattern": "hostname"},
+    "uptime": {"read_tier": true, "pattern": "uptime"},
+    "uname": {"read_tier": true, "pattern": "uname(\\s+-[aAmnrsv]+)*"},
+    "free": {"read_tier": true, "pattern": "free(\\s+-[hkmgb]+)*"},
+    "df": {"read_tier": true, "pattern": "df(\\s+-[hHiTkP]+)*(\\s+[a-zA-Z0-9_./-]+)?"},
+    "ls": {"read_tier": true, "pattern": "ls(\\s+-[aAlrStZh1d]+)*(\\s+[a-zA-Z0-9_./][a-zA-Z0-9_./-]*)*"},
+    "ps": {
+      "_doc": "No BSD 'e' anywhere: 'ps e' / 'ps auxe' print every process's environment. A dashed cluster may start with -e (all processes) and otherwise holds only letters that are valid UNIX options, so procps never falls back to reading it as BSD letters (where 'e' would mean environment).",
+      "read_tier": true,
+      "pattern": "ps(\\s+(-e|-e?[AadfFHjlLNTw]+|[afjlmrSTuvwxH]+|(-e?[AadfFHjlLNTw]*)?[opuUCgG]\\s+[a-zA-Z0-9_,%.:=+][a-zA-Z0-9_,%.:=+-]*|--(forest|no-headers|headers)|--sort=[a-zA-Z0-9_,%+-]+))*"
+    },
+    "ip": {
+      "_doc": "Read verbs only (show/list/get). No set/add/del/flush/change/replace, no -batch, no netns exec.",
+      "read_tier": true,
+      "pattern": "ip(\\s+-(4|6|s|d|h|br|brief|c|color|j|json|p|pretty|o|oneline|details|stats|statistics|human))*\\s+(a|addr|address|l|link|r|ro|route|n|neigh|neighbor|neighbour|ru|rule|maddr|maddress|mr|mroute|nexthop|nh|netconf|ntable|tunnel|tuntap|addrlabel|vrf)(\\s+(show|list|lst|ls|sh|get)(\\s+[a-zA-Z0-9_.:/][a-zA-Z0-9_.:/-]*)*)?"
+    },
+    "ss": {
+      "_doc": "No -K (kill sockets), -D (dump to a file), -F (read a filter file), -N (netns), -E (never returns), and no long options. Filter words cannot start with '-'.",
+      "read_tier": true,
+      "pattern": "ss(\\s+-[tuwxlanpresmiHO460Sdob]+)*(\\s+[a-zA-Z0-9_.:/][a-zA-Z0-9_.:/-]*)*"
+    },
+    "systemctl": {
+      "_doc": "No daemon-reload: it is a state change and stays a privileged-only command.",
+      "read_tier": true,
+      "pattern": "systemctl\\s+(status|is-active|is-enabled|is-failed)(\\s+[a-zA-Z0-9_.@-]+)?"
+    },
+    "journalctl": {
+      "_doc": "Read flags only. No --flush/--rotate/--vacuum-*/--sync/--relinquish-var/--setup-keys/--update-catalog/-D/--file, no -f (never returns). Option values never start with '--', so a value slot cannot smuggle a flag.",
+      "read_tier": true,
+      "pattern": "journalctl(\\s+(-[xeraqkm]+|--(no-pager|utc|no-hostname|reverse|quiet|dmesg|catalog|merge|no-full|full|all|pager-end|list-boots)|-[xeraqkm]*[unpotSUg](\\s*[a-zA-Z0-9_.:@+/][a-zA-Z0-9_.:@+/-]*|\\s+-[0-9][a-zA-Z0-9]*)|--(unit|user-unit|lines|priority|output|identifier|grep|since|until|boot)=[a-zA-Z0-9_.:@+/-]+|-b(-?[0-9]+|\\s+-?[0-9]+|\\s+[a-f0-9]{32})?))*"
+    },
+    "dpkg": {
+      "read_tier": true,
+      "pattern": "dpkg\\s+(-l|-s|-S|-L|--list|--status|--search|--listfiles)(\\s+[a-zA-Z0-9/][a-zA-Z0-9_.+:/-]*)*"
+    },
+    "cat": {
+      "_doc": "One absolute path, checked against read_paths exactly as read_file checks it.",
+      "read_tier": true,
+      "path_checked": true,
+      "pattern": "cat\\s+/[^\\s]*"
+    },
+    "docker": {
+      "_doc": "Agent-side safe set only: kept out of the MCP read tier (docker inspect prints container environments).",
+      "read_tier": false,
+      "pattern": "docker\\s+(ps|images|inspect|logs|stats|version|info)(\\s+[a-zA-Z0-9_.:/-]+)*"
+    }
+  },
+  "read_paths": {
+    "allow_prefixes": [
+      "/var/log/",
+      "/etc/systemd/",
+      "/lib/systemd/system/",
+      "/usr/lib/systemd/system/",
+      "/etc/apt/sources.list.d/"
+    ],
+    "allow_exact": [
+      "/etc/hostname",
+      "/etc/hosts",
+      "/etc/os-release",
+      "/usr/lib/os-release",
+      "/etc/lsb-release",
+      "/etc/debian_version",
+      "/etc/timezone",
+      "/etc/resolv.conf",
+      "/run/systemd/resolve/resolv.conf",
+      "/run/systemd/resolve/stub-resolv.conf",
+      "/etc/apt/sources.list",
+      "/proc/cpuinfo",
+      "/proc/meminfo",
+      "/proc/loadavg",
+      "/proc/uptime",
+      "/proc/version",
+      "/proc/mounts"
+    ],
+    "default_write_prefixes": [
+      "/etc/homepilot/",
+      "/opt/homepilot/",
+      "/tmp/homepilot/",
+      "/etc/systemd/system/",
+      "/etc/docker/",
+      "/etc/nginx/"
+    ],
+    "deny_exact": [
+      "/root",
+      "/etc/homepilot/agent.env",
+      "/etc/homepilot/agent.token",
+      "/etc/corosync/authkey"
+    ],
+    "deny_prefixes": [
+      "/root/",
+      "/etc/pve/priv/",
+      "/etc/ssl/private/",
+      "/etc/wireguard/",
+      "/etc/credstore/",
+      "/etc/credstore.encrypted/",
+      "/opt/homepilot/data/"
+    ],
+    "deny_path_regex": [
+      "/etc/[^/]*shadow[^/]*",
+      "/etc/ssh/[^/]*_key",
+      "/proc/[^/]+/(environ|mem|cmdline|auxv|maps)",
+      ".*/\\.(ssh|gnupg|aws|kube|docker|hp|password-store)(/.*)?"
+    ],
+    "deny_basename_regex": [
+      "id_(rsa|dsa|ecdsa|ed25519)(_sk)?",
+      ".*_key",
+      ".*\\.(key|pem|keyring|p12|pfx|jks|kdbx)",
+      "\\.env",
+      "key\\.json",
+      "\\.?(netrc|pgpass|git-credentials)",
+      ".*htpasswd.*"
+    ]
+  }
+}

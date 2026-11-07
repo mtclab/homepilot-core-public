@@ -6,6 +6,7 @@ from homepilot.artifacts.models import (
     compute_body_hash,
 )
 from homepilot.artifacts.validator import validate_composite_spec
+from homepilot.auth.principal import Principal
 
 
 def _composite_body(artifact_id: str, step_id: str = "s1") -> str:
@@ -65,7 +66,7 @@ class TestApprove:
     async def test_approve_proposed(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         fm, _ = mock_store.read(aid)
         assert fm["status"] == "approved"
         assert fm["approved_by"]["user"] == "admin"
@@ -73,7 +74,7 @@ class TestApprove:
     async def test_approve_with_reason(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin", reason="LGTM")
+        await lc.approve(aid, Principal.operator("admin"), reason="LGTM")
         fm, _ = mock_store.read(aid)
         assert fm["approved_by"]["reason"] == "LGTM"
 
@@ -84,7 +85,7 @@ class TestApprove:
         body = body + "\nTAMPERED"
         mock_store._storage[aid] = (fm, body)
         with pytest.raises(LifecycleError, match="Hash mismatch"):
-            await lc.approve(aid, user="admin")
+            await lc.approve(aid, Principal.operator("admin"))
 
 
 class TestReject:
@@ -101,14 +102,14 @@ class TestReject:
         aid = await lc.propose(_make_spec())
         await lc.reject(aid, user="admin")
         with pytest.raises(LifecycleError, match="Invalid transition"):
-            await lc.approve(aid, user="admin")
+            await lc.approve(aid, Principal.operator("admin"))
 
 
 class TestApply:
     async def test_apply_approved(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store)
         aid = await lc.propose(_make_spec())
-        await lc.approve(aid, user="admin")
+        await lc.approve(aid, Principal.operator("admin"))
         await lc.mark_applied(aid, execution_log="done")
         fm, _ = mock_store.read(aid)
         assert fm["status"] == "applied"
@@ -162,7 +163,7 @@ class TestCascadeInvalidate:
     async def test_cascade_resets_approved_composite(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store)
         child_id = await lc.propose(_make_spec(id="2025-01-01-child-ref-a1b2c3"))
-        await lc.approve(child_id, user="admin")
+        await lc.approve(child_id, Principal.operator("admin"))
 
         composite_spec = _make_spec(
             id="2025-01-01-comp-ref-d4e5f6",
@@ -172,7 +173,7 @@ class TestCascadeInvalidate:
             body=_composite_body(child_id),
         )
         comp_id = await lc.propose(composite_spec)
-        await lc.approve(comp_id, user="admin")
+        await lc.approve(comp_id, Principal.operator("admin"))
 
         fm, body = mock_store.read(child_id)
         mock_store._storage[child_id] = (fm, body + "\n# extra line")
@@ -184,7 +185,7 @@ class TestCascadeInvalidate:
     async def test_cascade_visited_set_prevents_revisit(self, mock_store):
         lc = ArtifactLifecycle(store=mock_store)
         child_id = await lc.propose(_make_spec(id="2025-01-01-child-ref-a1b2c3"))
-        await lc.approve(child_id, user="admin")
+        await lc.approve(child_id, Principal.operator("admin"))
 
         comp1_spec = _make_spec(
             id="2025-01-01-comp1-ref-d4e5f6",
@@ -194,7 +195,7 @@ class TestCascadeInvalidate:
             body=_composite_body(child_id),
         )
         comp1_id = await lc.propose(comp1_spec)
-        await lc.approve(comp1_id, user="admin")
+        await lc.approve(comp1_id, Principal.operator("admin"))
 
         fm, body = mock_store.read(child_id)
         mock_store._storage[child_id] = (fm, body + "\n# extra line")

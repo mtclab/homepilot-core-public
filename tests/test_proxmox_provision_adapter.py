@@ -107,6 +107,21 @@ class TestCloneVm:
         assert with_storage["storage"] == "local-zfs"
         assert "storage" not in without
 
+    async def test_a_description_is_sent_only_when_one_is_given(self, client: ProxmoxClient):
+        """The provision run's marker rides in the clone's own body (#719), so
+        the guest PVE creates carries it from its first config write."""
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post(f"{API}/nodes/pve1/qemu/9000/clone").mock(
+                return_value=Response(200, json={"data": UPID})
+            )
+            await client.clone_vm(
+                node="pve1", template_vmid=9000, new_vmid=105, name="web-01", description="run-1"
+            )
+            await client.clone_vm(node="pve1", template_vmid=9000, new_vmid=106, name="web-02")
+
+        assert json.loads(route.calls[0].request.read())["description"] == "run-1"
+        assert "description" not in json.loads(route.calls[1].request.read())
+
     async def test_http_error_is_wrapped(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
             mock.post(f"{API}/nodes/pve1/qemu/9000/clone").mock(

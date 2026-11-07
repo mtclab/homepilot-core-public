@@ -23,6 +23,21 @@ SCOPE_ENFORCER_ATTR = "_hp_enforces_scope"
 REQUIRED_SCOPE_ATTR = "_hp_required_scope"
 
 
+def token_expired(row: dict[str, Any]) -> bool:
+    """Whether a stored API token row is past its `expires_at`.
+
+    One definition for every place that accepts an API token: the enrolment
+    payload download validated only prefix + hash and so honoured tokens that
+    `require_token` had long since refused as expired (#690)."""
+    raw = row.get("expires_at")
+    if not raw:
+        return False
+    from datetime import datetime
+
+    expires = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return expires <= datetime.now(UTC)
+
+
 def get_db(request: Request) -> Repository:
     repo: Repository = request.app.state.repo
     return repo
@@ -65,15 +80,11 @@ async def require_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
         )
-    if row.get("expires_at"):
-        from datetime import datetime
-
-        expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
-        if expires <= datetime.now(UTC):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token expired",
-            )
+    if token_expired(row):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired",
+        )
 
     # --- CSRF check for cookie-authenticated mutations ---
     # Bearer token auth (CLI / MCP) is not a browser flow; no CSRF risk.
@@ -96,6 +107,11 @@ async def require_token(
     return {
         "user_id": row["user_id"],
         "token_id": row["id"],
+        # The credential's public id and label, so an action can be attributed
+        # to the TOKEN that took it - every minted token shares the one user.
+        # `prefix` is the validated lookup key (the row was fetched by it).
+        "prefix": prefix,
+        "label": row.get("label"),
         "display_name": user["display_name"] if user else None,
         "scope": row.get("scope"),
         "role": row.get("role"),

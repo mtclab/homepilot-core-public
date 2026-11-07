@@ -9,6 +9,7 @@ describe('taskStatusClass', () => {
 		expect(taskStatusClass('succeeded')).toBe('badge-applied');
 		expect(taskStatusClass('failed')).toBe('badge-failed');
 		expect(taskStatusClass('cancelled')).toBe('badge-revoked');
+		expect(taskStatusClass('unknown')).toBe('badge-proposed');
 	});
 
 	it('falls back to a neutral badge for an unknown status', () => {
@@ -40,6 +41,11 @@ describe('isTerminalStatus', () => {
 	it('treats succeeded and failed as terminal', () => {
 		expect(isTerminalStatus('succeeded')).toBe(true);
 		expect(isTerminalStatus('failed')).toBe(true);
+	});
+
+	it('treats unknown as terminal: the run is over, PVE settles the rest (#774)', () => {
+		expect(isTerminalStatus('unknown')).toBe(true);
+		expect(isCancellable('unknown')).toBe(false);
 	});
 
 	it('is false only while the task is in flight', () => {

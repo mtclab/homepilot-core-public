@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...common import format_validation_error
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "query_guests",
@@ -46,11 +48,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cn": {"type": "string", "description": "The guest's certificate CN"},
-                "max_vms": {"type": ["integer", "null"]},
-                "max_cores": {"type": ["integer", "null"]},
-                "max_memory_mb": {"type": ["integer", "null"]},
-                "max_disk_gb": {"type": ["integer", "null"]},
+                "cn": {
+                    "type": "string",
+                    "pattern": "\\S",
+                    "description": "The guest's certificate CN",
+                },
+                "max_vms": {"type": ["integer", "null"], "minimum": 0},
+                "max_cores": {"type": ["integer", "null"], "minimum": 0},
+                "max_memory_mb": {"type": ["integer", "null"], "minimum": 0},
+                "max_disk_gb": {"type": ["integer", "null"], "minimum": 0},
             },
             "required": ["cn"],
         },
@@ -83,7 +89,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cn": {"type": "string", "description": "The guest's certificate CN"},
+                "cn": {
+                    "type": "string",
+                    "pattern": "\\S",
+                    "description": "The guest's certificate CN",
+                },
             },
             "required": ["cn"],
         },
@@ -394,11 +404,20 @@ async def handle_set_guest_quota(arguments: dict[str, Any], ctx: dict[str, Any])
     repo = ctx["repo"]
     cn = str(arguments.get("cn") or "").strip()
     if not cn:
-        return {"error": "cn is required"}
+        # Raised, not returned: a dict answer is an is_error=false SUCCESS over
+        # MCP, so the caller was told its refused call had worked (#696).
+        raise ValueError("cn is required")
 
     def _axis(name: str) -> int | None:
         v = arguments.get(name)
-        return None if v is None else max(0, int(v))
+        if v is None:
+            return None
+        # Refused, not clamped: -1 used to become 0 - a HARD BLOCK on that
+        # axis - while the call answered success (#696). REST refuses it too.
+        value = int(v)
+        if value < 0:
+            raise ValueError(f"{name} must be 0 or more")
+        return value
 
     await set_quota(
         repo,
@@ -409,7 +428,7 @@ async def handle_set_guest_quota(arguments: dict[str, Any], ctx: dict[str, Any])
         max_disk_gb=_axis("max_disk_gb"),
     )
     await repo.log_audit(
-        user_id=ctx.get("caller_id", "mcp"),
+        user_id=str(ctx.get("_mcp_caller_id") or "mcp"),
         source="mcp",
         action="guest_quota_set",
         target_host=cn,
@@ -447,12 +466,14 @@ async def handle_delete_guest_quota(
     repo = ctx["repo"]
     cn = str(arguments.get("cn") or "").strip()
     if not cn:
-        return {"error": "cn is required"}
+        # Raised, not returned: a dict answer is an is_error=false SUCCESS over
+        # MCP, so the caller was told its refused call had worked (#696).
+        raise ValueError("cn is required")
 
     removed = await delete_quota(repo, cn)
     if removed:
         await repo.log_audit(
-            user_id=ctx.get("caller_id", "mcp"),
+            user_id=str(ctx.get("_mcp_caller_id") or "mcp"),
             source="mcp",
             action="guest_quota_removed",
             target_host=cn,
@@ -484,7 +505,7 @@ async def handle_revoke_guest_invite(
     ok = await invites_repo.revoke(prefix)
     if ok:
         await repo.log_audit(
-            user_id=ctx.get("caller_id", "mcp"),
+            user_id=str(ctx.get("_mcp_caller_id") or "mcp"),
             source="mcp",
             action="guest_invite_revoked",
             target_host=prefix,
@@ -514,7 +535,9 @@ async def handle_provision_guest(arguments: dict[str, Any], ctx: dict[str, Any])
     except MissingProvisioningDefaultError as exc:
         raise ValueError(str(exc)) from exc
     except ValidationError as exc:
-        raise ValueError(f"Invalid provision request: {exc}") from exc
+        # Field and message only: str(exc) carries input_value, which here can
+        # be the tailnet auth key (#697).
+        raise ValueError(f"Invalid provision request: {format_validation_error(exc)}") from None
     actor = str(ctx.get("_mcp_caller_id") or "mcp")
     try:
         task_id = await service.start(body, actor=actor)
@@ -554,7 +577,7 @@ async def handle_rejoin_tailnet(arguments: dict[str, Any], ctx: dict[str, Any]) 
     except ValidationError as exc:
         # The message names the FIELD, never the value: a validation error that
         # echoed the auth key back would put it in the transcript.
-        raise ValueError(f"Invalid tailnet-join request: {exc.errors()[0]['msg']}") from exc
+        raise ValueError(f"Invalid tailnet-join request: {format_validation_error(exc)}") from None
 
     try:
         node, hostname = await resolve_join_target(
@@ -597,7 +620,7 @@ async def handle_create_guest_template(
     except MissingProvisioningDefaultError as exc:
         raise ValueError(str(exc)) from exc
     except ValidationError as exc:
-        raise ValueError(f"Invalid template request: {exc}") from exc
+        raise ValueError(f"Invalid template request: {format_validation_error(exc)}") from None
     actor = str(ctx.get("_mcp_caller_id") or "mcp")
     try:
         task_id = await service.start(body, actor=actor)

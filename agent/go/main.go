@@ -31,6 +31,9 @@ type Agent struct {
 	// write onto the socket that replaced it. Read and written under writeMu.
 	connGen uint64
 
+	// workers is the request pool's semaphore (see serve), process-wide.
+	workers chan struct{}
+
 	// Bounded FIFO of metric samples awaiting delivery. Lives on the Agent, not
 	// on a connection, so a hub restart delays the series instead of holing it.
 	metrics *metricBuffer
@@ -123,13 +126,13 @@ func (a *Agent) sendLocked(m msg) error {
 // an unsendable frame is not a local error: the hub refuses to parse a body it
 // cannot MAC-verify, so an oversize reply CLOSES the connection, and the caller
 // that asked the question gets neither an answer nor a reason.
-func (a *Agent) sendResult(m msg, forAction, reqID string) {
-	err := a.send(m)
+func (a *Agent) sendResult(gen uint64, m msg, forAction, reqID string) {
+	err := a.sendOn(gen, m)
 	if err == nil || !errors.Is(err, errFrameTooLarge) {
 		return
 	}
 	log.Printf("refusing to send an oversize %s result for %s: %v", forAction, reqID, err)
-	_ = a.send(msg{
+	_ = a.sendOn(gen, msg{
 		"action": "command_result", "for_action": forAction, "request_id": reqID,
 		"error": fmt.Sprintf(
 			"the %s result is too large to return over the agent hub protocol (%v)",
@@ -269,7 +272,74 @@ func (a *Agent) register() error {
 		log.Printf("replay protection enabled for this connection")
 	}
 	log.Printf("registered as agent %s", a.agentID)
+	a.scrubEnrolmentToken()
 	return nil
+}
+
+// scrubEnrolmentToken removes the enrolment token from agent.env once this
+// host holds a working, persisted per-agent credential (#683).
+//
+// The installer writes HP_AGENT_AUTH_TOKEN - normally the SHARED fleet token -
+// into agent.env, and it used to stay there for the life of the host: a secret
+// that enrols any machine, sitting on every machine, long after each one had its
+// own credential. It is removed only when all of these hold, because removing it
+// early strands the host (it is the only way back after a restart when no
+// credential reached the disk):
+//   - the live credential is the per-agent one, and the hub just accepted it (or
+//     just minted it - this runs only after a successful register);
+//   - that exact credential is what the token file now holds;
+//   - the line being removed carries the token THIS agent enrolled with, so an
+//     operator who put a fresh token there to re-enrol after a revoke keeps it.
+//
+// Failure is logged, never fatal: the host keeps working on its credential.
+func (a *Agent) scrubEnrolmentToken() {
+	if !a.hasPerAgent || a.cfg.EnvFile == "" || a.cfg.EnvAuthToken == "" {
+		return
+	}
+	if a.cfg.AuthToken == a.cfg.EnvAuthToken || resolveToken(a.cfg.AuthTokenFile, "") != a.cfg.AuthToken {
+		return
+	}
+	removed, err := removeEnvToken(a.cfg.EnvFile, a.cfg.EnvAuthToken)
+	if err != nil {
+		log.Printf("warning: could not remove the enrolment token from %s: %v", a.cfg.EnvFile, err)
+		return
+	}
+	// Either it is gone now or it was never there: nothing on disk holds it, so
+	// the process must not keep offering it as a fallback either.
+	a.cfg.EnvAuthToken = ""
+	if removed {
+		log.Printf("removed the enrolment token from %s: this host now holds its own credential",
+			a.cfg.EnvFile)
+	}
+}
+
+// removeEnvToken rewrites envFile without the HP_AGENT_AUTH_TOKEN line whose
+// value is token, atomically and 0600. It reports whether a line was removed. A
+// missing file, or one whose token line holds a different value, is left as is.
+func removeEnvToken(envFile, token string) (bool, error) {
+	raw, err := os.ReadFile(envFile) // #nosec G304 -- operator-configured agent state path
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	lines := strings.Split(string(raw), "\n")
+	kept := make([]string, 0, len(lines))
+	removed := false
+	for _, line := range lines {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if found && strings.TrimSpace(key) == "HP_AGENT_AUTH_TOKEN" &&
+			strings.Trim(strings.TrimSpace(value), `"'`) == token {
+			removed = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if !removed {
+		return false, nil
+	}
+	return true, writeAgentStateFile(envFile, strings.Join(kept, "\n"), ".agent.env-*")
 }
 
 // isAuthError reports whether a hub error reply means "your credential was not
@@ -381,7 +451,7 @@ func (a *Agent) closeConn() {
 }
 
 func (a *Agent) heartbeatLoop(done <-chan struct{}, gen uint64) {
-	t := time.NewTicker(time.Duration(a.cfg.HeartbeatInterval) * time.Second)
+	t := time.NewTicker(tickEvery(a.cfg.HeartbeatInterval, defaultHeartbeatInterval))
 	defer t.Stop()
 	for {
 		select {
@@ -405,6 +475,17 @@ func (a *Agent) serve() error {
 	gen := a.currentGen()
 	go a.heartbeatLoop(done, gen)
 	go a.metricsLoop(done, acks, gen)
+	// Request handlers run OFF this loop, in a bounded pool (#720). Inline, one
+	// overrunning command stalled every later request and every metrics ack
+	// while the heartbeat goroutine kept calling the agent healthy. The pool
+	// belongs to the PROCESS, not the connection: work started on a dropped
+	// connection keeps its slot until it finishes, so a reconnect storm cannot
+	// multiply how much runs on the host at once. Only this goroutine touches
+	// the field (serve runs one connection at a time).
+	if a.workers == nil {
+		a.workers = make(chan struct{}, maxConcurrentRequests)
+	}
+	workers := a.workers
 
 	for {
 		_ = a.conn.SetReadDeadline(time.Now().Add(300 * time.Second))
@@ -420,19 +501,12 @@ func (a *Agent) serve() error {
 			}
 		}
 		reqID := str(m, "request_id")
-		switch str(m, "action") {
-		case "exec":
-			a.handleExec(m, reqID)
-		case "read_file":
-			a.handleReadFile(m, reqID)
-		case "write_file":
-			a.handleWriteFile(m, reqID)
-		case "install_package":
-			a.handleInstallPackage(m, reqID)
-		case "manage_service":
-			a.handleManageService(m, reqID)
-		case "write_config":
-			a.handleWriteConfig(m, reqID)
+		action := str(m, "action")
+		if handler, ok := workerActions[action]; ok {
+			a.dispatch(workers, gen, action, reqID, func() { handler(a, m, reqID, gen) })
+			continue
+		}
+		switch action {
 		case "set_transport":
 			a.handleSetTransport(m, reqID)
 		case "metrics_ack":
@@ -448,37 +522,78 @@ func (a *Agent) serve() error {
 	}
 }
 
-func (a *Agent) handleExec(m msg, reqID string) {
+// maxConcurrentRequests bounds how many hub requests run at once. Past it the
+// agent answers "busy" immediately: the hub gets a reason at once instead of a
+// timeout, and neither memory nor the read loop grows with a flood.
+const maxConcurrentRequests = 8
+
+// workerActions are the hub requests that do work on the host, and so run in
+// the worker pool. set_transport stays on the read loop: it swaps the
+// connection itself and must not race the next frame.
+//
+// Each handler answers through sendOn with the generation of the connection the
+// request arrived on: a result that outlives its connection is dropped, never
+// written onto the one that replaced it (whose sequence and MAC state belong to
+// a different register).
+var workerActions = map[string]func(a *Agent, m msg, reqID string, gen uint64){
+	"exec":            (*Agent).handleExec,
+	"read_file":       (*Agent).handleReadFile,
+	"write_file":      (*Agent).handleWriteFile,
+	"install_package": (*Agent).handleInstallPackage,
+	"manage_service":  (*Agent).handleManageService,
+	"write_config":    (*Agent).handleWriteConfig,
+}
+
+// dispatch runs work in the pool, or refuses it at once when every worker is
+// busy. It never blocks the read loop.
+func (a *Agent) dispatch(workers chan struct{}, gen uint64, action, reqID string, work func()) {
+	select {
+	case workers <- struct{}{}:
+		go func() {
+			defer func() { <-workers }()
+			work()
+		}()
+	default:
+		log.Printf("refusing %s %s: all %d workers busy", action, reqID, maxConcurrentRequests)
+		_ = a.sendOn(gen, msg{
+			"action": "command_result", "for_action": action, "request_id": reqID,
+			"error": fmt.Sprintf("agent busy: %d requests already running; retry shortly",
+				maxConcurrentRequests),
+		})
+	}
+}
+
+func (a *Agent) handleExec(m msg, reqID string, gen uint64) {
 	command := str(m, "command")
 	timeout := 30
 	if t, ok := m["timeout"].(float64); ok {
 		timeout = int(t)
 	}
 	code, stdout, stderr := a.exec.Exec(command, timeout)
-	a.sendResult(msg{
+	a.sendResult(gen, msg{
 		"action": "command_result", "for_action": "exec", "exit_code": code,
 		"stdout": stdout, "stderr": stderr, "request_id": reqID,
 	}, "exec", reqID)
 }
 
-func (a *Agent) handleReadFile(m msg, reqID string) {
+func (a *Agent) handleReadFile(m msg, reqID string, gen uint64) {
 	content, err := readFile(str(m, "path"))
 	if err != nil {
-		_ = a.send(msg{"action": "command_result", "for_action": "read_file",
+		_ = a.sendOn(gen, msg{"action": "command_result", "for_action": "read_file",
 			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	a.sendResult(msg{"action": "command_result", "for_action": "read_file",
+	a.sendResult(gen, msg{"action": "command_result", "for_action": "read_file",
 		"content": content, "request_id": reqID}, "read_file", reqID)
 }
 
-func (a *Agent) handleWriteFile(m msg, reqID string) {
+func (a *Agent) handleWriteFile(m msg, reqID string, gen uint64) {
 	if err := writeFile(str(m, "path"), str(m, "content")); err != nil {
-		_ = a.send(msg{"action": "command_result", "for_action": "write_file",
+		_ = a.sendOn(gen, msg{"action": "command_result", "for_action": "write_file",
 			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	_ = a.send(msg{"action": "command_result", "for_action": "write_file",
+	_ = a.sendOn(gen, msg{"action": "command_result", "for_action": "write_file",
 		"status": "ok", "request_id": reqID})
 }
 
@@ -487,35 +602,35 @@ func (a *Agent) handleWriteFile(m msg, reqID string) {
 // action through the agent's own allowlist-checked exec / write path, and
 // returns a structured {changed, detail} result (or an error frame). The
 // existing send() path stamps replay framing.
-func (a *Agent) handleInstallPackage(m msg, reqID string) {
+func (a *Agent) handleInstallPackage(m msg, reqID string, gen uint64) {
 	res, err := installPackage(a.exec.Exec, a.exec.allow.privileged,
 		a.exec.allow.allowPackageInstall, str(m, "name"))
-	a.sendProvisionResult("install_package", res, err, reqID)
+	a.sendProvisionResult(gen, "install_package", res, err, reqID)
 }
 
-func (a *Agent) handleManageService(m msg, reqID string) {
+func (a *Agent) handleManageService(m msg, reqID string, gen uint64) {
 	res, err := manageService(a.exec.Exec, a.exec.allow.privileged, str(m, "name"), str(m, "state"))
-	a.sendProvisionResult("manage_service", res, err, reqID)
+	a.sendProvisionResult(gen, "manage_service", res, err, reqID)
 }
 
-func (a *Agent) handleWriteConfig(m msg, reqID string) {
+func (a *Agent) handleWriteConfig(m msg, reqID string, gen uint64) {
 	mode := str(m, "mode")
 	if mode == "" {
 		mode = "0644"
 	}
 	res, err := writeConfig(a.exec.allow.privileged, str(m, "path"), str(m, "content"), mode)
-	a.sendProvisionResult("write_config", res, err, reqID)
+	a.sendProvisionResult(gen, "write_config", res, err, reqID)
 }
 
 // sendProvisionResult frames a provisioning outcome as a command_result: an
 // error frame on failure, else a structured {changed, detail} success.
-func (a *Agent) sendProvisionResult(forAction string, res provisionResult, err error, reqID string) {
+func (a *Agent) sendProvisionResult(gen uint64, forAction string, res provisionResult, err error, reqID string) {
 	if err != nil {
-		_ = a.send(msg{"action": "command_result", "for_action": forAction,
+		_ = a.sendOn(gen, msg{"action": "command_result", "for_action": forAction,
 			"error": err.Error(), "request_id": reqID})
 		return
 	}
-	_ = a.send(msg{
+	_ = a.sendOn(gen, msg{
 		"action": "command_result", "for_action": forAction, "status": "ok",
 		"changed": res.Changed, "detail": res.Detail, "request_id": reqID,
 	})
@@ -608,6 +723,11 @@ func main() {
 		}
 	}
 	cfg := ConfigFromEnv()
+	// Out-of-range intervals are clamped with a warning rather than handed to a
+	// ticker that panics on them (#727).
+	for _, w := range normaliseIntervals(&cfg) {
+		log.Print(w)
+	}
 	// Fail closed, at startup, loudly: an agent that was TOLD to be privileged but
 	// cannot do privileged work must say so now, not fail opaquely on the first
 	// hub request hours later (#422).

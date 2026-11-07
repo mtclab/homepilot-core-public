@@ -81,7 +81,16 @@
 		key: string;
 		text: string;
 		href: string;
+		/** 'unread' (the read failed) or 'partial' (it read only part of the set). */
+		label?: string;
 	}
+
+	// How much of each set the page actually read (#704). The host strip reads
+	// the first INVENTORY_PAGE hosts and the task lines the TASK_PAGE most
+	// recent tasks; past that, "no agent offline" or "no failed task" is not
+	// something this page has established, so it says how much it looked at.
+	const INVENTORY_PAGE = 100;
+	const TASK_PAGE = 50;
 	let unread: Unread[] = [];
 
 	async function load() {
@@ -89,9 +98,9 @@
 		try {
 			d = await api.getDashboard();
 			const [inv, alerts, taskRes, auditRes] = await Promise.allSettled([
-				api.listInventory({ limit: 100 }),
+				api.listInventory({ limit: INVENTORY_PAGE }),
 				api.listFiringAlerts(),
-				api.listTasks(undefined, 50, 0),
+				api.listTasks(undefined, TASK_PAGE, 0),
 				api.listAudit({ limit: 20 }),
 			]);
 			fleet = inv.status === 'fulfilled' ? inv.value.items : [];
@@ -125,6 +134,20 @@
 					key: 'unread:journal',
 					text: 'Could not read the journal, so recent movement is incomplete',
 					href: `${base}/records/journal`,
+				});
+			if (inv.status === 'fulfilled' && (inv.value.total ?? 0) > fleet.length)
+				unread.push({
+					key: 'partial:hosts',
+					label: 'partial',
+					text: `Agent state is checked here for ${fleet.length} of ${inv.value.total} hosts; the rest are on the hosts page`,
+					href: `${base}/hosts`,
+				});
+			if (taskRes.status === 'fulfilled' && (taskRes.value.total ?? 0) > tasks.length)
+				unread.push({
+					key: 'partial:tasks',
+					label: 'partial',
+					text: `Failed and stuck tasks are read from the ${tasks.length} most recent of ${taskRes.value.total}; older ones are in Records`,
+					href: `${base}/records/tasks`,
 				});
 		} catch (e) {
 			error = String(e);
@@ -253,7 +276,7 @@
 			out.push({
 				key: u.key,
 				severity: 'warning',
-				label: 'unread',
+				label: u.label ?? 'unread',
 				text: u.text,
 				href: u.href,
 				meta: '',
@@ -346,9 +369,13 @@
 			),
 		);
 
-		// Stuck: still running long after it should have finished.
+		// Stuck: still pending or running long after it should have finished. A
+		// task that never left `pending` is stuck too - it is the one that never
+		// even started (#704: this used to look at `running` only).
 		const stuck = taskList.filter(
-			(t) => t.status === 'running' && Date.now() - Date.parse(t.created_at) > STUCK_MS,
+			(t) =>
+				(t.status === 'running' || t.status === 'pending') &&
+				Date.now() - Date.parse(t.created_at) > STUCK_MS,
 		);
 		out.push(
 			...capped(
@@ -356,7 +383,7 @@
 					key: `stuck:${t.id}`,
 					severity: 'warning' as const,
 					label: 'stuck',
-					text: `${t.action} ${taskTarget(t)} is still running`,
+					text: `${t.action} ${taskTarget(t)} is still ${t.status}`,
 					href: taskHref(t),
 					meta: ago(t.created_at),
 				})),
@@ -409,6 +436,11 @@
 		host_forgotten: 'badge-revoked',
 	};
 
+	/** The chip for a journal action; an action with none says nothing (#704). */
+	function journalChip(action: string): string {
+		return JOURNAL_CHIPS[action] ?? 'badge-neutral';
+	}
+
 	function buildMovement(taskList: Task[], entries: AuditEntry[]): Movement[] {
 		const items: Movement[] = [];
 		for (const t of taskList) {
@@ -432,7 +464,7 @@
 				ts: Date.parse(e.timestamp) || 0,
 				when: ago(e.timestamp),
 				kind: e.action,
-				chip: JOURNAL_CHIPS[e.action] ?? 'badge-proposed',
+				chip: journalChip(e.action),
 				text: `${target || '—'} · ${e.source}`,
 				href: e.artifact_id ? `${base}/changes/${e.artifact_id}` : `${base}/records/journal`,
 			});

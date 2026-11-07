@@ -13,9 +13,12 @@ UPID quoting and error wrapping are all exercised for real.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -127,7 +130,23 @@ def proxmox(pve: FakePVE) -> ProxmoxClient:
 def app(db: Database, proxmox: ProxmoxClient) -> FastAPI:
     repo = Repository(db)
     task_repo = TaskRepository(db)
-    application = FastAPI()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # The shutdown half of main.lifespan, and the reason this app has one at
+        # all: the provision job runs behind an accepted request on the
+        # TestClient's portal loop, and that loop is CLOSED when the `with`
+        # block exits. A test that leaves as soon as the task row reads
+        # terminal used to race the job's last write (the audit row lands
+        # after the status): about one gate run in a few, the write was still
+        # in flight, aiosqlite's worker thread resolved it onto the closed loop
+        # and died with "Event loop is closed". Production drains before the
+        # database closes (main.lifespan, gated in test_background_shutdown);
+        # this harness now does exactly that before its loop goes.
+        yield
+        await app.state.provision_service.drain()
+
+    application = FastAPI(lifespan=lifespan)
     application.include_router(
         provision_router, prefix="/guests", dependencies=[Depends(require_token)]
     )
@@ -264,3 +283,106 @@ class TestProvisionJourney:
         # left behind is destroyed, not orphaned (#595). The error says so.
         assert pve.destroyed == [105]
         assert "destroyed guest vmid 105" in task["error"]
+
+    def test_the_failed_jobs_last_write_lands_before_the_app_loop_goes(
+        self, app: FastAPI, db: Database, pve: FakePVE
+    ):
+        """The gate flake, made deterministic.
+
+        A provision job writes its terminal status and THEN its audit row, so a
+        poller can see 'failed' while the job is still writing. When that poller
+        was a TestClient leaving its `with` block, the portal loop closed under
+        the write and aiosqlite's worker thread died with "Event loop is
+        closed" - about one gate run in a few, in the failure journey above.
+        Here the audit write is held back on purpose, so the job is ALWAYS
+        still writing when the row reads 'failed': the write must land anyway,
+        because whatever owns the loop drains the service before it goes.
+
+        Teeth: drop the drain from the `app` fixture's lifespan and the audit
+        row is lost on every run.
+        """
+        service = app.state.provision_service
+
+        async def failing_wait(node: Any, upid: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            from homepilot.adapters.proxmox import ProxmoxError
+
+            if "clone" in str(upid):
+                raise ProxmoxError("GET", "/tasks", 0, "exitstatus 'no space left on device'")
+            return {"status": "stopped", "exitstatus": "OK"}
+
+        service.proxmox.wait_for_task = failing_wait
+        real_log_audit = service.repo.log_audit
+
+        async def slow_log_audit(**kwargs: Any) -> Any:
+            await asyncio.sleep(0.3)
+            return await real_log_audit(**kwargs)
+
+        service.repo.log_audit = slow_log_audit
+
+        with TestClient(app) as client:
+            accepted = client.post("/guests/provision", json=BODY)
+            assert accepted.status_code == 202
+            task = _poll_task(client, accepted.json()["task_id"])
+            assert task["status"] == "failed"
+
+        conn = sqlite3.connect(db.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT action FROM audit_log WHERE source = 'provision'"
+            ).fetchall()
+        finally:
+            conn.close()
+        assert ("provision_failed",) in rows, (
+            "the failed provision's audit row never landed: the job was still "
+            "writing when the app's loop closed, and nothing drained it"
+        )
+
+
+async def test_a_shutdown_drain_outlasts_the_cleanup_it_starts(
+    db: Database, proxmox: ProxmoxClient, pve: FakePVE
+) -> None:
+    """A drain that has to cancel a provision must not return while the
+    cleanup that cancel started is still running.
+
+    Cancelling a job mid-clone spawns a tracked cleanup (stop, destroy, record
+    the outcome). The drain used to wait only for the jobs it saw on entry, so
+    a cleanup slower than its one-second grace was still running - still about
+    to write the task row - when the lifespan closed the database. Here the
+    destroy's wait never finishes on its own, so the drain must cancel the
+    cleanup too, and nothing tracked may be left running when it returns.
+
+    Teeth: make drain_tasks snapshot its tasks once (the old behaviour) and the
+    cleanup is still running here.
+    """
+    from homepilot.provision.models import ProvisionRequest
+
+    service = ProvisionService(
+        proxmox=proxmox,
+        task_repo=TaskRepository(db),
+        repo=Repository(db),
+        poll_interval=0.01,
+        task_timeout_s=30.0,
+    )
+    clone_waiting = asyncio.Event()
+    cleanup_waiting = asyncio.Event()
+
+    async def wait(node: Any, upid: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        if "clone" in str(upid):
+            clone_waiting.set()
+        else:
+            cleanup_waiting.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    service.proxmox.wait_for_task = wait  # type: ignore[method-assign]
+    await service.start(ProvisionRequest(**BODY))
+    await asyncio.wait_for(clone_waiting.wait(), timeout=5)
+
+    await asyncio.wait_for(service.drain(timeout=0.1), timeout=15)
+
+    assert cleanup_waiting.is_set(), "the cancel never started its cleanup"
+    still_running = [t for t in service._running_tasks if not t.done()]
+    assert not still_running, (
+        f"the drain returned with {len(still_running)} provision task(s) still running: "
+        "the database would close under them"
+    )

@@ -307,11 +307,12 @@ class TestHealthReadsTheDatabase:
 
     @staticmethod
     async def _health(db) -> dict:
-        """Call the real handler against a real database, no TestClient portal."""
-        import json
+        """Run the real health verdict against a real database, no TestClient
+        portal. It is the computation /health serves (cached and, since #687,
+        with the checks map shown only to an authenticated caller)."""
         from types import SimpleNamespace
 
-        from homepilot.main import health
+        from homepilot.main import _compute_health
 
         settings = SimpleNamespace(
             proxmox_host="",
@@ -319,8 +320,8 @@ class TestHealthReadsTheDatabase:
             cors_origins="http://localhost:5173",
         )
         state = SimpleNamespace(db=db, settings=settings)
-        response = await health(SimpleNamespace(app=SimpleNamespace(state=state)))
-        return json.loads(bytes(response.body))
+        overall, checks = await _compute_health(SimpleNamespace(app=SimpleNamespace(state=state)))
+        return {"status": overall, "checks": checks}
 
     @pytest.mark.asyncio
     async def test_a_database_that_cannot_be_read_is_not_ok(self, tmp_path):

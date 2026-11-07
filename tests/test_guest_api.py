@@ -12,6 +12,7 @@ Real migrated DB, real router, FakePVE at the httpx boundary for power calls.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -35,6 +36,25 @@ class PowerPVE:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
         self.fail = False
+        # Which machine each (node, vmid) holds NOW. The power route asks
+        # before it acts (#706), so the fake answers the way PVE does.
+        self.guests: dict[tuple[str, int], str] = {
+            ("pve1", 105): "alice-web",
+            ("pve1", 106): "bob-box",
+        }
+
+    async def get_vm_config(self, node: str, vmid: int) -> dict[str, Any]:
+        from homepilot.adapters.proxmox import ProxmoxError
+
+        name = self.guests.get((node, vmid))
+        if name is None:
+            raise ProxmoxError(
+                "GET",
+                f"nodes/{node}/qemu/{vmid}/config",
+                500,
+                f"Configuration file 'nodes/{node}/qemu-server/{vmid}.conf' does not exist",
+            )
+        return {"name": name}
 
     async def start_vm(self, node: str, vmid: int) -> str:
         return self._record("start", node, vmid)

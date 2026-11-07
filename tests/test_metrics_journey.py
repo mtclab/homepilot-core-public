@@ -33,14 +33,16 @@ from typing import Any
 
 import pytest
 
+from .go_toolchain import GO as _GO
+from .go_toolchain import GO_SKIP_REASON
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_SRC = REPO_ROOT / "agent" / "go"
 UI_SERIES_FIXTURE = REPO_ROOT / "web" / "src" / "lib" / "series.fixture.json"
 
-_GO = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
 # Applied to the binary-driving class only: the fixture-contract test below runs
 # everywhere, so a drifted UI contract is caught even without a Go toolchain.
-_needs_go = pytest.mark.skipif(not _GO, reason="Go toolchain not available")
+_needs_go = pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON)
 
 
 # Built once per session by tests/conftest.py, shared with the TLS journey.

@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
+from homepilot.artifacts.models import ArtifactBusyError
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.executor.orchestrator import ExecutorError
@@ -138,6 +139,8 @@ class TestTaskRepository:
     async def test_list_tasks(self, task_repo: TaskRepository):
         aid = "2025-01-01-test-abc123"
         t1 = await task_repo.create_task(aid, "apply")
+        # One run in flight per artifact (#710): finish the first.
+        await task_repo.update_task_status(t1, "succeeded")
         t2 = await task_repo.create_task(aid, "revoke")
         tasks = await task_repo.list_tasks(aid)
         assert len(tasks) == 2
@@ -148,7 +151,8 @@ class TestTaskRepository:
     async def test_list_tasks_pagination(self, task_repo: TaskRepository):
         aid = "2025-01-01-test-abc123"
         for _ in range(5):
-            await task_repo.create_task(aid, "apply")
+            tid = await task_repo.create_task(aid, "apply")
+            await task_repo.update_task_status(tid, "succeeded")  # one in flight (#710)
         tasks = await task_repo.list_tasks(aid, limit=2, offset=0)
         assert len(tasks) == 2
         all_tasks = await task_repo.list_tasks(aid, limit=50, offset=0)
@@ -157,7 +161,8 @@ class TestTaskRepository:
     async def test_count_tasks(self, task_repo: TaskRepository):
         aid = "2025-01-01-test-abc123"
         assert await task_repo.count_tasks(aid) == 0
-        await task_repo.create_task(aid, "apply")
+        t1 = await task_repo.create_task(aid, "apply")
+        await task_repo.update_task_status(t1, "succeeded")  # one in flight (#710)
         await task_repo.create_task(aid, "revoke")
         assert await task_repo.count_tasks(aid) == 2
 
@@ -399,17 +404,20 @@ class TestTaskRunner:
             t.cancel()
         await asyncio.sleep(0.05)
 
-    async def test_start_apply_returns_existing_task_if_pending(
+    async def test_start_apply_refuses_while_a_run_is_pending(
         self, task_repo: TaskRepository, mock_store: MagicMock
     ):
+        # #710: a second run is refused and the refusal NAMES the run in flight;
+        # it used to hand back that task as if it were the caller's own.
         _store_artifact(mock_store, status="approved")
         runner = self._make_runner(task_repo, mock_store, lifecycle=MagicMock())
 
         existing_id = await task_repo.create_task("2025-01-01-test-abc123", "apply")
 
-        result = await runner.start_apply("2025-01-01-test-abc123", approved_by="testuser")
+        with pytest.raises(ArtifactBusyError) as busy:
+            await runner.start_apply("2025-01-01-test-abc123", approved_by="testuser")
 
-        assert result["task_id"] == existing_id
+        assert busy.value.task_id == existing_id
         total = await task_repo.count_tasks("2025-01-01-test-abc123")
         assert total == 1
 
@@ -452,9 +460,9 @@ class TestTaskRunner:
         _store_artifact(mock_store, status="approved")
         runner = self._make_runner(task_repo, mock_store, lifecycle=MagicMock())
 
-        await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        existing = await task_repo.create_task("2025-01-01-test-abc123", "apply")
 
-        with pytest.raises(ValueError, match="apply_in_progress"):
+        with pytest.raises(ArtifactBusyError, match=existing):
             await runner.start_revoke("2025-01-01-test-abc123")
 
     async def test_start_revoke_409_when_replay_in_progress(
@@ -463,30 +471,27 @@ class TestTaskRunner:
         _store_artifact(mock_store, status="approved")
         runner = self._make_runner(task_repo, mock_store, lifecycle=MagicMock())
 
-        await task_repo.create_task("2025-01-01-test-abc123", "replay")
+        existing = await task_repo.create_task("2025-01-01-test-abc123", "replay")
 
-        with pytest.raises(ValueError, match="apply_in_progress"):
+        with pytest.raises(ArtifactBusyError, match=existing):
             await runner.start_revoke("2025-01-01-test-abc123")
 
-    async def test_start_revoke_allows_revoke_task_in_parallel(
+    async def test_start_revoke_refuses_a_second_revoke_in_parallel(
         self, task_repo: TaskRepository, mock_store: MagicMock
     ):
+        # #710: two rollbacks of one change used to run side by side.
         _store_artifact(mock_store, status="approved")
         runner = self._make_runner(task_repo, mock_store, lifecycle=MagicMock())
 
-        await task_repo.create_task("2025-01-01-test-abc123", "revoke")
+        existing = await task_repo.create_task("2025-01-01-test-abc123", "revoke")
 
-        result = await runner.start_revoke(
-            "2025-01-01-test-abc123", user="admin", reason="double revoke"
-        )
-        assert result["action"] == "revoke"
+        with pytest.raises(ArtifactBusyError, match=existing):
+            await runner.start_revoke(
+                "2025-01-01-test-abc123", user="admin", reason="double revoke"
+            )
 
         total = await task_repo.count_tasks("2025-01-01-test-abc123")
-        assert total == 2
-
-        for t in list(runner._running_tasks):
-            t.cancel()
-        await asyncio.sleep(0.05)
+        assert total == 1
 
     async def test_start_revoke_artifact_not_found(
         self, task_repo: TaskRepository, mock_store: MagicMock
@@ -792,7 +797,8 @@ class TestTaskEndpoints:
     async def test_list_tasks_pagination(self, task_repo: TaskRepository, mock_store: MagicMock):
         aid = "2025-01-01-test-abc123"
         for _ in range(5):
-            await task_repo.create_task(aid, "apply")
+            tid = await task_repo.create_task(aid, "apply")
+            await task_repo.update_task_status(tid, "succeeded")  # one in flight (#710)
 
         lifecycle = ArtifactLifecycle(store=mock_store)
         runner = TaskRunner(
@@ -906,7 +912,7 @@ class TestArtifactEndpointsAsync:
             t.cancel()
         await asyncio.sleep(0.05)
 
-    async def test_apply_returns_existing_task_when_pending(
+    async def test_apply_409_names_the_run_already_pending(
         self, task_repo: TaskRepository, mock_store: MagicMock
     ):
         _store_artifact(mock_store, status="approved")
@@ -932,9 +938,11 @@ class TestArtifactEndpointsAsync:
             json={"approved_by": "test"},
             headers=client._auth_headers,
         )
-        assert resp.status_code == 202
-        data = resp.json()
-        assert data["task_id"] == existing_id
+        # #710: a second run is a conflict that names the one in flight.
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["task_id"] == existing_id
+        assert existing_id in detail["message"]
 
     async def test_apply_404_nonexistent_artifact(
         self, task_repo: TaskRepository, mock_store: MagicMock
@@ -973,7 +981,7 @@ class TestArtifactEndpointsAsync:
             store=mock_store,
         )
 
-        await task_repo.create_task("2025-01-01-test-abc123", "apply")
+        existing = await task_repo.create_task("2025-01-01-test-abc123", "apply")
 
         client = await _create_authenticated_client(task_repo.db, task_repo, runner)
 
@@ -984,8 +992,10 @@ class TestArtifactEndpointsAsync:
             headers=client._auth_headers,
         )
         assert resp.status_code == 409
-        data = resp.json()
-        assert "apply_in_progress" in str(data)
+        detail = resp.json()["detail"]
+        assert detail["code"] == "artifact_busy"
+        assert detail["task_id"] == existing
+        assert detail["action"] == "apply"
 
     async def test_revoke_returns_202_normal(
         self, task_repo: TaskRepository, mock_store: MagicMock

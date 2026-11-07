@@ -17,7 +17,11 @@ The shape here is deliberately narrow:
   purpose (#487).
 
 `redact()` is the counterpart to `resolve()` and they are used as a pair: if a
-body was resolved, whatever is logged about it must be redacted first.
+body was resolved, whatever is logged about it must be redacted first. Redaction
+is BEST-EFFORT, not a boundary: it knows the exact value, so a script that
+prints the secret base64-encoded, reversed or split walks past it (#684). The
+boundary is which names an artifact may reference at all - see
+`check_referenceable`, enforced at propose AND at execute.
 """
 
 from __future__ import annotations
@@ -47,6 +51,69 @@ class SecretResolutionError(Exception):
     """
 
 
+# The vault entries HomePilot itself runs on (#684). An artifact is operator-
+# or assistant-authored text that runs on a managed host and whose output lands
+# in an execution log; none of these may ever be substituted into one.
+# `admin-secret` mints API tokens, the pve tokens drive the cluster, the hub
+# token authenticates agents. tests/test_684_vault_ref_policy.py scans src/ for
+# every literal vault name the platform reads or writes and fails if one is
+# missing here, so a new platform credential cannot ship referenceable.
+PLATFORM_SECRET_NAMES: frozenset[str] = frozenset(
+    {
+        "admin-secret",
+        "agent-hub-token",
+        "n8n-key",
+        "proxmox-config",
+        "pve-token",
+        "pve-write-token",
+        "webhook-secret",
+    }
+)
+
+
+def artifact_vault_allowlist() -> frozenset[str] | None:
+    """The operator's `HP_ARTIFACT_VAULT_ALLOWLIST`, or None when unset.
+
+    Unset means every vault entry that is not a platform credential; set, it is
+    exactly the names listed. Read per call so a restart is the only thing that
+    changes it, like every other setting."""
+    from homepilot.config import get_settings
+
+    raw = get_settings().artifact_vault_allowlist
+    names = frozenset(n.strip() for n in (raw or "").split(",") if n.strip())
+    return names or None
+
+
+def refused_reference(name: str, allowlist: frozenset[str] | None) -> str | None:
+    """Why an artifact may not reference vault entry `name`, or None if it may.
+
+    Platform credentials are refused by name whatever the allowlist says, and
+    case-insensitively (a case-folding filesystem would serve `Admin-Secret`)."""
+    if name.lower() in PLATFORM_SECRET_NAMES:
+        return (
+            f"vault credential '{name}' is one of HomePilot's own platform "
+            "credentials and cannot be referenced by an artifact"
+        )
+    if allowlist is not None and name not in allowlist:
+        return (
+            f"vault credential '{name}' is not in HP_ARTIFACT_VAULT_ALLOWLIST, "
+            "so artifacts may not reference it"
+        )
+    return None
+
+
+def check_referenceable(names: list[str]) -> None:
+    """Raise SecretResolutionError if any of `names` may not be referenced.
+
+    Called at propose (so the author hears it at once) and again immediately
+    before any vault read at execute (so an artifact proposed before this rule,
+    or edited in the store afterwards, still cannot resolve one)."""
+    allowlist = artifact_vault_allowlist()
+    reasons = [r for r in (refused_reference(n, allowlist) for n in names) if r]
+    if reasons:
+        raise SecretResolutionError("; ".join(dict.fromkeys(reasons)))
+
+
 def references(text: str) -> list[tuple[str, str]]:
     """Every `(secret_name, field)` a body refers to."""
     return [(m.group(1), m.group(2) or "value") for m in VAULT_REF_RE.finditer(text or "")]
@@ -62,6 +129,8 @@ async def resolve(text: str, vault: Any) -> tuple[str, list[str]]:
     refs = references(text)
     if not refs:
         return text, []
+    # Before the vault is touched at all: a refused name is never decrypted.
+    check_referenceable([name for name, _field in refs])
     if vault is None:
         raise SecretResolutionError(
             "this artifact references vault credentials but no vault is configured"

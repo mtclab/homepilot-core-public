@@ -28,6 +28,7 @@ import pytest
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactKind, LifecycleError
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.executor.orchestrator import ArtifactExecutor
 from homepilot.executor.rollback import derive_rollback, has_rollback_section
 
@@ -178,7 +179,7 @@ class TestAnUnhonourableClaimIsRefusedAtPropose:
 class TestRevokeSaysWhetherTheHostWasPutBack:
     async def _applied(self, lifecycle, artifact_id: str, body: str) -> ArtifactExecutor:
         await lifecycle.propose(_spec(artifact_id, body))
-        await lifecycle.approve(artifact_id, user="admin")
+        await lifecycle.approve(artifact_id, Principal.operator("admin"))
         executor = _executor(lifecycle)
         executor._dispatch = AsyncMock(
             return_value=__import__(
@@ -305,7 +306,7 @@ class TestHostProvisionActuallyReverses:
                     target={"kind": "vm", "vmid": 100, "node": "pve1", "host": "web1"},
                 )
             )
-            await lifecycle.approve(artifact_id, user="admin")
+            await lifecycle.approve(artifact_id, Principal.operator("admin"))
             executor = await self._executor_with_agent(lifecycle, repo, agent)
 
             await executor.apply(artifact_id, approved_by="admin")

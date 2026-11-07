@@ -107,13 +107,40 @@ def _kill_worker_by_closing_its_loop(conn) -> None:
         loop.run_until_complete(asyncio.sleep(0.05))
         loop.close()
 
-    thread = threading.Thread(target=other_loop)
-    thread.start()
-    thread.join()
-    # Let the worker thread try to resolve into the closed loop and die.
-    deadline = time.monotonic() + 10
-    while conn._thread.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.05)
+    # The worker's death IS the scenario: it raises `Event loop is closed` while
+    # resolving into the loop we closed. The suite turns any unhandled thread
+    # exception into an error (#622), and that must keep catching real leaks
+    # in this test too, so this is not a filterwarnings marker: only THIS
+    # worker's THIS exception is absorbed - and asserted, so a worker dying of
+    # anything else (or not dying) still fails - and every other thread's
+    # exception goes to the hook pytest installed.
+    worker = conn._thread
+    expected: list[BaseException] = []
+    previous_hook = threading.excepthook
+
+    def absorb_the_intended_death(args: threading.ExceptHookArgs) -> None:
+        if (
+            args.thread is worker
+            and isinstance(args.exc_value, RuntimeError)
+            and "Event loop is closed" in str(args.exc_value)
+        ):
+            expected.append(args.exc_value)
+            return
+        previous_hook(args)
+
+    threading.excepthook = absorb_the_intended_death
+    try:
+        thread = threading.Thread(target=other_loop)
+        thread.start()
+        thread.join()
+        # Let the worker thread try to resolve into the closed loop and die.
+        deadline = time.monotonic() + 10
+        while worker.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker.join(timeout=1)
+    finally:
+        threading.excepthook = previous_hook
+    assert expected, "the worker did not die of the closed loop - wrong scenario"
 
 
 class TestACloseAlwaysReturns:
@@ -289,6 +316,113 @@ class TestDrainingBackgroundWork:
 
         assert cancelled == 1
         assert task.cancelled()
+
+    async def test_work_started_while_draining_is_drained_too(self):
+        """A job cancelled by the drain may start - and track - its own unwind:
+        a cancelled provision spawns the cleanup that destroys its half-made
+        guest and records the outcome. The drain used to wait only for the
+        tasks it saw on entry, so it returned with that cleanup still running
+        and the caller closed the database under it.
+
+        Teeth: snapshot `tasks` once in drain_tasks (the old behaviour) and the
+        unwind below is still running when the drain returns.
+        """
+        tracked: set[asyncio.Task[None]] = set()
+
+        def track(task: asyncio.Task[None]) -> None:
+            tracked.add(task)
+            task.add_done_callback(tracked.discard)
+
+        unwind_started = asyncio.Event()
+
+        async def unwind() -> None:
+            unwind_started.set()
+            # Slower than any grace the drain gives a cancellation.
+            await asyncio.sleep(3600)
+
+        async def job() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                track(asyncio.create_task(unwind()))
+                raise
+
+        track(asyncio.create_task(job()))
+        await asyncio.sleep(0)
+        cancelled = await asyncio.wait_for(
+            drain_tasks(tracked, "test job(s)", timeout=0.1), timeout=10
+        )
+
+        assert unwind_started.is_set(), "the job's unwind never started"
+        still_running = [t for t in tracked if not t.done()]
+        assert not still_running, (
+            f"the drain returned with {len(still_running)} task(s) still running - "
+            "work started while draining outlived the drain"
+        )
+        assert cancelled == 2
+
+    @pytest.mark.parametrize(
+        "relpath", ["src/homepilot/provision/service.py", "src/homepilot/provision/template.py"]
+    )
+    async def test_every_job_a_provisioning_service_starts_is_tracked(self, relpath: str) -> None:
+        """drain() can only wait for what it can see. A job these services
+        start with a bare `asyncio.create_task` and never hand to `_track_task`
+        is invisible to the shutdown drain, and writes to a closed database.
+
+        Every `asyncio.create_task(...)` must either be the argument of
+        `self._track_task(...)` or be bound to a name that the same function
+        then passes to `self._track_task(...)`.
+
+        Teeth: drop `self._track_task(cleanup)` from either file's cancel path
+        and this fails naming the line.
+        """
+        import ast
+
+        tree = ast.parse((REPO_ROOT / relpath).read_text())
+
+        def is_create_task(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "create_task"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "asyncio"
+            )
+
+        def is_track(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_track_task"
+            )
+
+        found = 0
+        untracked: list[int] = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            tracked_args = [a for n in ast.walk(fn) if is_track(n) for a in n.args]
+            tracked_names = {a.id for a in tracked_args if isinstance(a, ast.Name)}
+            tracked_calls = {id(a) for a in tracked_args}
+            bound: dict[int, str] = {}
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Assign) and len(n.targets) == 1:
+                    target = n.targets[0]
+                    if isinstance(target, ast.Name) and is_create_task(n.value):
+                        bound[id(n.value)] = target.id
+            for n in ast.walk(fn):
+                if not is_create_task(n):
+                    continue
+                found += 1
+                if id(n) in tracked_calls or bound.get(id(n)) in tracked_names:
+                    continue
+                untracked.append(n.lineno)
+
+        assert found, f"no asyncio.create_task in {relpath} - the gate is reading the wrong file"
+        assert not untracked, (
+            f"{relpath}: asyncio.create_task at line(s) {untracked} is never passed to "
+            "self._track_task, so the shutdown drain cannot see it"
+        )
 
     async def test_every_service_that_runs_jobs_is_drained_by_the_real_shutdown(self):
         """Not "does the class have a drain method" - that stays green when the

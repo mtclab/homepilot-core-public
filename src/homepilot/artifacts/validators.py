@@ -141,6 +141,16 @@ def _body_skip_if_expressions(fm: dict[str, Any], body: str) -> list[tuple[str, 
     `precheck`. Nothing validated them; the propose-time check looked only at a
     frontmatter key the spec does not define.
     """
+    found: list[tuple[str, str]] = []
+    for step in _body_steps(fm, body):
+        precheck = step.get("precheck")
+        if isinstance(precheck, dict) and precheck.get("skip_if"):
+            found.append((str(step.get("id", "?")), str(precheck["skip_if"])))
+    return found
+
+
+def _body_steps(fm: dict[str, Any], body: str) -> list[dict[str, Any]]:
+    """Every step of this body's spec and rollback fences, for the sequence kinds."""
     import re
 
     import yaml
@@ -152,7 +162,7 @@ def _body_skip_if_expressions(fm: dict[str, Any], body: str) -> list[tuple[str, 
     if not fences:
         return []
 
-    found: list[tuple[str, str]] = []
+    found: list[dict[str, Any]] = []
     for fence in fences:
         m = re.search(rf"```yaml\s+{re.escape(fence)}\s*\n(.*?)```", body, re.DOTALL)
         if not m:
@@ -166,12 +176,7 @@ def _body_skip_if_expressions(fm: dict[str, Any], body: str) -> list[tuple[str, 
         steps = parsed.get("steps")
         if not isinstance(steps, list):
             continue
-        for step in steps:
-            if not isinstance(step, dict):
-                continue
-            precheck = step.get("precheck")
-            if isinstance(precheck, dict) and precheck.get("skip_if"):
-                found.append((str(step.get("id", "?")), str(precheck["skip_if"])))
+        found.extend(step for step in steps if isinstance(step, dict))
     return found
 
 
@@ -183,6 +188,15 @@ def validate_artifact_expressions(fm: dict[str, Any], body: str) -> list[str]:
         errors.extend(validate_skip_if(fm["skip_if"]))
     for step_id, expr in _body_skip_if_expressions(fm, body):
         errors.extend(f"step '{step_id}': {e}" for e in validate_skip_if_expression(expr))
+    if fm.get("kind") == "proxmox-api-sequence":
+        from homepilot.executor.proxmox_api import step_timeout_error
+
+        # A step's own wait on its PVE task (#774). Refused here so a typo is
+        # caught at propose, not by an apply that has already changed the cluster.
+        for step in _body_steps(fm, body):
+            bad = step_timeout_error(step.get("timeout_s"))
+            if bad:
+                errors.append(f"step '{step.get('id', '?')}': {bad}")
     if "{{" in body or "{%" in body:
         errors.extend(validate_jinja2_template(body, fm))
     return errors
