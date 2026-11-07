@@ -17,8 +17,8 @@ from tests.tree import IS_PUBLIC_MIRROR, MIRROR_DROPPED, REPO_ROOT
 def test_every_file_listed_as_dropped_is_deleted_by_the_scrub() -> None:
     scrub = (REPO_ROOT / "scripts" / "scrub-for-public.sh").read_text(encoding="utf-8")
     deleted: set[str] = set()
-    for args in re.findall(r"^\s*rm -f (.+?)\s*$", scrub, flags=re.MULTILINE):
-        deleted.update(args.split())
+    for args in re.findall(r"^\s*rm -r?f (.+?)\s*$", scrub, flags=re.MULTILINE):
+        deleted.update(p.rstrip("/") for p in args.split())
     not_deleted = sorted(MIRROR_DROPPED - deleted)
     assert not not_deleted, (
         f"tests/tree.py treats {not_deleted} as absent from the mirror, "

@@ -30,8 +30,14 @@ from typing import Any
 import pytest
 
 from homepilot.webhooks.catalog import EVENT_TYPES, TEST_EVENT
+from tests.tree import IS_PUBLIC_MIRROR
 
 FLOW = Path(__file__).resolve().parents[1] / "n8n" / "artifact-notification.json"
+
+# The scrub drops n8n/ from the public mirror on purpose (tests/tree.py).
+pytestmark = pytest.mark.skipif(
+    IS_PUBLIC_MIRROR, reason="the public mirror does not ship n8n/ (removed by the scrub)"
+)
 EMITTED = sorted(set(EVENT_TYPES) | {TEST_EVENT})
 FALLBACK_FORMATTER = "Format Other Event"
 

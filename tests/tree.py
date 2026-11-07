@@ -12,8 +12,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 IS_PUBLIC_MIRROR = (REPO_ROOT / "PROVENANCE").is_file()
 
-# Exactly what the scrub deletes (scripts/scrub-for-public.sh, "agent overlay").
-MIRROR_DROPPED = frozenset({"docker-compose.agent.yml", ".env.example.agent"})
+# Paths tests read that scripts/scrub-for-public.sh deletes from every export
+# (the agent overlay and the internal n8n/ flows). Checked against the scrub by
+# tests/test_tree_mirror_overlay.py; `make gate-mirror` runs the whole suite in
+# the mirror's file tree so a new one cannot slip through.
+MIRROR_DROPPED = frozenset({"docker-compose.agent.yml", ".env.example.agent", "n8n"})
 
 
 def shipped(*relative: str) -> tuple[Path, ...]:

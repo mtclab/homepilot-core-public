@@ -37,9 +37,18 @@ HP_GO_BIN := $(shell command -v $(GO_BIN) 2>/dev/null)
 GOCACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/homepilot-gate/go-build
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security
+.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security gate-mirror
 
-gate: gate-py gate-web gate-go gate-go-race gate-security
+gate: gate-py gate-web gate-go gate-go-race gate-security gate-mirror
+
+# The suite in the public mirror's file tree (the scrub's deletions + PROVENANCE).
+# The mirror's CI runs the same tests; a test that reads a file the scrub removes
+# used to fail only there, after merge (3.6.25, 3.7.0).
+gate-mirror: export HP_GATE := 1
+gate-mirror: export HP_GO_BIN := $(HP_GO_BIN)
+gate-mirror: export GOCACHE := $(GOCACHE)
+gate-mirror:
+	$(VENV)/python scripts/mirror_tree_check.py
 	@echo "gate: all sub-gates passed"
 
 gate-security:
