@@ -33,8 +33,14 @@
 		// trail as first-class actions rather than as unfilterable strays.
 		'host_added',
 		'host_forgotten',
+		// The credential lifecycle (#686): who minted, revoked or used a token,
+		// and when the instance was claimed.
+		'token_minted',
+		'token_revoked',
+		'instance_claimed',
+		'login',
 	];
-	const SOURCES = ['', 'cli', 'ui', 'mcp', 'reconciler', 'system'];
+	const SOURCES = ['', 'cli', 'ui', 'mcp', 'api', 'claim', 'reconciler', 'system'];
 
 	const ACTION_COLORS: Record<string, string> = {
 		propose: 'badge-proposed',
@@ -46,6 +52,10 @@
 		drift_check: 'bg-info-tint text-info',
 		host_added: 'badge-approved',
 		host_forgotten: 'badge-revoked',
+		token_minted: 'badge-approved',
+		token_revoked: 'badge-revoked',
+		instance_claimed: 'badge-applied',
+		login: 'bg-info-tint text-info',
 	};
 
 	const SOURCE_COLORS: Record<string, string> = {

@@ -59,6 +59,11 @@ PREAUTH_READ_TIMEOUT = 10  # seconds to send a valid handshake before disconnect
 # to return a result, so the transport wait outlives the on-host deadline.
 RESULT_WAIT_MARGIN = 5
 
+# The longest exec the hub will ask an agent for, in seconds (#720). Matches the
+# agent's own ceiling (agent/go/exec.go maxExecTimeout). The longest thing the
+# product runs is an apt install or a shell-script artifact at 300 s.
+MAX_EXEC_TIMEOUT_S = 600
+
 # ── Metric ingest bounds (ADR-004 S5) ────────────────────────────────────────
 # One frame is bounded independently of MAX_MESSAGE_SIZE: an agent flushing a
 # long backlog sends several frames, and a single frame must never be able to
@@ -100,6 +105,16 @@ GENERIC_AUTH_ERROR = "invalid auth_token"
 ENROLMENT_WINDOW_CLOSED_ERROR = (
     "enrolment refused: this hub is not accepting new hosts right now. Ask an "
     "operator to open the enrolment window (or enrol with a bootstrap token)."
+)
+
+# What a shared-token register is told when its hostname already holds a live
+# per-agent credential (#683). Also free of the word "auth", for the same reason:
+# the refused peer holds no credential that would help, and the host's real agent
+# never sees this - it authenticates with its own credential before this rule.
+HOST_HOLDS_CREDENTIAL_ERROR = (
+    "enrolment refused: this hostname already holds its own agent credential. "
+    "Reconnect with that credential, or ask an operator to revoke it (or enrol "
+    "with a bootstrap token)."
 )
 
 
@@ -414,13 +429,34 @@ class AgentHubServer:
         Not gated here, on purpose: per-agent reconnects (they authenticate
         before this is reached), bootstrap tokens (single-use, expiring,
         operator-minted - the sanctioned way to add one host later), and
-        re-enrolment of a hostname the fleet already contains.
+        re-enrolment of a hostname the fleet already contains - unless that
+        hostname still holds a LIVE per-agent credential (#683).
+
+        That exception is checked first and no window overrides it. A hostname
+        with a non-revoked credential has an agent that can prove who it is; a
+        shared-token register claiming the same name under another agent_id is
+        not that agent. Letting it through minted the claimant a credential,
+        routed the host's exec/write_file/drift/fence traffic to it, and locked
+        the real agent out as "identity already claimed". The ways back for a
+        host that genuinely lost its credential are both operator actions:
+        revoke the old credential (the host is then known but holds nothing
+        live, and the shared token re-enrols it), or mint a bootstrap token.
         """
         repo = self._repo
         if repo is None:
             # No persistence: there is no window to store and no fleet to grow.
             # A bare registry (unit tests, embedded use) keeps the old behaviour.
             return None
+        if hostname and await repo.get_agent_credentials_by_hostname(hostname):
+            return Denial(
+                reason=(
+                    f"shared-token enrolment refused: host {hostname} already holds a "
+                    "live per-agent credential, so a shared-token register for it is "
+                    "not that host's agent. Revoke the credential to re-enrol the "
+                    "host, or use a bootstrap token."
+                ),
+                wire_error=HOST_HOLDS_CREDENTIAL_ERROR,
+            )
         if await repo.count_agents() == 0:
             return None
         if hostname and await repo.agent_hostname_known(hostname):
@@ -1260,6 +1296,10 @@ class AgentHubServer:
             )
             raise ConnectionError(f"agent {agent_id} not connected")
 
+        # Bounded whatever the caller asked for (#720): the value used to reach
+        # the agent unchanged, so one request could hold an agent worker - and,
+        # before the agent's worker pool, the whole agent - indefinitely.
+        timeout = min(max(int(timeout), 1), MAX_EXEC_TIMEOUT_S)
         request_id = str(uuid.uuid4())
         msg = {
             "action": "exec",

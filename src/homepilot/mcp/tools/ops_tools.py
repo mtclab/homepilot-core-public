@@ -32,8 +32,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": ["string", "null"],
                     "description": "Only this artifact's tasks, or null for all",
                 },
-                "limit": {"type": "integer", "description": "Page size (1-1000, default 50)"},
-                "offset": {"type": "integer", "description": "Rows to skip (default 0)"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Page size (1-1000, default 50)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Rows to skip (default 0)",
+                },
             },
         },
         "outputSchema": {
@@ -112,8 +121,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": ["string", "null"],
                     "description": "Free text over artifact, host, command, actor",
                 },
-                "limit": {"type": "integer", "description": "Page size (1-10000, default 100)"},
-                "offset": {"type": "integer", "description": "Rows to skip (default 0)"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000,
+                    "description": "Page size (1-10000, default 100)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Rows to skip (default 0)",
+                },
             },
         },
         "outputSchema": {
@@ -354,4 +372,16 @@ async def handle_delete_auth_token(
     if row is None:
         raise ValueError(f"Token not found: {prefix}")
     await repo.delete_token(row["id"])
+    # The same audit row the REST revoke writes (#686), naming the MCP caller.
+    from homepilot.auth.audit import ACTION_REVOKED, audit_credential_event
+
+    await audit_credential_event(
+        repo,
+        action=ACTION_REVOKED,
+        actor=str(ctx.get("_mcp_caller_id") or "mcp"),
+        source="mcp",
+        prefix=prefix,
+        label=row.get("label"),
+        scope=row.get("scope"),
+    )
     return {"prefix": prefix, "deleted": True}

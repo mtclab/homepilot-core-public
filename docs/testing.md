@@ -139,7 +139,7 @@ docker compose exec backend hp token create --label smoketest --output json
 
 ```bash
 docker compose exec backend hp vault list
-docker compose exec backend hp vault set smoketest-secret --value '{"key":"value"}'
+printf '%s' '{"key":"value"}' | docker compose exec -T backend hp vault set smoketest-secret
 docker compose exec backend hp vault get smoketest-secret
 docker compose exec backend hp vault delete smoketest-secret --yes
 ```

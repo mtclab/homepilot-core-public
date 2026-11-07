@@ -159,7 +159,15 @@ class TestHttpTransportLive:
 
             # --- Fix 1 health: /health must report mcp "ok" only because the
             # session manager is truly running (not merely because a route exists).
-            health = await client.get("/health")
+            # The checks map is for authenticated callers (#687); this test
+            # holds the legacy MCP secret, not an API token, so it stands in one.
+            from unittest.mock import AsyncMock
+
+            from homepilot import main as main_mod
+
+            main_mod._health_cache_clear()
+            with patch.object(main_mod, "_is_authenticated", AsyncMock(return_value=True)):
+                health = await client.get("/health")
             assert health.json()["checks"]["mcp"] == "ok"
 
             # --- Fix 2b: the app-built HTTP context carries every key the tools read

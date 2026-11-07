@@ -168,7 +168,7 @@ async def vault_unlocked(vault: Any) -> bool:
     return True
 
 
-def _embeddings_subsystem(settings: Any) -> Subsystem:
+def _embeddings_subsystem(settings: Any, state: Any = None) -> Subsystem:
     primary = (getattr(settings, "embedding_service_url", "") or "").strip()
     fallback = (getattr(settings, "embedding_fallback_url", "") or "").strip()
     url = primary or fallback
@@ -179,11 +179,32 @@ def _embeddings_subsystem(settings: Any) -> Subsystem:
     )
     target = redact_endpoint(url)
 
-    async def probe() -> bool:
+    async def probe() -> bool | ProbeVerdict:
         from .kb.service import _call_embed_service
+        from .kb.vector_index import index_dimension
 
         vector = await _call_embed_service(url, model, "selfcheck", timeout=PROBE_TIMEOUT_SECONDS)
-        return vector is not None
+        if vector is None:
+            return False
+        # Answering is not enough (#777): a model whose vectors are not the
+        # index's size answers every probe and fails every insert. "ok" only
+        # when the vector would fit.
+        repo = getattr(state, "repo", None)
+        try:
+            indexed = await index_dimension(repo.db) if repo is not None else None
+        except Exception:
+            indexed = None
+        if isinstance(indexed, int) and indexed != len(vector):
+            return ProbeVerdict(
+                state=STATE_UNREACHABLE,
+                consequence=(
+                    f"KB search is keyword-only: the embedding model at {target} returns "
+                    f"{len(vector)}-dimension vectors but the KB index holds {indexed}, so "
+                    "no document can be embedded. Run a KB reindex to rebuild the index "
+                    "for this model."
+                ),
+            )
+        return True
 
     return Subsystem(
         name="embeddings",
@@ -726,7 +747,7 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _proxmox_subsystem(state, settings),
         _agent_hub_subsystem(state, settings),
         _vault_subsystem(state),
-        _embeddings_subsystem(settings),
+        _embeddings_subsystem(settings, state),
         _events_webhook_subsystem(settings),
         _mcp_subsystem(state),
         _artifacts_remote_subsystem(state, settings),

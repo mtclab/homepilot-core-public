@@ -27,8 +27,9 @@ from prometheus_client import Counter, Histogram, generate_latest
 
 from . import __version__
 from .app_state import create_app_state, get_agent_registry
-from .auth.deps import SCOPE_ENFORCER_ATTR, require_token
+from .auth.deps import _SAFE_METHODS, SCOPE_ENFORCER_ATTR, require_token
 from .auth.tokens import validate_token as _validate_token
+from .client_ip import client_ip, is_loopback_client
 from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
@@ -94,26 +95,11 @@ _ProxyNetworks = list[ipaddress.IPv4Network | ipaddress.IPv6Network]
 
 
 def _get_client_ip(request: Request, trusted_proxies: _ProxyNetworks) -> str:
-    peer = request.client.host if request.client else "unknown"
-    if not trusted_proxies:
-        return peer
-    try:
-        peer_addr = ipaddress.ip_address(peer)
-    except ValueError:
-        return peer
-    for network in trusted_proxies:
-        if peer_addr in network:
-            xff = request.headers.get("x-forwarded-for", "")
-            if xff:
-                first_client = xff.split(",")[0].strip()
-                if first_client:
-                    try:
-                        ipaddress.ip_address(first_client)
-                    except ValueError:
-                        return peer
-                    return first_client
-            break
-    return peer
+    """The rate-limit key: the shared trusted-proxy-aware resolver (#705).
+
+    It used to take the FIRST X-Forwarded-For hop, which is the one the client
+    writes, so every request could name a fresh address and never be limited."""
+    return client_ip(request, trusted_proxies)
 
 
 def _cleanup_rate_window() -> None:
@@ -442,8 +428,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         store=state.artifact_store,
     )
     app.state.task_runner = task_runner
+    if apply_reconciler is not None:
+        # Auto-apply claims runs through THIS runner (#710): one slot per
+        # artifact, and its runs are tracked for cancel and shutdown drain.
+        apply_reconciler.task_runner = task_runner
 
+    from .provision.reservations import GuestReservations
     from .provision.service import ProvisionService
+
+    # ONE reservation book for every service that creates guests (#719), so a
+    # provision and a template build can never both be handed the same vmid.
+    guest_reservations = GuestReservations()
 
     # Always constructed, even without Proxmox: the adapter can be configured
     # later through the admin settings UI, and _do_reload rebinds .proxmox onto
@@ -455,6 +450,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Read through the app state, so the provisioning defaults come from the
         # same resolver the settings UI writes to and are re-read per provision.
         defaults_source=app.state,
+        reservations=guest_reservations,
     )
 
     from .provision.template import GuestTemplateService
@@ -467,6 +463,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         task_repo=task_repo,
         repo=state.repo,
         defaults_source=app.state,
+        reservations=guest_reservations,
     )
 
     from .agent_hub.enroll import AgentEnrollService
@@ -706,6 +703,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # transport check fails (#468's upgrade case) while the registry
             # stays live and still writes. Draining twice is a no-op.
             ("agent registry", getattr(app.state, "agent_registry", None)),
+            # The KB rebuild started by a lifecycle transition or by startup's
+            # reindex_if_needed writes to the database from a task nobody
+            # awaits (#622).
+            ("kb service", getattr(app.state, "kb_service", None)),
         )
         for label, service in drainable:
             drain = getattr(service, "drain", None)
@@ -782,7 +783,14 @@ app.add_middleware(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next: Any) -> Response:
-    if request.url.path.startswith("/ui/") or request.url.path in ("/health", "/metrics"):
+    if (
+        request.url.path.startswith("/ui/")
+        or request.url.path == "/metrics"
+        or (request.url.path == "/health" and _is_loopback_probe(request))
+    ):
+        # /health is rate-limited like any anonymous route (#687) EXCEPT for the
+        # container's own healthcheck on loopback: a liveness probe refused by
+        # a flood would get a healthy container restarted.
         return cast(Response, await call_next(request))
 
     start = time.time()
@@ -914,14 +922,17 @@ async def _is_authenticated(request: Request) -> bool:
         if expires <= datetime.now(UTC):
             return False
 
-    if using_cookie:
+    # CSRF on UNSAFE methods only - the same rule `require_token` enforces. The
+    # UI sends no CSRF header on a GET (it has no reason to), so demanding one
+    # here judged every console read unauthenticated past the anonymous count:
+    # a cookie session got 120 requests a minute, not the 300 #514 promised
+    # (#689).
+    if using_cookie and request.method not in _SAFE_METHODS:
         csrf_header = request.headers.get("x-csrf-token")
         csrf_cookie = request.cookies.get("hp_csrf")
         if not csrf_cookie or csrf_header != csrf_cookie:
             return False
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and not request.headers.get(
-            "x-requested-with"
-        ):
+        if not request.headers.get("x-requested-with"):
             return False
 
     return True
@@ -957,6 +968,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 from .admin.router import router as admin_router  # noqa: E402
 from .agent_hub.router import router as agent_router  # noqa: E402
+from .artifacts.edit_router import router as artifacts_edit_router  # noqa: E402
 from .artifacts.router import router as artifacts_router  # noqa: E402
 from .audit.router import router as audit_router  # noqa: E402
 from .auth.router import router as auth_router  # noqa: E402
@@ -981,6 +993,14 @@ app.include_router(
 app.include_router(
     artifacts_router, prefix="/artifacts", tags=["artifacts"], dependencies=[Depends(require_token)]
 )
+# Operator edits (#693): its own module so the lifecycle routes stay one file's
+# concern; mounted under the same prefix and the same auth.
+app.include_router(
+    artifacts_edit_router,
+    prefix="/artifacts",
+    tags=["artifacts"],
+    dependencies=[Depends(require_token)],
+)
 app.include_router(
     tasks_router, prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_token)]
 )
@@ -1001,10 +1021,14 @@ app.include_router(portal_router, prefix="/invite", tags=["invite"])
 # separate guest client (G2) is its only intended consumer.
 from .guest.admin_router import router as guest_admin_router  # noqa: E402
 from .guest.router import router as guest_router  # noqa: E402
+from .webhooks.router import router as webhooks_router  # noqa: E402
 
 app.include_router(guest_router, prefix="/guest", tags=["guest"])
 # Operator-side guest management (#442 G3): ordinary admin-scoped console API.
 app.include_router(guest_admin_router, dependencies=[Depends(require_token)])
+# Webhook configs (#700): they existed only in a CLI that opened the database,
+# so a running install could not configure them at all.
+app.include_router(webhooks_router, dependencies=[Depends(require_token)])
 # The first-run claim carries NO token dependency by design: it is the path by
 # which the FIRST token comes into existence, so requiring one is a deadlock.
 # Its own credential is the claim code (constant-time compared, rate limited),
@@ -1198,8 +1222,48 @@ def assert_all_routes_scoped(target_app: FastAPI) -> None:
         )
 
 
+# The /health verdict is computed at most once per window and shared (#687).
+# It runs live Proxmox reads with both tokens and a vault unwrap; answered per
+# request, an anonymous caller could drive those as fast as it could ask.
+_HEALTH_CACHE_SECONDS = 10.0
+_health_cache: tuple[float, str, dict[str, str]] | None = None
+_health_lock = asyncio.Lock()
+
+
+def _health_cache_clear() -> None:
+    global _health_cache
+    _health_cache = None
+
+
+def _is_loopback_probe(request: Request) -> bool:
+    """The container's own healthcheck: the resolved CLIENT is on loopback.
+
+    Not the raw peer (#705): a reverse proxy on the same host also connects
+    from loopback, and keying the exemption on the peer exempted every request
+    it forwarded from the /health rate limit."""
+    return is_loopback_client(request, _trusted_proxy_networks)
+
+
 @app.get("/health")
 async def health(request: Request) -> JSONResponse:
+    """Liveness. Anonymous callers get the overall status and version; the
+    per-subsystem map needs a credential (#687) - it names what is configured
+    and what is failing, which is an operator's business."""
+    global _health_cache
+    async with _health_lock:
+        cached = _health_cache
+        if cached is None or time.monotonic() - cached[0] >= _HEALTH_CACHE_SECONDS:
+            overall, checks = await _compute_health(request)
+            _health_cache = (time.monotonic(), overall, checks)
+        else:
+            _, overall, checks = cached
+    content: dict[str, Any] = {"status": overall, "version": __version__}
+    if await _is_authenticated(request):
+        content["checks"] = dict(checks)
+    return JSONResponse(status_code=503 if overall == "down" else 200, content=content)
+
+
+async def _compute_health(request: Request) -> tuple[str, dict[str, str]]:
     checks: dict[str, str] = {}
 
     db_status = "ok"
@@ -1377,11 +1441,7 @@ async def health(request: Request) -> JSONResponse:
     else:
         overall = "degraded"
 
-    status_code = 503 if overall == "down" else 200
-    return JSONResponse(
-        status_code=status_code,
-        content={"status": overall, "version": __version__, "checks": checks},
-    )
+    return overall, checks
 
 
 @app.get("/", include_in_schema=False)

@@ -68,6 +68,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "kind": {
                     "type": "string",
+                    # The note kinds ARTIFACT_SPEC.md 5.6 defines, as POST /kb/notes
+                    # enforces them; `fact` stays accepted because installs wrote it.
+                    "enum": ["note", "policy", "decision", "fact"],
                     "description": "note, policy, or decision",
                 },
                 "content": {
@@ -105,8 +108,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "kind": {"type": ["string", "null"], "description": "Filter by kind"},
                 "target": {"type": ["string", "null"], "description": "Filter by target"},
-                "limit": {"type": "integer", "description": "Page size (1-1000, default 100)"},
-                "offset": {"type": "integer", "description": "Rows to skip (default 0)"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Page size (1-1000, default 100)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Rows to skip (default 0)",
+                },
             },
         },
         "outputSchema": {
@@ -248,9 +260,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "an embedding gets one. Pass no_embeddings=true to skip embeddings "
             "entirely, or force_embeddings=true to drop every stored vector and "
             "recompute - the step to run after changing the embedding model, since "
-            "an unchanged document otherwise keeps the old model's vector. Returns "
-            "reindexed / removed / errors, and status `completed_with_errors` when "
-            "anything failed. Admin only."
+            "an unchanged document otherwise keeps the old model's vector. When the "
+            "model's vectors are a different size than the index's, the index is "
+            "rebuilt for it and `vector_index_rebuilt` says from/to and how many old "
+            "vectors were dropped. Returns reindexed / removed / errors / "
+            "embedding_failures, and status `completed_with_errors` when anything "
+            "failed - including an embedding that could not be stored "
+            "(`embedding_first_failure` names the first). Admin only."
         ),
         "inputSchema": {
             "type": "object",

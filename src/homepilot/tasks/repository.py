@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -14,6 +15,14 @@ def _now() -> str:
 def _uuid4() -> str:
     return str(uuid.uuid4())
 
+
+# A task in one of these states will never change again. `cancelled` is one:
+# leaving it out held a sync caller for the whole wait on a task that had
+# already stopped (#694).
+# Statuses at which a waiter stops waiting. "unknown" (#774) is not a final
+# outcome - a later settle can still move it - but nothing more will happen
+# until someone asks PVE again, so polling it is pointless.
+TERMINAL_TASK_STATUSES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
 
 VALID_ACTIONS = {
     "apply",
@@ -69,14 +78,26 @@ class TaskRepository:
         _validate_action(action, artifact_id)
         task_id = _uuid4()
         ts = _now()
-        cursor = await self.db.execute(
-            """INSERT INTO tasks (id, artifact_id, action, status, created_at)
-               SELECT ?, ?, ?, 'pending', ?
-               WHERE NOT EXISTS (
-                   SELECT 1 FROM tasks WHERE artifact_id = ? AND status IN ('pending', 'running')
-               )""",
-            (task_id, artifact_id, action, ts, artifact_id),
-        )
+        # The NOT EXISTS answers the common case without an exception; the
+        # partial UNIQUE index (migration 34, #710) is what makes it hold when
+        # another connection - the CLI, a stdio MCP server - inserts between
+        # our check and our write. Either way the loser gets None.
+        try:
+            cursor = await self.db.execute(
+                """INSERT INTO tasks (id, artifact_id, action, status, created_at)
+                   SELECT ?, ?, ?, 'pending', ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM tasks
+                       WHERE artifact_id = ? AND status IN ('pending', 'running')
+                   )""",
+                (task_id, artifact_id, action, ts, artifact_id),
+            )
+        except sqlite3.IntegrityError:
+            # A constraint failure aborts only this statement, not the
+            # connection's transaction, so there is nothing to roll back - and
+            # a rollback here would discard other writers' uncommitted work on
+            # the shared connection.
+            return None
         if cursor.rowcount == 0:
             return None
         await self.db.conn.commit()
@@ -93,7 +114,9 @@ class TaskRepository:
         error: str | None = None,
         result_json: str | None = None,
     ) -> None:
-        ts = _now() if status in ("succeeded", "failed") else None
+        # 'unknown' (#774) is finished too: THIS run is over, even though the
+        # PVE task it started is not.
+        ts = _now() if status in ("succeeded", "failed", "unknown") else None
         await self.db.execute(
             """UPDATE tasks SET status = ?, finished_at = ?, error = ?, result_json = ?
                WHERE id = ?""",

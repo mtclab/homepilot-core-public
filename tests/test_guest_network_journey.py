@@ -38,6 +38,7 @@ import pytest
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactKind, ArtifactStatus, LifecycleError
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -263,14 +264,14 @@ class TestTheJourney:
         cluster that already matches touches the cluster zero times."""
         lifecycle, _store, _repo, executor, cluster = world
         aid = await lifecycle.propose(_spec())
-        await lifecycle.approve(aid, "olli")
+        await lifecycle.approve(aid, Principal.operator("olli"))
         await executor.apply(aid, approved_by="olli")
         cluster.calls.clear()
 
         # The cluster now HAS what was built. Re-run the same artifact.
         _promote_fake_cluster(cluster)
         second = await lifecycle.propose(_spec("2026-08-26-guest-network-again1"))
-        await lifecycle.approve(second, "olli")
+        await lifecycle.approve(second, Principal.operator("olli"))
         outcome = await executor.apply(second, approved_by="olli")
         assert outcome.success
         assert cluster.calls == [], "a converged cluster must be touched zero times"
@@ -280,7 +281,7 @@ class TestTheJourney:
         lifecycle, store, _repo, executor, cluster = world
         cluster.fail_on = "apply_sdn"
         aid = await lifecycle.propose(_spec())
-        await lifecycle.approve(aid, "olli")
+        await lifecycle.approve(aid, Principal.operator("olli"))
         outcome = await executor.apply(aid, approved_by="olli")
         assert outcome.success is False
         assert "dnsmasq is not installed" in (outcome.failure_reason or "")
@@ -292,7 +293,7 @@ class TestDriftIsThePlan:
     async def test_a_converged_network_is_in_spec(self, world) -> None:
         lifecycle, store, repo, executor, cluster = world
         aid = await lifecycle.propose(_spec())
-        await lifecycle.approve(aid, "olli")
+        await lifecycle.approve(aid, Principal.operator("olli"))
         await executor.apply(aid, approved_by="olli")
         _promote_fake_cluster(cluster)
 
@@ -303,7 +304,7 @@ class TestDriftIsThePlan:
     async def test_a_network_somebody_changed_reads_as_drifted(self, world) -> None:
         lifecycle, store, repo, executor, cluster = world
         aid = await lifecycle.propose(_spec())
-        await lifecycle.approve(aid, "olli")
+        await lifecycle.approve(aid, Principal.operator("olli"))
         await executor.apply(aid, approved_by="olli")
         _promote_fake_cluster(cluster)
         # Somebody deleted the DROP towards the operator LAN.
@@ -316,7 +317,7 @@ class TestDriftIsThePlan:
     async def test_an_unreachable_cluster_is_unknown_not_in_spec(self, world) -> None:
         lifecycle, store, repo, executor, _cluster = world
         aid = await lifecycle.propose(_spec())
-        await lifecycle.approve(aid, "olli")
+        await lifecycle.approve(aid, Principal.operator("olli"))
         await executor.apply(aid, approved_by="olli")
 
         class Dead(FakeCluster):

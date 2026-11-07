@@ -1,5 +1,103 @@
 # Changelog
 
+## 3.6.25 - 2026-11-07
+
+### Shutdown waits for the cleanup it starts (#496)
+
+Cancelling a provision or guest-template build at shutdown starts the cleanup
+that destroys the half-made guest and records the outcome. The shutdown drain
+only waited for the jobs it saw when it began, so a cleanup slower than its 1 s
+grace could still be writing when the database closed. The drain now re-reads
+the live job set and cancels in bounded rounds, so that cleanup is finished or
+cancelled before shutdown moves on. Every background task the provision and
+template services start is now checked to be tracked.
+
+### Security: an empty `.env` key took its template comment as its value (#773)
+
+Docker Compose's `env_file` reads `KEY=   # note` as the value `# note`; the
+inline-comment rule only applies after a real value. `.env.example` shipped 33
+empty keys written that way (`.env.example.agent` two more), so an install that
+copied the template and left them empty ran with the comment text as the
+setting. On a production install that made `HP_VAULT_PASSPHRASE` - the key the
+whole vault is encrypted with - the string `# Override: an existing
+passphrase`, readable by anyone who has seen the repo.
+
+- Both templates now put every comment on its own line, and a gate test fails
+  if any shipped env template has `KEY=<whitespace>#` again, commented-out
+  assignments included.
+- The backend (and every `hp` command) refuses to start while any `HP_*` value
+  starts with `#`, naming the key and never the value. Other variables with a
+  `#` value are named in the log. Settings errors no longer echo the loaded
+  input.
+
+**Operator action - check every install whose `.env` came from an older
+template.** Run `grep -nE '^[A-Z0-9_]+=[[:space:]]*#' .env`: every line it
+prints is affected. After upgrading, a backend that refuses to start is telling
+you which key it found.
+
+- `HP_VAULT_PASSPHRASE`: the vault is protected only by filesystem
+  permissions until you rotate. There is no `hp` command for this; the
+  mechanism is `VaultManager.rotate_passphrase`, and `docs/vault.md`
+  ("Passphrase taken from a template comment") has the exact procedure - a
+  one-off `docker compose run` that writes a generated passphrase to
+  `<data_dir>/.vault_passphrase` (0600) and re-wraps the vault with it. Do this
+  BEFORE clearing the `.env` line: the environment value is the only thing
+  that still opens the vault. Pre-rotation copies of the vault identity still
+  open with the public string; destroy them.
+- `HP_MCP_TOKEN`, `HP_AGENT_HUB_AUTH_TOKEN`, `HP_PORTAL_PROXY_SECRET`,
+  `SEARXNG_SECRET_KEY`: these were public strings. Clear them (or set a
+  generated value) and treat anything authenticated with them as exposed; a
+  new hub token means re-enrolling agents.
+- `N8N_ENCRYPTION_KEY`: n8n encrypted its stored credentials with the comment
+  text. n8n also records the key in its settings file (`/home/node/.n8n/config`
+  in the `n8n-data` volume) and refuses to start when `N8N_ENCRYPTION_KEY`
+  differs from it, so a new key is a migration: export the credentials with
+  `n8n export:credentials --all --decrypted --output=<file>` (the file is
+  plain text - delete it afterwards), set a generated key in both `.env` and
+  that settings file, then `n8n import:credentials --input=<file>`. With few
+  credentials, a fresh `n8n-data` volume (workflows re-imported, credentials
+  re-entered) is simpler.
+- The rest (`HP_ENV`, `HP_TRUSTED_PROXIES`, `HP_PORTAL_TRUSTED_PROXY`,
+  `HP_VAULT_AUTO_INIT`, `HP_VAULT_DIR`, the `HP_PROVISION_*` and
+  `HP_GUEST_NETWORK_*` defaults, `HP_EMBEDDING_*_URL`, `HP_AGENT_HUB_TLS_CA`,
+  `HP_ARTIFACTS_*`, ...) changed behaviour rather than leaking anything: clear
+  them and restart.
+
+### Security: the bundled n8n is never up without an owner (#775)
+
+The `agents` profile's n8n set `N8N_BASIC_AUTH_*`, which n8n removed in 1.0;
+the pinned 2.35.3 ignores them. A production instance had never had an owner
+account, so the first person to reach its UI - through a port mapping, a proxy
+or a tunnel - could claim the owner and every credential stored in n8n. No port
+is published by default, so nobody had reached it.
+
+The dead variables are gone from the compose file and both env templates. n8n
+now runs with `N8N_INSTANCE_OWNER_MANAGED_BY_ENV=true`: it sets the owner from
+`N8N_INSTANCE_OWNER_EMAIL` and `N8N_INSTANCE_OWNER_PASSWORD_HASH` (bcrypt) at
+every start, and refuses to start while either is empty.
+
+**Operator action, `agents` profile only:** before upgrading, set both in
+`.env` (`docs/deployment.md` has the commands; keep the hash in single
+quotes). Without them n8n stops starting - by design. On an instance whose
+owner was already claimed, the owner's email and password become the ones in
+`.env` at the next start. Remove `N8N_BASIC_AUTH_USER`/`_PASSWORD` from `.env`.
+If you ever published n8n's port, check in n8n that the owner and users are the
+ones you expect.
+
+### piper starts (#776)
+
+`rhasspy/wyoming-piper` 2.4.2 takes its settings as command-line flags only
+and exits with `--voice is required for the piper backend` without one; the
+compose file passed them as `PIPER_*` environment, which it never reads, so
+piper crash-looped. They are now its `command:` (`--voice
+${PIPER_VOICE:-en_US-lessac-medium}`, `--length-scale`, `--noise-scale`,
+`--noise-w-scale`, each still overridable from `.env`). Two more defects
+that would have kept it unhealthy once it started: voices were mounted at
+`/voices` while the image downloads into its `--data-dir /data` (so every
+restart downloaded the voice again), and the healthcheck spoke HTTP to port
+10200, which speaks the Wyoming protocol - it now asks the server to describe
+itself and expects `info` back.
+
 ## 3.6.24 - 2026-09-02
 
 ### The fence probe waits for the guest's network (#648)
@@ -737,7 +835,7 @@ cancel cleanup.
 `get_selfcheck` reported "No hypervisor is configured, so inventory stays empty
 and guest provisioning is unavailable", and `hp status` printed
 "PVE host | (not configured)" - on an install that was listing nine inventory
-items and provisioning guests off 10.0.0.1.
+items and provisioning guests off its configured PVE host.
 
 `settings.proxmox_host` is only the ENVIRONMENT half. An install claimed through
 the web UI keeps its hypervisor in the vault, and that secret wins - but the
@@ -1877,7 +1975,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 
 ### Testing
 
-- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance at `10.0.0.1:8000`.
+- **E2E test rewrite**: `tests/test_e2e.py` completely rewritten for live server testing against the dev instance.
 - **Rate limit resilience**: Session-scoped `session_auth` fixture pre-creates all tokens (session, revoke target, scope target, read-only, roundtrip) with 429 retry logic. Individual tests reuse pre-created tokens instead of creating new ones on the fly, eliminating rate-limit skips.
 - **Browser cookie auth**: `auth_page` fixture authenticates via browser UI login so cookies (`hp_token`, `hp_csrf`) are set correctly in the Playwright context.
 - **CSRF headers**: All cookie-authenticated mutations include `x-csrf-token` + `x-requested-with: XMLHttpRequest` headers.
@@ -1887,7 +1985,7 @@ Large hardening + upgrade batch from the 2026-08-15 code audit.
 ### Fixes
 
 - **AGENTS.md model assignments**: Updated to match current `~/.config/opencode/agents/roles.md` (deepseek-v4-pro removed, kimi-k2.6 now primary for CoreSquad/ToolingSquad/QATester).
-- **matrix_server.py default URL**: Changed from `example.com` to `matrix.example.com` and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
+- **matrix_server.py default URL**: Changed from `example.com` to the operator's own Matrix server and regex from `@hp-([a-z]+):example\.com` to `@hp-([a-z]+):`.
 
 ## v2.2.3 (2026-05-25)
 

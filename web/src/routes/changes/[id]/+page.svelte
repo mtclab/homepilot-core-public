@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { api, sessionStore, type ArtifactDetail, type Task } from '$lib/api';
-	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { canWrite as capCanWrite, isAdmin } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import ApprovalCodePanel from '$lib/components/ApprovalCodePanel.svelte';
@@ -30,6 +30,8 @@
 	// Approve/Reject/Apply/Revoke all 403 without write scope — don't offer them.
 	// Default-deny while the session is still loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+	// Approving needs an operator (admin) session (#681).
+	$: canApprove = isAdmin($sessionStore?.capabilities);
 	$: status = detail?.frontmatter.status ?? '';
 	$: hasActiveTask = detail?.active_task !== null && detail?.active_task !== undefined;
 
@@ -58,14 +60,14 @@
 		switch (status) {
 			case 'proposed':
 				return [
-					{ label: 'Approve', cls: 'btn-success', fn: doApprove },
+					...(canApprove ? [{ label: 'Approve', cls: 'btn-success', fn: doApprove }] : []),
 					{ label: 'Reject', cls: 'btn-danger', fn: doReject, destructive: true },
 				];
 			case 'approved':
 				return [{ label: 'Apply', cls: 'btn-success', fn: doApply }];
 			case 'failed':
 				return [
-					{ label: 'Re-approve', cls: 'btn-success', fn: doApprove },
+					...(canApprove ? [{ label: 'Re-approve', cls: 'btn-success', fn: doApprove }] : []),
 					{ label: 'Revoke', cls: 'btn-danger', fn: doRevoke, destructive: true },
 				];
 			case 'applied':
@@ -73,7 +75,7 @@
 					{ label: 'Revoke', cls: 'btn-danger', fn: doRevoke, destructive: true },
 				];
 				if (detail?.frontmatter?.replay_safe !== false) {
-					actions.push({ label: 'Replay', cls: 'btn-success', fn: doApply });
+					actions.push({ label: 'Replay', cls: 'btn-success', fn: doReplay });
 				}
 				return actions;
 			default:
@@ -153,6 +155,20 @@
 		}
 	}
 
+	async function doReplay() {
+		working = true;
+		try {
+			const res = await api.replayArtifact(id);
+			notify('Replay queued');
+			startPolling(res.task_id);
+			await load();
+		} catch (e) {
+			notify(String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
 	async function doRevoke() {
 		working = true;
 		try {
@@ -186,6 +202,10 @@
 						notify('Task failed: ' + (task.error ?? 'unknown'), 'err');
 					} else if (task.status === 'cancelled') {
 						notify('Task cancelled', 'err');
+					} else if (task.status === 'unknown') {
+						// Not a failure and not a success (#774): PVE is still
+						// working. Opening the task again settles it.
+						notify('Outcome unknown: ' + (task.error ?? 'the PVE task is still running'), 'err');
 					} else {
 						notify('Task completed');
 					}
@@ -266,7 +286,7 @@
 	// fine-grained apply/revoke progress.
 	const refresh = debounce(() => load(false), 400);
 	const unsub = onArtifactEvent((e) => {
-		if (e.data?.id === id) refresh();
+		if (e.type === 'resync' || e.data?.id === id) refresh();
 	});
 	onDestroy(() => {
 		stopPolling();

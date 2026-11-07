@@ -67,7 +67,17 @@ is not rebuilt, and the key is used once and never stored.</p>
 
 {% else %}
 <p><span class="status status-bad">Did not finish</span></p>
+{% if failure == "left" %}
+<p class="lede">The build stopped part-way, and a machine it had started could not be
+removed. Your invite link stays used until the operator has cleaned that up - tell them you
+saw this page and they can look at the details.</p>
+{% elif failure == "unknown" %}
+<p class="lede">The build did not complete, and whether it left a half-made machine behind
+could not be confirmed. Your invite link stays used until the operator has checked - tell them
+you saw this page and they can look at the details.</p>
+{% else %}
 <p class="lede">The build did not complete. Nothing was left half-made that you need to clean
 up. Tell the operator you saw this page and they can look at the details.</p>
+{% endif %}
 {% endif %}
 {% endblock %}

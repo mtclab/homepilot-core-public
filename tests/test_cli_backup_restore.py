@@ -115,15 +115,49 @@ def _vault_secret(data_dir: Path, passphrase: str, name: str = "pve-token") -> d
     return asyncio.run(vault.get_secret(name))
 
 
+def _invoke_on(data_dir: Path, args: list[str]):
+    """Run the CLI against `data_dir`, and ONLY it.
+
+    `get_settings` is cached process-wide. These helpers are imported by other
+    modules (#722) that do not carry this module's autouse cache fixture, so
+    the helper clears it itself: otherwise the CLI reads whatever settings an
+    earlier import cached - the test sandbox's own data dir - and exports THAT
+    directory, green or red by test order. Cleared again after, so the settings
+    for this throwaway directory never leak into the next test either."""
+    get_settings.cache_clear()
+    try:
+        with patch.dict("os.environ", _env(data_dir), clear=True):
+            return runner.invoke(app, args)
+    finally:
+        get_settings.cache_clear()
+
+
 def _export(data_dir: Path, tarball: Path, *extra: str):
-    with patch.dict("os.environ", _env(data_dir), clear=True):
-        return runner.invoke(app, ["export", "-o", str(tarball), *extra])
+    return _invoke_on(data_dir, ["export", "-o", str(tarball), *extra])
 
 
 def _import(data_dir: Path, tarball: Path, *extra: str):
-    get_settings.cache_clear()
-    with patch.dict("os.environ", _env(data_dir), clear=True):
-        return runner.invoke(app, ["import", str(tarball), "--yes", *extra])
+    return _invoke_on(data_dir, ["import", str(tarball), "--yes", *extra])
+
+
+class TestTheHelpersExportTheDirectoryTheyAreGiven:
+    def test_a_settings_cache_primed_elsewhere_does_not_redirect_the_export(self, tmp_path):
+        """Teeth for `_invoke_on`: prime the process-wide settings with a decoy
+        data dir (what an earlier import does in a full run), then export a
+        real host. The archive must hold the real host's files, not the decoy's."""
+        decoy, real = tmp_path / "decoy", tmp_path / "real"
+        decoy.mkdir()
+        _seed_host(real)
+        with patch.dict("os.environ", _env(decoy), clear=True):
+            assert get_settings().data_dir == str(decoy)
+
+        tarball = tmp_path / "backup.tar.gz"
+        result = _export(real, tarball, "--include-secrets")
+        assert result.exit_code == 0, _out(result)
+        with tarfile.open(tarball, "r:gz") as tar:
+            manifest = json.load(tar.extractfile("manifest.json"))
+        assert "vault/identities" in manifest["secret_paths"], manifest["secret_paths"]
+        assert "api-token" in manifest["secret_paths"]
 
 
 class TestJourneyWipedHostComesBack:

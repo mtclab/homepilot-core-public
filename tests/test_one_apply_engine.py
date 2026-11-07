@@ -27,6 +27,7 @@ import pytest
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactStatus
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -89,7 +90,7 @@ async def engine(tmp_path: Path):
 class TestReplayGuardsHoldOnTheOnlyPathIn:
     async def _applied(self, runner, lifecycle, artifact_id: str, **overrides) -> None:
         await lifecycle.propose(_spec(artifact_id, **overrides))
-        await lifecycle.approve(artifact_id, "operator")
+        await lifecycle.approve(artifact_id, Principal.operator("operator"))
         started = await runner.start_apply(artifact_id, approved_by="operator")
         await runner.await_task(started["task_id"], timeout=10.0)
 
@@ -229,7 +230,14 @@ class TestTheCliUsesTheOneEngine:
         helper = text[
             text.index("def _run_artifact_task(") : text.index('@artifacts_app.command("apply")')
         ]
-        assert "sync=true" in helper
+        # It follows the task to its end rather than holding one sync request
+        # open under a short client timeout (#694); the outcome contract itself
+        # is driven end to end in tests/test_cli_task_outcome_694.py.
+        assert "_follow_task" in helper and "/tasks/" in text
+        assert 'status == "succeeded"' in helper, (
+            "success must be established by the task saying it succeeded, not "
+            "assumed from the absence of a failure"
+        )
         assert re.search(r'status in \(\s*"failed"', helper), (
             "the CLI does not fail when the task failed - it would report success "
             "for a change that did not happen"

@@ -159,6 +159,9 @@ HP_AGENT_HUB_AUTH_TOKEN=$(openssl rand -hex 32)
 
 ```env
 N8N_ENCRYPTION_KEY=$(openssl rand -hex 32)
+# n8n refuses to start without an owner (#775); hash: htpasswd -nBC 10 "" | tr -d ':\n'
+N8N_INSTANCE_OWNER_EMAIL=admin@example.com
+N8N_INSTANCE_OWNER_PASSWORD_HASH='$2y$10$...'
 SEARXNG_SECRET_KEY=$(openssl rand -hex 32)
 RADICALE_PASSWORD=...
 ```

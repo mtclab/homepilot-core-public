@@ -146,7 +146,9 @@ export interface Artifact {
 	version?: string;
 }
 
-export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+// 'unknown' (#774): the run stopped following a PVE task that was still
+// running; reading the task again settles it from PVE.
+export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 
 export interface Task {
 	id: string;
@@ -547,12 +549,23 @@ export interface AuditEntry {
 	details_json: string | null;
 }
 
+/** Whether one half of the environment doc could be read (#642/#701). */
+export interface DocSource {
+	read: boolean;
+	error?: string;
+}
+
 export interface HostDoc {
 	target: string;
 	hosts: Host[];
 	services: Service[];
 	kb_entries: KBEntry[];
 	artifact_history: Artifact[];
+	sources?: {
+		inventory?: DocSource;
+		knowledge_base?: DocSource;
+		artifact_history?: DocSource;
+	};
 }
 
 export interface Service {
@@ -602,6 +615,25 @@ export interface TokenInfo {
 	created_at: string;
 	last_used_at: string | null;
 	expires_at: string | null;
+}
+
+export interface WebhookConfig {
+	id: number;
+	/** scheme://host:port - never the path or query, which carry credentials. */
+	endpoint: string;
+	event_types: string[];
+	enabled: boolean;
+	max_retries: number;
+	has_secret: boolean;
+	created_at: string | null;
+}
+
+export interface WebhookListing {
+	items: WebhookConfig[];
+	total: number;
+	/** Every event the platform emits; '*' (wildcard) subscribes to all of them. */
+	event_types: string[];
+	wildcard: string;
 }
 
 export interface MeInfo {
@@ -696,10 +728,14 @@ export const api = {
 	planArtifact(id: string) {
 		return req<ArtifactPlan>(`/artifacts/${id}/plan`, { method: 'POST' });
 	},
-	approveArtifact(id: string, user = 'web') {
+	// No `user`/`approved_by` in these bodies: the server records the
+	// authenticated credential and ignores any name a client claims (#681).
+	// Approving here needs an operator (admin) session; the approval code is for
+	// relaying to the assistant, not for this screen.
+	approveArtifact(id: string) {
 		return req<{ id: string; status: string }>(`/artifacts/${id}/approve`, {
 			method: 'POST',
-			body: JSON.stringify({ user }),
+			body: JSON.stringify({}),
 		});
 	},
 	resetApprovalCode(id: string) {
@@ -707,22 +743,30 @@ export const api = {
 			method: 'POST',
 		});
 	},
-	rejectArtifact(id: string, user = 'web', reason?: string) {
+	rejectArtifact(id: string, reason?: string) {
 		return req<{ id: string; status: string }>(`/artifacts/${id}/reject`, {
 			method: 'POST',
-			body: JSON.stringify({ user, reason }),
+			body: JSON.stringify({ reason }),
 		});
 	},
-	applyArtifact(id: string, approved_by = 'web') {
+	applyArtifact(id: string) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}/apply`, {
 			method: 'POST',
-			body: JSON.stringify({ approved_by }),
+			body: JSON.stringify({}),
 		});
 	},
-	revokeArtifact(id: string, user = 'web', reason?: string) {
+	// Replay re-runs an APPLIED artifact through the engine's replay guards
+	// (`replay_safe: false`, replay-only). It is its own route: `/apply` refuses
+	// anything not APPROVED, so a Replay wired to apply failed every time (#695).
+	replayArtifact(id: string) {
+		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}/replay`, {
+			method: 'POST',
+		});
+	},
+	revokeArtifact(id: string, reason?: string) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}`, {
 			method: 'DELETE',
-			body: JSON.stringify({ user, reason }),
+			body: JSON.stringify({ reason }),
 		});
 	},
 
@@ -1017,6 +1061,26 @@ export const api = {
 			method: 'PATCH',
 			body: JSON.stringify(patch),
 		});
+	},
+	// --- Webhooks (#700): admin. `endpoint` is scheme://host:port only; the full
+	// URL comes back once, in the create response.
+	listWebhooks() {
+		return req<WebhookListing>('/admin/webhooks');
+	},
+	createWebhook(body: { url: string; event_types: string[]; secret?: string; max_retries?: number }) {
+		return req<WebhookConfig & { url: string }>('/admin/webhooks', {
+			method: 'POST',
+			body: JSON.stringify(body),
+		});
+	},
+	deleteWebhook(id: number) {
+		return req<{ id: number; deleted: boolean }>(`/admin/webhooks/${id}`, { method: 'DELETE' });
+	},
+	testWebhook(id: number) {
+		return req<{ id: number; endpoint: string; event: string; delivered: boolean }>(
+			`/admin/webhooks/${id}/test`,
+			{ method: 'POST' },
+		);
 	},
 	deleteAlertRule(ruleId: string) {
 		return req<{ id: string; deleted: boolean }>(`/monitoring/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' });

@@ -81,11 +81,25 @@ func systemInfoToSamples(sys map[string]any, now int64) []metricSample {
 // the OLDEST samples are dropped first (recent data is what an operator acts
 // on) and every drop is logged with a running total - a silent hole is exactly
 // the failure this buffer exists to prevent.
+//
+// Every sample carries a sequence number (head is the sequence of samples[0]),
+// so a flush acknowledges an exact RANGE, not "this many from the front": the
+// front moves when add() evicts while a batch is in flight (#727). Evicting a
+// sample that is in flight is not yet a drop - it was sent - and is only
+// counted as one if that batch is never acknowledged.
 type metricBuffer struct {
 	mu       sync.Mutex
 	samples  []metricSample
+	head     uint64 // sequence number of samples[0]
 	capacity int
 	dropped  uint64
+
+	// The batch awaiting its ack, as [inflightStart, inflightEnd), and how many
+	// of its samples add() evicted meanwhile.
+	inflight        bool
+	inflightStart   uint64
+	inflightEnd     uint64
+	inflightEvicted uint64
 }
 
 func newMetricBuffer(capacity int) *metricBuffer {
@@ -105,11 +119,44 @@ func (b *metricBuffer) add(s []metricSample) int {
 	if over <= 0 {
 		return 0
 	}
+	evictedFrom, evictedTo := b.head, b.head+uint64(over)
 	b.samples = append(b.samples[:0], b.samples[over:]...)
-	b.dropped += uint64(over)
-	log.Printf("metrics buffer full (%d samples): dropped %d oldest sample(s), %d dropped since start",
-		b.capacity, over, b.dropped)
+	b.head = evictedTo
+	lost := uint64(over)
+	if b.inflight {
+		// The part of the evicted range that is in flight was sent; whether it
+		// is lost is decided by the ack, not here.
+		lo, hi := max(evictedFrom, b.inflightStart), min(evictedTo, b.inflightEnd)
+		if hi > lo {
+			b.inflightEvicted += hi - lo
+			lost -= hi - lo
+		}
+	}
+	if lost > 0 {
+		b.dropped += lost
+		log.Printf("metrics buffer full (%d samples): dropped %d oldest sample(s), %d dropped since start",
+			b.capacity, lost, b.dropped)
+	}
 	return over
+}
+
+// take returns a copy of up to n leading samples without removing them, marks
+// them in flight, and returns the sequence number of the first.
+func (b *metricBuffer) take(n int) ([]metricSample, uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n > len(b.samples) {
+		n = len(b.samples)
+	}
+	if n == 0 {
+		return nil, b.head
+	}
+	out := make([]metricSample, n)
+	copy(out, b.samples[:n])
+	b.inflight = true
+	b.inflightStart, b.inflightEnd = b.head, b.head+uint64(n)
+	b.inflightEvicted = 0
+	return out, b.head
 }
 
 // peek returns a copy of up to n leading samples without removing them.
@@ -127,14 +174,34 @@ func (b *metricBuffer) peek(n int) []metricSample {
 	return out
 }
 
-// dropFront removes n delivered samples from the head.
-func (b *metricBuffer) dropFront(n int) {
+// ack removes the acknowledged range [start, start+n) - whatever of it is still
+// buffered - and nothing after it.
+func (b *metricBuffer) ack(start uint64, n int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if n > len(b.samples) {
-		n = len(b.samples)
+	end := start + uint64(n)
+	if end > b.head {
+		drop := end - b.head
+		if drop > uint64(len(b.samples)) {
+			drop = uint64(len(b.samples))
+		}
+		b.samples = append(b.samples[:0], b.samples[drop:]...)
+		b.head += drop
 	}
-	b.samples = append(b.samples[:0], b.samples[n:]...)
+	b.inflight, b.inflightEvicted = false, 0
+}
+
+// abandon ends an in-flight batch that was never acknowledged. Its samples that
+// add() evicted meanwhile are now known to be lost, and are counted.
+func (b *metricBuffer) abandon() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inflightEvicted > 0 {
+		b.dropped += b.inflightEvicted
+		log.Printf("metrics batch unacknowledged: %d sample(s) evicted while in flight are lost, "+
+			"%d dropped since start", b.inflightEvicted, b.dropped)
+	}
+	b.inflight, b.inflightEvicted = false, 0
 }
 
 func (b *metricBuffer) len() int {
@@ -163,7 +230,7 @@ func (a *Agent) samplerLoop(stop <-chan struct{}) {
 		a.metrics.add(systemInfoToSamples(collectSystemInfo(), time.Now().Unix()))
 	}
 	sample() // a fresh agent reports now, not one interval from now
-	t := time.NewTicker(time.Duration(a.cfg.MetricsInterval) * time.Second)
+	t := time.NewTicker(tickEvery(a.cfg.MetricsInterval, defaultMetricsInterval))
 	defer t.Stop()
 	for {
 		select {
@@ -183,7 +250,7 @@ func (a *Agent) metricsLoop(done <-chan struct{}, acks <-chan string, gen uint64
 		return
 	}
 	a.flushMetrics(done, acks, gen)
-	t := time.NewTicker(time.Duration(a.cfg.MetricsInterval) * time.Second)
+	t := time.NewTicker(tickEvery(a.cfg.MetricsInterval, defaultMetricsInterval))
 	defer t.Stop()
 	for {
 		select {
@@ -200,18 +267,20 @@ func (a *Agent) metricsLoop(done <-chan struct{}, acks <-chan string, gen uint64
 // soon as anything fails so the samples stay buffered for the next attempt.
 func (a *Agent) flushMetrics(done <-chan struct{}, acks <-chan string, gen uint64) {
 	for a.metrics.len() > 0 {
-		batch := a.metrics.peek(maxSamplesPerFrame)
+		batch, start := a.metrics.take(maxSamplesPerFrame)
 		reqID := newUUID()
 		if err := a.sendOn(gen, msg{
 			"action": "metrics", "samples": asWireSamples(batch), "request_id": reqID,
 		}); err != nil {
+			a.metrics.abandon()
 			log.Printf("metrics send failed (%v); %d sample(s) buffered", err, a.metrics.len())
 			return
 		}
 		if !a.waitMetricAck(done, acks, reqID) {
+			a.metrics.abandon()
 			return
 		}
-		a.metrics.dropFront(len(batch))
+		a.metrics.ack(start, len(batch))
 	}
 }
 

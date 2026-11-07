@@ -2,49 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 from typing import Any
+
+from homepilot.adapters.readonly_policy import readonly_command_refusal
 
 logger = logging.getLogger(__name__)
 
-_SHELL_METACHAR_RE = re.compile(r"[|;&`$<>!#\(\){}\[\]]")
-
-_SAFE_READONLY_COMMANDS = {
-    "cat": re.compile(r"^cat\s+[^\s]+$"),
-    "ls": re.compile(r"^ls(\s+[a-zA-Z0-9_./-]+)*$"),
-    "ps": re.compile(r"^ps(\s+[a-zA-Z0-9_-]+)*$"),
-    "hostname": re.compile(r"^hostname$"),
-    "uname": re.compile(r"^uname(\s+-[aAmnrsv]+)*$"),
-    "df": re.compile(r"^df(\s+-[hHiTkP]+)*(\s+[a-zA-Z0-9_./-]+)?$"),
-    "free": re.compile(r"^free(\s+-[hkmgb]+)*$"),
-    "uptime": re.compile(r"^uptime$"),
-    "ip": re.compile(r"^ip\s+(addr|link|route|neigh)(\s+[a-zA-Z0-9_./-]+)*$"),
-    "ss": re.compile(r"^ss(\s+-[a-zA-Z0-9]+)*(\s+[a-zA-Z0-9_./-]+)?$"),
-    # Kept in lockstep with agent/go/allowlist.go safeCommands["systemctl"] — the
-    # adapter must not reject a read-only subcommand (is-active/is-enabled/
-    # daemon-reload) the agent itself allows. Parity is gated by
-    # tests/test_allowlist_parity.py.
-    "systemctl": re.compile(
-        r"^systemctl\s+(status|is-active|is-enabled|daemon-reload)"
-        r"(\s+[a-zA-Z0-9_.-]+(\.service)?)?$"
-    ),
-    "journalctl": re.compile(r"^journalctl(\s+-[a-zA-Z0-9]+(\s+\S+)?)*$"),
-    "dpkg": re.compile(r"^dpkg\s+-[lSs](\s+[a-zA-Z0-9_.+-]+)*$"),
-}
-
-# Kept in lockstep with agent/go/allowlist.go catAllowedPrefixes — gated by
-# tests/test_allowlist_parity.py so the adapter never permits a cat path the
-# agent would reject (subset), and does not reject one the agent allows.
-_CAT_ALLOWED_PREFIXES = (
-    "/var/log/",
-    "/etc/homepilot/",
-    "/etc/hostname",
-    "/etc/os-release",
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/systemd/",
-    "/opt/",
-)
+# The READ-tier command gate lives in the policy shared with the Go agent
+# (adapters/readonly_policy.json, a byte-identical copy of
+# agent/go/readonly_policy.json). The regex tables that used to sit here drifted
+# from the agent's and let mutating verbs through at the read tier (#682).
 
 
 class AgentAdapterError(Exception):
@@ -196,28 +163,12 @@ class AgentAdapter:
         )
 
     async def exec_readonly(self, host: str, command: str) -> tuple[int, str, str]:
-        if not self._validate_readonly_command(command):
-            raise ReadOnlyCommandError(f"command not in read-only whitelist: {command}")
+        refusal = readonly_command_refusal(command)
+        if refusal is not None:
+            raise ReadOnlyCommandError(f"command not in read-only whitelist: {refusal}")
         return await self.exec(host=host, command=command)
 
     @staticmethod
     def _validate_readonly_command(command: str) -> bool:
-        stripped = command.strip()
-        if _SHELL_METACHAR_RE.search(stripped):
-            return False
-        cmd_base = stripped.split()[0] if stripped.split() else ""
-        pattern = _SAFE_READONLY_COMMANDS.get(cmd_base)
-        if pattern is None:
-            return False
-        if not pattern.match(stripped):
-            return False
-        if cmd_base == "cat":
-            parts = stripped.split()
-            if len(parts) < 2:
-                return False
-            cat_path = parts[1]
-            if ".." in cat_path:
-                return False
-            if not any(cat_path == p or cat_path.startswith(p) for p in _CAT_ALLOWED_PREFIXES):
-                return False
-        return True
+        """Whether ``command`` may run at the READ tier (see readonly_policy)."""
+        return readonly_command_refusal(command) is None

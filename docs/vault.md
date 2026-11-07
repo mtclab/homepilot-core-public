@@ -204,6 +204,88 @@ So:
 reason: a generated one that nobody knows about is a vault waiting to be
 orphaned by the next volume.
 
+## Passphrase taken from a template comment (#773)
+
+Docker Compose's `env_file` reads `KEY=   # note` as the value `# note`. Up to
+3.6.24, `.env.example` shipped `HP_VAULT_PASSPHRASE=            # Override: an
+existing passphrase`, so an install whose `.env` was copied from it and left
+that key empty encrypted its vault with the public string `# Override: an
+existing passphrase`. Check with:
+
+```bash
+docker compose exec backend printenv HP_VAULT_PASSPHRASE
+```
+
+Anything starting with `#` is affected. Since the fix for #773 the backend
+refuses to start while any `HP_*` value starts with `#`, and names the
+key (never the value).
+
+There is no `hp` command for rotating the passphrase; the mechanism is
+`VaultManager.rotate_passphrase` (`src/homepilot/vault/manager.py`), which
+re-wraps the vault identity under a new passphrase atomically. Run it once, in
+a one-off container of the backend image - this works while the backend
+refuses to start, because it never loads the settings:
+
+```bash
+docker compose stop backend
+docker compose run --rm --no-deps -T --entrypoint python3 backend - <<'EOF'
+import asyncio
+import os
+import secrets
+from pathlib import Path
+
+from homepilot.vault import VaultManager
+
+data = Path(os.environ.get("HP_DATA_DIR", "/home/homepilot/.hp"))
+old = os.environ["HP_VAULT_PASSPHRASE"]  # the comment text, exactly as Compose passes it
+new = secrets.token_urlsafe(32)
+target = data / ".vault_passphrase"
+
+# Write the new passphrase FIRST (0600, refuses to overwrite): if the rotation
+# succeeded and this write then failed, nothing would know the vault's key.
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as fh:
+    fh.write(new)
+
+
+async def rotate() -> None:
+    await VaultManager(data, old).rotate_passphrase(new)
+    await VaultManager(data, new).ensure_master_identity()
+
+
+try:
+    asyncio.run(rotate())
+except BaseException:
+    target.unlink()
+    raise
+print(f"Rotated. The new passphrase is in {target} - back it up now.")
+EOF
+```
+
+If it stops on `File exists`, a `.vault_passphrase` is already in the data
+dir: find out which passphrase it holds before doing anything else. If it stops
+on `wrong passphrase`, the vault was not encrypted with the value in the
+environment and nothing was changed.
+
+Then fix `.env` - copy the vault block from the current `.env.example`, so
+`HP_VAULT_PASSPHRASE=` is EMPTY with its comment on the line above - and fix
+every other `KEY=   # ...` line the same way (`grep -nE '^[A-Z0-9_]+=[[:space:]]*#' .env`
+lists them). With the variable empty, the backend loads the new passphrase
+from `<data_dir>/.vault_passphrase`. Under `HP_ENV=production`, which never
+reads that file on its own, also set
+`HP_VAULT_PASSPHRASE_FILE=/home/homepilot/.hp/.vault_passphrase`. Start the
+backend and confirm `/health` reports the vault unlocked; copy the new
+passphrase (`./data/hp/.vault_passphrase` on the Docker host) into your password
+manager.
+
+Rotation re-wraps the identity; it does not change the key the secrets are
+encrypted to. Any copy of `vault/identities/master.protected` taken before the
+rotation - a backup, an `hp export --include-secrets` archive - still opens
+with the public string. Destroy those copies, and if any of them could have
+left your control, replace the secrets themselves at their source (a new
+Proxmox API token, a new admin secret, a new agent-hub token and re-enrolled
+agents).
+
 ## Security Considerations
 
 - Passphrase file (`{data_dir}/.vault_passphrase`) is mode `0o600` — only the HomePilot process can read it

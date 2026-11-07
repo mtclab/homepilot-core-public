@@ -119,15 +119,17 @@ Actual state on a host has diverged from the desired state defined by an applied
 
 ## SSE Streaming
 
-Clients connect to `GET /events` to receive events in real time via Server-Sent Events. Each SSE message has `event` (the type), `data` (JSON payload), and `id` fields.
+Clients connect to `GET /artifacts/events/stream` (read scope) to receive events in real time via Server-Sent Events. Each SSE message has `event` (the type), `data` (JSON payload), and `id` fields.
 
 ## Webhooks
 
-Webhook endpoints can be registered via `hp webhook add` or the API. Each webhook configuration specifies:
+Webhook endpoints are managed in Settings -> Monitoring -> Webhooks, with `hp webhook add|list|delete|test`, or through `/admin/webhooks` (admin scope: `GET`, `POST`, `DELETE /{id}`, `POST /{id}/test`). Each configuration specifies:
 
-- `url` — target endpoint URL
-- `event_types` — list of event type strings to receive (or `["*"]` for all)
-- `secret` — HMAC-SHA256 signing key (optional)
-- `max_retries` — delivery retry count (default 3)
+- `url` — target endpoint URL, `http://` or `https://`. Treated as a credential: every listing, log line and audit row shows only `scheme://host:port`; the full URL is returned once, to the admin who created it.
+- `event_types` — the event types to receive, checked against the events listed above (or `["*"]` for all, including events added later). An unknown name is refused rather than stored and never matched.
+- `secret` — HMAC-SHA256 signing key (optional; `hp webhook add --with-secret` prompts for it, never on the command line)
+- `max_retries` — delivery retry count, 0-10 (default 3)
+
+The `artifact_proposed` event carries the approval code, so a webhook endpoint receives approval codes. That is why adding or deleting one is an admin action and neither is offered as an MCP tool; MCP has `list_webhooks` and `test_webhook` only. A test sends one `webhook_test` event, once, and reports whether the endpoint accepted it.
 
 Deliveries use exponential backoff (1s, 5s, 30s). The `X-Webhook-Signature` header contains the HMAC-SHA256 of the request body when a secret is configured. Delivery status and attempts are tracked in the `webhook_deliveries` database table.

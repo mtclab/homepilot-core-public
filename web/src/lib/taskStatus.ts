@@ -8,6 +8,7 @@ const TASK_STATUS_CLASSES: Record<TaskStatus, string> = {
 	succeeded: 'badge-applied',
 	failed: 'badge-failed',
 	cancelled: 'badge-revoked',
+	unknown: 'badge-proposed',
 };
 
 export function taskStatusClass(status: string): string {

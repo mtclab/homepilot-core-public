@@ -7,7 +7,7 @@ from typing import Any
 
 from mcp.types import TextContent
 
-from homepilot.adapters.proxmox import ProxmoxError
+from homepilot.common import format_validation_error
 from homepilot.db.repository import Repository
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
 
@@ -39,29 +39,33 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "refresh_inventory",
         "description": (
-            "Re-pull inventory data from the Proxmox REST API and connected hp-agents. "
-            'Pass "full" to refresh everything, or a specific scope like '
-            '"hosts", "services", or "networks".'
+            "Re-pull the host inventory from the Proxmox REST API: every node and "
+            "its VMs and containers are upserted, and (on a full, complete sweep) "
+            "guests Proxmox no longer lists are marked absent. Pass a node name as "
+            'scope to refresh only that node, or "full"/null for every node. The '
+            "result says how many hosts were seen and whether the sweep was complete."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "scope": {
                     "type": ["string", "null"],
-                    "description": (
-                        '"full" for complete refresh, or a specific scope, or null for full'
-                    ),
+                    "description": ('A Proxmox node name, or "full"/null for every node'),
                 },
             },
         },
         "outputSchema": {
             "type": "object",
             "properties": {
-                "status": {"type": "string"},
-                "nodes": {"type": "object"},
-                "version": {"type": "object"},
+                "hosts": {"type": "integer"},
+                "services": {"type": "integer"},
+                "proxmox_host_ids": {"type": "array"},
+                "complete": {"type": "boolean"},
+                "absent": {"type": "integer"},
+                "absent_skipped": {"type": "string"},
+                "error": {"type": "string"},
             },
-            "required": ["status"],
+            "required": ["hosts", "complete"],
         },
     },
     {
@@ -253,6 +257,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "action": {
                     "type": "string",
+                    "enum": ["adopt", "ignore", "enrich"],
                     "description": "adopt, ignore, or enrich",
                 },
                 "host_ids": {"type": "array", "items": {"type": "string"}},
@@ -310,15 +315,25 @@ async def handle_query_inventory(arguments: dict[str, Any], ctx: dict[str, Any])
 async def handle_refresh_inventory(
     arguments: dict[str, Any], ctx: dict[str, Any]
 ) -> dict[str, Any]:
-    proxmox = ctx["proxmox"]
-    if proxmox is None:
-        raise RuntimeError("Proxmox not configured")
-    try:
-        version = await proxmox.read("/version")
-        nodes_data = await proxmox.read("/nodes")
-        return {"status": "refreshed", "nodes": nodes_data, "version": version}
-    except ProxmoxError as e:
-        raise RuntimeError(f"Proxmox refresh failed — {e}") from e
+    """Re-pull the inventory from Proxmox - the same sweep as the REST twin.
+
+    This used to read ``/version`` and ``/nodes``, write nothing, ignore
+    ``scope`` and answer ``{"status": "refreshed"}`` (#692), so the assistant
+    planned around an inventory that was never refreshed. It now runs
+    ``InventoryService.refresh_inventory`` - the sweep ``POST /inventory/refresh``
+    and the reconciler run - and returns its real outcome, ``complete``
+    included. A sweep that could not establish anything is an error, not a
+    success with a status string.
+    """
+    service = ctx.get("inventory_service")
+    if service is None:
+        raise RuntimeError("Inventory service not configured")
+    scope = arguments.get("scope")
+    result: dict[str, Any] = await service.refresh_inventory(scope=scope)
+    error = result.get("error")
+    if error and not result.get("proxmox_host_ids"):
+        raise RuntimeError(f"Inventory refresh failed - {error}")
+    return result
 
 
 async def handle_get_environment_doc(
@@ -414,6 +429,11 @@ def _require_service(ctx: dict[str, Any]) -> Any:
     return service
 
 
+def _mcp_actor(ctx: dict[str, Any]) -> str:
+    """The MCP caller the dispatcher authenticated (#702)."""
+    return str(ctx.get("_mcp_caller_id") or "mcp")
+
+
 async def handle_add_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     from pydantic import ValidationError
 
@@ -431,9 +451,14 @@ async def handle_add_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dic
     try:
         body = HostCreateRequest(hostname=host, **fields)
     except ValidationError as exc:
-        raise ValueError(f"Invalid host: {exc}") from exc
+        raise ValueError(f"Invalid host: {format_validation_error(exc)}") from None
     try:
-        return with_host_warning(await create_manual_host_record(_require_repo(ctx), body), warning)
+        return with_host_warning(
+            await create_manual_host_record(
+                _require_repo(ctx), body, actor=_mcp_actor(ctx), source="mcp"
+            ),
+            warning,
+        )
     except InventoryError as exc:
         raise ValueError(exc.detail) from exc
 
@@ -475,7 +500,7 @@ async def handle_update_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> 
     try:
         body = HostPatchRequest(**fields)
     except ValidationError as exc:
-        raise ValueError(f"Invalid update: {exc}") from exc
+        raise ValueError(f"Invalid update: {format_validation_error(exc)}") from None
     try:
         return await update_host_record(_require_repo(ctx), host_id, body)
     except InventoryError as exc:
@@ -486,7 +511,9 @@ async def handle_delete_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> 
     from homepilot.inventory.router import InventoryError, forget_host_record
 
     try:
-        return await forget_host_record(_require_repo(ctx), str(arguments["host_id"]))
+        return await forget_host_record(
+            _require_repo(ctx), str(arguments["host_id"]), actor=_mcp_actor(ctx), source="mcp"
+        )
     except InventoryError as exc:
         raise ValueError(exc.detail) from exc
 
@@ -506,9 +533,18 @@ async def handle_bulk_host_action(arguments: dict[str, Any], ctx: dict[str, Any]
     from homepilot.inventory.router import BulkRequest, bulk_host_action_record
 
     try:
-        body = BulkRequest(action=str(arguments["action"]), host_ids=list(arguments["host_ids"]))
-    except (ValidationError, KeyError, TypeError) as exc:
-        raise ValueError(f"Invalid bulk request: {exc}") from exc
+        # Validated as given, not coerced: str()/list() turned a wrong-typed
+        # value into a plausible one (#696).
+        body = BulkRequest.model_validate(
+            {"action": arguments["action"], "host_ids": arguments["host_ids"]}
+        )
+    except ValidationError as exc:
+        # Field and reason only: never the value that was sent (#697).
+        raise ValueError(f"Invalid bulk request: {format_validation_error(exc)}") from None
+    except KeyError as exc:
+        raise ValueError(f"Invalid bulk request: missing {exc}") from None
+    except TypeError:
+        raise ValueError("Invalid bulk request: host_ids must be a list") from None
     return await bulk_host_action_record(
         body,
         repo=_require_repo(ctx),

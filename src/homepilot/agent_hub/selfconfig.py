@@ -13,7 +13,6 @@ import datetime as _dt
 import hashlib
 import ipaddress
 import logging
-import os
 import socket
 from pathlib import Path
 
@@ -21,6 +20,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+
+from ..common import write_private
 
 logger = logging.getLogger(__name__)
 
@@ -194,16 +195,14 @@ def _usable(cert_path: Path, key_path: Path) -> bool:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    """Create/replace ``path`` with 0600 from the moment it exists.
+    """Create/replace ``path`` with 0600 from the moment it exists, atomically.
 
-    ``os.open`` with the mode carries the permission through creation, so the
-    key is never briefly world-readable the way write-then-chmod leaves it."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
-    path.chmod(0o600)
+    The shared implementation (#690): a temp file created 0600 and renamed
+    over the target, so the key is never briefly readable and never half
+    written - including when an older file already sat there with a looser
+    mode, which `os.open(..., 0o600)` alone does not fix (the mode only applies
+    on creation)."""
+    write_private(path, data)
 
 
 def ensure_hub_certificate(data_dir: Path, extra_hosts: tuple[str, ...] = ()) -> tuple[Path, Path]:

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import ValidationError
 
+from ..client_ip import client_ip
 from ..common import SlidingWindowLimiter
 from ..config import get_settings
 from ..provision.models import validate_tailscale_auth_key
@@ -100,6 +101,17 @@ def _client_cn(request: Request) -> str:
     trust = load_trust(settings)
     peer = request.client.host if request.client else None
     return assert_trusted_cn(peer, request.headers, trust)
+
+
+def _limiter_client(request: Request) -> str:
+    """The client behind the portal's own trusted proxy, for limiter keys (#705).
+
+    The raw peer here is ALWAYS the portal proxy, so keying on it put every
+    guest in one bucket (the CN kept them apart only by luck). Resolved through
+    the shared resolver against HP_PORTAL_TRUSTED_PROXY - the proxy this surface
+    trusts - after _client_cn has already proven the peer is that proxy."""
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    return client_ip(request, load_trust(settings).networks)
 
 
 def _hosts_repo(request: Request) -> Any:
@@ -227,7 +239,7 @@ async def invite_redeem(request: Request, token: str) -> Any:
     except PortalUntrustedError:
         return _refused()
 
-    peer = request.client.host if request.client else "?"
+    peer = _limiter_client(request)
     if not _redeem_attempts.allow(f"{peer}|{cn}"):
         return _too_many()
 
@@ -410,6 +422,11 @@ async def _render_status(
     status_name = str(task["status"]) if task else "pending"
     machine_gone = await _machine_is_gone(request, row)
     facts = _machine_facts(task)
+    # What a failed build left behind, as far as it is ESTABLISHED (#625). The
+    # page used to tell every failed redeemer "nothing was left half-made" -
+    # including the ones whose cleanup failed or could not be confirmed, whose
+    # link therefore stays used.
+    failure = ""
 
     if status_name == "succeeded":
         state = "ok"
@@ -456,6 +473,13 @@ async def _render_status(
                     "to look at it."
                 ),
             )
+        if cleanup in ("nothing_created", "deleted") and facts.get("vmid") is None:
+            failure = "clean"
+        elif cleanup == "failed" or facts.get("vmid") is not None:
+            failure = "left"
+        else:
+            # "unverified", or a task too old to say: neither claim is made.
+            failure = "unknown"
     else:
         state = "running"
 
@@ -481,6 +505,7 @@ async def _render_status(
         "status.html",
         status_code=status_code,
         state=state,
+        failure=failure,
         # The page stops refreshing when the machine is settled AND no re-join
         # is in flight - otherwise it would sit on "joining" forever.
         finished=state != "running" and not rejoin_running,
@@ -566,7 +591,7 @@ async def invite_rejoin_tailnet(request: Request, token: str) -> Any:
         # but nothing new is started from it.
         return _not_usable()
 
-    peer = request.client.host if request.client else "?"
+    peer = _limiter_client(request)
     if not _rejoin_attempts.allow(f"{peer}|{cn}"):
         return _too_many()
 

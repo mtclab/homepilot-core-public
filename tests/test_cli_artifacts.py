@@ -31,9 +31,17 @@ class TestArtifactsEdit:
 
         mock_store = MagicMock()
         mock_store.resolve_path.return_value = artifact_path / "2025-01-01-test-edit-abc123.md"
+        mock_store.read.return_value = ({"status": "proposed"}, "body")
 
-        mock_lifecycle = MagicMock()
-        mock_lifecycle.edit = MagicMock()
+        submitted: list[tuple[str, str]] = []
+
+        async def fake_edit(id: str, text: str) -> dict[str, str]:
+            submitted.append((id, text))
+            return {"status": "proposed"}
+
+        def fake_editor(cmd, check=False):
+            with open(cmd[1], "a") as fh:
+                fh.write("\n# edited")
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
@@ -43,16 +51,20 @@ class TestArtifactsEdit:
         with (
             patch.dict("os.environ", env, clear=False),
             patch("homepilot.cli.main._get_artifact_store", return_value=mock_store),
-            patch("homepilot.cli.main._get_lifecycle", return_value=mock_lifecycle),
-            patch("homepilot.cli.main.subprocess.run") as mock_run,
+            patch("homepilot.cli.main._edit_directly", fake_edit),
+            patch("homepilot.cli.main._server_is_running", return_value=False),
+            patch("homepilot.cli.main.subprocess.run", side_effect=fake_editor) as mock_run,
         ):
             result = runner.invoke(app, ["artifacts", "edit", "2025-01-01-test-edit-abc123"])
 
         assert result.exit_code == 0, result.output
         mock_run.assert_called_once()
+        # The editor works on a COPY (#693); the artifact file changes only when
+        # the lifecycle accepts the edit.
         editor_cmd = mock_run.call_args[0][0]
-        assert editor_cmd[1] == str(artifact_path / "2025-01-01-test-edit-abc123.md")
-        mock_lifecycle.edit.assert_called_once_with("2025-01-01-test-edit-abc123")
+        assert editor_cmd[1] != str(artifact_path / "2025-01-01-test-edit-abc123.md")
+        assert submitted and submitted[0][0] == "2025-01-01-test-edit-abc123"
+        assert submitted[0][1].endswith("# edited")
 
     def test_edit_uses_editor_env_variable(self, tmp_path):
         artifacts_dir = tmp_path / "artifacts"
@@ -66,7 +78,7 @@ class TestArtifactsEdit:
 
         mock_store = MagicMock()
         mock_store.resolve_path.return_value = artifact_path / "2025-01-01-test-editor-env.md"
-        mock_lifecycle = MagicMock()
+        mock_store.read.return_value = ({"status": "proposed"}, "body")
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
@@ -77,7 +89,6 @@ class TestArtifactsEdit:
         with (
             patch.dict("os.environ", env, clear=False),
             patch("homepilot.cli.main._get_artifact_store", return_value=mock_store),
-            patch("homepilot.cli.main._get_lifecycle", return_value=mock_lifecycle),
             patch("homepilot.cli.main.subprocess.run") as mock_run,
         ):
             result = runner.invoke(app, ["artifacts", "edit", "2025-01-01-test-editor-env"])
@@ -122,7 +133,7 @@ class TestArtifactsEdit:
         assert result.exit_code == 1
         assert "not found" in result.output.lower()
 
-    def test_edit_lifecycle_error_prints_warning(self, tmp_path):
+    def test_edit_of_a_terminal_artifact_is_refused_before_the_editor(self, tmp_path):
         artifacts_dir = tmp_path / "artifacts"
         artifacts_dir.mkdir()
         artifact_path = artifacts_dir / "2025" / "01"
@@ -134,9 +145,7 @@ class TestArtifactsEdit:
 
         mock_store = MagicMock()
         mock_store.resolve_path.return_value = artifact_path / "2025-01-01-test-lc-err-abc123.md"
-
-        mock_lifecycle = MagicMock()
-        mock_lifecycle.edit.side_effect = RuntimeError("terminal state")
+        mock_store.read.return_value = ({"status": "applied"}, "body")
 
         env = {
             "HP_DATA_DIR": str(tmp_path),
@@ -146,12 +155,14 @@ class TestArtifactsEdit:
         with (
             patch.dict("os.environ", env, clear=False),
             patch("homepilot.cli.main._get_artifact_store", return_value=mock_store),
-            patch("homepilot.cli.main._get_lifecycle", return_value=mock_lifecycle),
-            patch("homepilot.cli.main.subprocess.run"),
+            patch("homepilot.cli.main.subprocess.run") as mock_run,
         ):
             result = runner.invoke(app, ["artifacts", "edit", "2025-01-01-test-lc-err-abc123"])
 
-        assert "Edit sync" in result.output
+        # #693: it used to open the editor, print a dim "Edit sync" line and exit 0.
+        assert result.exit_code == 1
+        assert "can no longer be edited" in result.output
+        mock_run.assert_not_called()
 
 
 class TestArtifactsShow:

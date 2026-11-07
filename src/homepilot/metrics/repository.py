@@ -5,6 +5,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from fnmatch import fnmatchcase
 from typing import Any
 
 from ..db.connection import Database
@@ -326,10 +327,48 @@ class MetricsRepository:
         # every value is a bound ? parameter - no injection vector.
         query = f"UPDATE alert_rules SET {', '.join(assignments)} WHERE id = ?"  # nosec B608
         cursor = await self.db.execute(query, tuple(values))
-        await self.db.conn.commit()
         if (cursor.rowcount or 0) == 0:
+            await self.db.conn.commit()
             return None
+        await self._drop_unrevisited_state(rule_id, fields)
+        await self.db.conn.commit()
         return await self.get_rule(rule_id)
+
+    async def _drop_unrevisited_state(self, rule_id: str, fields: dict[str, Any]) -> None:
+        """Clear alert state the evaluator will never look at again (#714).
+
+        The evaluator only revisits (enabled rule, matching host) pairs, so a
+        firing row it will not revisit stays firing FOREVER: the Overview
+        counts it and the attention list names it, for a rule an operator has
+        switched off or a host they have taken out of its scope. So:
+
+        * disabling a rule drops all of its state - it is not watching;
+        * changing the metric drops all of it - every row was a verdict about
+          a different quantity;
+        * narrowing the host filter drops the rows for hosts now outside it.
+
+        A retuned threshold or duration keeps its state on purpose: the same
+        hosts are still being watched, and the next evaluation re-decides
+        them without losing when a real breach began.
+        """
+        if ("enabled" in fields and not fields["enabled"]) or "metric" in fields:
+            await self.db.execute("DELETE FROM alert_state WHERE rule_id = ?", (rule_id,))
+            return
+        if "host_filter" in fields:
+            host_filter = str(fields["host_filter"] or "*")
+            if host_filter == "*":
+                return
+            rows = await self.db.fetchall(
+                "SELECT hostname FROM alert_state WHERE rule_id = ?", (rule_id,)
+            )
+            outside = [
+                str(r["hostname"]) for r in rows if not fnmatchcase(str(r["hostname"]), host_filter)
+            ]
+            for hostname in outside:
+                await self.db.execute(
+                    "DELETE FROM alert_state WHERE rule_id = ? AND hostname = ?",
+                    (rule_id, hostname),
+                )
 
     async def set_rule_enabled(self, rule_id: str, enabled: bool) -> bool:
         """Thin wrapper over update_rule for the enable/silence-only path."""
@@ -395,6 +434,6 @@ class MetricsRepository:
             """SELECT s.rule_id, s.hostname, s.firing_since, s.last_value, s.last_eval,
                       r.name, r.metric, r.comparison, r.threshold, r.for_seconds
                  FROM alert_state s JOIN alert_rules r ON r.id = s.rule_id
-                WHERE s.firing_since IS NOT NULL
+                WHERE s.firing_since IS NOT NULL AND r.enabled = 1
                 ORDER BY s.firing_since"""
         )

@@ -32,6 +32,24 @@ from homepilot.mcp.tools.ssrf_guard import (
 # ── 1. app_state.py path validation ──
 
 
+@pytest.fixture(autouse=True)
+def _health_as_operator(monkeypatch):
+    """These tests read the per-subsystem checks, which /health gives only to an
+    authenticated caller (#687), and change the app state between requests, so
+    each starts with no cached verdict and a clean rate-limit window."""
+    from homepilot import main as main_mod
+
+    async def _authenticated(_request):
+        return True
+
+    monkeypatch.setattr(main_mod, "_is_authenticated", _authenticated)
+    main_mod._health_cache_clear()
+    main_mod._RATE_WINDOW.clear()
+    yield
+    main_mod._health_cache_clear()
+    main_mod._RATE_WINDOW.clear()
+
+
 class TestArtifactsDirPathValidation:
     """Validate that protected system paths are rejected for artifacts_dir.
 

@@ -15,7 +15,7 @@ The probes use only commands the host agent permits read-only (kept in lockstep
 with ``agent/go/allowlist.go`` ``safeCommands`` and the adapter's
 ``exec_readonly`` whitelist). ``docker ps`` is listed among the probes but is
 intentionally narrowed OUT of the adapter's read-only path
-(``_INTENTIONAL_NARROWING`` in ``adapters/agent.py``, parity-gated); when the
+(``read_tier: false`` in the shared ``readonly_policy.json``); when the
 adapter rejects it the docker probe is simply recorded ``unavailable`` — the
 parser is complete and ready should the read-only path ever include docker.
 """

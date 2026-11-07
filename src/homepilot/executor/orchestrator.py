@@ -4,18 +4,21 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from homepilot.adapters.agent import AgentAdapter
-from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError
+from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError, ProxmoxTaskStillRunningError
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import (
     ArtifactKind,
     ArtifactStatus,
+    ConflictError,
     Idempotence,
     compute_body_hash,
+    utcnow_iso,
 )
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
@@ -43,18 +46,37 @@ _SNAP_PREFIX = "hp-pre-"
 _SNAP_HASH_LEN = 7
 
 
-def snapshot_name_for(artifact_id: str) -> str:
+def snapshot_name_for(artifact_id: str, run: str | None = None) -> str:
     """The pre-apply snapshot name for this artifact, always ≤ 40 chars (#627).
 
-    Short ids keep the exact `hp-pre-<id>` they have always had, so nothing that
-    already exists on a cluster is renamed.
+    `run` names ONE run of the artifact (see `snapshot_run_tag`). Without it the
+    name is per-ARTIFACT, and nothing ever deletes the snapshot: the second run
+    of the same artifact - a replay, or a re-apply after a failed apply was
+    fixed - asked PVE for a name that already existed, PVE refused ("snapshot
+    name ... already used"), and the run died before step 1 (#709). Every run
+    the executor makes passes one.
+
+    Short ids with no run keep the exact `hp-pre-<id>` they have always had.
+    When the id has to be shortened, a hash of the WHOLE id rides along so two
+    long ids that share a prefix cannot land on one snapshot.
     """
-    candidate = f"{_SNAP_PREFIX}{artifact_id}"
+    suffix = f"-{run}" if run else ""
+    candidate = f"{_SNAP_PREFIX}{artifact_id}{suffix}"
     if len(candidate) <= PVE_SNAPNAME_MAX:
         return candidate
     digest = hashlib.sha256(artifact_id.encode()).hexdigest()[:_SNAP_HASH_LEN]
-    room = PVE_SNAPNAME_MAX - len(_SNAP_PREFIX) - 1 - _SNAP_HASH_LEN
-    return f"{_SNAP_PREFIX}{artifact_id[:room]}-{digest}"
+    room = PVE_SNAPNAME_MAX - len(_SNAP_PREFIX) - 1 - _SNAP_HASH_LEN - len(suffix)
+    return f"{_SNAP_PREFIX}{artifact_id[:room]}-{digest}{suffix}"
+
+
+def snapshot_run_tag(now: datetime | None = None) -> str:
+    """This run's part of a snapshot name: its UTC start, to the second.
+
+    A timestamp rather than a random token because it is what an operator
+    reading the guest's snapshot list needs - which run took which rollback
+    point - and PVE's snapname alphabet ([A-Za-z0-9_-]) takes it as is.
+    """
+    return (now or datetime.now(UTC)).strftime("%y%m%d%H%M%S")
 
 
 # The target kinds a Proxmox snapshot can actually be taken of. ARTIFACT_SPEC §3
@@ -64,6 +86,16 @@ def snapshot_name_for(artifact_id: str) -> str:
 # operator who read `requires_snapshot: true` on the review screen (#642 A7).
 SNAPSHOTTABLE_TARGET_KINDS = ("vm", "lxc")
 
+# How long the pre-apply snapshot is followed. A snapshot that saves RAM state
+# writes the guest's whole memory out, which outlasts the general 600 s on a big
+# guest; giving up early aborts an apply over a safety net that was in fact
+# being taken (#774).
+SNAPSHOT_TASK_TIMEOUT_S = 1800.0
+
+# How much of a run's log rides along in the artifact's `unsettled_task` record,
+# so the settled record says what the run did before it stopped watching.
+_UNSETTLED_LOG_MAX = 8000
+
 
 @dataclass
 class ExecutionResult:
@@ -71,6 +103,12 @@ class ExecutionResult:
     execution_log: str
     snapshot_id: str | None = None
     failure_reason: str | None = None
+    # A PVE task this run spawned that was STILL RUNNING when the run stopped
+    # following it (#774). Set means the outcome is UNKNOWN: `success` is False
+    # because nothing says it succeeded, and the artifact must not be recorded
+    # as failed either. Carries node + upid so the outcome can be settled from
+    # PVE once the task ends.
+    unsettled_task: dict[str, Any] | None = None
 
 
 @dataclass
@@ -142,6 +180,13 @@ class ArtifactExecutor:
         if current_hash != fm.get("hash"):
             raise TamperError(f"Hash mismatch for {artifact_id}: body tampered after approval")
 
+        if fm.get("unsettled_task"):
+            # An earlier run of this artifact left a PVE task running (#774).
+            # Running the steps again would start a second vzdump on top of the
+            # first; what this apply is for now is finding out how that one
+            # ended.
+            return await self._settle(artifact_id, fm)
+
         # (The `replay_safe` re-apply guard that used to sit here could never
         # fire: the status check above has already refused anything but
         # `approved`, so its `status == applied` test was dead. The real guard is
@@ -171,7 +216,9 @@ class ArtifactExecutor:
                 failure_reason=fail_reason,
             )
 
-        if result.success:
+        if result.unsettled_task:
+            await self._record_unsettled(artifact_id, "apply", approved_by, result, snapshot_id)
+        elif result.success:
             await self.lifecycle.mark_applied(artifact_id, result.execution_log)
             # The single actor-bearing record of this apply. The snapshot id rides
             # here because it is what an operator needs to undo the change.
@@ -218,6 +265,10 @@ class ArtifactExecutor:
         if current_hash != fm.get("hash"):
             raise TamperError(f"Hash mismatch for {artifact_id}: body tampered after approval")
 
+        if fm.get("unsettled_task"):
+            # Same as apply: never re-run the steps over a task still in flight.
+            return await self._settle(artifact_id, fm)
+
         target_data = fm.get("target", {})
         target_kind = target_data.get("kind", "")
         snapshot_id: str | None = None
@@ -231,7 +282,14 @@ class ArtifactExecutor:
             logger.exception("Replay failed for %s", artifact_id)
             fail_reason = str(exc)
             partial_log = f"Replay error: {fail_reason}"
-            await self.lifecycle.mark_failed(artifact_id, fail_reason, partial_log)
+            # Only an APPROVED artifact can become failed - exactly as on the
+            # non-raising branch below. A replay of an APPLIED one that raised
+            # used to call mark_failed anyway, the lifecycle refused
+            # "applied -> failed", and THAT error replaced the real reason on
+            # the task (#709). The applied artifact stays applied; the failed
+            # replay is on the task and in the journal.
+            if status == ArtifactStatus.APPROVED:
+                await self.lifecycle.mark_failed(artifact_id, fail_reason, partial_log)
             await self.lifecycle._log_audit(
                 "replay_failed", artifact_id, "replay", {"reason": fail_reason}
             )
@@ -242,7 +300,9 @@ class ArtifactExecutor:
                 failure_reason=fail_reason,
             )
 
-        if result.success:
+        if result.unsettled_task:
+            await self._record_unsettled(artifact_id, "replay", "replay", result, snapshot_id)
+        elif result.success:
             if status == ArtifactStatus.APPROVED:
                 await self.lifecycle.mark_applied(artifact_id, result.execution_log)
             await self.lifecycle._log_audit("replay", artifact_id, "replay")
@@ -258,6 +318,129 @@ class ArtifactExecutor:
         result.snapshot_id = snapshot_id
         return result
 
+    async def _record_unsettled(
+        self,
+        artifact_id: str,
+        action: str,
+        actor: str,
+        result: ExecutionResult,
+        snapshot_id: str | None,
+    ) -> None:
+        """Put a run whose outcome is UNKNOWN on the artifact itself (#774).
+
+        Not `failed`: the PVE task is still working and may well succeed (the
+        vzdump that started this ended `OK`). Not `applied`: nothing says it
+        did. The artifact keeps its status and carries `unsettled_task`, which
+        is what makes every later apply/replay settle from PVE instead of
+        starting the work a second time - including the auto-apply reconciler,
+        which would otherwise see a plain `approved` artifact and run it again.
+        """
+        log = result.execution_log
+        if len(log) > _UNSETTLED_LOG_MAX:
+            log = log[-_UNSETTLED_LOG_MAX:]
+        entry = {
+            **(result.unsettled_task or {}),
+            "action": action,
+            "since": utcnow_iso(),
+            "execution_log": log,
+        }
+        if snapshot_id:
+            entry["snapshot_id"] = snapshot_id
+        await self.lifecycle.mark_unsettled(artifact_id, entry)
+        await self.lifecycle._log_audit(
+            f"{action}_unsettled",
+            artifact_id,
+            actor,
+            {"upid": entry.get("upid"), "reason": result.failure_reason},
+        )
+
+    async def settle(self, artifact_id: str) -> ExecutionResult | None:
+        """Settle an artifact's unknown outcome from PVE, if it has one (#774).
+
+        None when the artifact carries no unsettled task. Otherwise the outcome
+        as it stands now: still unknown while PVE says the task runs, else the
+        verdict, which is also written onto the artifact.
+        """
+        fm, _ = self.store.read(artifact_id)
+        if not fm.get("unsettled_task"):
+            return None
+        return await self._settle(artifact_id, fm)
+
+    async def _settle(self, artifact_id: str, fm: dict[str, Any]) -> ExecutionResult:
+        entry: dict[str, Any] = dict(fm.get("unsettled_task") or {})
+        node = str(entry.get("node") or "")
+        upid = str(entry.get("upid") or "")
+        action = str(entry.get("action") or "apply")
+        snapshot_id = entry.get("snapshot_id")
+        earlier_log = str(entry.get("execution_log") or "")
+
+        def _still_unknown(why: str) -> ExecutionResult:
+            return ExecutionResult(
+                success=False,
+                execution_log=f"{earlier_log}\n[settle] {why}".strip(),
+                snapshot_id=snapshot_id,
+                failure_reason=f"outcome unknown: {why}",
+                unsettled_task=entry,
+            )
+
+        try:
+            # One look, no waiting: settling is a question, not a second wait.
+            await self.proxmox.wait_for_task(node, upid, timeout_s=0, poll_interval=0)
+            task_ok, said = True, f"PVE task {upid} finished OK"
+        except ProxmoxTaskStillRunningError:
+            return _still_unknown(f"PVE task {upid} is still running")
+        except ProxmoxError as exc:
+            if exc.status_code != 0:
+                # PVE did not answer about the task (an HTTP error): that settles
+                # nothing, any more than a precheck that got a 500 does.
+                return _still_unknown(f"could not read PVE task {upid}: {exc}")
+            task_ok, said = False, exc.body
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            return _still_unknown(f"could not reach PVE to read task {upid}: {exc}")
+
+        not_run = [str(s) for s in entry.get("steps_not_run") or []]
+        unfinished = [str(s) for s in entry.get("steps_unfinished") or []]
+        problems: list[str] = []
+        if not task_ok:
+            problems.append(f"step {entry.get('step')}: {said}")
+        if unfinished:
+            problems.append("these steps did not complete: " + ", ".join(unfinished))
+        if not_run:
+            # The run stopped following the task and therefore stopped; the
+            # steps behind it never ran. However well the task ended, the
+            # artifact's change is not all there.
+            problems.append(
+                "these steps were never run (the run stopped while the task was "
+                "still going): " + ", ".join(not_run)
+            )
+        success = not problems
+        log = f"{earlier_log}\n[settled] {said}".strip()
+        reason = None if success else "; ".join(problems)
+
+        status = ArtifactStatus(fm["status"])
+        details: dict[str, Any] = {"settled_upid": upid}
+        if status == ArtifactStatus.APPROVED:
+            # mark_applied / mark_failed drop `unsettled_task` with the transition.
+            if success:
+                await self.lifecycle.mark_applied(artifact_id, log)
+            else:
+                await self.lifecycle.mark_failed(artifact_id, reason or "unknown", log)
+        else:
+            # A replay of an APPLIED artifact: a failed replay never un-applies
+            # it (see replay()), so the verdict goes on the journal only.
+            await self.lifecycle.clear_unsettled(artifact_id)
+        if reason:
+            details["reason"] = reason
+        await self.lifecycle._log_audit(
+            action if success else f"{action}_failed", artifact_id, "settle", details
+        )
+        return ExecutionResult(
+            success=success,
+            execution_log=log,
+            snapshot_id=snapshot_id,
+            failure_reason=reason,
+        )
+
     async def revoke(self, artifact_id: str, user: str, reason: str | None = None) -> RevokeResult:
         """Revoke an artifact, and say whether the host was actually REVERSED.
 
@@ -268,6 +451,18 @@ class ArtifactExecutor:
         "reversed" and "relabelled" are different facts about a host.
         """
         fm, body = self.store.read(artifact_id)
+        if fm.get("unsettled_task"):
+            # A PVE task from the last apply/replay was still running when the
+            # run stopped following it (#774). Rolling back underneath it would
+            # race the very change the rollback undoes, so settle first: ask PVE
+            # once, and refuse while the task is still going.
+            settled = await self._settle(artifact_id, fm)
+            if settled.unsettled_task:
+                raise ConflictError(
+                    f"cannot revoke {artifact_id} yet: {settled.failure_reason}. "
+                    "Wait for that task to finish, then revoke again."
+                )
+            fm, body = self.store.read(artifact_id)
         kind = ArtifactKind(fm["kind"])
 
         outcome = RevokeResult(rolled_back=False, reason="no rollback for this artifact")
@@ -342,6 +537,7 @@ class ArtifactExecutor:
             execution_log=result.get("execution_log", ""),
             snapshot_id=result.get("snapshot_id"),
             failure_reason=result.get("failure_reason"),
+            unsettled_task=result.get("unsettled_task"),
         )
 
     async def _maybe_snapshot(self, fm: dict[str, Any], target: dict[str, Any]) -> str | None:
@@ -360,7 +556,9 @@ class ArtifactExecutor:
                 f"Pre-apply snapshot required for {fm.get('id')} but the target names "
                 f"no {'vmid' if vmid is None else 'node'} to snapshot"
             )
-        snap_name = snapshot_name_for(str(fm["id"]))
+        # Per RUN (#709): every apply and replay takes its own rollback point,
+        # so a second run never collides with the first one's snapshot.
+        snap_name = snapshot_name_for(str(fm["id"]), snapshot_run_tag())
         # The target already knows what the guest IS ("vm" => qemu, "lxc" =>
         # lxc). Handing it over stops the snapshot call guessing a collection
         # from the VMID and posting a QEMU guest to /lxc/ (#617); a target that
@@ -377,7 +575,7 @@ class ArtifactExecutor:
             # rollback point is not finished being taken.
             upid = ProxmoxClient.upid_of(result)
             if upid:
-                await self.proxmox.wait_for_task(node, upid)
+                await self.proxmox.wait_for_task(node, upid, timeout_s=SNAPSHOT_TASK_TIMEOUT_S)
             # The snapshot's NAME is what an operator rolls back to; the UPID
             # is the task that took it and is worthless once it has finished.
             return snap_name

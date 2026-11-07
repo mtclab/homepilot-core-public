@@ -19,9 +19,11 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from ..auth.deps import require_scope
+from ..auth.deps import require_scope, require_token
+from ..auth.principal import audit_actor
+from ..common import format_validation_error
 from ..portal.models import InviteCaps
 from ..portal.repository import InviteRepository, invite_state
 from ..provision.defaults import (
@@ -39,6 +41,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/guests", tags=["guests"])
 
 _admin = Depends(require_scope("admin"))
+# The authenticated token, for attribution (#702). FastAPI resolves
+# require_token once per request, so this is the same check _admin made.
+_principal = Depends(require_token)
 
 
 class QuotaIn(BaseModel):
@@ -69,6 +74,14 @@ class InviteIn(BaseModel):
     memory_mb: int = Field(ge=256)
     disk_gb: int = Field(ge=1)
     ttl_days: int = Field(default=7, ge=1, le=90)
+    # What `hp invite create` can say and this route could not (#623): the CLI
+    # mints through here whenever a backend runs, so the two must express the
+    # same invite. Each is optional and changes nothing when omitted.
+    pool: str | None = Field(default=None, min_length=1, max_length=63)
+    disk: str | None = Field(default=None, min_length=1, max_length=16)
+    # A finer validity window than whole days ('30m', '48h'); wins over
+    # ttl_days when given. Bounded by the same 90 days.
+    ttl_minutes: int | None = Field(default=None, ge=1, le=90 * 24 * 60)
 
 
 def _repo(request: Request) -> Any:
@@ -150,7 +163,9 @@ async def overview(request: Request) -> dict[str, Any]:
 
 
 @router.post("/quota", dependencies=[_admin])
-async def put_quota(request: Request, body: QuotaIn) -> dict[str, Any]:
+async def put_quota(
+    request: Request, body: QuotaIn, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     repo = _repo(request)
     await set_quota(
         repo,
@@ -162,7 +177,9 @@ async def put_quota(request: Request, body: QuotaIn) -> dict[str, Any]:
     )
     quota = await get_quota(repo, body.cn)
     used = await usage_for(repo, body.cn)
-    await repo.log_audit(user_id="ui", source="ui", action="guest_quota_set", target_host=body.cn)
+    await repo.log_audit(
+        user_id=audit_actor(token), source="api", action="guest_quota_set", target_host=body.cn
+    )
     return {
         "cn": body.cn,
         "limits": {
@@ -181,7 +198,9 @@ async def put_quota(request: Request, body: QuotaIn) -> dict[str, Any]:
 
 
 @router.delete("/quota/{cn}", dependencies=[_admin])
-async def drop_quota(request: Request, cn: str) -> dict[str, Any]:
+async def drop_quota(
+    request: Request, cn: str, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     """Remove a guest's budget (#607): the set route had no undo.
 
     DELETE with the CN in the path, matching every other removal in this API
@@ -198,7 +217,9 @@ async def drop_quota(request: Request, cn: str) -> dict[str, Any]:
     removed = await delete_quota(repo, cn)
     if not removed:
         raise HTTPException(status_code=404, detail="That guest has no budget set")
-    await repo.log_audit(user_id="ui", source="ui", action="guest_quota_removed", target_host=cn)
+    await repo.log_audit(
+        user_id=audit_actor(token), source="api", action="guest_quota_removed", target_host=cn
+    )
     used = await usage_for(repo, cn)
     return {
         "cn": cn,
@@ -247,7 +268,9 @@ async def _disk_floor(state: Any, node: str, template_vmid: int, asked_gb: int) 
 
 
 @router.post("/invites", dependencies=[_admin], status_code=201)
-async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
+async def mint_invite(
+    request: Request, body: InviteIn, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     """Mint a one-time, CN-bound invite. The token in this response is shown
     exactly once and stored nowhere."""
     # Resolved HERE, at mint time, and frozen into the invite row: the caps are
@@ -267,25 +290,40 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
     # being written. Unreadable template: keep what was asked and let the
     # provision report honestly.
     disk_gb = await _disk_floor(request.app.state, node, template_vmid, body.disk_gb)
-    caps = InviteCaps(
-        template_vmid=template_vmid,
-        node=node,
-        pool=resolve_pool(None, defaults),
-        storage=resolve_storage(body.storage, defaults),
-        ipconfig0=resolve_ipconfig(None, defaults),
-        cores=body.cores,
-        memory_mb=body.memory_mb,
-        disk_gb=disk_gb,
+    try:
+        caps = InviteCaps(
+            template_vmid=template_vmid,
+            node=node,
+            pool=resolve_pool(body.pool, defaults),
+            storage=resolve_storage(body.storage, defaults),
+            ipconfig0=resolve_ipconfig(None, defaults),
+            cores=body.cores,
+            memory_mb=body.memory_mb,
+            disk_gb=disk_gb,
+            **({"disk": body.disk} if body.disk else {}),
+        )
+    except ValidationError as exc:
+        # Caps provisioning would reject are a caller error, said as one.
+        raise HTTPException(
+            status_code=422, detail=f"Invalid caps: {format_validation_error(exc)}"
+        ) from exc
+    ttl = (
+        timedelta(minutes=body.ttl_minutes)
+        if body.ttl_minutes is not None
+        else timedelta(days=body.ttl_days)
     )
     invite_id, full_token = await _invites(request).create_invite(
         bound_cn=body.cn,
         caps=caps,
-        created_by="ui",
-        ttl=timedelta(days=body.ttl_days),
+        created_by=audit_actor(token),
+        ttl=ttl,
     )
     repo = _repo(request)
     await repo.log_audit(
-        user_id="ui", source="ui", action="guest_invite_minted", target_host=body.cn
+        user_id=audit_actor(token),
+        source="api",
+        action="guest_invite_minted",
+        target_host=body.cn,
     )
     # The caps are echoed back: when the operator named neither node nor
     # template, this response is where they see which ones the invite got.
@@ -304,12 +342,17 @@ async def mint_invite(request: Request, body: InviteIn) -> dict[str, Any]:
 
 
 @router.post("/invites/{prefix}/revoke", dependencies=[_admin])
-async def revoke_invite(request: Request, prefix: str) -> dict[str, Any]:
+async def revoke_invite(
+    request: Request, prefix: str, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     ok = await _invites(request).revoke(prefix)
     if not ok:
         raise HTTPException(status_code=404, detail="No open invite with that prefix")
     repo = _repo(request)
     await repo.log_audit(
-        user_id="ui", source="ui", action="guest_invite_revoked", target_host=prefix
+        user_id=audit_actor(token),
+        source="api",
+        action="guest_invite_revoked",
+        target_host=prefix,
     )
     return {"prefix": prefix, "revoked": True}

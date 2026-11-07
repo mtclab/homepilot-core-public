@@ -966,6 +966,79 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
         # reindex sweep, which embeds anything missing one.
         "DELETE FROM vec_docs WHERE id NOT IN (SELECT id FROM doc_metadata)",
     ],
+    33: [
+        # A task whose outcome is UNKNOWN (#774).
+        #
+        # An apply that spawned a PVE task and stopped following it while PVE
+        # still reported it running (a 13-minute vzdump against a 600 s wait)
+        # had two words to choose from, and both were false: it was recorded
+        # 'failed', and the backup then finished OK. 'unknown' is the honest
+        # third: this run is over, the work it started is not, and the verdict
+        # is settled from PVE later (the artifact carries the UPID).
+        #
+        # Same rebuild dance as migrations 14, 15, 18, 28 and 30 (a CHECK
+        # constraint is not ALTERable in SQLite): rename -> recreate -> copy ->
+        # drop -> recreate the indexes AFTER the drop.
+        "ALTER TABLE tasks RENAME TO tasks_old",
+        (
+            "CREATE TABLE tasks ("
+            "id TEXT PRIMARY KEY, "
+            "artifact_id TEXT, "
+            "action TEXT NOT NULL "
+            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+            "'create_guest_template', 'tailnet_join')), "
+            "status TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled', "
+            "'unknown')), "
+            "result_json TEXT, "
+            "created_at TEXT NOT NULL, "
+            "finished_at TEXT, "
+            "error TEXT)"
+        ),
+        (
+            "INSERT INTO tasks "
+            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
+            "FROM tasks_old"
+        ),
+        "DROP TABLE tasks_old",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+    ],
+    34: [
+        # One in-flight run per artifact, enforced by the DATABASE (#710).
+        #
+        # The runner checked for an active task and then inserted one with an
+        # await in between, so two replays (or two revokes) of one artifact both
+        # started; auto-apply re-dispatched an apply that was still running. A
+        # check in Python only serialises one process - the CLI, a second
+        # worker or a stdio MCP server each have their own. A partial UNIQUE
+        # index makes a second pending/running row for the same artifact an
+        # IntegrityError no matter who writes it.
+        #
+        # First retire any duplicates already there, keeping the NEWEST active
+        # row per artifact (the one `get_active_task` already reports): the
+        # index cannot be built over them. They are marked failed with a reason
+        # that says why, never deleted - they are history.
+        (
+            "UPDATE tasks SET status = 'failed', "
+            "error = 'superseded_duplicate_active_run', "
+            "finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running') "
+            "AND EXISTS (SELECT 1 FROM tasks newer "
+            "WHERE newer.artifact_id = tasks.artifact_id "
+            "AND newer.status IN ('pending', 'running') "
+            "AND (newer.created_at > tasks.created_at "
+            "OR (newer.created_at = tasks.created_at AND newer.id > tasks.id)))"
+        ),
+        # Any future rebuild of `tasks` (the rename dance of 14/15/18/28/30/33)
+        # must recreate this index after the drop, like the other two.
+        (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_per_artifact "
+            "ON tasks(artifact_id) "
+            "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running')"
+        ),
+    ],
 }
 
 

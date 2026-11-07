@@ -19,7 +19,7 @@ managed host by hand.
 Monitoring is the extreme case: nothing installs or configures Zabbix. There is
 no Zabbix service in `docker-compose.yml`, `scripts/install-agent.sh` installs no
 Zabbix agent, `deploy/control-plane/nginx-hp-proxy.conf` proxies `/zabbix/` to a
-hardcoded `10.0.0.1:8084` that HomePilot never provisions, and
+hardcoded LAN address on port 8084 that HomePilot never provisions, and
 `monitoring/zabbix/template_hp_agent.json` must be imported by hand. A fresh
 install therefore ships "Metrics" deep-links that 502 and collects no metrics.
 

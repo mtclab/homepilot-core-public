@@ -242,6 +242,10 @@ class TestAFailedBuildDoesNotBurnTheLink:
             status = await poll_status(client, token)
 
             assert "your link still works" not in status.text.lower()
+            # #625: and the page says so, rather than the old blanket "nothing
+            # was left half-made" - which was false exactly here.
+            assert "nothing was left half-made" not in status.text.lower()
+            assert "stays used" in status.text.lower()
 
             # The link stays spent: a second machine is not on offer.
             again = await client.get(f"/invite/{token}", headers=cert_headers())
@@ -280,6 +284,9 @@ class TestAFailedBuildDoesNotBurnTheLink:
 
             status = await client.get(f"/invite/{token}/status", headers=cert_headers())
             assert "your link still works" not in status.text.lower()
+            # #625: an unestablished cleanup is said as one, not as "clean".
+            assert "could not be confirmed" in status.text.lower()
+            assert "nothing was left half-made" not in status.text.lower()
 
         row = invite_row(portal_db.db_path, invite_id)
         assert row["redeemed_at"] is not None

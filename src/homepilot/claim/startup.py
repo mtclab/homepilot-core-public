@@ -4,6 +4,7 @@ import contextlib
 import logging
 from pathlib import Path
 
+from ..common import write_private
 from .repository import ClaimRepository, has_admin_credential
 from .tokens import generate_claim_code, validate_token
 
@@ -44,8 +45,7 @@ def _write_claim_code(data_dir: Path | str, code: str) -> bool:
     path = claim_code_path(data_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(code)
-        path.chmod(0o600)
+        write_private(path, code)
         return True
     except OSError:
         logger.warning(

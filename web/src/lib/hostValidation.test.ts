@@ -3,7 +3,7 @@ import { isValidHubHost } from './hostValidation';
 
 describe('isValidHubHost', () => {
 	it('accepts plain IPv4 addresses', () => {
-		expect(isValidHubHost('10.0.0.1')).toBe(true);
+		expect(isValidHubHost('10.0.0.18')).toBe(true);
 		expect(isValidHubHost('127.0.0.1')).toBe(true);
 		expect(isValidHubHost('255.255.255.255')).toBe(true);
 	});

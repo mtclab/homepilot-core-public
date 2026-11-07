@@ -165,4 +165,25 @@ describe('Review queue bulk actions', () => {
 
 		expect(screen.queryByRole('button', { name: /approve selected/i })).not.toBeInTheDocument();
 	});
+
+	it('offers reject but not approve to a write session without admin (#681)', async () => {
+		// Approving needs an operator credential; a write token (the assistant
+		// tier) only approves with a relayed code, so an Approve button here
+		// would be a control that can only ever answer 403.
+		const { sessionStore } = await import('$lib/api');
+		const store = sessionStore as unknown as { set: (v: unknown) => void };
+		store.set({ authenticated: true, token_label: 'rw', capabilities: ['read', 'write'] });
+		try {
+			render(Review);
+			await screen.findByText('Install nginx');
+
+			expect(screen.queryAllByRole('button', { name: /✓ approve/i })).toHaveLength(0);
+			expect(screen.getAllByRole('button', { name: /reject/i }).length).toBeGreaterThan(0);
+			await fireEvent.click(screen.getByLabelText(/select all/i));
+			expect(screen.queryByRole('button', { name: /approve selected/i })).not.toBeInTheDocument();
+			expect(screen.getByRole('button', { name: /reject selected/i })).toBeInTheDocument();
+		} finally {
+			store.set({ authenticated: true, token_label: 't', capabilities: ['read', 'write', 'admin'] });
+		}
+	});
 });

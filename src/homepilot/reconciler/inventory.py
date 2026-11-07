@@ -100,7 +100,11 @@ class InventoryReconciler(Reconciler):
 
             proxmox_ids: set[str] = set(result.get("proxmox_host_ids", []))
 
-            absent_ids = pre_ids - proxmox_ids
+            # The hosts the sweep actually MARKED absent this cycle (#712). The
+            # set difference this used to be counted every host the hypervisor
+            # does not report - a manual NAS, a guest gone for a month - as
+            # "absent" again on every cycle, while the sweep had marked none.
+            absent_ids = set(result.get("absent_host_ids", []))
             new_ids = proxmox_ids - pre_ids
             changed_ids: set[str] = set()
 

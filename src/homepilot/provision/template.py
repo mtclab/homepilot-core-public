@@ -50,11 +50,13 @@ import json
 import logging
 from typing import Any
 
-from ..adapters.proxmox import ProxmoxClient
+from ..adapters.proxmox import ProxmoxClient, ProxmoxError
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
 from .models import GuestTemplateRequest
+from .pve_tasks import stop_inflight
+from .reservations import GuestReservations
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,26 @@ class GuestTemplateConflictError(Exception):
 
 class GuestTemplateExistsError(Exception):
     """The vmid is taken. Refused rather than overwritten."""
+
+
+def template_marker(task_id: str) -> str:
+    """The description a template build writes into the shell it creates (#719).
+
+    Read back when the create's fate is unknown, so the unwind destroys a shell
+    only when the cluster shows THIS build made it.
+    """
+    return f"Created by HomePilot template build task {task_id}"
+
+
+def _pve_refused(exc: ProxmoxError) -> bool:
+    """PVE answered the create with a refusal, so nothing was created.
+
+    The same rule the provision clone uses: PVE locks and checks before it forks
+    the worker whose UPID is the success answer, so an error from PVE's own API
+    handler (4xx, or its 500) means nothing ran. Transport failures and proxy
+    errors are unknowns, settled by reading the cluster.
+    """
+    return 400 <= exc.status_code <= 500
 
 
 def upid_of(result: Any) -> str | None:
@@ -99,8 +121,13 @@ class GuestTemplateService:
         task_timeout_s: float = 600.0,
         download_timeout_s: float = 1800.0,
         defaults_source: Any = None,
+        reservations: GuestReservations | None = None,
     ):
         self.proxmox = proxmox
+        # Shared with provisioning when the app wires one in (#719): the vmid a
+        # build has checked is claimed here until its shell exists, so a
+        # provision cannot be handed it during the multi-minute download.
+        self.reservations = reservations or GuestReservations()
         self.task_repo = task_repo
         self.repo = repo
         self.poll_interval = poll_interval
@@ -206,6 +233,12 @@ class GuestTemplateService:
         # it, and an attempted destroy of a VM that was never created is a cheap,
         # reported failure - a leaked shell is not.
         create_issued = False
+        # What is KNOWN about whether this build created the shell at `vmid`
+        # (#719): True once PVE accepted the create, False once PVE refused it
+        # (somebody else's machine may be sitting there), None while unknown.
+        # Only True - or a config carrying this build's marker - is destroyed.
+        created: bool | None = False
+        reserved = False
         content_added = False
         source_volid = request.source_volid
         inflight_upid: str | None = None
@@ -216,14 +249,20 @@ class GuestTemplateService:
                 raise RuntimeError("Proxmox not configured")
 
             step = "check_vmid"
-            if vmid in await proxmox.cluster_vmids():
-                # No overwrite, ever. Converting to a template is one-way, and
-                # the id may belong to somebody's running machine.
-                raise GuestTemplateExistsError(
-                    f"vmid {vmid} is already in use on this cluster; refusing to "
-                    "overwrite it. Pick a free template_vmid (or destroy the "
-                    "existing guest yourself first)."
-                )
+            # Checked AND claimed under the lock provisioning allocates under
+            # (#719): the download below takes minutes, and a provision that
+            # asked /cluster/nextid in that window was handed this very id.
+            async with self.reservations.lock:
+                taken = vmid in await proxmox.cluster_vmids()
+                if taken or not self.reservations.reserve_vmid(vmid):
+                    # No overwrite, ever. Converting to a template is one-way,
+                    # and the id may belong to somebody's running machine.
+                    raise GuestTemplateExistsError(
+                        f"vmid {vmid} is already in use on this cluster; refusing to "
+                        "overwrite it. Pick a free template_vmid (or destroy the "
+                        "existing guest yourself first)."
+                    )
+                reserved = True
 
             step = "storage_content"
             content_added = await self._ensure_import_content(request.storage)
@@ -245,22 +284,25 @@ class GuestTemplateService:
 
             step = "create_vm"
             create_issued = True
-            upid = await proxmox.create_vm(
-                node,
-                vmid,
-                {
-                    "name": request.name,
-                    "memory": request.memory_mb,
-                    "cores": request.cores,
-                    "sockets": 1,
-                    # A Linux cloud image. PVE's unset default is 'other', which
-                    # picks weaker device defaults for a guest we know is Linux.
-                    "ostype": "l26",
-                    # The controller the imported disk attaches to; scsi0 below
-                    # is meaningless without it.
-                    "scsihw": "virtio-scsi-pci",
-                },
-            )
+            created = None
+            try:
+                upid = await proxmox.create_vm(
+                    node,
+                    vmid,
+                    self._create_config(request, task_id),
+                )
+            except ProxmoxError as exc:
+                if _pve_refused(exc):
+                    # Refused - including "config file already exists" when the
+                    # operator's GUI took the id during the download. Nothing of
+                    # ours is there, so nothing may be destroyed.
+                    created = False
+                raise
+            created = True
+            # The shell's config is on the cluster now, and the cluster's own
+            # answer covers the id from here on.
+            self.reservations.release_vmid(vmid)
+            reserved = False
             inflight_upid = upid or None
             await self._wait(upid, node, self.task_timeout_s)
             inflight_upid = None
@@ -291,7 +333,12 @@ class GuestTemplateService:
             # console because that is what Ubuntu's cloud images expect, and the
             # guest agent - which is how provisioning discovers the guest's IP
             # and joins a tailnet.
-            await proxmox.set_vm_config(
+            #
+            # WAITED for (#711): POST .../config answers with a qmconfig UPID,
+            # and a template converted before that worker finished - or after
+            # it failed - is a template with no cloud-init drive, which every
+            # clone of it inherits.
+            written = await proxmox.set_vm_config(
                 node,
                 vmid,
                 {
@@ -302,6 +349,10 @@ class GuestTemplateService:
                     "agent": "enabled=1",
                 },
             )
+            config_upid = upid_of(written)
+            inflight_upid = config_upid
+            await self._wait(config_upid, node, self.task_timeout_s)
+            inflight_upid = None
 
             step = "convert_template"
             upid = await proxmox.convert_vm_to_template(node, vmid)
@@ -334,7 +385,7 @@ class GuestTemplateService:
             # What it MUST do is unwind what this run put on PVE.
             cleanup = asyncio.create_task(
                 self._cleanup_after_cancel(
-                    task_id, request, actor, create_issued, inflight_upid, content_added
+                    task_id, request, actor, create_issued, inflight_upid, content_added, created
                 )
             )
             self._track_task(cleanup)
@@ -352,7 +403,15 @@ class GuestTemplateService:
             # else will remove (#595's class, on this path). A failure BEFORE it
             # has nothing to unwind.
             if create_issued:
-                error = f"{error}; {await self._destroy_partial(node, vmid)}"
+                if created is True and inflight_upid is not None:
+                    # A task of ours may still hold the shell's lock (an import
+                    # that outlived its budget): stop it and wait before the
+                    # destroy, or PVE refuses the destroy and the task finishes
+                    # into an orphan (#711).
+                    stopped = await self._stop_inflight(node, inflight_upid, check_first=True)
+                    if stopped != "not_needed":
+                        error = f"{error}; in-flight PVE task {stopped}"
+                error = f"{error}; {await self._unwind_create(node, vmid, task_id, created)}"
             if content_added:
                 error = f"{error}; note: 'import' content was added to storage {request.storage!r}"
             try:
@@ -362,6 +421,8 @@ class GuestTemplateService:
                 logger.error("Could not mark template task %s failed", task_id, exc_info=True)
         finally:
             self._inflight_vmids.discard(vmid)
+            if reserved:
+                self.reservations.release_vmid(vmid)
 
     async def _cleanup_after_cancel(
         self,
@@ -371,6 +432,7 @@ class GuestTemplateService:
         create_issued: bool,
         inflight_upid: str | None,
         content_added: bool,
+        created: bool | None = True,
     ) -> None:
         """Unwind a cancelled build and record what actually happened.
 
@@ -388,20 +450,25 @@ class GuestTemplateService:
             outcome["cleanup"] = "nothing_created"
         else:
             if inflight_upid is not None:
-                try:
-                    await self.proxmox.stop_task(node, inflight_upid)
-                    outcome["stop_task"] = "stopped"
-                except Exception as exc:
-                    logger.warning("Could not stop PVE task %s: %s", inflight_upid, exc)
-                    outcome["stop_task"] = "failed"
+                outcome["stop_task"] = await self._stop_inflight(
+                    node, inflight_upid, check_first=False
+                )
             else:
                 outcome["stop_task"] = "not_needed"
-            unwound = await self._destroy_partial(node, vmid)
-            if unwound.startswith("cleanup FAILED"):
-                outcome["cleanup"] = "failed"
-                error = f"cancelled but {unwound}"
+            if created is None:
+                created = await self._created_by(node, vmid, task_id)
+            if created is False:
+                outcome["cleanup"] = "nothing_created"
+            elif created is None:
+                outcome["cleanup"] = "unverified"
+                error = f"cancelled; {self._untouched_note(node, vmid)}"
             else:
-                outcome["cleanup"] = "deleted"
+                unwound = await self._destroy_partial(node, vmid)
+                if unwound.startswith("cleanup FAILED"):
+                    outcome["cleanup"] = "failed"
+                    error = f"cancelled but {unwound}"
+                else:
+                    outcome["cleanup"] = "deleted"
         outcome["storage_import_content_added"] = content_added
 
         try:
@@ -415,6 +482,72 @@ class GuestTemplateService:
         await self._audit(actor, request, "guest_template_cancelled", outcome)
 
     # ── the pieces ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _create_config(request: GuestTemplateRequest, task_id: str) -> dict[str, Any]:
+        """The shell's config, carrying this build's marker in its description."""
+        return {
+            "name": request.name,
+            "memory": request.memory_mb,
+            "cores": request.cores,
+            "sockets": 1,
+            # A Linux cloud image. PVE's unset default is 'other', which picks
+            # weaker device defaults for a guest we know is Linux.
+            "ostype": "l26",
+            # The controller the imported disk attaches to; scsi0 below is
+            # meaningless without it.
+            "scsihw": "virtio-scsi-pci",
+            # Read back when the create's fate is unknown (#719).
+            "description": template_marker(task_id),
+        }
+
+    async def _created_by(self, node: str, vmid: int, task_id: str) -> bool | None:
+        """Did THIS build create the shell at `vmid`? Read from the cluster (#719).
+
+        True when the config carries this build's marker, False when PVE says
+        there is no guest there, None otherwise - and None is never destroyed.
+        """
+        proxmox = self.proxmox
+        if proxmox is None:  # pragma: no cover - the caller checked
+            return None
+        try:
+            config = await proxmox.get_vm_config(node, vmid)
+        except Exception as exc:
+            if isinstance(exc, ProxmoxError) and _pve_refused(exc):
+                body = (exc.body or "").lower()
+                if "does not exist" in body or "no such" in body:
+                    return False
+            logger.warning("Could not read vmid %s to see if this build made it: %s", vmid, exc)
+            return None
+        if isinstance(config, dict) and template_marker(task_id) in str(
+            config.get("description") or ""
+        ):
+            return True
+        return None
+
+    async def _unwind_create(self, node: str, vmid: int, task_id: str, created: bool | None) -> str:
+        """Destroy the shell only when this build is SHOWN to have made it (#719).
+
+        Returns the sentence for the record. A refused create made nothing, and
+        an unknown one whose config does not carry our marker is left alone: the
+        machine at that vmid may be somebody else's, and a template build that
+        purges an operator's VM because its own request failed is the worst
+        possible way to fail.
+        """
+        if created is None:
+            created = await self._created_by(node, vmid, task_id)
+        if created is False:
+            return f"nothing was created at vmid {vmid}"
+        if created is None:
+            return self._untouched_note(node, vmid)
+        return await self._destroy_partial(node, vmid)
+
+    @staticmethod
+    def _untouched_note(node: str, vmid: int) -> str:
+        return (
+            f"vmid {vmid} on {node} was NOT touched: nothing shows this build created "
+            "the guest there. Check that vmid before retrying."
+        )
 
     async def _ensure_import_content(self, storage: str) -> bool:
         """Make the storage declare `import` content. True when this had to add it.
@@ -456,6 +589,17 @@ class GuestTemplateService:
         await proxmox.set_storage_content(storage, ",".join([*content, "import"]))
         logger.info("Added 'import' content type to storage %s (kept %s)", storage, content)
         return True
+
+    async def _stop_inflight(self, node: str, upid: str, check_first: bool = False) -> str:
+        """Stop a task of ours and wait until it lets go of the guest (#711)."""
+        return await stop_inflight(
+            self.proxmox,
+            node,
+            upid,
+            timeout_s=self.task_timeout_s,
+            poll_interval=self.poll_interval,
+            check_first=check_first,
+        )
 
     async def _wait(self, upid: str | None, node: str, timeout_s: float) -> None:
         """Wait for a PVE task, when the call produced one.

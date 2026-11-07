@@ -395,6 +395,14 @@
 		border-style: dashed;
 		border-color: var(--color-border-strong);
 	}
+	/* No claim at all (#704): an action the journal has no chip for. Falling
+	   back to `badge-proposed` coloured every unknown action as a pending
+	   review. */
+	.badge-neutral {
+		background: var(--color-surface-raised);
+		color: var(--color-muted);
+		border-color: var(--color-border);
+	}
 
 	/* --- Buttons ---------------------------------------------------------- */
 	.btn {

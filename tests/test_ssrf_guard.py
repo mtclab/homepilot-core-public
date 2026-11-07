@@ -5,19 +5,14 @@ from __future__ import annotations
 import ipaddress
 from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 
 from homepilot.mcp.tools.ssrf_guard import SSRFError, _is_private_ip, _PinnedTransport, validate_url
 
 
-def _mock_dns_response(ips: list[str]) -> httpx.Response:
-    answers = [{"data": ip, "type": 1} for ip in ips]
-    return httpx.Response(
-        200,
-        json={"Status": 0, "Answer": answers},
-        request=httpx.Request("GET", "https://dns.google/resolve"),
-    )
+def _fake_resolver(ips: list[str]) -> AsyncMock:
+    """A resolver that answers every lookup with *ips* (records what it was asked)."""
+    return AsyncMock(return_value=list(ips))
 
 
 class TestIsPrivateIP:
@@ -89,33 +84,25 @@ class TestSchemeValidation:
 class TestPrivateIPBlocking:
     @pytest.mark.asyncio
     async def test_localhost_blocked(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["127.0.0.1"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["127.0.0.1"])
         with pytest.raises(SSRFError, match="private/forbidden"):
             await validate_url("https://localhost/api", resolver=client)
 
     @pytest.mark.asyncio
     async def test_internal_ip_blocked(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["10.0.0.1"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["10.0.0.1"])
         with pytest.raises(SSRFError, match="private/forbidden"):
             await validate_url("https://internal.corp/api", resolver=client)
 
     @pytest.mark.asyncio
     async def test_cloud_metadata_blocked(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["169.254.169.254"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["169.254.169.254"])
         with pytest.raises(SSRFError, match="private/forbidden"):
             await validate_url("https://metadata.google/api", resolver=client)
 
     @pytest.mark.asyncio
     async def test_192_168_blocked(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["192.168.1.1"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["192.168.1.1"])
         with pytest.raises(SSRFError, match="private/forbidden"):
             await validate_url("https://home.router/api", resolver=client)
 
@@ -123,33 +110,13 @@ class TestPrivateIPBlocking:
 class TestDNSRebinding:
     @pytest.mark.asyncio
     async def test_private_ip_in_second_answer_blocked(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        mixed = [
-            {"data": "8.8.8.8", "type": 1},
-            {"data": "10.0.0.1", "type": 1},
-        ]
-        client.get = AsyncMock(
-            return_value=httpx.Response(
-                200,
-                json={"Status": 0, "Answer": mixed},
-                request=httpx.Request("GET", "https://dns.google/resolve"),
-            )
-        )
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["8.8.8.8", "10.0.0.1"])
         with pytest.raises(SSRFError, match="private/forbidden"):
             await validate_url("https://rebinding.evil/api", resolver=client)
 
     @pytest.mark.asyncio
     async def test_no_dns_answer_raises(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(
-            return_value=httpx.Response(
-                200,
-                json={"Status": 0, "Answer": []},
-                request=httpx.Request("GET", "https://dns.google/resolve"),
-            )
-        )
-        client.aclose = AsyncMock()
+        client = _fake_resolver([])
         with pytest.raises(SSRFError, match="DNS resolution failed"):
             await validate_url("https://nonexistent.invalid/api", resolver=client)
 
@@ -157,9 +124,7 @@ class TestDNSRebinding:
 class TestDomainAllowlist:
     @pytest.mark.asyncio
     async def test_allowed_domain_passes(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["1.2.3.4"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["1.2.3.4"])
         url, resolved_ips = await validate_url(
             "https://api.authentik.local/health",
             allowed_domains=["authentik.local"],
@@ -170,9 +135,7 @@ class TestDomainAllowlist:
 
     @pytest.mark.asyncio
     async def test_subdomain_passes(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["1.2.3.4"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["1.2.3.4"])
         url, resolved_ips = await validate_url(
             "https://api.authentik.local/health",
             allowed_domains=["authentik.local"],
@@ -183,9 +146,7 @@ class TestDomainAllowlist:
 
     @pytest.mark.asyncio
     async def test_blocked_domain_not_in_allowlist(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["1.2.3.4"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["1.2.3.4"])
         with pytest.raises(SSRFError, match="not in allowed domains"):
             await validate_url(
                 "https://evil.com/api",
@@ -195,9 +156,7 @@ class TestDomainAllowlist:
 
     @pytest.mark.asyncio
     async def test_no_allowlist_allows_any_domain(self) -> None:
-        client = AsyncMock(spec=httpx.AsyncClient)
-        client.get = AsyncMock(return_value=_mock_dns_response(["1.2.3.4"]))
-        client.aclose = AsyncMock()
+        client = _fake_resolver(["1.2.3.4"])
         url, resolved_ips = await validate_url("https://any.public/api", resolver=client)
         assert url == "https://any.public/api"
         assert resolved_ips == ["1.2.3.4"]

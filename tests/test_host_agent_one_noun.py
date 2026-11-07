@@ -86,13 +86,18 @@ async def _stack(tmp_path: Path):
 
     await open_window(repo, 60)
 
+    # A real agent reconnects with the per-agent credential its first register
+    # was handed, never the shared token again: a hostname that holds a live
+    # credential is refused shared-token enrolment (#683).
+    credentials: dict[str, str] = {}
+
     async def register(agent_id: str, hostname: str):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(
             _encode(
                 {
                     "action": "register",
-                    "auth_token": AUTH,
+                    "auth_token": credentials.get(agent_id, AUTH),
                     "agent_id": agent_id,
                     "hostname": hostname,
                     "system_info": SYSTEM_INFO,
@@ -102,7 +107,9 @@ async def _stack(tmp_path: Path):
         )
         await writer.drain()
         ack = await _recv(reader)
-        assert ack["action"] == "register_ack", ack
+        assert ack.get("action") == "register_ack", ack
+        if ack.get("auth_token"):
+            credentials[agent_id] = ack["auth_token"]
         # The write is fire-and-forget behind the ack; drain makes it a fact.
         await registry.drain()
         return reader, writer

@@ -82,6 +82,9 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # an admin-tier tool. There is no mutating twin: the change ships as a
     # `guest-network` artifact through propose/approve/apply.
     "/admin/guest-network": "query_guest_network",
+    # Webhook configs (#700): an API-admin read (the endpoints are where the
+    # approval codes go), so an admin-tier tool. URLs come back redacted.
+    "/admin/webhooks": "list_webhooks",
     # Agent fleet
     "/agents/": "list_agents",
     "/agents/audit": "get_agent_audit",
@@ -285,6 +288,8 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     ("PUT", "/admin/settings/overrides/{key}"): "set_setting_override",
     ("DELETE", "/admin/settings/overrides/{key}"): "clear_setting_override",
     ("POST", "/admin/settings/overrides/{key}/probe"): "probe_setting_override",
+    # #700: one test delivery to a configured webhook. API admin -> admin tier.
+    ("POST", "/admin/webhooks/{webhook_id}/test"): "test_webhook",
     ("DELETE", "/auth/tokens/{prefix}"): "delete_auth_token",
     # Artifacts
     ("POST", "/artifacts"): "propose_artifact",
@@ -318,6 +323,12 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
+    # ── Operator hand-edit of an artifact file (#693). ──
+    ("POST", "/artifacts/{artifact_id}/edit"): (
+        "the route `hp artifacts edit` submits an operator's $EDITOR session to. The "
+        "assistant changes a plan by proposing a new artifact (propose_artifact, "
+        "which can supersede this one) - it has no editor session to submit."
+    ),
     # ── Operator-only reset of a coded-approval lock. Not mirrored over MCP. ──
     ("POST", "/artifacts/{artifact_id}/approval-code/reset"): (
         "clears the brute-force LOCK on an artifact's approval code - the very lock "
@@ -329,6 +340,16 @@ EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/admin/guests/invites"): (
         "minting a guest invite returns a fresh credential; a token an MCP transcript "
         "must never carry. Deferred to the secret-mint wave."
+    ),
+    # ── Where events go (#700). ──
+    ("POST", "/admin/webhooks"): (
+        "adding an endpoint chooses who receives the artifact_proposed event, which "
+        "carries the approval code to the operator (#681). An assistant that could add "
+        "one could send itself the codes it must only ever get from a human."
+    ),
+    ("DELETE", "/admin/webhooks/{webhook_id}"): (
+        "removing an endpoint silences the channel that tells the operator a change "
+        "awaits approval; an operator action at the console or `hp webhook delete`."
     ),
     # ── Secret/credential configuration - kept OUT of MCP by owner secret rules. ─
     ("PUT", "/admin/settings/proxmox"): (

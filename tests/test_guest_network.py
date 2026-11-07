@@ -143,6 +143,14 @@ class FakeCluster:
     async def cluster_firewall_options(self) -> dict[str, Any]:
         return dict(self.dc_fw_options)
 
+    # The per-VM fence read-back (#713). No guests by default; a test that
+    # needs fenced guests uses tests/test_fence_convergence.py's chain model.
+    async def list_guest_vms(self) -> list[dict[str, Any]]:
+        return []
+
+    async def vm_firewall_rules(self, node: str, vmid: int) -> list[dict[str, Any]] | None:
+        return None
+
     # mutations
     async def _record(self, op: str, params: dict[str, Any]) -> str:
         self.calls.append((op, params))
@@ -167,6 +175,9 @@ class FakeCluster:
 
     async def set_vnet_firewall_options(self, **params: Any) -> str:
         return await self._record("set_vnet_firewall_options", params)
+
+    async def delete_vnet_firewall_rule(self, **params: Any) -> str:
+        return await self._record("delete_vnet_firewall_rule", params)
 
     async def create_vnet_firewall_rule(self, **params: Any) -> str:
         result = await self._record("create_vnet_firewall_rule", params)
@@ -339,14 +350,33 @@ class TestThePlan:
         assert result.steps[0].op == "update_subnet"
         assert result.steps[0].params["gateway"] == "198.51.100.1"
 
-    async def test_a_missing_firewall_rule_is_the_only_thing_planned(self) -> None:
+    async def test_a_missing_firewall_rule_rewrites_only_the_fence(self) -> None:
         cluster = converged_cluster()
         cluster.fw_rules = cluster.fw_rules[:-1]  # the gateway DROP went missing
         result = plan(desired(), await survey(cluster, desired()))
         # Firewall config is not SDN-pending state: repairing a rule needs no
         # apply at all (the old order wastefully applied for it).
-        assert [s.id for s in result.steps] == ["vnet-firewall-rule-4"]
+        #
+        # It used to plan ONLY the missing rule - POSTed at pos=0, which PVE
+        # puts at the TOP, so the "repair" landed the gateway DROP above the
+        # DNS/DHCP ACCEPTs it shadows (#599 through the back door). The fence
+        # is now rewritten in order: the whole fence on top first, then the
+        # four superseded rules removed from where they were pushed to (#713).
+        assert [s.id for s in result.steps] == [
+            "vnet-firewall-rule-4",
+            "vnet-firewall-rule-3",
+            "vnet-firewall-rule-2",
+            "vnet-firewall-rule-1",
+            "vnet-firewall-rule-0",
+            "vnet-firewall-remove-3",
+            "vnet-firewall-remove-2",
+            "vnet-firewall-remove-1",
+            "vnet-firewall-remove-0",
+        ]
         assert result.steps[0].params["dest"] == "198.51.100.1/32"
+        # Each superseded rule is removed from where the five new ones pushed it.
+        assert result.steps[5].params["pos"] == 3 + 5
+        assert result.steps[5].op == "delete_vnet_firewall_rule"
 
     async def test_a_zone_somebody_else_built_is_a_blocker_not_a_step(self) -> None:
         cluster = FakeCluster(zones=[{"zone": "guest", "type": "vxlan"}])

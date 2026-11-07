@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
+from .common import write_private
+
 
 class ConfigError(ValueError):
     pass
@@ -48,8 +50,36 @@ def _env_files() -> list[str]:
     return files
 
 
+def _looks_like_a_comment(value: object) -> bool:
+    """Whether a configured value is really an env-template comment (#773).
+
+    Docker Compose's `env_file` reads `KEY=   # note` as the VALUE `# note` -
+    the inline-comment rule only applies after a real value. A stock install
+    that left such a key empty therefore ran with the template's comment text
+    as its setting: in production that put `HP_VAULT_PASSPHRASE` - the key the
+    whole vault is encrypted with - equal to a string anyone can read in the
+    repo."""
+    return isinstance(value, str) and value.lstrip().startswith("#")
+
+
+def _settings_env_name(field_name: str, alias: object) -> str:
+    if isinstance(alias, str):
+        return alias
+    if isinstance(alias, AliasChoices):
+        return "/".join(str(choice) for choice in alias.choices)
+    return f"HP_{field_name.upper()}"
+
+
 class Settings(BaseSettings):
-    model_config = {"env_prefix": "HP_", "env_file": _env_files(), "extra": "ignore"}
+    # hide_input_in_errors: a refusal raised while settings load must never
+    # echo what was loaded - the input includes the vault passphrase and every
+    # other secret-bearing value (#773).
+    model_config = {
+        "env_prefix": "HP_",
+        "env_file": _env_files(),
+        "extra": "ignore",
+        "hide_input_in_errors": True,
+    }
 
     data_dir: str = str(Path.home() / ".hp")
     artifacts_dir: str = str(Path.home() / ".hp" / "artifacts")
@@ -127,6 +157,9 @@ class Settings(BaseSettings):
     vault_passphrase_file: str = ""
 
     allowed_http_domains: str = ""
+    # Vault entries an artifact may reference (#684). Empty = any entry except
+    # the platform's own credentials, which are refused whatever this says.
+    artifact_vault_allowlist: str = ""
 
     events_webhook_url: str | None = None
     events_webhook_secret: str | None = None
@@ -244,8 +277,7 @@ class Settings(BaseSettings):
                     return passphrase
             passphrase = secrets_mod.token_urlsafe(32)
             passphrase_path.parent.mkdir(parents=True, exist_ok=True)
-            passphrase_path.write_text(passphrase)
-            passphrase_path.chmod(0o600)
+            write_private(passphrase_path, passphrase)
             logger.info(
                 "No HP_VAULT_PASSPHRASE — auto-generated and saved to %s",
                 passphrase_path,
@@ -280,8 +312,7 @@ class Settings(BaseSettings):
                     return token
             token = secrets_mod.token_urlsafe(32)
             token_path.parent.mkdir(parents=True, exist_ok=True)
-            token_path.write_text(token)
-            token_path.chmod(0o600)
+            write_private(token_path, token)
             logger.info(
                 "No HP_AGENT_HUB_AUTH_TOKEN - auto-generated and saved to %s",
                 token_path,
@@ -357,11 +388,62 @@ class Settings(BaseSettings):
             )
             return ""
 
+    def _refuse_comment_values(self) -> None:
+        """Refuse to start when any HP_* value is a template comment (#773).
+
+        Checked before anything is derived from the values - above all before
+        the vault passphrase is used. Both places a value can come from are
+        covered: the process environment (which also holds the HP_* names read
+        directly with os.environ, e.g. HP_VAULT_AUTO_INIT, HP_MCP_TOKEN) and
+        every loaded field (dotenv files, init arguments). The error names the
+        keys and NEVER the values: one of them may be a real secret.
+
+        Non-HP_ variables with a `#` value cannot be refused here (other
+        services own them) but are named in the log, names only, because they
+        are the same defect - e.g. N8N_ENCRYPTION_KEY or SEARXNG_SECRET_KEY
+        left empty in an old template."""
+        import logging
+        import os as _os
+
+        poisoned: set[str] = set()
+        others: set[str] = set()
+        for key, value in _os.environ.items():
+            if _looks_like_a_comment(value):
+                (poisoned if key.startswith("HP_") else others).add(key)
+        for field_name, info in type(self).model_fields.items():
+            if _looks_like_a_comment(getattr(self, field_name, None)):
+                poisoned.add(_settings_env_name(field_name, info.validation_alias))
+
+        if others:
+            logging.getLogger(__name__).warning(
+                "Environment variables whose value starts with '#': %s. A value "
+                "like that is almost always an env-template comment that Docker "
+                "Compose read as the value (`KEY=   # note`). Check them; if a "
+                "secret is among them, it is public text and must be replaced.",
+                ", ".join(sorted(others)),
+            )
+        if poisoned:
+            names = ", ".join(sorted(poisoned))
+            raise ConfigError(
+                f"Refusing to start: the value of {names} starts with '#'. "
+                "Docker Compose reads `KEY=   # note` in an env file as the "
+                "value `# note`, so this is a template comment, not a setting. "
+                "Put the comment on its own line and leave the value empty (or "
+                "set a real one). If HP_VAULT_PASSPHRASE is listed, the vault "
+                "is encrypted with that public text: rotate it before anything "
+                "else (docs/vault.md, 'Passphrase taken from a template "
+                "comment'). A real secret that begins with '#' cannot be passed "
+                "through the environment; use HP_VAULT_PASSPHRASE_FILE or the "
+                "vault instead."
+            )
+
     def model_post_init(self, __context: object) -> None:
         import logging
         import os as _os
 
         logger = logging.getLogger(__name__)
+
+        self._refuse_comment_values()
 
         if _os.environ.get("HP_AUTO_APPLY_MUTATING"):
             logger.warning(

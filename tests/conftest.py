@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from . import hermetic
+
 # COLOUR OFF, BEFORE ANYTHING IMPORTS RICH.
 #
 # `rich` builds its Console at import time and decides then whether to emit ANSI
@@ -25,6 +27,46 @@ os.environ["TERM"] = "dumb"
 # which is the colour bug wearing a different hat: a gate whose result depends
 # on the caller's environment is not a gate.
 os.environ["COLUMNS"] = "200"
+
+# NOTHING FROM THE DEVELOPER'S OWN HOMEPILOT, BEFORE ANYTHING IMPORTS IT (#759).
+#
+# `Settings` reads `~/.hp/.env`, and on a workstation that file holds a LIVE
+# admin secret: test runs loaded it into the suite, where any test echoing
+# settings could print it. HOME becomes a per-run sandbox, every HP_* variable
+# but the harness's own is dropped, and the run refuses to start if Settings
+# would still read a dotenv from outside the sandbox. See tests/hermetic.py.
+hermetic.ACTIVE = hermetic.isolate()
+hermetic.assert_no_foreign_env_files(hermetic.ACTIVE)
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if hermetic.ACTIVE is not None:
+        hermetic.remove(hermetic.ACTIVE)
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """`make gate` must not pass by skipping the real-binary journeys (#726).
+
+    Refused before a single test runs, rather than reported afterwards, so the
+    gate cannot print a green count over journeys it never exercised."""
+    from .go_toolchain import GO, GoToolchainRequiredError, check_gate_go
+
+    try:
+        warning = check_gate_go(os.environ, GO)
+    except GoToolchainRequiredError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+    if warning:
+        session.config.stash[_GO_WARNING_KEY] = warning
+
+
+_GO_WARNING_KEY = pytest.StashKey[str]()
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """Repeat the explicit no-Go opt-out at the END, where the counts are read."""
+    warning = config.stash.get(_GO_WARNING_KEY, "")
+    if warning:
+        terminalreporter.write_line(warning, yellow=True, bold=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -131,14 +173,18 @@ def portal_app(portal_db, portal_proxmox):
 
 @pytest.fixture(scope="session")
 def hp_agent_binary(tmp_path_factory: pytest.TempPathFactory) -> str:
-    """Build agent/go once per session; skip when no Go toolchain is present."""
+    """Build agent/go once per session; skip when no Go toolchain is present.
+
+    Under `make gate` a missing toolchain never gets this far - see
+    `pytest_sessionstart` below and tests/go_toolchain.py (#726)."""
     import os
-    import shutil
     import subprocess
 
-    go = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
+    from .go_toolchain import GO, GO_SKIP_REASON
+
+    go = GO
     if not go:
-        pytest.skip("Go toolchain not available")
+        pytest.skip(GO_SKIP_REASON)
     repo_root = Path(__file__).resolve().parents[1]
     out = tmp_path_factory.mktemp("hp-agent-build") / "hp-agent"
     env = {

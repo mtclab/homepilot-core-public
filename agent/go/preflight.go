@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 type prefixState int
@@ -157,4 +158,49 @@ func preflight(cfg Config, euid int, prefixes []string) (report []string, err er
 		return report, fmt.Errorf("%s", b.String())
 	}
 	return report, nil
+}
+
+// Interval bounds (#727). A non-positive interval reached time.NewTicker, which
+// panics; under the unit's StartLimitBurst the agent then ended dead with no
+// clear error. The heartbeat is also bounded from above: the hub drops a
+// connection that has been silent for 300 s.
+const (
+	defaultHeartbeatInterval = 30
+	maxHeartbeatInterval     = 240
+	defaultMetricsInterval   = 60
+	maxMetricsInterval       = 3600
+)
+
+// normaliseIntervals clamps the configured heartbeat and metrics intervals into
+// range and returns one warning per value it changed, naming the variable. It is
+// part of the startup self-check: a bad value costs a warning and the default,
+// never the agent (a monitoring agent that refuses to start over a tuning knob
+// takes a healthy host off the fleet).
+func normaliseIntervals(cfg *Config) []string {
+	var warnings []string
+	fix := func(name string, v *int, def, most int) {
+		switch {
+		case *v <= 0:
+			warnings = append(warnings, fmt.Sprintf(
+				"WARNING: %s=%d is not a positive number of seconds; using %d", name, *v, def))
+			*v = def
+		case *v > most:
+			warnings = append(warnings, fmt.Sprintf(
+				"WARNING: %s=%d is above the %d s maximum; using %d", name, *v, most, most))
+			*v = most
+		}
+	}
+	fix("HP_AGENT_HEARTBEAT_INTERVAL", &cfg.HeartbeatInterval, defaultHeartbeatInterval, maxHeartbeatInterval)
+	fix("HP_AGENT_METRICS_INTERVAL", &cfg.MetricsInterval, defaultMetricsInterval, maxMetricsInterval)
+	return warnings
+}
+
+// tickEvery is the ticker period for an interval in seconds, never
+// non-positive: a second line of defence for an Agent not built through
+// ConfigFromEnv + normaliseIntervals.
+func tickEvery(seconds, def int) time.Duration {
+	if seconds <= 0 {
+		seconds = def
+	}
+	return time.Duration(seconds) * time.Second
 }

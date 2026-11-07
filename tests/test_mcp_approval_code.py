@@ -12,7 +12,8 @@ human decided. These gates prove, with teeth:
 * five wrong codes lock the artifact until an operator reset; the lock is
   per-artifact;
 * approve with no code is refused (the self-approve guard);
-* the code IS surfaced on the webhook payload and the management API GET, and is
+* the code IS surfaced on the outbound webhook POST and the management API GET
+  for an operator credential (#681), and is
   NOT on the MCP get_artifact.
 """
 
@@ -166,8 +167,11 @@ class TestApproveFlow:
         assert result["status"] == "approved"
         fm, _ = store.read(aid)
         assert fm["status"] == "approved"
-        # Actor recorded as an operator-via-code, NOT the assistant/caller.
-        assert fm["approved_by"]["user"] == "operator-code via MCP"
+        # The record names the credential that presented the code (#681: the
+        # identity is always the authenticated principal) and says the
+        # authority behind it was a human-relayed code.
+        assert fm["approved_by"]["user"] == "mcp-test"
+        assert fm["approved_by"]["authority"] == "relayed-code"
 
     async def test_grouped_and_lowercased_code_still_verifies(self, lifecycle, store, repo):
         aid = await lifecycle.propose(_spec())
@@ -203,7 +207,9 @@ class TestSelfApproveGuard:
     async def test_missing_code_refused_no_transition(self, lifecycle, store, repo):
         aid = await lifecycle.propose(_spec())
         ctx = _ctx(lifecycle, store, repo)
-        with pytest.raises(ValueError, match="requires an approval_code"):
+        # Refused by the tool's schema before the handler runs (#696); the answer
+        # still names the code and says a human relays it.
+        with pytest.raises(ValueError, match=r"`approval_code` is required - .*a human relayed"):
             await _handle_tool("approve_artifact", {"artifact_id": aid}, ctx)
         fm, _ = store.read(aid)
         assert fm["status"] == "proposed"
@@ -276,8 +282,17 @@ class TestSurfacing:
     async def test_webhook_payload_carries_the_code(self, store, repo, monkeypatch):
         captured: list[tuple[str, dict[str, Any]]] = []
 
-        async def _fake_emit(event_type: str, payload: dict[str, Any], repo: Any = None) -> None:
-            captured.append((event_type, payload))
+        async def _fake_emit(
+            event_type: str,
+            payload: dict[str, Any],
+            repo: Any = None,
+            *,
+            outbound_only: dict[str, Any] | None = None,
+        ) -> None:
+            # The code rides only the outbound webhook POST (#681): never the
+            # SSE payload, never the stored delivery row.
+            assert "approval_code" not in payload
+            captured.append((event_type, {**payload, **(outbound_only or {})}))
 
         monkeypatch.setattr("homepilot.artifacts.lifecycle.emit_event", _fake_emit)
         lifecycle = ArtifactLifecycle(store, repository=repo)
@@ -321,7 +336,9 @@ class TestSurfacing:
             def __init__(self) -> None:
                 self.app = _App()
 
-        detail = await api_get_artifact(_Req(), aid)  # type: ignore[arg-type]
+        # Surfaced to an OPERATOR credential only (#681).
+        operator = {"scope": "all", "label": "owner", "prefix": "hp_0123456789abc"}
+        detail = await api_get_artifact(_Req(), aid, operator)  # type: ignore[arg-type]
         assert detail["approval_code"] is not None
         # Displayed grouped; normalising recovers the stored code.
         assert normalize_code(detail["approval_code"]) == code

@@ -11,6 +11,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import typer
 from rich.console import Console
@@ -21,11 +22,16 @@ from rich.table import Table
 from homepilot import __version__
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.auth.tokens import generate_api_token
+from homepilot.common import format_validation_error, write_private
 from homepilot.config import get_settings
+from homepilot.tasks.repository import TERMINAL_TASK_STATUSES
 from homepilot.vault import VaultManager
 
 if TYPE_CHECKING:  # imports kept out of CLI startup, present for type checking only
+    from collections.abc import AsyncIterator
+
     from homepilot.db.connection import Database
     from homepilot.portal.repository import InviteRepository
 
@@ -194,9 +200,64 @@ def _get_artifact_store() -> ArtifactStore:
     )
 
 
-def _get_lifecycle() -> ArtifactLifecycle:
-    store = _get_artifact_store()
-    return ArtifactLifecycle(store)
+@contextlib.asynccontextmanager
+async def _lifecycle_with_repo(what: str) -> AsyncIterator[ArtifactLifecycle]:
+    """The artifact lifecycle WITH its repository, for a stopped backend (#693).
+
+    Without the repository every transition is file-only: the DB row, the audit
+    entry and the per-config webhooks silently never happen. Refused (by
+    `_open_cli_db`) while a backend holds the data directory - then the CLI
+    goes through the API instead.
+    """
+    from homepilot.db.repository import Repository
+
+    database = await _open_cli_db(what)
+    try:
+        yield ArtifactLifecycle(_get_artifact_store(), repository=Repository(database))
+    finally:
+        await database.close()
+
+
+# The on-box CLI approves as an operator (#681): it opens the control plane's
+# database and artifact store directly, so whoever runs it already holds
+# everything an operator credential would grant.
+_CLI_OPERATOR = Principal.operator("cli")
+
+
+def _lifecycle_transition(action: str, id: str, reason: str | None) -> None:
+    """Approve or reject through whoever owns the lifecycle right now (#693).
+
+    With the backend running it is a request to its API - the same route the UI
+    uses, so its DB, audit log, SSE stream and webhooks all see it and its
+    policy applies. With the backend stopped the CLI runs the lifecycle itself,
+    with the repository. Any failure exits non-zero.
+    """
+
+    async def _direct() -> None:
+        async with _lifecycle_with_repo(f"hp artifacts {action}") as lifecycle:
+            if action == "approve":
+                await lifecycle.approve(id, _CLI_OPERATOR, reason=reason)
+            else:
+                await lifecycle.reject(id, _CLI_OPERATOR.name, reason=reason)
+
+    try:
+        if _server_is_running(_get_settings()):
+            # No identity in the body: the API takes it from the credential
+            # (#681). Approving needs an OPERATOR credential - a write-tier
+            # token is an assistant there and would need a relayed code - so
+            # approve mints the admin capability; reject needs only write.
+            body: dict[str, Any] = {}
+            if reason:
+                body["reason"] = reason
+            scope = "admin" if action == "approve" else "write"
+            asyncio.run(_backend_api("POST", f"/artifacts/{id}/{action}", body, scope=scope))
+        else:
+            asyncio.run(_direct())
+    except typer.Exit:
+        raise
+    except Exception as e:
+        err_console.print(f"[red]{action.capitalize()} failed for {id}: {e}[/red]")
+        raise typer.Exit(1) from None
 
 
 def _db_path() -> Path:
@@ -238,6 +299,24 @@ def _artifact_approval_code(artifact_id: str, status: str) -> tuple[str | None, 
         return result
     except Exception:
         return None, False
+
+
+async def _audit_cli_mint(repo: Any, prefix: str, label: str, scope: str) -> None:
+    """The audit row for a token the CLI minted straight into the database (#686).
+
+    `hp init` and the zero-token bootstrap of `hp token create` are the two
+    mints with no API in between, so they write the row the API would."""
+    from homepilot.auth.audit import ACTION_MINTED, audit_credential_event
+
+    await audit_credential_event(
+        repo,
+        action=ACTION_MINTED,
+        actor="cli",
+        source="cli",
+        prefix=prefix,
+        label=label,
+        scope=scope,
+    )
 
 
 @app.command()
@@ -362,8 +441,7 @@ def init(
         with contextlib.suppress(ValueError):
             env_lines.append(f"HP_PROXMOX_PORT={int(port_part)}")
 
-    env_path.write_text("\n".join(env_lines) + "\n")
-    os.chmod(str(env_path), 0o600)
+    write_private(env_path, "\n".join(env_lines) + "\n")
 
     vault_dir = data_dir / "vault"
     vault_dir.mkdir(parents=True, exist_ok=True)
@@ -377,8 +455,7 @@ def init(
 
     full_token, token_prefix, token_hash = generate_api_token()
     token_path = data_dir / "api-token"
-    token_path.write_text(full_token + "\n")
-    os.chmod(str(token_path), 0o600)
+    write_private(token_path, full_token + "\n")
 
     async def _register_token() -> None:
         from homepilot.db.repository import Repository
@@ -402,6 +479,7 @@ def init(
                 expires_at=None,
             )
             await database.conn.commit()
+            await _audit_cli_mint(repo, token_prefix, "admin", "all")
         finally:
             await database.close()
 
@@ -437,11 +515,15 @@ def init(
     console.print(
         f"[dim]API token (save this — it won't be shown again):[/dim] [bold]{full_token}[/bold]"
     )
-    console.print("[dim]Add to your MCP config:[/dim]")
+    console.print("[dim]Add to your MCP config (the backend serves MCP at /mcp):[/dim]")
     console.print(
         f'[dim]  {{"mcpServers": {{"homepilot": '
-        f'{{"command": "hp", "args": ["mcp-serve"], '
-        f'"env": {{"HP_MCP_TOKEN": "{full_token}"}}}}}}}}[/dim]'
+        f'{{"url": "http://<backend-host>:{_get_settings().daemon_port}/mcp", '
+        f'"headers": {{"Authorization": "Bearer {full_token}"}}}}}}}}[/dim]'
+    )
+    console.print(
+        "[dim]  (`hp mcp-serve` over stdio is for running WITHOUT a backend; it "
+        "refuses while one is running.)[/dim]"
     )
 
 
@@ -507,7 +589,13 @@ def claim_code() -> None:
 
 @app.command()
 def status() -> None:
-    """Show daemon info, PVE connectivity, artifact counts, and vault state."""
+    """Show whether a backend holds this data dir, the configured PVE address,
+    whether the vault opens, and artifact counts.
+
+    The PVE row is the CONFIGURED address; nothing here connects to it (#704:
+    the docstring promised connectivity it never checked). Settings -> Proxmox
+    in the web UI runs a real connection test.
+    """
     settings = _get_settings()
     data_dir = Path(settings.data_dir)
 
@@ -517,7 +605,13 @@ def status() -> None:
 
     table.add_row("Data dir", str(data_dir))
     table.add_row("Artifacts dir", str(Path(settings.artifacts_dir)))
-    table.add_row("PVE host", _pve_host(settings))
+    # Established from the instance lock the backend holds for its lifetime -
+    # not from a port answering.
+    table.add_row(
+        "Backend",
+        "running (holds the data dir)" if _server_is_running(settings) else "not running",
+    )
+    table.add_row("PVE host (configured, not probed)", _pve_host(settings))
     table.add_row("Vault", _vault_state(settings))
 
     store = _get_artifact_store()
@@ -547,15 +641,26 @@ def mcp_serve(
     host: str = typer.Option("0.0.0.0", "--host", help="Bind host (http only)"),
     port: int = typer.Option(8000, "--port", help="Bind port (http only)"),
 ) -> None:
-    """Start the MCP server (stdio or http transport)."""
-    if transport == "http":
-        from homepilot.mcp.server import run_server_http
+    """Start a STANDALONE MCP server (stdio or http transport).
 
-        asyncio.run(run_server_http(host=host, port=port))
-    else:
-        from homepilot.mcp.server import main as mcp_main
+    Standalone means no backend is running on this data directory: this process
+    then is the control plane. With a backend running it refuses (#698) - point
+    the client at the backend's own /mcp endpoint instead.
+    """
+    from homepilot.instance_lock import InstanceLockError
 
-        mcp_main()
+    try:
+        if transport == "http":
+            from homepilot.mcp.server import run_server_http
+
+            asyncio.run(run_server_http(host=host, port=port))
+        else:
+            from homepilot.mcp.server import main as mcp_main
+
+            mcp_main()
+    except InstanceLockError as exc:
+        err_console.print(f"[red]hp mcp-serve refused: {exc}[/red]")
+        raise typer.Exit(1) from None
 
 
 @artifacts_app.command("list")
@@ -718,17 +823,9 @@ def artifacts_approve(
     reason: list[str] | None = typer.Option(None, "--reason", help="Approval reason"),  # noqa: B008
 ) -> None:
     """Approve a proposed artifact."""
-    lifecycle = _get_lifecycle()
     reason_str = " ".join(reason) if reason else None
-    try:
-        asyncio.run(lifecycle.approve(id, user="cli", reason=reason_str))
-        # The CLI lifecycle carries no repo, so clear the spent code directly.
-        with contextlib.suppress(Exception):
-            asyncio.run(_with_repo(lambda repo: repo.clear_approval_code(id)))
-        console.print(f"[green]Approved: {id}[/green]")
-    except Exception as e:
-        err_console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1) from e
+    _lifecycle_transition("approve", id, reason_str)
+    console.print(f"[green]Approved: {id}[/green]")
 
 
 @artifacts_app.command("reset-approval")
@@ -761,23 +858,26 @@ def artifacts_reject(
     reason: list[str] | None = typer.Option(None, "--reason", help="Rejection reason"),  # noqa: B008
 ) -> None:
     """Reject a proposed artifact."""
-    lifecycle = _get_lifecycle()
     reason_str = " ".join(reason) if reason else None
-    try:
-        asyncio.run(lifecycle.reject(id, user="cli", reason=reason_str))
-        with contextlib.suppress(Exception):
-            asyncio.run(_with_repo(lambda repo: repo.clear_approval_code(id)))
-        console.print(f"[yellow]Rejected: {id}[/yellow]")
-    except Exception as e:
-        err_console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1) from e
+    _lifecycle_transition("reject", id, reason_str)
+    console.print(f"[yellow]Rejected: {id}[/yellow]")
 
 
 @artifacts_app.command("edit")
 def artifacts_edit(
     id: str = typer.Argument(..., help="Artifact ID"),
 ) -> None:
-    """Open artifact in $EDITOR."""
+    """Edit an artifact in $EDITOR, then submit the edit to its lifecycle.
+
+    The editor works on a COPY. The artifact's own file changes only when the
+    lifecycle accepts the edit - through the running backend's API, or directly
+    with the backend stopped - so a refused edit leaves it exactly as it was
+    (#693: editing an applied artifact used to save the change into its file,
+    print a dim line and exit 0). A terminal artifact is refused before the
+    editor opens.
+    """
+    from homepilot.artifacts.models import ArtifactStatus
+
     store = _get_artifact_store()
     try:
         path = store.resolve_path(id)
@@ -789,15 +889,103 @@ def artifacts_edit(
         err_console.print(f"[red]Artifact not found: {id}[/red]")
         raise typer.Exit(1)
 
-    editor = os.environ.get("EDITOR", "vi")
-    subprocess.run([editor, str(path)], check=False)
+    fm, _body = store.read(id)
+    terminal = {
+        ArtifactStatus.APPLIED.value,
+        ArtifactStatus.SUPERSEDED.value,
+        ArtifactStatus.REVOKED.value,
+        ArtifactStatus.REJECTED.value,
+    }
+    if fm.get("status") in terminal:
+        err_console.print(
+            f"[red]{id} is {fm.get('status')} and can no longer be edited. "
+            "Propose a new artifact (it can supersede this one) instead.[/red]"
+        )
+        raise typer.Exit(1)
 
-    lifecycle = _get_lifecycle()
+    original = path.read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="hp-edit-") as tmp:
+        draft = Path(tmp) / f"{id}.md"
+        draft.write_text(original, encoding="utf-8")
+        editor = os.environ.get("EDITOR", "vi")
+        subprocess.run([editor, str(draft)], check=False)
+        edited = draft.read_text(encoding="utf-8")
+
+    if edited == original:
+        console.print(f"[dim]No changes to {id}.[/dim]")
+        return
+
     try:
-        asyncio.run(lifecycle.edit(id))
-        console.print(f"[green]Edit recorded for: {id}[/green]")
+        if _server_is_running(_get_settings()):
+            result = asyncio.run(
+                _backend_api("POST", f"/artifacts/{id}/edit", {"content": edited}, scope="write")
+            )
+        else:
+            result = asyncio.run(_edit_directly(id, edited))
     except Exception as e:
-        console.print(f"[dim]Edit sync: {e}[/dim]")
+        err_console.print(f"[red]Edit refused, {id} is unchanged: {e}[/red]")
+        raise typer.Exit(1) from None
+    status = result.get("status") if isinstance(result, dict) else None
+    console.print(
+        f"[green]Edit recorded for: {id}[/green]" + (f" (now {status})" if status else "")
+    )
+
+
+async def _edit_directly(id: str, edited: str) -> dict[str, Any]:
+    from homepilot.artifacts.edit_router import submit_edit
+
+    async with _lifecycle_with_repo("hp artifacts edit") as lifecycle:
+        return await submit_edit(lifecycle, id, edited, "cli")
+
+
+# How long `hp artifacts apply|replay|revoke` follow a task before saying its
+# outcome is unknown. Generous on purpose: an apply that provisions a guest or
+# runs a long playbook legitimately takes many minutes, and giving up early is
+# only honest if it is reported as "unknown", which it is.
+_TASK_WAIT_SECONDS = 1800.0
+_TASK_POLL_INTERVAL = 2.0
+# Consecutive poll failures tolerated before the backend counts as gone.
+_TASK_POLL_MAX_FAILURES = 5
+# Exit status when the command cannot say whether the change happened. Distinct
+# from 1 (it failed) so a script can tell "go and look" from "it did not work".
+EXIT_OUTCOME_UNKNOWN = 3
+
+
+async def _follow_task(call: Any, path: str, method: str, body: dict[str, Any] | None) -> Any:
+    """Start the task, then follow ``GET /tasks/{id}`` to a terminal status.
+
+    Returns the last task record seen, or ``None`` if the task could not be
+    started. A task still pending/running when this returns is one whose outcome
+    is unknown - the caller must not report it as done.
+    """
+    import httpx
+
+    started = await call(method, path, body)
+    task_id = started.get("task_id") if isinstance(started, dict) else None
+    if not task_id:
+        raise RuntimeError(f"{path} did not start a task: {started!r}")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TASK_WAIT_SECONDS
+    task: dict[str, Any] = {"id": task_id, "status": started.get("status", "pending")}
+    failures = 0
+    while True:
+        try:
+            polled = await call("GET", f"/tasks/{task_id}")
+            failures = 0
+            if isinstance(polled, dict):
+                task = polled
+        except (httpx.HTTPError, RuntimeError) as exc:
+            failures += 1
+            task = {**task, "_poll_error": str(exc) or type(exc).__name__}
+            if failures >= _TASK_POLL_MAX_FAILURES:
+                return task
+        else:
+            if task.get("status") in TERMINAL_TASK_STATUSES:
+                return task
+        if loop.time() >= deadline:
+            return task
+        await asyncio.sleep(_TASK_POLL_INTERVAL)
 
 
 def _run_artifact_task(
@@ -809,32 +997,70 @@ def _run_artifact_task(
 ) -> None:
     """Drive an apply/replay/revoke through the backend and report the OUTCOME.
 
-    `sync=true` so the command does not exit while the change is still happening:
-    a CLI that returns before the host has been touched is the same lie as a
-    rollback that prints and does nothing.
+    The command follows the task until it finishes: a CLI that returns before the
+    host has been touched is the same lie as a rollback that prints and does
+    nothing. It used to hold ONE `?sync=true` request open for the whole apply
+    under a 15 s client timeout, so a long apply crashed the CLI with a
+    ReadTimeout traceback while the apply carried on - and a task the server
+    stopped waiting for came back `running` and was printed as done (#694).
+
+    Only ``succeeded`` is success. ``failed``/``cancelled`` exit 1; a task that
+    is still going at the deadline, or a backend that stops answering, exits
+    ``EXIT_OUTCOME_UNKNOWN`` and says how to find out.
     """
+    import httpx
+
+    async def _go() -> Any:
+        # read AND write: starting the task is a write, but following it
+        # (GET /tasks/{id}) is a read, and a "write" token does not include it.
+        async with _backend_session("read,write") as call:
+            return await _follow_task(call, path, method, body)
+
     try:
-        result = asyncio.run(_backend_api(method, f"{path}?sync=true", body, scope="write"))
+        task = asyncio.run(_go())
     except RuntimeError as exc:
         err_console.print(f"[yellow]{exc}[/yellow]")
         raise typer.Exit(1) from None
+    except httpx.HTTPError as exc:
+        # The START request did not get an answer: the backend may or may not
+        # have queued the change.
+        err_console.print(
+            f"[yellow]No answer from the backend while starting the task for "
+            f"{artifact_id} ({type(exc).__name__}). The outcome is unknown: check "
+            f"`hp artifacts show {artifact_id}` or the Tasks page.[/yellow]"
+        )
+        raise typer.Exit(EXIT_OUTCOME_UNKNOWN) from None
 
-    if not isinstance(result, dict):
-        err_console.print(f"[red]Unexpected response from {path}[/red]")
-        raise typer.Exit(1)
-
-    # A finished task reports its own status; a successful sync apply returns the
-    # artifact instead. Anything that is not an explicit failure is a success.
-    status = result.get("status")
+    status = task.get("status")
+    task_id = task.get("id", "?")
+    if status == "succeeded":
+        console.print(f"[green]{past_tense}: {artifact_id}[/green]")
+        return
     if status in ("failed", "cancelled"):
-        error = result.get("error") or "no reason recorded"
-        err_console.print(f"[red]{past_tense} failed for {artifact_id}: {error}[/red]")
-        log = (result.get("result") or {}).get("execution_log") if result.get("result") else None
+        default = "cancelled before it finished" if status == "cancelled" else "no reason recorded"
+        error = task.get("error") or default
+        err_console.print(f"[red]{past_tense} {status} for {artifact_id}: {error}[/red]")
+        raw = task.get("result_json")
+        log = None
+        if isinstance(raw, str) and raw:
+            with contextlib.suppress(ValueError):
+                log = (json.loads(raw) or {}).get("execution_log")
         if log:
             console.print(f"[dim]{log}[/dim]")
         raise typer.Exit(1)
 
-    console.print(f"[green]{past_tense}: {artifact_id}[/green]")
+    reason = task.get("_poll_error")
+    why = (
+        f"the backend stopped answering ({reason})"
+        if reason
+        else f"task {task_id} is still {status or 'in an unknown state'}"
+    )
+    err_console.print(
+        f"[yellow]The outcome of task {task_id} for {artifact_id} is unknown: {why}. "
+        f"It may still complete - check `hp artifacts show {artifact_id}` or the "
+        "Tasks page.[/yellow]"
+    )
+    raise typer.Exit(EXIT_OUTCOME_UNKNOWN)
 
 
 @artifacts_app.command("apply")
@@ -851,17 +1077,11 @@ def artifacts_apply(
     executed nothing, telling the operator a rollback had happened while the host
     was untouched.
     """
-    lifecycle = _get_lifecycle()
-
     if approve:
-        try:
-            asyncio.run(lifecycle.approve(id, user="cli"))
-            console.print(f"[green]Approved: {id}[/green]")
-        except Exception as e:
-            err_console.print(f"[red]Approve failed: {e}[/red]")
-            raise typer.Exit(1) from e
+        _lifecycle_transition("approve", id, None)
+        console.print(f"[green]Approved: {id}[/green]")
 
-    _run_artifact_task("POST", f"/artifacts/{id}/apply", {"approved_by": "cli"}, "Applied", id)
+    _run_artifact_task("POST", f"/artifacts/{id}/apply", {}, "Applied", id)
 
 
 @artifacts_app.command("replay")
@@ -893,7 +1113,8 @@ def artifacts_revoke(
     heading and printed that one existed (#423).
     """
     reason_str = " ".join(reason) if reason else None
-    body: dict[str, Any] = {"user": "cli"}
+    # No `user`: the backend records the authenticated credential (#681).
+    body: dict[str, Any] = {}
     if reason_str:
         body["reason"] = reason_str
     _run_artifact_task("DELETE", f"/artifacts/{id}", body, "Revoked", id)
@@ -958,40 +1179,102 @@ def artifacts_sync_status() -> None:
         console.print(info["log"])
 
 
+def _drift_rows(
+    artifacts: list[dict[str, Any]], checks: list[dict[str, Any]]
+) -> list[tuple[str, str, str, str, str]]:
+    """(id, kind, target, state, checked) per active artifact, from the stored checks.
+
+    The state is what the last check ESTABLISHED (#425/#712): `drifted`,
+    `in spec`, `unknown` (the check ran and could not tell, with its reason) or
+    `never checked`. Nothing here is inferred from the artifact alone.
+    """
+    by_id = {str(c.get("artifact_id")): c for c in checks}
+    rows: list[tuple[str, str, str, str, str]] = []
+    for a in artifacts:
+        target = a.get("target") or {}
+        target_str = str(
+            target.get("host") or target.get("service") or target.get("node") or "(global)"
+        )
+        check = by_id.get(str(a.get("id", "")))
+        if check is None:
+            state, checked = "never checked", "-"
+        else:
+            raw = check.get("state")
+            checked = str(check.get("checked_at") or "-")
+            if raw == "drifted":
+                state = "drifted"
+            elif raw == "in_spec":
+                state = "in spec"
+            else:
+                reason = ""
+                with contextlib.suppress(TypeError, ValueError, AttributeError):
+                    reason = str(
+                        (json.loads(check.get("details_json") or "{}") or {}).get("reason") or ""
+                    )
+                state = f"unknown ({reason.replace('_', ' ')})" if reason else "unknown"
+        rows.append((str(a.get("id", "")), str(a.get("kind", "")), target_str, state, checked))
+    return rows
+
+
 @app.command()
-def drift() -> None:
-    """Show artifact pile vs current inventory."""
-    store = _get_artifact_store()
+def drift(
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Run a drift check of every active artifact first"
+    ),
+) -> None:
+    """Show what the last drift check established for each active artifact.
 
-    active_artifacts = [a for a in store.list() if a.get("status") in ("applied", "approved")]
+    It used to print the applied/approved artifacts under the title "Drift:
+    Artifact Pile vs Inventory" while comparing nothing (#704). The checks live
+    in the backend (the drift reconciler and its results), so this asks it: the
+    state per artifact is the stored verdict - drifted, in spec, unknown (with
+    why), or never checked - and `--refresh` runs a check first.
+    """
 
-    if not active_artifacts:
-        console.print("[dim]No active artifacts to compare against.[/dim]")
+    unread = 0
+
+    async def _read() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        nonlocal unread
+        async with _backend_session("read") as call:
+            artifacts: list[dict[str, Any]] = []
+            for status in ("applied", "approved"):
+                page = await call("GET", f"/artifacts?status={status}&limit=1000") or {}
+                items = page.get("items", [])
+                artifacts.extend(items)
+                unread += max(0, int(page.get("total", len(items))) - len(items))
+            query = "refresh=true&limit=1000" if refresh else "limit=1000"
+            checks = await call("GET", f"/artifacts/drift?{query}", timeout=600.0)
+            return artifacts, (checks or {}).get("items", [])
+
+    try:
+        artifacts, checks = asyncio.run(_read())
+    except Exception as exc:
+        err_console.print(f"[red]Could not read drift from the backend: {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    if not artifacts:
+        console.print("[dim]No applied or approved artifacts, so there is nothing to check.[/dim]")
         return
 
-    table = Table(title="Drift: Artifact Pile vs Inventory")
+    rows = _drift_rows(artifacts, checks)
+    table = Table(title="Drift: last check per active artifact")
     table.add_column("Artifact ID", style="cyan")
     table.add_column("Kind")
-    table.add_column("Intent", max_width=40)
-    table.add_column("Status")
     table.add_column("Target", max_width=20)
-
-    for a in active_artifacts:
-        target = a.get("target", {})
-        target_str = target.get("host", "") or target.get("node", "") or "(global)"
-        table.add_row(
-            a.get("id", ""),
-            a.get("kind", ""),
-            a.get("intent", ""),
-            a.get("status", ""),
-            target_str,
-        )
-
+    table.add_column("State")
+    table.add_column("Checked")
+    for row in rows:
+        table.add_row(*row)
     console.print(table)
+    drifted = sum(1 for r in rows if r[3] == "drifted")
+    unchecked = sum(1 for r in rows if r[3] == "never checked")
     console.print(
-        "[dim]Run 'hp status' for live inventory counts. "
-        "Compare targets above against inventory.[/dim]"
+        f"{drifted} drifted, {unchecked} never checked, of {len(rows)} active artifact(s)."
     )
+    if unread:
+        console.print(f"[yellow]{unread} more active artifact(s) were not read.[/yellow]")
+    if drifted:
+        raise typer.Exit(2)
 
 
 @app.command()
@@ -1026,6 +1309,13 @@ MANIFEST_NAME = "manifest.json"
 # tarball. Without every one of these a restored host can decrypt nothing it
 # used to own: master.protected is the vault identity, the passphrase sources
 # unwrap it, and the rest are the credentials the backend hands out.
+#
+# `hub/` (the agent hub's certificate and key) and `.agent_hub_token` are the
+# FLEET's identity, and were missing (#722). Every agent pins the hub
+# certificate by fingerprint (HP_AGENT_TLS_PIN, the installer default) and
+# authenticates with the hub token; a restore without them mints a new cert and
+# token on first boot, every agent refuses the new hub, and an env-pinned agent
+# cannot be re-pinned remotely - the whole fleet needs re-enrolling by hand.
 SECRET_PATHS: tuple[str, ...] = (
     ".env",
     ".vault_passphrase",
@@ -1033,6 +1323,8 @@ SECRET_PATHS: tuple[str, ...] = (
     "vault/identities",
     "vault/secrets",
     "ssh",
+    "hub",
+    ".agent_hub_token",
 )
 
 # The archive entry a passphrase harvested from the ENVIRONMENT is written to.
@@ -1189,8 +1481,9 @@ def export(
     include_secrets: bool = typer.Option(
         False,
         "--include-secrets",
-        help="Include vault identity, vault secrets and key material. "
-        "The tarball can then decrypt everything - guard it accordingly.",
+        help="Include vault identity, vault secrets, key material and the agent "
+        "hub's certificate, key and token. The tarball can then decrypt "
+        "everything - guard it accordingly.",
     ),
     output: Path | None = typer.Option(  # noqa: B008
         None,
@@ -1275,8 +1568,7 @@ def export(
         staged_passphrase: Path | None = None
         if harvested_passphrase:
             staged_passphrase = staging / "vault_passphrase"
-            staged_passphrase.write_text(harvested_passphrase, encoding="utf-8")
-            staged_passphrase.chmod(0o600)
+            write_private(staged_passphrase, harvested_passphrase)
 
         contents = [MANIFEST_NAME, "README.md"]
         if db_snapshot.exists():
@@ -1307,7 +1599,16 @@ def export(
         readme_path = staging / "README.md"
         readme_path.write_text(_export_readme(bool(secret_rels), has_passphrase), encoding="utf-8")
 
-        with tarfile.open(str(tarball_path), "w:gz") as tar:
+        # An archive with secrets in it is a credential from its first byte: it
+        # is created 0600 rather than chmodded once complete (#690). fchmod also
+        # tightens a pre-existing file before anything is written into it.
+        if secret_rels:
+            fd = os.open(str(tarball_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            tar_target = os.fdopen(fd, "wb")
+        else:
+            tar_target = open(str(tarball_path), "wb")  # noqa: SIM115 - closed below
+        with tar_target, tarfile.open(fileobj=tar_target, mode="w:gz") as tar:
             tar.add(str(manifest_path), arcname=MANIFEST_NAME)
             tar.add(str(readme_path), arcname="README.md")
             if db_snapshot.exists():
@@ -1323,10 +1624,6 @@ def export(
                     else data_dir / rel
                 )
                 tar.add(str(source), arcname=f"secrets/{rel}")
-
-    if secret_rels:
-        # The archive is now a credential; keep it off other users' reach.
-        os.chmod(str(tarball_path), 0o600)
 
     console.print(f"[green]Exported to {tarball_path}[/green]")
     if secret_rels:
@@ -1447,13 +1744,24 @@ def _restore_secret_entry(src: Path, dest: Path, backup_dir: Path, rel: str) -> 
             shutil.copytree(str(dest), str(stashed), symlinks=True, dirs_exist_ok=True)
         else:
             shutil.copy2(str(dest), str(stashed))
-    _restore_tree(src, dest)
-    if dest.is_dir():
-        os.chmod(str(dest), 0o700)
-        for child in dest.rglob("*"):
+    # Modes are tightened on the STAGED copy, inside the private (0700) staging
+    # dir, and only then moved into place (#690). Moving first and chmodding
+    # after left restored keys at whatever mode the archive carried, inside the
+    # data dir, until the chmod landed. A rename keeps the mode; when staging and
+    # the data dir are different filesystems the move is a COPY, which creates
+    # each file under the umask before copying the mode across - so the umask is
+    # tightened for the move as well. (The CLI is single-threaded here.)
+    if src.is_dir():
+        for child in src.rglob("*"):
             os.chmod(str(child), 0o700 if child.is_dir() else 0o600)
+        os.chmod(str(src), 0o700)
     else:
-        os.chmod(str(dest), 0o600)
+        os.chmod(str(src), 0o600)
+    previous_umask = os.umask(0o077)
+    try:
+        _restore_tree(src, dest)
+    finally:
+        os.umask(previous_umask)
 
 
 @app.command("import")
@@ -1463,8 +1771,9 @@ def import_backup(
     restore_secrets: bool = typer.Option(
         False,
         "--restore-secrets",
-        help="Also restore the vault identity, vault secrets and key material. "
-        "Overwrites the live keys on this host (the old ones are backed up).",
+        help="Also restore the vault identity, vault secrets, key material and "
+        "the agent hub's identity. Overwrites the live keys on this host (the old "
+        "ones are backed up).",
     ),
 ) -> None:
     """Restore a HomePilot data dir from a tarball. Backs up current state first."""
@@ -1878,12 +2187,7 @@ def policy_init() -> None:
         ("Naming convention for hosts (e.g. service-lxc, service.service)", "naming_convention"),
     ]
 
-    _get_artifact_store()
-    lifecycle = _get_lifecycle()
-    written = 0
-    failed: list[str] = []
-    proposed_ids: list[str] = []
-
+    specs: list[tuple[str, dict[str, Any]]] = []
     for question_text, key in questions:
         answer = typer.prompt(question_text, default="")
         if not answer:
@@ -1891,21 +2195,59 @@ def policy_init() -> None:
 
         date_prefix = datetime.now(UTC).strftime("%Y-%m-%d")
         fact_id = f"{date_prefix}-kb-policy-{key}"
-        spec = {
-            "id": fact_id,
-            "kind": "kb-note",
-            "intent": f"policy: {key}",
-            "body": f"# Policy: {key}\n\n{answer}",
-            "note_kind": "policy",
-            "target": {"kind": "global"},
-            "produced_by": {"session": "policy-init", "agent": "cli", "user": "cli"},
-        }
+        specs.append(
+            (
+                key,
+                {
+                    "id": fact_id,
+                    "kind": "kb-note",
+                    "intent": f"policy: {key}",
+                    "body": f"# Policy: {key}\n\n{answer}",
+                    "note_kind": "policy",
+                    "target": {"kind": "global"},
+                    "produced_by": {"session": "policy-init", "agent": "cli", "user": "cli"},
+                },
+            )
+        )
+
+    written = 0
+    failed: list[str] = []
+    proposed_ids: list[str] = []
+    backend_running = _server_is_running(_get_settings())
+
+    async def _propose_via_api() -> None:
+        # The backend proposes AND indexes each note (its lifecycle carries the
+        # KB service), with the DB row and audit entry a file-only propose
+        # skipped. The direct path wrote the file behind a running backend and
+        # was then refused the index (#700).
+        nonlocal written
+        async with _backend_session("read,write") as call:
+            for key, spec in specs:
+                try:
+                    await call("POST", "/artifacts", spec)
+                    written += 1
+                except BackendRefusedError as exc:
+                    failed.append(f"{key}: {exc.detail}")
+
+    async def _propose_directly() -> None:
+        nonlocal written
+        async with _lifecycle_with_repo("hp policy init") as lifecycle:
+            for key, spec in specs:
+                try:
+                    await lifecycle.propose(spec)
+                    written += 1
+                    proposed_ids.append(spec["id"])
+                except Exception as exc:
+                    failed.append(f"{key}: {exc}")
+
+    if specs:
         try:
-            asyncio.run(lifecycle.propose(spec))
-            written += 1
-            proposed_ids.append(fact_id)
+            asyncio.run(_propose_via_api() if backend_running else _propose_directly())
+        except typer.Exit:
+            raise
         except Exception as exc:
-            failed.append(f"{key}: {exc}")
+            err_console.print(f"[red]Could not record policies: {exc}[/red]")
+            raise typer.Exit(code=1) from None
 
     # Every propose failure used to be swallowed by `contextlib.suppress` and
     # the command printed the same green success line, so an operator who
@@ -1919,6 +2261,9 @@ def policy_init() -> None:
         err_console.print("[red]No policies were recorded.[/red]")
         raise typer.Exit(code=1)
     console.print(f"\n[green]Recorded {written} policy note(s).[/green]")
+    if backend_running:
+        console.print("[dim]Indexed by the backend - the agent will find them via search_kb.[/dim]")
+        return
 
     # Index them HERE rather than promising someone else will. Writing the
     # artifact is not the same as putting it in the knowledge base, and this
@@ -2008,38 +2353,53 @@ def kb_reindex(
         # silently through to the offline path - which is the path that wiped the
         # index (#388). Mint a short-lived admin token the same way the other
         # CLI-to-backend commands do.
-        token, mint_error = await _mint_token_via_api(settings, "cli-kb-reindex", "admin")
-        if token is None:
-            if mint_error:
-                err_console.print(f"[yellow]{mint_error}[/yellow]")
-            return None
-        headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
-        import httpx as _httpx
+        async with _ephemeral_token(settings, "cli-kb-reindex", "admin") as (token, mint_error):
+            if token is None:
+                if mint_error:
+                    err_console.print(f"[yellow]{mint_error}[/yellow]")
+                return None
+            headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
+            import httpx as _httpx
 
-        async with _httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                resp = await client.post(
-                    f"{base_url}/kb/reindex",
-                    params={"no_embeddings": no_embs, "force_embeddings": force},
-                    headers=headers,
-                )
-                if resp.status_code == 200:
-                    result: dict[str, Any] | None = resp.json()
-                    return result
-            except _httpx.ConnectError:
-                pass  # backend down → fall back to direct DB below
-            except Exception:
-                # any other API failure: fall back to the direct-DB path, but
-                # leave a breadcrumb instead of swallowing it silently.
-                import logging as _logging
-
-                _logging.getLogger(__name__).debug("token API mint failed, using DB", exc_info=True)
+            # A reindex with embeddings is minutes of work on a real KB.
+            async with _backend_http_client(600.0) as client:
+                try:
+                    resp = await client.post(
+                        f"{base_url}/kb/reindex",
+                        params={"no_embeddings": no_embs, "force_embeddings": force},
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        result: dict[str, Any] | None = resp.json()
+                        return result
+                    # Answered and refused: say so. This used to drop through
+                    # to the direct path, which a running backend refuses (#700).
+                    err_console.print(
+                        f"[red]The backend refused the reindex ({resp.status_code}): "
+                        f"{_api_error_text(resp)}[/red]"
+                    )
+                except _httpx.ConnectError:
+                    pass  # backend down → fall back to direct DB below
+                except Exception as exc:
+                    # Any other failure of the call: say what it was. The
+                    # caller decides whether a direct rebuild is allowed.
+                    err_console.print(
+                        f"[yellow]The reindex request failed: {type(exc).__name__}[/yellow]"
+                    )
         return None
 
     async def _do(skip_embeddings: bool = False, force: bool = False) -> dict[str, Any]:
         via_api = await _kb_reindex_via_api(skip_embeddings, force)
         if via_api is not None:
             return via_api
+        if _server_is_running(_get_settings()):
+            # The backend holds the index; rebuilding it behind its back is
+            # exactly what the direct path below would refuse to do (#700).
+            err_console.print(
+                "[red]The backend is running and the reindex did not go through its "
+                "API (see above). Nothing was reindexed.[/red]"
+            )
+            raise typer.Exit(1)
 
         from homepilot.db.repository import Repository
         from homepilot.executor import kb_note
@@ -2126,7 +2486,10 @@ def kb_reindex(
     result = asyncio.run(_do(skip_embeddings=no_embeddings, force=force_embeddings))
     errors = int(result.get("errors", 0))
     unverified_ids = list(result.get("unverified") or [])
-    headline = "[green]Reindex complete:[/green]" if not errors else "[red]Reindex FAILED for"
+    # The backend's verdict counts embedding failures too (#777): every insert
+    # of a model whose vectors do not fit the index failed under a green line.
+    failed = bool(errors) or result.get("status") == "completed_with_errors"
+    headline = "[green]Reindex complete:[/green]" if not failed else "[red]Reindex FAILED for"
     console.print(
         f"{headline} "
         f"{result.get('reindexed', 0)} indexed, "
@@ -2137,6 +2500,19 @@ def kb_reindex(
     # operator reads and then does not go looking.
     for line in result.get("errors_detail") or []:
         err_console.print(f"  [red]{line}[/red]")
+    rebuilt = result.get("vector_index_rebuilt")
+    if isinstance(rebuilt, dict):
+        console.print(
+            f"[yellow]Vector index rebuilt for the embedding model: {rebuilt.get('from')} -> "
+            f"{rebuilt.get('to')} dimensions; {rebuilt.get('vectors_dropped')} vector(s) of "
+            "the previous model dropped and re-embedded.[/yellow]"
+        )
+    embedding_failures = int(result.get("embedding_failures") or 0)
+    if embedding_failures and result.get("embedding_first_failure"):
+        err_console.print(
+            f"[red]{embedding_failures} document(s) not embedded; first failure: "
+            f"{result.get('embedding_first_failure')}[/red]"
+        )
     if unverified_ids:
         err_console.print(
             f"[yellow]{len(unverified_ids)} document(s) kept without being able to read "
@@ -2144,7 +2520,7 @@ def kb_reindex(
         )
         for artifact_id in unverified_ids[:10]:
             err_console.print(f"  [yellow]{artifact_id}[/yellow]")
-    if errors:
+    if failed:
         raise typer.Exit(code=1)
 
 
@@ -2198,10 +2574,61 @@ def _admin_headers(settings: Any) -> dict[str, str]:
     return headers
 
 
-async def _mint_token_via_api(
+# Lifetime of the credential a CLI command mints for its own calls. Long
+# enough to follow the longest apply (`_TASK_WAIT_SECONDS`), short enough that
+# a token the cleanup could not delete stops working on its own (#699).
+_CLI_TOKEN_TTL_SECONDS = 3600
+
+
+@contextlib.asynccontextmanager
+async def _ephemeral_token(
     settings: Any, label: str, scope: str
+) -> AsyncIterator[tuple[str | None, str | None]]:
+    """Mint a short-lived token for one command and DELETE it afterwards.
+
+    Yields ``_mint_token_via_api``'s ``(token, error)``. The delete is made with
+    the ADMIN credential that minted the token, not with the token itself: a
+    ``write`` token is not allowed to delete tokens, so self-deletion answered
+    403 and every `hp artifacts apply` left a live write credential behind
+    (#699). A delete that still fails is logged as a warning - the expiry
+    bounds the damage, but the operator should know.
+    """
+    import httpx
+
+    token, err = await _mint_token_via_api(
+        settings, label, scope, expires_in_seconds=_CLI_TOKEN_TTL_SECONDS
+    )
+    try:
+        yield token, err
+    finally:
+        if token:
+            port = getattr(settings, "daemon_port", 8000)
+            failure = ""
+            try:
+                async with _backend_http_client(5.0) as client:
+                    resp = await client.delete(
+                        f"http://127.0.0.1:{port}/auth/tokens/{token[:16]}",
+                        headers=_admin_headers(settings),
+                    )
+                if resp.status_code not in (204, 404):
+                    failure = f"{resp.status_code} {resp.text[:200]}"
+            except httpx.HTTPError as exc:
+                failure = type(exc).__name__
+            if failure:
+                err_console.print(
+                    f"[yellow]Could not delete the temporary CLI token {token[:16]} "
+                    f"({failure}); it expires on its own within "
+                    f"{_CLI_TOKEN_TTL_SECONDS // 60} minutes.[/yellow]"
+                )
+
+
+async def _mint_token_via_api(
+    settings: Any, label: str, scope: str, expires_in_seconds: int | None = None
 ) -> tuple[str | None, str | None]:
     """Create an API token through the running backend, as an admin.
+
+    ``expires_in_seconds`` makes the backend store an expiry; the per-command
+    credentials the CLI mints for itself always pass one (#699).
 
     The backend owns the DB, so this is also what avoids sqlite write-lock
     contention. Returns ``(token, error)``:
@@ -2218,11 +2645,14 @@ async def _mint_token_via_api(
         return None, None  # nothing to authenticate with - caller decides
     port = getattr(settings, "daemon_port", 8000)
 
+    payload: dict[str, Any] = {"label": label, "scope": scope}
+    if expires_in_seconds is not None:
+        payload["expires_in_seconds"] = expires_in_seconds
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with _backend_http_client(3.0) as client:
             resp = await client.post(
                 f"http://127.0.0.1:{port}/auth/tokens",
-                json={"label": label, "scope": scope},
+                json=payload,
                 headers=headers,
             )
     except httpx.ConnectError:
@@ -2368,6 +2798,7 @@ def token_create(
                 expires_at=None,
             )
             await database.conn.commit()
+            await _audit_cli_mint(repo, prefix, label, scope)
             bootstrapped = True
         except OperationalError as exc:
             if "database is locked" in str(exc).lower():
@@ -2483,10 +2914,10 @@ def token_revoke(
 async def _open_invite_repo() -> tuple[Database, InviteRepository]:
     """Open the control-plane database for invite work. Returns (database, repo).
 
-    Invites are minted on the box by the operator and there is no admin API for
-    them by design (the portal's whole point is a small surface), so the CLI
-    talks to SQLite directly - WAL plus busy_timeout lets it write while the
-    backend is running.
+    Only for a STOPPED backend (#623, #700). While one runs, `hp invite` and
+    `hp quota` go through its admin API (`_via_backend`): a second process
+    writing the same SQLite file is the class `hp token create` was cured of,
+    and `_open_cli_db` refuses it.
     """
     from homepilot.portal.repository import InviteRepository
 
@@ -2532,6 +2963,7 @@ def invite_create(
     except ValueError as exc:
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
     try:
         # Validated through the SAME model provisioning uses, so a mint can
         # never produce caps that redemption would later reject.
@@ -2546,7 +2978,7 @@ def invite_create(
             disk=disk_device,
         )
     except ValidationError as exc:
-        err_console.print(f"[red]Invalid caps: {exc.errors()[0]['msg']}[/red]")
+        err_console.print(f"[red]Invalid caps: {format_validation_error(exc)}[/red]")
         raise typer.Exit(1) from exc
 
     async def _mint() -> tuple[str, str]:
@@ -2562,7 +2994,40 @@ def invite_create(
             await database.close()
         return full_token, full_token[:16]
 
-    token, prefix = asyncio.run(_mint())
+    if _server_is_running(_get_settings()):
+        # The console's mint asks for an explicit size; "template default" is a
+        # direct-write-only shape, and quietly inventing a size would mint a
+        # different invite than the one asked for.
+        sizes = (("--cores", cores), ("--ram", ram), ("--disk", disk))
+        missing = [flag for flag, value in sizes if not value]
+        if missing:
+            err_console.print(
+                "[red]The HomePilot backend is running, so `hp invite create` mints through "
+                f"its API, which needs an explicit size: pass {', '.join(missing)}.[/red]"
+            )
+            raise typer.Exit(1)
+        body: dict[str, Any] = {
+            "cn": cn.strip(),
+            "template_vmid": template,
+            "node": node,
+            "cores": cores,
+            "memory_mb": ram,
+            "disk_gb": disk,
+            "disk": disk_device,
+            "ttl_minutes": int(ttl.total_seconds() // 60),
+        }
+        if pool:
+            body["pool"] = pool
+        if storage:
+            body["storage"] = storage
+        minted = _via_backend("hp invite create", "POST", "/admin/guests/invites", body)
+        token = str((minted or {}).get("token") or "")
+        if not token:
+            err_console.print("[red]The backend answered the mint without a token.[/red]")
+            raise typer.Exit(1)
+        prefix = token[:16]
+    else:
+        token, prefix = asyncio.run(_mint())
     origin = (base_url or getattr(_get_settings(), "portal_base_url", "")).rstrip("/")
     url = f"{origin}/invite/{token}" if origin else f"/invite/{token}"
     console.print(
@@ -2581,6 +3046,10 @@ def invite_create(
         )
 
 
+# The caps `hp invite list` shows, as both the DB row and the API name them.
+_INVITE_CAP_KEYS = ("template_vmid", "node", "cores", "memory_mb", "disk_gb")
+
+
 @invite_app.command("list")
 def invite_list(
     output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
@@ -2595,9 +3064,24 @@ def invite_list(
         finally:
             await database.close()
 
-    rows = asyncio.run(_list())
+    if _server_is_running(_get_settings()):
+        overview = _via_backend("hp invite list", "GET", "/admin/guests")
+        rows = [
+            {
+                "id": i.get("id"),
+                "token_prefix": i.get("prefix"),
+                "bound_cn": i.get("cn"),
+                **{k: (i.get("caps") or {}).get(k) for k in _INVITE_CAP_KEYS},
+                "expires_at": i.get("expires_at"),
+                "created_at": i.get("created_at"),
+                "state": i.get("state"),
+            }
+            for i in (overview or {}).get("invites", [])
+        ]
+    else:
+        rows = [{**r, "state": invite_state(r)} for r in asyncio.run(_list())]
     if output == "json":
-        console.print(json.dumps([{**r, "state": invite_state(r)} for r in rows]))
+        console.print(json.dumps(rows, default=str))
         return
     if not rows:
         console.print("No invites.")
@@ -2612,7 +3096,7 @@ def invite_list(
             str(row["node"]),
             caps,
             str(row["expires_at"]),
-            invite_state(row),
+            str(row["state"]),
         )
     console.print(table)
 
@@ -2630,6 +3114,13 @@ def invite_revoke(
         finally:
             await database.close()
 
+    if _server_is_running(_get_settings()):
+        path = f"/admin/guests/invites/{quote(prefix, safe='')}/revoke"
+        _via_backend(
+            "hp invite revoke", "POST", path, not_found=f"No open invite with prefix {prefix}."
+        )
+        console.print(f"Revoked invite {prefix}.")
+        return
     if not asyncio.run(_revoke()):
         err_console.print(f"[red]No open invite with prefix {prefix}.[/red]")
         raise typer.Exit(1)
@@ -2642,7 +3133,9 @@ def inventory_list(
     status: str = typer.Option("", "--status", "-s", help="Filter by status"),
     output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
 ) -> None:
-    """List hosts in the local inventory DB."""
+    """List hosts in inventory - from the running backend, or the database when it is stopped."""
+    from urllib.parse import urlencode
+
     from homepilot.inventory.service import InventoryService
 
     async def _list() -> list[dict[str, Any]]:
@@ -2666,7 +3159,23 @@ def inventory_list(
         finally:
             await db.close()
 
-    hosts = asyncio.run(_list())
+    truncated = 0
+    if _server_is_running(_get_settings()):
+        params = {
+            "limit": 1000,
+            **({"role": role} if role else {}),
+            **({"status": status} if status else {}),
+        }
+        page = (
+            _via_backend(
+                "hp inventory list", "GET", f"/inventory?{urlencode(params)}", scope="read"
+            )
+            or {}
+        )
+        hosts = list(page.get("items", []))
+        truncated = max(0, int(page.get("total", len(hosts))) - len(hosts))
+    else:
+        hosts = asyncio.run(_list())
 
     if output == "json":
         console.print(json.dumps(hosts, default=str))
@@ -2691,6 +3200,10 @@ def inventory_list(
             h.get("node", "") or "—",
         )
     console.print(table)
+    if truncated:
+        console.print(
+            f"[yellow]{truncated} more host(s) not shown; filter with --role/--status.[/yellow]"
+        )
 
 
 @inventory_app.command("show")
@@ -2715,7 +3228,20 @@ def inventory_show(
         finally:
             await db.close()
 
-    host = asyncio.run(_show())
+    if _server_is_running(_get_settings()):
+        page = (
+            _via_backend(
+                "hp inventory show",
+                "GET",
+                f"/inventory?q={quote(hostname)}&limit=1000",
+                scope="read",
+            )
+            or {}
+        )
+        # `q` is free text; the command names ONE host, by its exact name.
+        host = next((h for h in page.get("items", []) if h.get("hostname") == hostname), None)
+    else:
+        host = asyncio.run(_show())
 
     if host is None:
         err_console.print(f"[red]Host '{hostname}' not found in inventory[/red]")
@@ -2745,21 +3271,25 @@ def inventory_refresh(
 
         # Prefer the API when the backend is running — it owns the sqlite write
         # lock, so a direct CLI write would hit "database is locked" (Bug 10).
-        token, err = await _mint_token_via_api(settings, "cli-inventory-refresh", "write")
-        if token:
-            import httpx
-
-            port = getattr(settings, "daemon_port", 8000)
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"http://127.0.0.1:{port}/inventory/refresh",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={"scope": scope} if scope else {},
-                )
-                resp.raise_for_status()
-                return dict(resp.json())
-        if err:
-            err_console.print(f"[yellow]{err}[/yellow]")
+        async with _ephemeral_token(settings, "cli-inventory-refresh", "write") as (token, err):
+            if token:
+                port = getattr(settings, "daemon_port", 8000)
+                async with _backend_http_client(120.0) as client:
+                    resp = await client.post(
+                        f"http://127.0.0.1:{port}/inventory/refresh",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"scope": scope} if scope else {},
+                    )
+                    resp.raise_for_status()
+                    return dict(resp.json())
+        if err or _server_is_running(settings):
+            # A backend holds the database: the direct path below would only be
+            # refused (#700). Say what stopped the API call instead.
+            why = err or (
+                "The backend is running, but this box holds no admin credential "
+                "to call it with (set HP_ADMIN_TOKEN)."
+            )
+            err_console.print(f"[yellow]{why}[/yellow]")
             err_console.print(
                 "[yellow]The backend refreshes inventory automatically; you can "
                 "also use the UI 'Sync from Proxmox' button.[/yellow]"
@@ -2813,24 +3343,42 @@ def _get_vault() -> VaultManager:
     return VaultManager(data_dir, settings.vault_passphrase)
 
 
+def _read_secret_value() -> str:
+    """The secret, never from argv (#704).
+
+    `--value` put the secret in the process list and the shell history, and the
+    interactive prompt echoed it to the screen. A terminal now gets a hidden,
+    confirmed prompt; anything else (a pipe, `docker compose exec -T`) is read
+    from stdin.
+    """
+    import sys
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        return str(typer.prompt("Value (JSON)", hide_input=True, confirmation_prompt=True))
+    return sys.stdin.read().strip() if sys.stdin is not None else ""
+
+
 @vault_app.command("set")
 def vault_set(
     name: str = typer.Argument(..., help="Secret name (e.g. pve-token)"),
-    value: str = typer.Option("", "--value", "-v", help="JSON value. Omit to enter interactively."),
 ) -> None:
-    """Store a secret in the vault. Value must be valid JSON (e.g. '{\"token\": \"abc\"}')."""
+    """Store a secret in the vault. The JSON value (e.g. '{\"token\": \"...\"}')
+    is typed at a hidden prompt, or piped on stdin - never passed as an argument."""
     import json as _json
 
     vault = _get_vault()
 
+    value = _read_secret_value()
     if not value:
-        value = typer.prompt("Value (JSON)", hide_input=False)
+        err_console.print("[red]No value given; nothing stored.[/red]")
+        raise typer.Exit(1)
 
     try:
         parsed = _json.loads(value)
     except _json.JSONDecodeError as exc:
-        console.print(f"[red]Invalid JSON: {exc}[/red]")
-        raise typer.Exit(1) from exc
+        # Position only: the message must not echo the secret back.
+        err_console.print(f"[red]Invalid JSON (line {exc.lineno}, column {exc.colno}).[/red]")
+        raise typer.Exit(1) from None
 
     async def _store() -> None:
         await vault.ensure_master_identity()
@@ -2892,10 +3440,13 @@ def vault_delete(
     if not yes:
         typer.confirm(f"Delete secret '{name}'?", abort=True)
 
-    async def _delete() -> None:
-        await vault.delete_secret(name)
+    async def _delete() -> bool:
+        return await vault.delete_secret(name)
 
-    asyncio.run(_delete())
+    if not asyncio.run(_delete()):
+        # It used to print "deleted" for a name that was never there (#704).
+        err_console.print(f"[red]No secret named '{name}'; nothing was deleted.[/red]")
+        raise typer.Exit(1)
     console.print(f"[green]Secret '{name}' deleted[/green]")
 
 
@@ -2923,51 +3474,98 @@ async def _webhook_repo() -> Any:
 
 @webhook_app.command("add")
 def webhook_add(
-    url: str = typer.Option(..., "--url", help="Webhook endpoint URL"),
-    events: str = typer.Option(..., "--events", help="Comma-separated event types (use * for all)"),
-    secret: str = typer.Option("", "--secret", help="HMAC signing key (optional)"),
-    max_retries: int = typer.Option(3, "--max-retries", help="Max retry attempts"),
+    url: str = typer.Option(..., "--url", help="Webhook endpoint URL (http or https)"),
+    events: str = typer.Option(
+        ..., "--events", help="Comma-separated event types, or * for every event"
+    ),
+    with_secret: bool = typer.Option(
+        False,
+        "--with-secret",
+        help="Prompt (hidden) for an HMAC signing key; never passed as an argument",
+    ),
+    max_retries: int = typer.Option(3, "--max-retries", help="Retry attempts (0-10)"),
 ) -> None:
-    """Register a new webhook endpoint."""
+    """Register a webhook endpoint for the named events.
+
+    Event names are checked against what the platform emits: a typo used to be
+    stored and then never matched anything (#700). With the backend running
+    this goes through `/admin/webhooks`; stopped, the CLI runs the same code.
+    """
+    from homepilot.webhooks import service
+    from homepilot.webhooks.catalog import validate_event_types, validate_webhook_url
+
     event_list = [e.strip() for e in events.split(",") if e.strip()]
-    secret_val = secret or None
+    try:
+        validate_webhook_url(url)
+        event_list = validate_event_types(event_list)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    secret_val = (
+        str(typer.prompt("Signing key", hide_input=True, confirmation_prompt=True))
+        if with_secret
+        else None
+    )
 
-    async def _add() -> int:
-        async with _webhook_repo() as (db, repo):
-            config_id: int = await repo.create_webhook_config(
-                url=url, event_types=event_list, secret=secret_val, max_retries=max_retries
-            )
-            await db.conn.commit()
-            return config_id
+    if _server_is_running(_get_settings()):
+        body: dict[str, Any] = {
+            "url": url,
+            "event_types": event_list,
+            "max_retries": max_retries,
+        }
+        if secret_val:
+            body["secret"] = secret_val
+        view = _via_backend("hp webhook add", "POST", "/admin/webhooks", body) or {}
+    else:
 
-    config_id = asyncio.run(_add())
-    console.print(f"[green]Webhook #{config_id} registered[/green] — {url} → {events}")
+        async def _add() -> dict[str, Any]:
+            async with _webhook_repo() as (_db, repo):
+                return await service.create_webhook(
+                    repo,
+                    url=url,
+                    event_types=event_list,
+                    secret=secret_val,
+                    max_retries=max_retries,
+                    actor=_CLI_OPERATOR.name,
+                    source="cli",
+                )
+
+        try:
+            view = asyncio.run(_add())
+        except ValueError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
+    console.print(
+        f"[green]Webhook #{view.get('id')} registered[/green] — "
+        f"{view.get('endpoint')} → {', '.join(view.get('event_types') or event_list)}"
+    )
 
 
 @webhook_app.command("list")
 def webhook_list(
     output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
 ) -> None:
-    """List all webhook configurations."""
+    """List webhook configurations. Endpoints show scheme://host:port only."""
+    from homepilot.webhooks import service
 
-    async def _list() -> list[dict[str, Any]]:
-        async with _webhook_repo() as (_db, repo):
-            configs: list[dict[str, Any]] = await repo.list_webhook_configs()
-            return configs
+    if _server_is_running(_get_settings()):
+        configs = list(
+            (_via_backend("hp webhook list", "GET", "/admin/webhooks") or {}).get("items", [])
+        )
+    else:
 
-    configs = asyncio.run(_list())
+        async def _list() -> list[dict[str, Any]]:
+            async with _webhook_repo() as (_db, repo):
+                return await service.list_webhooks(repo)
+
+        configs = asyncio.run(_list())
 
     if output == "json":
-        # The HMAC signing key is redacted, exactly as the table branch omits it
-        # (#388). `--output json` is what gets piped into CI logs.
-        # nosec B105 - "***" is the redaction MARKER that replaces the signing
-        # key, not a credential. Flagged as a hardcoded password by bandit,
-        # which cannot tell the two apart.
-        redacted = [
-            {**c, "secret": "***"} if c.get("secret") else dict(c)  # nosec B105
-            for c in configs
-        ]
-        console.print(json.dumps(redacted, default=str))
+        # Neither the signing key nor the URL's path ever leaves this command:
+        # `--output json` is what gets piped into CI logs (#388), and endpoint
+        # paths routinely carry their own credential (#700). typer.echo: machine
+        # output must never be wrapped to the terminal width.
+        typer.echo(json.dumps(configs, default=str))
         return
 
     if not configs:
@@ -2976,17 +3574,19 @@ def webhook_list(
 
     table = Table(title="Webhooks", show_header=True, header_style="bold")
     table.add_column("ID", style="cyan")
-    table.add_column("URL")
+    table.add_column("Endpoint")
     table.add_column("Events")
     table.add_column("Enabled")
+    table.add_column("Signed")
     table.add_column("Max Retries")
     for c in configs:
         table.add_row(
             str(c["id"]),
-            c["url"],
-            c["event_types"],
-            str(c["enabled"]),
-            str(c["max_retries"]),
+            str(c.get("endpoint", "")),
+            ", ".join(c.get("event_types") or []),
+            "yes" if c.get("enabled") else "no",
+            "yes" if c.get("has_secret") else "no",
+            str(c.get("max_retries", "")),
         )
     console.print(table)
 
@@ -2996,15 +3596,23 @@ def webhook_delete(
     id: int = typer.Argument(..., help="Webhook config ID to delete"),
 ) -> None:
     """Delete a webhook configuration."""
+    from homepilot.webhooks import service
+
+    if _server_is_running(_get_settings()):
+        _via_backend(
+            "hp webhook delete",
+            "DELETE",
+            f"/admin/webhooks/{id}",
+            not_found=f"Webhook #{id} not found",
+        )
+        console.print(f"[green]Webhook #{id} deleted[/green]")
+        return
 
     async def _delete() -> bool:
-        async with _webhook_repo() as (db, repo):
-            deleted: bool = await repo.delete_webhook_config(id)
-            await db.conn.commit()
-            return deleted
+        async with _webhook_repo() as (_db, repo):
+            return await service.delete_webhook(repo, id, actor=_CLI_OPERATOR.name, source="cli")
 
-    deleted = asyncio.run(_delete())
-    if deleted:
+    if asyncio.run(_delete()):
         console.print(f"[green]Webhook #{id} deleted[/green]")
     else:
         err_console.print(f"[red]Webhook #{id} not found[/red]")
@@ -3015,47 +3623,169 @@ def webhook_delete(
 def webhook_test(
     id: int = typer.Argument(..., help="Webhook config ID to test"),
 ) -> None:
-    """Send a test event to a webhook endpoint."""
+    """Send one test event and say whether the endpoint accepted it."""
+    from homepilot.webhooks import service
 
-    async def _test() -> None:
-        from homepilot.events import deliver_with_retry
-
-        async with _webhook_repo() as (_db, repo):
-            config = await repo.get_webhook_config(id)
-            if not config:
-                err_console.print(f"[red]Webhook #{id} not found[/red]")
-                raise typer.Exit(1)
-
-            test_payload = {
-                "event": "webhook_test",
-                "message": f"Test event from webhook #{id}",
-                "timestamp": datetime.now(UTC).isoformat(),
-            }
-            console.print(f"[dim]Sending test event to {config['url']}...[/dim]")
-            delivered = await deliver_with_retry(
-                url=config["url"],
-                payload=test_payload,
-                secret=config.get("secret"),
-                max_retries=config.get("max_retries", 3),
+    if _server_is_running(_get_settings()):
+        result = (
+            _via_backend(
+                "hp webhook test",
+                "POST",
+                f"/admin/webhooks/{id}/test",
+                not_found=f"Webhook #{id} not found",
             )
-        if not delivered:
-            # This command exists to answer "does delivery work". Printing
-            # success for an endpoint that never answered is the one thing it
-            # must not do (#388).
-            err_console.print(
-                f"[red]Test event was NOT accepted by {config['url']} "
-                f"after {config.get('max_retries', 3) + 1} attempt(s)[/red]"
-            )
+            or {}
+        )
+    else:
+
+        async def _test() -> dict[str, Any] | None:
+            async with _webhook_repo() as (_db, repo):
+                try:
+                    return await service.send_test_event(
+                        repo, id, actor=_CLI_OPERATOR.name, source="cli"
+                    )
+                except LookupError:
+                    return None
+
+        found = asyncio.run(_test())
+        if found is None:
+            err_console.print(f"[red]Webhook #{id} not found[/red]")
             raise typer.Exit(1)
-        console.print("[green]Test event delivered[/green]")
+        result = found
 
-    asyncio.run(_test())
+    if not result.get("delivered"):
+        # This command exists to answer "does delivery work". Printing
+        # success for an endpoint that never answered is the one thing it
+        # must not do (#388).
+        err_console.print(f"[red]Test event was NOT accepted by {result.get('endpoint')}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Test event delivered to {result.get('endpoint')}[/green]")
 
 
 # ── Agent management ──────────────────────────────────────────────────────────
 
 agent_app = typer.Typer(help="Agent hub management")
 app.add_typer(agent_app, name="agent")
+
+
+def _backend_http_client(timeout: float) -> Any:
+    """The HTTP client every CLI-to-backend call goes through (a test seam)."""
+    import httpx
+
+    return httpx.AsyncClient(timeout=timeout)
+
+
+class BackendRefusedError(RuntimeError):
+    """The backend answered, and said no. `status` is the HTTP status."""
+
+    def __init__(self, status: int, path: str, detail: str) -> None:
+        self.status = status
+        self.path = path
+        self.detail = detail
+        super().__init__(f"{status} from {path}: {detail}")
+
+
+def _via_backend(
+    what: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    scope: str = "admin",
+    not_found: str | None = None,
+) -> Any:
+    """One call to the running backend for an `hp` command, or a clean exit 1.
+
+    The commands that opened the database directly refused on every running
+    install (the backend holds it), so on the shipped Docker deploy they were
+    dead (#700). With the backend up they now go through its API - the same
+    routes, validation and audit trail the console uses. ``not_found`` is the
+    message for a 404, which is an answer, not a failure of the call.
+
+    Every failure says that the backend is running and that the command went
+    through its API, then what the API answered (#623) - an operator who
+    expected a direct write should not have to guess where the "no" came from.
+    Text from the backend is escaped so it cannot inject console markup.
+    """
+    from rich.markup import escape
+
+    lead = f"The HomePilot backend is running, so `{what}` goes through its API - "
+    try:
+        return asyncio.run(_backend_api(method, path, body, scope=scope))
+    except BackendRefusedError as exc:
+        if exc.status == 404 and not_found:
+            err_console.print(f"[yellow]{lead}and it answered: {escape(not_found)}[/yellow]")
+        else:
+            err_console.print(
+                f"[red]{lead}and it refused ({exc.status}):[/red] {escape(exc.detail)}"
+            )
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        err_console.print(f"[red]{lead}and that failed:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from None
+
+
+def _api_error_text(resp: Any) -> str:
+    """The human sentence of an API refusal, not its raw JSON.
+
+    A structured `detail` (the #710 busy refusal names the running task in
+    `message`) collapses to that sentence, the way the web UI shows it; a body
+    that is not JSON is passed through.
+    """
+    try:
+        detail = resp.json().get("detail")
+    except Exception:
+        return str(resp.text)
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        for key in ("message", "reason", "error"):
+            if isinstance(detail.get(key), str):
+                return str(detail[key])
+    return json.dumps(detail) if detail is not None else str(resp.text)
+
+
+@contextlib.asynccontextmanager
+async def _backend_session(scope: str = "admin") -> AsyncIterator[Any]:
+    """A short-lived credential against the running backend, for several calls.
+
+    Yields ``call(method, path, json_body=None, timeout=15.0)`` which returns the
+    decoded JSON body and raises ``RuntimeError`` on an HTTP error status.
+    Transport errors (``httpx.HTTPError``) propagate so a caller that follows a
+    task can tell "the backend did not answer" from "the backend said no".
+    The credential expires on its own and is deleted on the way out (#699).
+    """
+    settings = _get_settings()
+    async with _ephemeral_token(settings, f"cli-{scope}", scope) as (token, err):
+        if token is None:
+            raise RuntimeError(
+                err
+                or (
+                    "The HomePilot backend is not reachable on "
+                    f"127.0.0.1:{getattr(settings, 'daemon_port', 8000)}, or this box holds "
+                    "no admin credential to call it with (HP_ADMIN_TOKEN, or the data "
+                    "dir's api-token). This command works through its API."
+                )
+            )
+        port = getattr(settings, "daemon_port", 8000)
+        auth = {"Authorization": f"Bearer {token}"}
+
+        async def call(
+            method: str,
+            path: str,
+            json_body: dict[str, Any] | None = None,
+            timeout: float = 15.0,
+        ) -> Any:
+            async with _backend_http_client(timeout) as client:
+                resp = await client.request(
+                    method, f"http://127.0.0.1:{port}{path}", headers=auth, json=json_body
+                )
+            if resp.status_code >= 400:
+                raise BackendRefusedError(resp.status_code, path, _api_error_text(resp))
+            if resp.status_code == 204 or not resp.content:
+                return None
+            return resp.json()
+
+        yield call
 
 
 async def _backend_api(
@@ -3082,44 +3812,9 @@ async def _backend_api(
     read-only `hp agent list` must not leave a fleet-root credential behind on
     every invocation.
     """
-    import httpx
-
-    settings = _get_settings()
-    token, err = await _mint_token_via_api(settings, f"cli-{scope}", scope)
-    if token is None:
-        raise RuntimeError(
-            err
-            or (
-                "The HomePilot backend is not reachable on "
-                f"127.0.0.1:{getattr(settings, 'daemon_port', 8000)}. The agent hub runs "
-                "inside it, so it has to be running to answer this."
-            )
-        )
-    port = getattr(settings, "daemon_port", 8000)
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.request(
-                method,
-                f"http://127.0.0.1:{port}{path}",
-                headers={"Authorization": f"Bearer {token}"},
-                json=json_body,
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(f"{resp.status_code} from {path}: {resp.text}")
-            body: dict[str, Any] | list[Any] = resp.json()
-            return body
-    finally:
-        # Best-effort cleanup: the prefix is the token's own first 16 chars.
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.delete(
-                    f"http://127.0.0.1:{port}/auth/tokens/{token[:16]}",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-        except Exception:
-            import logging as _logging
-
-            _logging.getLogger(__name__).debug("could not revoke the CLI token", exc_info=True)
+    async with _backend_session(scope) as call:
+        body: dict[str, Any] | list[Any] = await call(method, path, json_body)
+        return body
 
 
 @agent_app.command("list")
@@ -3310,6 +4005,23 @@ def agent_revoke(
         finally:
             await db.close()
 
+    if _server_is_running(_get_settings()):
+        # The route also closes the agent's live channel (#430), which a
+        # database write from here never could (#700).
+        answer = (
+            _via_backend(
+                "hp agent revoke",
+                "POST",
+                f"/agents/{agent_id}/revoke",
+                not_found=f"No active credential to revoke for agent '{agent_id}'",
+            )
+            or {}
+        )
+        console.print(f"[green]Revoked per-agent credential for {agent_id}[/green]")
+        if answer.get("channel_closed"):
+            console.print("[dim]Its live connection was closed.[/dim]")
+        console.print("[dim]The agent must re-enroll (bootstrap/shared token) to reconnect.[/dim]")
+        return
     revoked = asyncio.run(_revoke())
     if revoked:
         console.print(f"[green]Revoked per-agent credential for {agent_id}[/green]")
@@ -3331,10 +4043,9 @@ def agent_remove(
     good - the `agents` table doubles as the per-agent credential store, so a
     record left behind is a credential a scrapped machine can still present.
 
-    This CLI path talks to the database directly, so it does NOT know whether the
-    agent is currently connected (the API refuses that case). Removing a live
-    agent's record pulls the credential out from under an open connection; stop
-    the agent first.
+    With the backend running this goes through its API, which refuses a
+    connected agent. With it stopped no agent can be connected, and the CLI
+    writes the database itself.
     """
 
     async def _remove() -> bool:
@@ -3363,6 +4074,17 @@ def agent_remove(
             console.print("[dim]Left alone.[/dim]")
             raise typer.Exit(0)
 
+    if _server_is_running(_get_settings()):
+        # The route refuses a CONNECTED agent (409), which the direct path
+        # below cannot know about (#700).
+        _via_backend(
+            "hp agent remove",
+            "DELETE",
+            f"/agents/{agent_id}",
+            not_found=f"No agent '{agent_id}' to forget",
+        )
+        console.print(f"[green]Forgot agent {agent_id}; its credential is revoked[/green]")
+        return
     removed = asyncio.run(_remove())
     if removed:
         console.print(f"[green]Forgot agent {agent_id}; its credential is revoked[/green]")
@@ -3382,6 +4104,30 @@ def quota_set(
     max_disk_gb: int | None = typer.Option(None, "--max-disk-gb", help="Total disk (GB)"),
 ) -> None:
     """Set (or replace) a guest's resource budget. Unset axes are unlimited."""
+
+    if _server_is_running(_get_settings()):
+        result = (
+            _via_backend(
+                "hp quota set",
+                "POST",
+                "/admin/guests/quota",
+                {
+                    "cn": cn,
+                    "max_vms": max_vms,
+                    "max_cores": max_cores,
+                    "max_memory_mb": max_memory_mb,
+                    "max_disk_gb": max_disk_gb,
+                },
+            )
+            or {}
+        )
+        used = result.get("usage") or {}
+        console.print(f"Budget for [bold]{cn}[/bold]: {result.get('limits')}")
+        console.print(
+            f"Current use: {used.get('vms', 0)} machines, {used.get('cores', 0)} cores, "
+            f"{used.get('memory_mb', 0)} MB memory, {used.get('disk_gb', 0)} GB disk"
+        )
+        return
 
     async def _run() -> None:
         from homepilot.db.repository import Repository
@@ -3414,6 +4160,22 @@ def quota_set(
 @quota_app.command("list")
 def quota_list() -> None:
     """Every guest budget, next to what each guest actually uses."""
+
+    if _server_is_running(_get_settings()):
+        overview = _via_backend("hp quota list", "GET", "/admin/guests") or {}
+        budgets = [g for g in overview.get("guests", []) if g.get("limits") is not None]
+        if not budgets:
+            console.print("[dim]No guest budgets set — invites alone cap provisioning.[/dim]")
+            return
+        for g in budgets:
+            lim, used = g["limits"], g.get("usage") or {}
+            console.print(
+                f"[bold]{g['cn']}[/bold]: vms {used.get('vms', 0)}/{lim.get('vms') or '∞'} · "
+                f"cores {used.get('cores', 0)}/{lim.get('cores') or '∞'} · "
+                f"mem {used.get('memory_mb', 0)}/{lim.get('memory_mb') or '∞'} MB · "
+                f"disk {used.get('disk_gb', 0)}/{lim.get('disk_gb') or '∞'} GB"
+            )
+        return
 
     async def _run() -> None:
         from homepilot.db.repository import Repository

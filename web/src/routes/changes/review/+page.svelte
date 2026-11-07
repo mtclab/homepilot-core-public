@@ -18,7 +18,7 @@
 		type ArtifactDetail,
 		type ArtifactPlan,
 	} from '$lib/api';
-	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { canWrite as capCanWrite, isAdmin } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import { pruneSelection } from '$lib/selection';
 	import { base } from '$app/paths';
@@ -30,6 +30,9 @@
 	let loadError = '';
 	// Approve/Reject 403 without write scope. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+	// Approving needs an operator (admin) session (#681): a write token only
+	// approves with a relayed code, which is for the assistant, not this screen.
+	$: canApprove = isAdmin($sessionStore?.capabilities);
 	let working: Record<string, boolean> = {};
 	let expanded: string | null = null;
 	let details: Record<string, ArtifactDetail> = {};
@@ -198,7 +201,7 @@
 		for (const id of ids) {
 			try {
 				if (action === 'approve') await api.approveArtifact(id);
-				else await api.rejectArtifact(id, 'web', (rejectReasons[id] ?? '').trim() || undefined);
+				else await api.rejectArtifact(id, (rejectReasons[id] ?? '').trim() || undefined);
 				done += 1;
 				items = items.filter((a) => a.id !== id);
 			} catch {
@@ -235,7 +238,7 @@
 		const reason = (rejectReasons[id] ?? '').trim() || undefined;
 		working = { ...working, [id]: true };
 		try {
-			await api.rejectArtifact(id, 'web', reason);
+			await api.rejectArtifact(id, reason);
 			notify(`Rejected ${id.slice(-8)}`);
 			items = items.filter((a) => a.id !== id);
 		} catch (e) {
@@ -313,9 +316,11 @@
 					>
 					<button class="btn btn-ghost text-xs" on:click={() => (bulkConfirm = null)}>Cancel</button>
 				{:else}
-					<button class="btn btn-success text-xs" on:click={() => (bulkConfirm = 'approve')}
-						>✓ Approve selected</button
-					>
+					{#if canApprove}
+						<button class="btn btn-success text-xs" on:click={() => (bulkConfirm = 'approve')}
+							>✓ Approve selected</button
+						>
+					{/if}
 					<button class="btn btn-danger text-xs" on:click={() => (bulkConfirm = 'reject')}
 						>✗ Reject selected</button
 					>
@@ -375,11 +380,13 @@
 						</div>
 						{#if canWrite}
 							<div class="flex gap-2 shrink-0">
-								<button
-									class="btn btn-success text-xs"
-									disabled={working[a.id]}
-									on:click={() => approve(a.id)}>✓ Approve</button
-								>
+								{#if canApprove}
+									<button
+										class="btn btn-success text-xs"
+										disabled={working[a.id]}
+										on:click={() => approve(a.id)}>✓ Approve</button
+									>
+								{/if}
 								<button
 									class="btn btn-danger text-xs"
 									disabled={working[a.id]}

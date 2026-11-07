@@ -6,11 +6,11 @@ import logging
 from typing import Any
 
 from ..artifacts.lifecycle import ArtifactLifecycle, ConflictError
-from ..artifacts.models import ArtifactStatus
+from ..artifacts.models import ArtifactBusyError, ArtifactStatus
 from ..artifacts.store import ArtifactStore
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..executor.orchestrator import ArtifactExecutor
-from .repository import TaskRepository
+from .repository import TERMINAL_TASK_STATUSES, TaskRepository
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,37 @@ class TaskRunner:
         -accepted request - so a shutdown is where they get lost."""
         await drain_tasks(self._running_tasks, "artifact run(s)", timeout)
 
+    async def _claim(self, artifact_id: str, action: str) -> str:
+        """Take the artifact's ONE run slot for `action`, or say who holds it (#710).
+
+        Every apply, replay and revoke - from the API, MCP, the CLI through the
+        API, and auto-apply - starts here, and the claim is a single INSERT the
+        database refuses while another pending/running row exists for the
+        artifact (migration 34's partial unique index). So the guarantee holds
+        across connections and processes, not just inside this event loop: two
+        concurrent replays used to both pass a check-then-insert with an await
+        between them.
+
+        A refused claim raises `ArtifactBusyError` naming the run that holds the
+        slot - every transport turns that into a 409 (or a tool error) that says
+        which task to wait on or cancel.
+        """
+        # Two attempts: the holder can finish between our refused insert and the
+        # read that names it, and then the slot is simply free.
+        for _ in range(2):
+            task_id = await self.repo.create_task_if_no_active(artifact_id, action)
+            if task_id is not None:
+                return task_id
+            active = await self.repo.get_active_task(artifact_id)
+            if active is not None:
+                raise ArtifactBusyError(
+                    artifact_id, active["id"], active["action"], active["status"]
+                )
+        raise ConflictError(
+            f"{artifact_id} is busy with another run that finished while this one "
+            "was being started; ask again."
+        )
+
     async def start_apply(self, artifact_id: str, approved_by: str = "system") -> dict[str, Any]:
         # Validate the artifact BEFORE creating a task (#386). An already-APPLIED
         # (or otherwise non-approved) artifact must be rejected cleanly here: if
@@ -68,23 +99,7 @@ class TaskRunner:
         if status != ArtifactStatus.APPROVED:
             raise ConflictError(f"Invalid transition: {status.value} → apply")
 
-        task_id = await self.repo.create_task_if_no_active(artifact_id, "apply")
-        if task_id is None:
-            active = await self.repo.get_active_task(artifact_id)
-            if active is not None:
-                full_task = await self.repo.get_task(active["id"])
-                t = full_task or active
-                return {
-                    "task_id": t["id"],
-                    "artifact_id": t["artifact_id"],
-                    "action": t["action"],
-                    "status": t["status"],
-                }
-
-        # task_id is non-None here (the None branch returned above); guard
-        # explicitly so it survives `python -O` (which strips asserts).
-        if task_id is None:  # pragma: no cover - defensive
-            raise RuntimeError("task_id unexpectedly None after creation")
+        task_id = await self._claim(artifact_id, "apply")
         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
         self._track_task(task, task_id)
 
@@ -98,10 +113,6 @@ class TaskRunner:
     async def start_revoke(
         self, artifact_id: str, user: str = "system", reason: str | None = None
     ) -> dict[str, Any]:
-        active = await self.repo.get_active_task(artifact_id)
-        if active is not None and active["action"] in ("apply", "replay"):
-            raise ValueError(f"apply_in_progress: task {active['id']} is {active['status']}")
-
         try:
             fm, _body = self.store.read(artifact_id)
         except FileNotFoundError:
@@ -111,7 +122,9 @@ class TaskRunner:
         if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED, ArtifactStatus.FAILED):
             raise ConflictError(f"Invalid transition: {status.value} → revoke")
 
-        task_id = await self.repo.create_task(artifact_id, "revoke")
+        # A revoke beside ANY other run is refused - a second revoke included:
+        # two rollbacks of one change ran in parallel before #710.
+        task_id = await self._claim(artifact_id, "revoke")
         task = asyncio.create_task(self._run_revoke(task_id, artifact_id, user, reason))
         self._track_task(task, task_id)
 
@@ -131,10 +144,6 @@ class TaskRunner:
         ARTIFACT_SPEC promises. Those guards live in the executor, so the fix is
         to have exactly one way in.
         """
-        active = await self.repo.get_active_task(artifact_id)
-        if active is not None and active["action"] in ("apply", "replay", "revoke"):
-            raise ValueError(f"apply_in_progress: task {active['id']} is {active['status']}")
-
         try:
             fm, _body = self.store.read(artifact_id)
         except FileNotFoundError:
@@ -144,7 +153,7 @@ class TaskRunner:
         if status not in (ArtifactStatus.APPROVED, ArtifactStatus.APPLIED):
             raise ConflictError(f"Invalid transition: {status.value} -> replay")
 
-        task_id = await self.repo.create_task(artifact_id, "replay")
+        task_id = await self._claim(artifact_id, "replay")
         task = asyncio.create_task(self._run_replay(task_id, artifact_id))
         self._track_task(task, task_id)
 
@@ -154,6 +163,28 @@ class TaskRunner:
             "action": "replay",
             "status": "pending",
         }
+
+    async def run_apply_now(self, artifact_id: str, approved_by: str) -> dict[str, Any]:
+        """Apply through the task gate and WAIT for the outcome (auto-apply, #710).
+
+        The auto-apply reconciler used to call the executor directly, with no
+        task row, so a tick during a running apply dispatched the same artifact
+        again; the second run then died on `applied -> applied` and the
+        uncaught error skipped every later approved artifact in that tick. It
+        now claims the same slot every other run does - a busy artifact raises
+        `ArtifactBusyError` and is left to the run that holds it - and the run
+        is a tracked task, so cancel and shutdown drain reach it.
+
+        Returns the finished task row.
+        """
+        task_id = await self._claim(artifact_id, "apply")
+        task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
+        self._track_task(task, task_id)
+        # `wait`, not `await task`: a cancel of THIS run (hp/UI cancel) must
+        # end this run only, not raise into the reconciler's loop over the rest.
+        await asyncio.wait({task})
+        row = await self.repo.get_task(task_id)
+        return row or {"id": task_id, "artifact_id": artifact_id, "status": "failed"}
 
     async def cancel_task(self, task_id: str) -> dict[str, Any]:
         # Best-effort stop-then-mark. If we still hold the in-flight asyncio.Task
@@ -179,7 +210,7 @@ class TaskRunner:
             task = await self.repo.get_task(task_id)
             if task is None:
                 raise ValueError(f"Task not found: {task_id}")
-            if task["status"] in ("succeeded", "failed"):
+            if task["status"] in TERMINAL_TASK_STATUSES:
                 return task
             await asyncio.sleep(interval)
             elapsed += interval
@@ -212,7 +243,21 @@ class TaskRunner:
             )
         payload = json.dumps({"execution_log": log}) if log else None
 
-        if getattr(result, "success", False):
+        unsettled = getattr(result, "unsettled_task", None)
+        if isinstance(unsettled, dict) and unsettled:
+            # Neither verdict is true yet (#774): the PVE task is still running.
+            # The UPID rides on the record so an operator can look at it in PVE.
+            payload = json.dumps(
+                {"execution_log": log, "outcome": "unknown", "unsettled_task": unsettled}
+            )
+            await self.repo.update_task_status(
+                task_id,
+                "unknown",
+                error=getattr(result, "failure_reason", None)
+                or f"outcome unknown: PVE task {unsettled.get('upid')} is still running",
+                result_json=payload,
+            )
+        elif getattr(result, "success", False):
             await self.repo.update_task_status(task_id, "succeeded", result_json=payload)
         else:
             await self.repo.update_task_status(
@@ -221,6 +266,34 @@ class TaskRunner:
                 error=getattr(result, "failure_reason", None) or "apply failed",
                 result_json=payload,
             )
+
+    async def settle(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Bring an 'unknown' apply/replay task to its verdict, if PVE has one.
+
+        A task reads 'unknown' when its run stopped following a PVE task that
+        was still running (#774). Reading it is the natural moment to ask PVE
+        how that task ended. Returns the task as it now stands; anything that is
+        not an unknown apply/replay is returned untouched.
+        """
+        if (
+            task.get("status") != "unknown"
+            or task.get("action") not in ("apply", "replay")
+            or not task.get("artifact_id")
+            or self.executor is None
+        ):
+            return task
+        try:
+            result = await self.executor.settle(str(task["artifact_id"]))
+        except Exception:
+            # Settling is opportunistic: the task stays 'unknown', which is
+            # still the truth, and the next read asks again.
+            logger.warning("Could not settle task %s", task.get("id"), exc_info=True)
+            return task
+        if result is None or result.unsettled_task:
+            return task
+        await self._record_outcome(str(task["id"]), result)
+        settled = await self.repo.get_task(str(task["id"]))
+        return settled if settled is not None else task
 
     async def _run_apply(self, task_id: str, artifact_id: str, approved_by: str) -> None:
         await self.repo.update_task_status(task_id, "running")

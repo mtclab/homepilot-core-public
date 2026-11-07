@@ -81,7 +81,9 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-For local / stdio use (no server):
+For local / stdio use with NO backend running (the standalone server refuses to
+start while a backend holds the data directory - it would be a second control
+plane with no agents connected, #698):
 
 ```bash
 hp mcp-serve               # default: stdio transport
@@ -97,11 +99,8 @@ Claude Code config (`~/.claude/settings.json`):
 }
 ```
 
-For remote / HTTP use (recommended for shared homelab):
-
-```bash
-hp mcp-serve --transport http --port 8000
-```
+For remote / HTTP use (recommended for shared homelab) the running backend serves
+MCP at `/mcp` on its own port - no separate process.
 
 The client authenticates with an API token from Settings -> Tokens; `HP_MCP_TOKEN=<secret>` still works as the legacy static fallback (see MCP authentication below).
 
@@ -241,6 +240,8 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 | `set_setting_override` | settings table | admin | Persist one operator setting through the same `checked_set` the admin route uses. Refused - storing nothing - for an unknown key (which is every secret), a key the environment already decides, a value of the wrong shape, or a value the live cluster refutes or cannot be asked about |
 | `clear_setting_override` | settings table | admin | Drop a stored setting so the install falls back to the environment or the code default. Same refusals |
 | `probe_setting_override` | no | admin | Ask the cluster about a candidate value WITHOUT saving it (is this node real, is this bridge on it, is this vmid a template). Admin-tier despite writing nothing: its route is |
+| `list_webhooks` | no | admin | The configured event webhooks: endpoint as scheme://host:port only (paths carry credentials), event types, enabled, signed, retries (#700) |
+| `test_webhook` | no | admin | One `webhook_test` delivery to a configured webhook; says whether the endpoint accepted it. Creating and deleting webhooks are NOT tools: an endpoint receives the approval codes (#681) |
 | `record_fact` | KB only | write | Write note/policy/decision to KB (auto-applied, no approval) |
 | `propose_artifact` | triggers flow | write | Creates artifact with status: proposed; requires human approval |
 | `approve_artifact` | triggers flow | write | Exposed, but gated by a per-artifact approval code a human relays: the code is generated at propose time and returned by no MCP read, so the assistant cannot approve its own proposal (#385 follow-up) |
@@ -248,6 +249,8 @@ The agent never mutates directly. It drafts a fully-specified plan; you decide w
 **Naming.** Every tool that addresses a machine by name takes `host` (#608). `hostname` is accepted as a deprecated alias so older callers keep working, and tools that answer with a dict say so in a `warning` field; new tools must use `host` alone. `tests/test_mcp_host_param.py` walks the registry and enforces it.
 
 `propose_artifact` initiates a change (requires write scope). Approval used to be refused over MCP outright, because the MCP credential is a single shared token and an LLM able to approve would both propose and approve its own mutations (#385); the relayed approval code replaced the blanket ban with a gate the assistant cannot pass on its own.
+
+**Approval authority (#681).** The gate lives in `ArtifactLifecycle.approve`, so REST, MCP and the CLI all meet the same rule. A credential is either an *operator* (a token holding the admin capability - what the browser claim and `hp init` mint - or the on-box CLI) or an *assistant* (everything below admin, and every MCP caller whatever its tier). An operator approves on its own authority; an assistant approves only with the per-artifact code a human relayed, with wrong codes counted toward the lock. The code is returned only to operator credentials (`GET /artifacts/{id}`), rides only the outbound webhook POST (never the SSE stream or the stored `webhook_deliveries` row), and resetting its lock is admin scope. Who approved, rejected, applied or revoked is always the authenticated credential; `user`/`approved_by` in a request body are ignored. The audience is derived from the scope ladder rather than stored: an admin credential is already root on every agent host (`exec_on_host`), so a separate "assistant" label at admin tier would gate nothing.
 
 ### MCP authentication
 
@@ -281,7 +284,7 @@ Each tool that mirrors a management route sits at exactly that route's API scope
 
 Seven tools mirror no route and therefore have no scope to be compared against; their tiers are placed by hand. Each is declared, with its tier and its reason, in `ROUTELESS_TOOLS` in the same test file, and `TestEveryToolIsTierGoverned` fails on any tool that is neither mapped nor declared — so a new tool cannot slip past the tier gate by simply not appearing in a map. `create_guest_template` (admin, MCP-only) is the deliberate one; `get_artifact_status`, `check_artifact_drift`, `proxmox_api_read` and `http_call_read` are narrow reads with no management twin.
 
-**The two that are not settled**: `read_file_on_guest` and `exec_on_guest_readonly` run at the `read_only` tier, while every API route that reads a file from — or executes on — a managed host (`POST /agents/host/read-file`, `POST /agents/host/exec`, `GET /agents/test/adapter`) is `require_scope("admin")`. These tools are guarded in their own way (a read prefix allowlist plus a secret denylist; an allowlist of read-only commands), but they are the only place in the product where an MCP tier is deliberately **weaker** than the API scope for the same capability. A `read`-scope token therefore reads `/etc`, `/home`, `/var/log` and `/opt` on any managed host as root — which is enough to lift whatever credentials that host keeps in a config file. Under review (#648, tranche 2); until it is decided, treat a `read`-scope token as trusted with every managed host's on-disk configuration.
+**The two that are not settled**: `read_file_on_guest` and `exec_on_guest_readonly` run at the `read_only` tier, while every API route that reads a file from — or executes on — a managed host (`POST /agents/host/read-file`, `POST /agents/host/exec`, `GET /agents/test/adapter`) is `require_scope("admin")`. These tools are guarded in their own way (a read prefix allowlist plus a secret denylist; an allowlist of read-only commands), but they are the only place in the product where an MCP tier is deliberately **weaker** than the API scope for the same capability. Since #682/#691 both run under one default-deny, positive-only policy shared with the agent (`agent/go/readonly_policy.json`): a `read`-scope token reads logs, unit files, a few identity files and what HomePilot wrote, never keys, shadow files, PVE or HomePilot credentials or `/root`, and runs only read verbs. The tier question itself is still under review (#648, tranche 2).
 
 ---
 
@@ -384,7 +387,7 @@ must never produce one.
 
 ### File access
 
-**Read prefixes**: `/var/log/`, `/etc/`, `/opt/homepilot/`, `/proc/`, `/sys/`, `/tmp/homepilot/`, `/home/`, `/usr/local/bin/`
+**Reads**: default-deny under the one read-only policy shared byte-for-byte by the agent and the control plane (`agent/go/readonly_policy.json` = `src/homepilot/adapters/readonly_policy.json`, #682/#691): logs, unit files, a few identity files and the write prefixes are readable; private keys (`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `*.key`, `*.pem`, ...), shadow files, PVE and HomePilot credentials, `/root`, process environments and dotfile credential stores are denied even under an allowed prefix. `HP_AGENT_READ_PREFIXES` replaces the agent's read prefixes; the deny rules still apply.
 
 **Write prefixes** (`HP_AGENT_WRITE_PREFIXES`, privileged default): `/etc/homepilot/`, `/opt/homepilot/`, `/tmp/homepilot/`, `/etc/systemd/system/`, `/etc/docker/`, `/etc/nginx/`. An unprivileged install grants only HomePilot's own three directories.
 
@@ -494,7 +497,7 @@ The agent is a **drop-in** replacement — existing artifact executors work unch
 
 ## Events, SSE, and Webhooks
 
-Every artifact lifecycle transition (proposed, approved, applied, etc.) and drift detection emits an SSE event via the `EventBus`. Connected clients stream these at `GET /events`.
+Every artifact lifecycle transition (proposed, approved, applied, etc.) and drift detection emits an SSE event via the `EventBus`. Connected clients stream these at `GET /artifacts/events/stream` (read scope).
 
 Registered webhooks receive the same events as outbound HTTP POST deliveries with HMAC-SHA256 signatures. The webhook system supports configurable per-endpoint event type filters, retry with exponential backoff, and delivery status tracking in the database.
 

@@ -3,15 +3,24 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
+from ..client_ip import client_ip as _client_ip
+from ..client_ip import is_trusted_proxy, trusted_proxies_of
 from ..common import SlidingWindowLimiter
 from ..config import get_settings
 from ..db.repository import Repository
+from .audit import (
+    ACTION_LOGIN,
+    ACTION_MINTED,
+    ACTION_REVOKED,
+    audit_actor,
+    audit_credential_event,
+)
 from .deps import (
     REQUIRED_SCOPE_ATTR,
     SCOPE_ENFORCER_ATTR,
@@ -48,9 +57,38 @@ _token_create_attempts = SlidingWindowLimiter(
 
 
 def _cookie_secure(request: Request | None = None) -> bool:
+    """Whether the session cookies carry `Secure` (#685).
+
+    HP_COOKIE_SECURE=false is the explicit opt-out. Otherwise the cookie is
+    Secure whenever the CLIENT's leg is, or may be, TLS:
+
+    * the backend itself was reached over https;
+    * X-Forwarded-Proto says https - from ANY peer, because the header can only
+      make the cookie stricter, so a forged one gains an attacker nothing. This
+      is the documented deployment: TLS on a separate proxy host, plain HTTP to
+      the backend, where `request.url.scheme` is always `http` (uvicorn trusts
+      X-Forwarded-Proto only from 127.0.0.1) and the 30-day admin cookie used to
+      go out without `Secure`;
+    * the peer is a trusted proxy (HP_TRUSTED_PROXIES) that did not say `http`
+      - fail closed when the proxy does not name the scheme.
+
+    The one case left non-Secure is a DIRECT plain-HTTP connection: the README
+    install path (`http://<host>:8000/ui` from the LAN). A browser drops a
+    Secure cookie set over plain HTTP, so marking it would leave the operator
+    unable to log in at all, and the token it answers already crossed that
+    connection in the clear.
+    """
     if not get_settings().cookie_secure:
         return False
-    return not (request is not None and request.url.scheme == "http")
+    if request is None or request.url.scheme == "https":
+        return True
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if proto == "https":
+        return True
+    peer = request.client.host if request.client else None
+    if is_trusted_proxy(peer, trusted_proxies_of(request)):
+        return proto != "http"
+    return False
 
 
 async def resolve_admin_secret(request: Request) -> str:
@@ -191,6 +229,10 @@ class LoginRequest(BaseModel):
 class TokenCreateRequest(BaseModel):
     label: str = "admin"
     scope: str = "all"
+    # Optional lifetime. The CLI mints a credential for each command it runs
+    # against the backend; without an expiry every one it failed to delete was
+    # a permanent live token (#699). Omitted = no expiry, as before.
+    expires_in_seconds: int | None = Field(default=None, ge=60, le=366 * 86400)
 
 
 async def _validate_bearer(token: str, db: Repository) -> dict[str, Any]:
@@ -273,8 +315,7 @@ async def login(
     stored_fingerprint = row.get("fingerprint")
     current_fingerprint = request.headers.get(
         "x-hp-session-fingerprint",
-        f"{(request.client.host if request.client else 'unknown')}"
-        f":{request.headers.get('user-agent', '')}",
+        f"{_client_ip(request)}:{request.headers.get('user-agent', '')}",
     )
 
     if stored_fingerprint and stored_fingerprint != current_fingerprint:
@@ -312,6 +353,16 @@ async def login(
         secure=_cookie_secure(request),
         path="/",
         max_age=60 * 60 * 24 * 30,
+    )
+    # A login opens a 30-day session with this credential: on the trail (#686).
+    await audit_credential_event(
+        db,
+        action=ACTION_LOGIN,
+        actor=audit_actor(row),
+        source="api",
+        prefix=row.get("prefix"),
+        label=row.get("label"),
+        scope=row.get("scope"),
     )
     return {"status": "ok"}
 
@@ -351,13 +402,14 @@ async def admin_create_token(
     minting used to fall back to an unauthenticated direct-DB write; that
     fallback is now bootstrap-only (see `hp token create`).
     """
-    client_ip = request.client.host if request.client else "unknown"
+    # The real client behind a trusted proxy (#705), not the proxy itself.
+    client_ip = _client_ip(request)
     if not _token_create_attempts.allow(client_ip):
         raise HTTPException(status_code=429, detail="Rate limit exceeded for token creation")
 
     # Rate limiting stays AHEAD of authorization so a brute-force attempt on
     # either credential is counted, not just a well-formed one.
-    await _authorize_mint(request, authorization, hp_token, hp_csrf, db)
+    minter = await _authorize_mint(request, authorization, hp_token, hp_csrf, db)
 
     # Refuse a scope this instance cannot honour rather than storing it and
     # answering 201 with a credential that is silently good for nothing.
@@ -380,9 +432,24 @@ async def admin_create_token(
         hash=token_hash,
         scope=body.scope,
         label=body.label,
-        expires_at=None,
+        expires_at=(
+            (datetime.now(UTC) + timedelta(seconds=body.expires_in_seconds)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            if body.expires_in_seconds
+            else None
+        ),
     )
     await db.db.conn.commit()
+    await audit_credential_event(
+        db,
+        action=ACTION_MINTED,
+        actor=audit_actor(minter),
+        source="api",
+        prefix=prefix,
+        label=body.label,
+        scope=body.scope,
+    )
     return {"token": full_token, "scope": body.scope}
 
 
@@ -406,6 +473,19 @@ async def revoke_token(
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Token not found")
     await db.delete_token(row["id"])
-    logger.info("Token revoked: prefix=%s, by=%s", prefix, auth.get("prefix", "admin-secret"))
+    # WHO revoked it: the authenticated credential, or the admin secret. This
+    # used to read auth.get("prefix", "admin-secret") off a dict that carried
+    # no prefix, so every revoke was logged as the admin secret (#686).
+    actor = audit_actor(auth)
+    logger.info("Token revoked: prefix=%s, by=%s", prefix, actor)
     await db.db.conn.commit()
+    await audit_credential_event(
+        db,
+        action=ACTION_REVOKED,
+        actor=actor,
+        source="api",
+        prefix=prefix,
+        label=row.get("label"),
+        scope=row.get("scope"),
+    )
     return Response(status_code=204)

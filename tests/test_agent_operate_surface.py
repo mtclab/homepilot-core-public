@@ -21,7 +21,6 @@ import asyncio
 import contextlib
 import json
 import os
-import shutil
 import struct
 import subprocess
 from pathlib import Path
@@ -35,12 +34,14 @@ from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
 
+from .go_toolchain import GO as _GO
+from .go_toolchain import GO_SKIP_REASON
+
 pytestmark = pytest.mark.asyncio
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_SRC = REPO_ROOT / "agent" / "go"
-_GO = os.environ.get("HP_GO_BIN") or shutil.which("go") or ""
-_needs_go = pytest.mark.skipif(not _GO, reason="Go toolchain not available")
+_needs_go = pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON)
 
 AUTH = "shared-secret-for-tests"
 HEADER_LEN = 4
@@ -269,7 +270,7 @@ class TestARejectedAgentSaysWhy:
             # never seen has no row to write a reason onto (and must not create
             # one - the agents table is the credential store).
             r0, w0 = await register("agent-4", "box-4")
-            await _recv(r0)
+            minted = (await _recv(r0))["auth_token"]
             await _wait_for(lambda: _row(repo, "agent-4"))
             w0.close()
             with contextlib.suppress(Exception):
@@ -281,8 +282,10 @@ class TestARejectedAgentSaysWhy:
                 "fixture precondition: the refusal was not recorded"
             )
 
-            # Now it registers properly again.
-            r2, w2 = await register("agent-4", "box-4")
+            # Now it registers properly again - with the credential it was issued.
+            # (Not the shared token: a host holding a live credential is refused
+            # shared-token enrolment, #683.)
+            r2, w2 = await register("agent-4", "box-4", token=minted)
             await _recv(r2)
 
             cleared = await _wait_for(

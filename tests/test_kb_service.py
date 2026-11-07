@@ -8,6 +8,7 @@ import pytest
 
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.kb.service import KBService
 from homepilot.main import _walk_api_routes
 
@@ -43,7 +44,11 @@ def artifact_store(tmp_path: Path) -> ArtifactStore:
 @pytest.fixture
 async def kb_service(repo, artifact_store):
     lc = ArtifactLifecycle(artifact_store, repo)
-    return KBService(repo=repo, store=artifact_store, lifecycle=lc)
+    svc = KBService(repo=repo, store=artifact_store, lifecycle=lc)
+    yield svc
+    # Tests wire the lifecycle back-reference, so a transition starts a
+    # BACKGROUND reindex; finish it before the database closes (#622).
+    await svc.drain()
 
 
 async def _insert_doc(
@@ -627,7 +632,7 @@ class TestKBReindexIfNeeded:
             "body": "echo hello",
         }
         artifact_id = await kb_service.lifecycle.propose(spec)
-        await kb_service.lifecycle.approve(artifact_id, user="test-user")
+        await kb_service.lifecycle.approve(artifact_id, Principal.operator("test-user"))
 
         mock_reindex = AsyncMock(return_value=None)
         with patch.object(kb_service, "reindex_if_needed", mock_reindex):

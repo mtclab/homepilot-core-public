@@ -11,13 +11,17 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse
 
 from ..auth.deps import require_scope, require_token
+from ..auth.principal import audit_actor, principal_from_token
+from ..client_ip import client_ip as _client_ip
 from ..sse import bus as sse_bus
 from .lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
+from .models import ApprovalRefusedError, ArtifactBusyError
 from .store import ArtifactStore
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,45 @@ def _get_store(request: Request) -> ArtifactStore:
 def _get_lifecycle(request: Request) -> ArtifactLifecycle:
     lifecycle: ArtifactLifecycle = request.app.state.artifact_lifecycle
     return lifecycle
+
+
+# ── Request bodies (#703) ─────────────────────────────────────────────────────
+# Declared, so a malformed body is FastAPI's 422 (value-stripped by the app's
+# handler, #628) instead of a JSONDecodeError/AttributeError 500, and so the
+# OpenAPI schema says what each route takes. Unknown fields are IGNORED, not
+# refused: clients before #681 sent `user` / `approved_by`, which the server no
+# longer reads (identity is the authenticated credential) - refusing them would
+# break an older CLI or UI for no gain.
+
+_REASON = Field(default=None, max_length=2000, description="Why - recorded on the artifact")
+
+
+class ApproveBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    reason: str | None = _REASON
+    approval_code: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "The per-artifact code a human relayed. Required unless the caller is "
+            "an operator (admin) credential (#681)."
+        ),
+    )
+
+
+class ReasonBody(BaseModel):
+    """Reject / revoke: the only thing a caller supplies is why."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    reason: str | None = _REASON
+
+
+class ApplyBody(BaseModel):
+    """Apply takes nothing from the body; declared so a malformed one is a 422."""
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class ArtifactActionError(Exception):
@@ -118,7 +161,7 @@ async def get_drift_status(
 
 
 @router.get("/{artifact_id}", dependencies=[Depends(require_scope("read"))])
-async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+async def get_artifact(request: Request, artifact_id: str, token: _TokenDep) -> dict[str, Any]:
     store = _get_store(request)
     try:
         fm, body = store.read(artifact_id)
@@ -126,11 +169,12 @@ async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
     task_repo = request.app.state.task_repo
     active_task = await task_repo.get_active_task(artifact_id)
-    # Approval code, for the operator review surface only. This management API is
-    # not the MCP transport, so returning it here to the web UI / CLI is exactly
-    # how a present human reads the code to relay it. Only while PROPOSED (that is
-    # the one state a coded approval applies to); backfilled lazily for artifacts
-    # proposed before the feature shipped. `locked` drives the reset control.
+    # Approval code, for the operator review surface only: returned to an
+    # OPERATOR credential, never to an assistant's write/read token (#681) - the
+    # same token that proposed could otherwise read it back and approve its own
+    # change. Only while PROPOSED (the one state a coded approval applies to);
+    # backfilled lazily for artifacts proposed before the feature shipped.
+    # `locked` drives the reset control.
     approval_code: str | None = None
     approval_locked = False
     if fm.get("status") == "proposed":
@@ -139,7 +183,8 @@ async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
             from .approval_code import ensure_approval_code, format_for_display
 
             code = await ensure_approval_code(repo, artifact_id)
-            approval_code = format_for_display(code)
+            if principal_from_token(token).is_operator:
+                approval_code = format_for_display(code)
             row = await repo.get_approval_code_row(artifact_id)
             approval_locked = bool(row and int(row["locked"]))
     return {
@@ -153,14 +198,15 @@ async def get_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
 
 @router.post(
     "/{artifact_id}/approval-code/reset",
-    dependencies=[Depends(require_scope("write"))],
+    dependencies=[Depends(require_scope("admin"))],
 )
 async def reset_approval_code(request: Request, artifact_id: str) -> dict[str, Any]:
     """Operator reset of a brute-force approval lock (present-human action).
 
-    After too many wrong codes relayed over MCP, approval for the artifact locks.
-    A human at the UI/CLI clears the lock here; the code itself is unchanged, so
-    the operator can re-read and re-relay it."""
+    After too many wrong codes, approval for the artifact locks. A human at the
+    UI/CLI clears the lock here; the code itself is unchanged, so the operator
+    can re-read and re-relay it. Admin scope = an operator credential (#681): at
+    `write` the assistant that tripped the lock could clear it and keep guessing."""
     repo = getattr(request.app.state, "repo", None)
     if repo is None:
         raise HTTPException(status_code=503, detail="approval-code store unavailable")
@@ -202,18 +248,23 @@ def _fill_proposal_defaults(spec: dict[str, Any], token: dict[str, Any]) -> dict
     produced_by.setdefault("agent", "web")
     produced_by.setdefault("session", f"web-{secrets.token_hex(4)}")
     # The authenticated identity wins over anything the client sent: the audit
-    # trail's whole value is that it names who really did this.
-    produced_by["user"] = str(token.get("display_name") or token.get("user_id") or "web")
+    # trail's whole value is that it names who really did this. The CREDENTIAL,
+    # not just the display name - every minted token shares the one user (#681).
+    produced_by["user"] = audit_actor(token)
     filled["produced_by"] = produced_by
     return filled
 
 
 @router.post("", dependencies=[Depends(require_scope("write"))])
-async def propose_artifact(request: Request, token: _TokenDep) -> dict[str, Any]:
+async def propose_artifact(
+    request: Request,
+    token: _TokenDep,
+    spec: Annotated[
+        dict[str, Any],
+        Body(description="The artifact spec (ARTIFACT_SPEC.md); id/produced_by are filled in"),
+    ],
+) -> dict[str, Any]:
     lifecycle = _get_lifecycle(request)
-    spec = await request.json()
-    if not isinstance(spec, dict):
-        raise HTTPException(status_code=400, detail="Artifact spec must be an object")
     try:
         artifact_id = await lifecycle.propose(_fill_proposal_defaults(spec, token))
     except LifecycleError as e:
@@ -418,13 +469,29 @@ async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]
 
 
 @router.post("/{artifact_id}/approve", dependencies=[Depends(require_scope("write"))])
-async def approve_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+async def approve_artifact(
+    request: Request,
+    artifact_id: str,
+    token: _TokenDep,
+    body: Annotated[ApproveBody | None, Body()] = None,
+) -> dict[str, Any]:
+    """Approve on the authenticated credential's authority (#681).
+
+    An operator credential approves directly; any other write token must carry
+    the human-relayed `approval_code`. The approver recorded is the credential,
+    never a `user` named in the body. The rule itself lives in
+    ArtifactLifecycle.approve so every transport meets the same one."""
     lifecycle = _get_lifecycle(request)
-    body = await request.json()
-    user = body.get("user", "system")
-    reason = body.get("reason")
+    body = body or ApproveBody()
     try:
-        await lifecycle.approve(artifact_id, user, reason)
+        await lifecycle.approve(
+            artifact_id,
+            principal_from_token(token),
+            body.reason,
+            approval_code=body.approval_code,
+        )
+    except ApprovalRefusedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
@@ -438,11 +505,16 @@ async def approve_artifact(request: Request, artifact_id: str) -> dict[str, Any]
 
 
 @router.post("/{artifact_id}/reject", dependencies=[Depends(require_scope("write"))])
-async def reject_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
+async def reject_artifact(
+    request: Request,
+    artifact_id: str,
+    token: _TokenDep,
+    body: Annotated[ReasonBody | None, Body()] = None,
+) -> dict[str, Any]:
     lifecycle = _get_lifecycle(request)
-    body = await request.json()
-    user = body.get("user", "system")
-    reason = body.get("reason")
+    # Who rejected is the authenticated credential, never the body (#681).
+    user = audit_actor(token)
+    reason = (body or ReasonBody()).reason
     try:
         await lifecycle.reject(artifact_id, user, reason)
     except ConflictError as e:
@@ -461,16 +533,22 @@ async def reject_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
 async def apply_artifact(
     request: Request,
     artifact_id: str,
+    token: _TokenDep,
     sync: bool = Query(False),
+    _body: Annotated[ApplyBody | None, Body()] = None,
 ) -> Any:
     from ..tasks.runner import TaskRunner
 
     task_runner: TaskRunner = request.app.state.task_runner
-    body = await request.json()
-    approved_by = body.get("approved_by", "system")
+    # Who ran it is the authenticated credential; a body `approved_by` is
+    # ignored (#681). Apply never grants approval: the runner refuses anything
+    # that is not already approved.
+    approved_by = audit_actor(token)
 
     try:
         task_info = await task_runner.start_apply(artifact_id, approved_by)
+    except ArtifactBusyError as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
@@ -519,18 +597,15 @@ async def replay_artifact(
 
     try:
         task_info = await task_runner.start_replay(artifact_id)
+    except ArtifactBusyError as e:
+        # Names the run holding the artifact's one slot (#710).
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
         msg = str(e)
-        if "apply_in_progress" in msg:
-            active = await request.app.state.task_repo.get_active_task(artifact_id)
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "apply_in_progress", "task_id": active["id"] if active else None},
-            ) from e
         if "not found" in msg.lower():
             raise HTTPException(status_code=404, detail=msg) from e
         raise HTTPException(status_code=400, detail=msg) from e
@@ -549,30 +624,28 @@ async def replay_artifact(
 async def revoke_artifact(
     request: Request,
     artifact_id: str,
+    token: _TokenDep,
     sync: bool = Query(False),
+    body: Annotated[ReasonBody | None, Body()] = None,
 ) -> Any:
     from ..tasks.runner import TaskRunner
 
     task_runner: TaskRunner = request.app.state.task_runner
-    raw = await request.body()
-    body = json.loads(raw) if raw else {}
-    user = body.get("user", "system")
-    reason = body.get("reason")
+    # Who revoked is the authenticated credential, never the body (#681).
+    user = audit_actor(token)
+    reason = (body or ReasonBody()).reason
 
     try:
         task_info = await task_runner.start_revoke(artifact_id, user, reason)
+    except ArtifactBusyError as e:
+        # Names the run holding the artifact's one slot (#710).
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     except ConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except LifecycleError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except ValueError as e:
         msg = str(e)
-        if "apply_in_progress" in msg:
-            active = await request.app.state.task_repo.get_active_task(artifact_id)
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "apply_in_progress", "task_id": active["id"] if active else None},
-            ) from e
         if "not found" in msg.lower():
             raise HTTPException(status_code=404, detail=msg) from e
         raise HTTPException(status_code=400, detail=msg) from e
@@ -599,16 +672,18 @@ _sse_conn_lock = asyncio.Lock()
 
 @router.get("/events/stream", dependencies=[Depends(require_scope("read"))])
 async def sse_stream(request: Request) -> EventSourceResponse:
-    client_ip = request.client.host if request.client else "unknown"
+    # Keyed on the REAL client behind a trusted proxy (#705); on the raw peer,
+    # every operator behind the proxy shared one bucket of three.
+    client_ip = _client_ip(request)
+    # Check and take the slot in ONE critical section, and hand it back if the
+    # bus is full, so a burst of opens cannot all pass the check before any of
+    # them counts.
     async with _sse_conn_lock:
         if _sse_conn_count.get(client_ip, 0) >= _SSE_MAX_CONN_PER_IP:
             raise HTTPException(status_code=429, detail="SSE connection limit reached")
-
-    q = sse_bus.subscribe()
-    if q is None:
-        raise HTTPException(status_code=503, detail="SSE subscriber limit reached")
-
-    async with _sse_conn_lock:
+        q = sse_bus.subscribe()
+        if q is None:
+            raise HTTPException(status_code=503, detail="SSE subscriber limit reached")
         _sse_conn_count[client_ip] = _sse_conn_count.get(client_ip, 0) + 1
 
     async def event_generator() -> AsyncIterator[dict[str, str]]:
@@ -619,6 +694,12 @@ async def sse_stream(request: Request) -> EventSourceResponse:
                     break
                 if (time.time() - start) > _SSE_CONN_TIMEOUT_SEC:
                     yield {"event": "ping", "data": json.dumps({"reason": "timeout"})}
+                    break
+                if sse_bus.missed(q) and q.empty():
+                    # Events for this client were dropped. Deliver what did fit
+                    # (above), then end the stream: the client reconnects and
+                    # re-reads, instead of trusting a view with a hole in it
+                    # (#701).
                     break
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=15)

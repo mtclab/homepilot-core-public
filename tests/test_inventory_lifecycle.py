@@ -200,9 +200,11 @@ class TestThePagerTellsTheTruth:
 
 class TestTheReconcilerSeesEveryHost:
     async def test_the_snapshot_is_not_truncated_at_a_hundred(self, tmp_path: Path):
-        """The absent/changed sets were computed from `list_hosts()`, whose
-        default limit is 100 - so on a larger estate they were computed from an
-        arbitrary first page (#428)."""
+        """The changed/new sets are computed from `list_hosts()`, whose default
+        limit is 100 - so on a larger estate they were computed from an
+        arbitrary first page (#428). (The absent set now comes from the sweep
+        itself - the ids it actually marked, #712 - so this asserts on a host
+        that CHANGED past the first hundred.)"""
         from homepilot.reconciler.inventory import InventoryReconciler
 
         db = Database(str(tmp_path / "recon.db"))
@@ -210,28 +212,31 @@ class TestTheReconcilerSeesEveryHost:
         await run_migrations(db)
         repo = Repository(db)
         try:
-            for n in range(150):
+            ids = [
                 await repo.create_host(hostname=f"h{n:03d}", host_type="qemu", role="guest")
+                for n in range(150)
+            ]
+            # list_hosts orders by hostname, so h140 is well past the first page.
+            late = ids[140]
 
-            service = AsyncMock()
-            # A COMPLETE sweep that saw nothing: the hypervisor answered and
-            # reports no guests, which is what makes "the other 150 are gone" a
-            # sentence this reconciler has earned. (An incomplete sweep is a
-            # different case, gated in test_reconciler.py.)
-            service.refresh_inventory = AsyncMock(
-                return_value={
-                    "hosts": 0,
+            async def sweep() -> dict:
+                await repo.update_host(late, ip_address="10.0.0.140")
+                return {
+                    "hosts": 150,
                     "services": 0,
                     "complete": True,
-                    "proxmox_host_ids": [],
+                    "proxmox_host_ids": ids,
+                    "absent_host_ids": [],
                 }
-            )
+
+            service = AsyncMock()
+            service.refresh_inventory = AsyncMock(side_effect=sweep)
             service.enrich_inventory = AsyncMock(return_value={"enriched": 0, "unchanged": 0})
             reconciler = InventoryReconciler(inventory_service=service, repo=repo)
 
             result = await reconciler.run()
 
-            assert result.details["absent_hosts"] == 150, (
+            assert result.details.get("changed_host_ids") == [late], (
                 "the reconciler saw only the first page of the estate"
             )
         finally:

@@ -9,17 +9,36 @@ from typing import TYPE_CHECKING, Any
 from .models import (
     ArtifactKind,
     ArtifactStatus,
+    ConflictError,
     LifecycleError,
     compute_body_hash,
     extract_composite_steps,
     utcnow_iso,
 )
-from .validator import validate_transition
+from .validator import validate_artifact_content, validate_transition
 
 if TYPE_CHECKING:
     from .file_store import ArtifactFileStore
 
 _logger = logging.getLogger(__name__)
+
+# Frontmatter the lifecycle writes. An operator's edit may change what the
+# artifact DOES; it may not rewrite where it stands (#693).
+LIFECYCLE_OWNED_FIELDS = frozenset(
+    {
+        "id",
+        "status",
+        "hash",
+        "created_at",
+        "approved_by",
+        "applied_at",
+        "failed_at",
+        "failure_reason",
+        "rejected_by",
+        "revoked_by",
+        "superseded_by",
+    }
+)
 
 
 class ArtifactTransitionManager:
@@ -87,7 +106,12 @@ class ArtifactTransitionManager:
             _logger.exception("DB sync failed for artifact %s: %s", artifact_id, exc)
 
     async def approve(
-        self, id: str, user: str, reason: str | None = None, role: str | None = None
+        self,
+        id: str,
+        user: str,
+        reason: str | None = None,
+        role: str | None = None,
+        authority: str | None = None,
     ) -> None:
         with self.file_store.file_lock(id):
             fm, body = self.file_store.read(id)
@@ -110,12 +134,19 @@ class ArtifactTransitionManager:
             fm["approved_by"] = {"user": user, "at": now}
             if role:
                 fm["approved_by"]["role"] = role
+            # WHERE the human decision came from (#681): "operator" (an operator
+            # credential approved) or "relayed-code" (a human relayed the code).
+            if authority:
+                fm["approved_by"]["authority"] = authority
             if reason:
                 fm["approved_by"]["reason"] = reason
 
             fm_yml = self.file_store.serialize_frontmatter(fm)
             self.file_store.write(id, fm_yml, body, "approve")
         details: dict[str, Any] | None = {"approved_by_role": role} if role else None
+        if authority:
+            details = dict(details or {})
+            details["authority"] = authority
         if cascade:
             details = dict(details or {})
             details["cascaded_to"] = cascade
@@ -264,6 +295,13 @@ class ArtifactTransitionManager:
             if new_hash == fm.get("hash"):
                 return
 
+            # The same checks propose runs (#652). Refused, the edit is NOT
+            # recorded: the stored hash stays stale, so approve refuses the
+            # file until it is put right.
+            derived = validate_artifact_content(fm, body)
+            if "rollback" in derived:
+                fm["rollback"] = derived["rollback"]
+
             fm["hash"] = new_hash
             if current_status in (
                 ArtifactStatus.APPROVED,
@@ -277,6 +315,88 @@ class ArtifactTransitionManager:
 
         await self._cascade_invalidate(id)
         await self._sync_to_db(id, fm)
+
+    async def edit_content(
+        self,
+        id: str,
+        new_fm: dict[str, Any],
+        new_body: str,
+        user: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace an artifact's frontmatter and body with an operator's edit (#693).
+
+        `edit()` only records an edit someone already wrote into the store file,
+        and only notices a BODY change - so a frontmatter-only edit of an
+        approved artifact (a new target, say) kept its approval. This is the
+        whole edit, under the file lock:
+
+        * a terminal artifact is refused (``ConflictError``) and nothing is
+          written;
+        * the fields the lifecycle owns (``LIFECYCLE_OWNED_FIELDS``) may not be
+          changed by an edit - status, hash and the approval/rejection records
+          are the lifecycle's to write, not the editor's;
+        * ANY change to an approved or failed artifact sends it back to
+          ``proposed`` and drops the approval: what was approved is no longer
+          what is on disk;
+        * the edited artifact must pass the SAME validation propose runs
+          (``validate_artifact_content``, #652) - otherwise nothing is written;
+        * the hash is recomputed, dependants are invalidated, the DB row is
+          synced and the edit is audited.
+
+        Returns ``{"changed": bool, "status": str}``.
+        """
+        terminal = {
+            ArtifactStatus.APPLIED,
+            ArtifactStatus.SUPERSEDED,
+            ArtifactStatus.REVOKED,
+            ArtifactStatus.REJECTED,
+        }
+        with self.file_store.file_lock(id):
+            fm, body = self.file_store.read(id)
+            current_status = ArtifactStatus(fm["status"])
+            if current_status in terminal:
+                raise ConflictError(
+                    f"Cannot edit artifact in terminal state: {current_status.value}"
+                )
+            changed_owned = sorted(
+                key for key in LIFECYCLE_OWNED_FIELDS if new_fm.get(key) != fm.get(key)
+            )
+            if changed_owned:
+                raise LifecycleError(
+                    "An edit cannot change "
+                    + ", ".join(changed_owned)
+                    + ": the lifecycle writes those. Leave them as they are."
+                )
+            if new_fm == fm and new_body == body:
+                return {"changed": False, "status": current_status.value}
+
+            # Everything propose checks, checked again on what the edit would
+            # store (#652): the edit used to run no validation at all, so every
+            # propose-time refusal could be walked around by proposing something
+            # valid and editing it afterwards. Refused here, nothing is written.
+            derived = validate_artifact_content(new_fm, new_body)
+
+            updated = dict(new_fm)
+            updated["hash"] = compute_body_hash(new_body)
+            updated["mutating"] = derived["mutating"]
+            if "rollback" in derived:
+                updated["rollback"] = derived["rollback"]
+            if current_status in (ArtifactStatus.APPROVED, ArtifactStatus.FAILED):
+                updated["status"] = ArtifactStatus.PROPOSED.value
+                updated.pop("approved_by", None)
+            self.file_store.write(
+                id, self.file_store.serialize_frontmatter(updated), new_body, "edit"
+            )
+
+        await self._cascade_invalidate(id)
+        await self._sync_to_db(id, updated)
+        await self._audit(
+            "edit",
+            id,
+            user,
+            {"from_status": current_status.value, "to_status": updated["status"]},
+        )
+        return {"changed": True, "status": updated["status"]}
 
     async def _cascade_invalidate(self, edited_id: str, visited: set[str] | None = None) -> None:
         if visited is None:
@@ -318,6 +438,8 @@ class ArtifactTransitionManager:
             body = body.rstrip("\n") + "\n\n## Execution log\n\n" + execution_log + "\n"
 
             fm["status"] = ArtifactStatus.APPLIED.value
+            # A verdict ends an unknown outcome (#774).
+            fm.pop("unsettled_task", None)
             fm["applied_at"] = utcnow_iso()
             fm["hash"] = compute_body_hash(body)
 
@@ -336,6 +458,7 @@ class ArtifactTransitionManager:
                 body = body.rstrip("\n") + "\n\n## Execution log\n\n" + partial_log + "\n"
 
             fm["status"] = ArtifactStatus.FAILED.value
+            fm.pop("unsettled_task", None)
             fm["failed_at"] = utcnow_iso()
             fm["failure_reason"] = reason
             fm["hash"] = compute_body_hash(body)
@@ -344,6 +467,28 @@ class ArtifactTransitionManager:
             self.file_store.write(id, fm_yml, body, "fail")
         await self._audit("fail", id)
         await self._sync_to_db(id, fm)
+
+    async def mark_unsettled(self, id: str, entry: dict[str, Any]) -> None:
+        """Record that a run's outcome is UNKNOWN: its PVE task was still running
+        when the run stopped following it (#774). No status change - the
+        artifact is neither applied nor failed until PVE says how the task
+        ended - and the body is untouched, so the approval hash still holds."""
+        with self.file_store.file_lock(id):
+            fm, body = self.file_store.read(id)
+            fm["unsettled_task"] = entry
+            fm_yml = self.file_store.serialize_frontmatter(fm)
+            self.file_store.write(id, fm_yml, body, "unsettled")
+        await self._audit("unsettled", id, details={"upid": entry.get("upid")})
+
+    async def clear_unsettled(self, id: str) -> None:
+        """Drop the unknown-outcome record without a status change - for a run
+        whose verdict does not move the artifact (a replay of an applied one)."""
+        with self.file_store.file_lock(id):
+            fm, body = self.file_store.read(id)
+            if fm.pop("unsettled_task", None) is None:
+                return
+            fm_yml = self.file_store.serialize_frontmatter(fm)
+            self.file_store.write(id, fm_yml, body, "settled")
 
     async def supersede(self, old_id: str, new_id: str) -> None:
         with self.file_store.file_lock(old_id):

@@ -7,6 +7,7 @@ import pathlib
 import re
 import sqlite3
 import struct
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -15,6 +16,7 @@ from homepilot.app_settings import effective
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import LifecycleError
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from homepilot.common import redact_endpoint
 from homepilot.config import get_settings
 from homepilot.db.repository import Repository
@@ -157,6 +159,20 @@ async def _get_embedding(text: str) -> list[float] | None:
     return None
 
 
+async def _embedding_configured() -> bool:
+    """Whether any embedding service is configured at all (primary or fallback)."""
+    settings = get_settings()
+    primary_url = await effective("embedding_service_url", settings)
+    return bool(primary_url or settings.embedding_fallback_url)
+
+
+@dataclass(frozen=True)
+class _EmbedFailure:
+    # True when a vector was produced and could not be stored.
+    stored: bool
+    reason: str
+
+
 def _embedding_to_bytes(embedding: list[float]) -> bytes:
     return b"".join(struct.pack("<f", v) for v in embedding)
 
@@ -239,6 +255,22 @@ class KBService:
         self._reindexing = False
         self._reindex_task: asyncio.Task[None] | None = None
 
+    async def drain(self, timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+        """Let a background reindex finish before the database goes away (#622).
+
+        `reindex_if_needed` starts the rebuild as a fire-and-forget task that
+        nothing awaits and that writes to the database throughout. Closing the
+        database - or the loop - under it is the #496 shape: a result landing
+        on a closed loop kills aiosqlite's worker thread ("Event loop is
+        closed"), and in the suite that surfaced as a flaky failure in whichever
+        test ran next (test_592). The lifespan drains this before the database
+        closes, like every other background writer; tests that wire a
+        KBService into a lifecycle drain it in their fixture teardown.
+        """
+        task = self._reindex_task
+        if task is not None:
+            await drain_tasks([task], "KB reindex", timeout)
+
     async def ingest(
         self,
         sources: list[dict[str, Any]],
@@ -314,21 +346,30 @@ class KBService:
 
     async def _embed_doc(self, doc_id: int, text: str) -> bool:
         """Store an embedding for a doc. Returns False if none could be made."""
+        return (await self._embed_doc_failure(doc_id, text)) is None
+
+    async def _embed_doc_failure(self, doc_id: int, text: str) -> _EmbedFailure | None:
+        """Store an embedding for a doc; None on success, else what went wrong.
+
+        Two failures, told apart because they mean different things (#777): no
+        vector to store (the service is down, or none is configured), and a
+        vector that could NOT be stored - which is never by design.
+        """
         from homepilot.executor.kb_note import _store_embedding
 
         try:
             embedding = await _get_embedding(text)
         except Exception as exc:
             logger.debug("No embedding for doc %s: %s", doc_id, exc)
-            return False
+            return _EmbedFailure(stored=False, reason=f"no embedding: {exc}")
         if not embedding:
-            return False
+            return _EmbedFailure(stored=False, reason="no embedding service returned a vector")
         try:
             await _store_embedding(self.repo, doc_id, embedding)
         except (sqlite3.OperationalError, sqlite3.IntegrityError, ValueError) as exc:
             logger.warning("Could not store embedding for doc %s: %s", doc_id, exc)
-            return False
-        return True
+            return _EmbedFailure(stored=True, reason=f"doc {doc_id}: {exc}")
+        return None
 
     async def reembed_doc(self, doc_id: int) -> bool:
         """Recompute the embedding for a document whose text just changed.
@@ -353,12 +394,16 @@ class KBService:
         text = f"{row.get('title') or ''}\n{row.get('content') or ''}"
         return await self._embed_doc(doc_id, text)
 
-    async def embed_missing(self) -> dict[str, int]:
+    async def embed_missing(self) -> dict[str, Any]:
         """Embed every doc that has none (#433).
 
         `reindex` only ever re-walked `source LIKE 'artifact:%'`, so a KB full of
         ingested documentation and observed-state notes stayed unembedded no
         matter how many times an operator reindexed.
+
+        `failed` counts every doc left without a vector; `store_failures` the
+        ones where a vector WAS produced and could not be stored (#777: every
+        insert of a 4096-dim model into a 768-dim index), with the first reason.
         """
         rows = await self.repo.db.fetchall(
             "SELECT dm.id, dm.title, dm.content FROM doc_metadata dm "
@@ -366,13 +411,59 @@ class KBService:
         )
         embedded = 0
         failed = 0
+        store_failures = 0
+        first_failure: str | None = None
         for row in rows:
             text = f"{row.get('title') or ''}\n{row.get('content') or ''}"
-            if await self._embed_doc(int(row["id"]), text):
+            failure = await self._embed_doc_failure(int(row["id"]), text)
+            if failure is None:
                 embedded += 1
-            else:
-                failed += 1
-        return {"embedded": embedded, "failed": failed}
+                continue
+            failed += 1
+            if failure.stored:
+                store_failures += 1
+            if first_failure is None:
+                first_failure = failure.reason
+        return {
+            "embedded": embedded,
+            "failed": failed,
+            "store_failures": store_failures,
+            "first_failure": first_failure,
+        }
+
+    async def _count_unembedded(self) -> int:
+        row = await self.repo.db.fetchone(
+            "SELECT COUNT(*) AS c FROM doc_metadata dm "
+            "LEFT JOIN vec_docs v ON dm.id = v.id WHERE v.id IS NULL"
+        )
+        return int(row["c"]) if row else 0
+
+    async def _fit_index_to_model(self) -> dict[str, Any] | None:
+        """Re-shape the vector index for the model that is configured NOW (#777).
+
+        Asks the embedding service for one vector and compares its length with
+        the index's. Equal (or no answer): nothing to do, None. Different: the
+        index is rebuilt for the new dimension and the result says so, with how
+        many old-model vectors went - never a silent drop. The documents stay;
+        the reindex that called this embeds them again.
+        """
+        from homepilot.kb.vector_index import index_dimension, rebuild_index
+
+        probe = await _get_embedding("homepilot kb dimension probe")
+        if not probe:
+            return None
+        current = await index_dimension(self.repo.db)
+        if current is None or current == len(probe):
+            return None
+        dropped = await rebuild_index(self.repo.db, len(probe))
+        logger.warning(
+            "KB vector index rebuilt for the embedding model: %d -> %d dimensions; "
+            "%d vector(s) of the previous model dropped and being re-embedded",
+            current,
+            len(probe),
+            dropped,
+        )
+        return {"from": current, "to": len(probe), "vectors_dropped": dropped}
 
     @staticmethod
     def _walk_dir(directory_path: str) -> list[tuple[str, str]]:
@@ -439,6 +530,26 @@ class KBService:
                 logger.info("KB reindex starting: reason=%s", reason)
                 from homepilot.executor import kb_note as kb_note_executor
 
+                seen_sources: set[str] = set()
+                reindexed = 0
+                errors = 0
+                errors_detail: list[str] = []
+
+                # The index's dimension must be the model's BEFORE anything is
+                # stored (#777). Asked only when there is embedding work to do -
+                # a forced rebuild, or documents with no vector (which is what
+                # every refused insert leaves behind) - so a reindex over an
+                # index that is complete costs no embedding call at all.
+                index_rebuilt: dict[str, Any] | None = None
+                if not no_embeddings:
+                    try:
+                        if force_embeddings or await self._count_unembedded() > 0:
+                            index_rebuilt = await self._fit_index_to_model()
+                    except (sqlite3.OperationalError, ValueError) as exc:
+                        logger.warning("Could not fit the KB vector index to the model: %s", exc)
+                        errors += 1
+                        errors_detail.append(f"vector index: {exc}")
+
                 if force_embeddings and not no_embeddings:
                     # Re-embedding is keyed on the TEXT changing, so a document
                     # whose text is the same keeps the vector it has - which is
@@ -452,11 +563,6 @@ class KBService:
                         logger.info("KB reindex: dropped all embeddings on request")
                     except sqlite3.OperationalError as exc:
                         logger.warning("Could not drop embeddings: %s", exc)
-
-                seen_sources: set[str] = set()
-                reindexed = 0
-                errors = 0
-                errors_detail: list[str] = []
 
                 for artifact_meta in self.store.list(kind="kb-note", status="applied"):
                     artifact_id = artifact_meta.get("id", "")
@@ -499,16 +605,31 @@ class KBService:
                 # Everything else that has no embedding, too: reindex only ever
                 # re-walked artifact notes, so ingested docs and observed-state
                 # notes stayed keyword-only however often it was run (#433).
-                swept = {"embedded": 0, "failed": 0}
+                swept: dict[str, Any] = {
+                    "embedded": 0,
+                    "failed": 0,
+                    "store_failures": 0,
+                    "first_failure": None,
+                }
                 if not no_embeddings:
                     swept = await self.embed_missing()
 
+                # Embedding failures are failures (#777): every insert of a
+                # 4096-dim model into a 768-dim index failed while this said
+                # `completed` with `errors: 0`. A vector that could not be
+                # STORED always counts; no vector at all counts only when a
+                # service is configured - keyword-only by choice is not broken.
+                embedding_failed = swept["store_failures"] > 0 or (
+                    swept["failed"] > 0 and await _embedding_configured()
+                )
                 return {
                     # "completed" is a verdict, so it may only be said when
                     # nothing failed. A half-done rebuild that calls itself
                     # completed is the reason an operator does not go looking.
                     "status": (
-                        "completed" if errors == 0 and not unverified else "completed_with_errors"
+                        "completed"
+                        if errors == 0 and not unverified and not embedding_failed
+                        else "completed_with_errors"
                     ),
                     "removed": removed,
                     "reindexed": reindexed,
@@ -520,6 +641,11 @@ class KBService:
                     "unverified": unverified,
                     "embedded_missing": swept["embedded"],
                     "embedding_failures": swept["failed"],
+                    "embedding_store_failures": swept["store_failures"],
+                    "embedding_first_failure": swept["first_failure"],
+                    # Set when the vector index was rebuilt for a model of
+                    # another dimension: from, to, and how many vectors went.
+                    "vector_index_rebuilt": index_rebuilt,
                 }
             finally:
                 self._reindexing = False
@@ -588,6 +714,17 @@ class KBService:
         if embedding:
             vec_bytes = _embedding_to_bytes(embedding)
             try:
+                # A query vector from a model of another dimension than the
+                # index cannot be compared with it (#777); say so in both
+                # numbers rather than through sqlite-vec's error text.
+                from homepilot.kb.vector_index import (
+                    EmbeddingDimensionMismatchError,
+                    index_dimension,
+                )
+
+                indexed_dim = await index_dimension(self.repo.db)
+                if indexed_dim is not None and indexed_dim != len(embedding):
+                    raise EmbeddingDimensionMismatchError(len(embedding), indexed_dim)
                 # sqlite-vec REQUIRES the k constraint on the vec0 table's own
                 # query - a `LIMIT` on an outer join does not count. The previous
                 # shape (JOIN doc_metadata ... WHERE v.embedding MATCH ? ORDER BY
@@ -812,13 +949,23 @@ class KBService:
         # Only probe what is configured: an unconfigured service is off, and
         # "off" must never be reported through the same path as "reachable".
         primary_ok = False
+        probe_vec: list[float] | None = None
         if primary_url:
-            test_vec = await _call_embed_service(primary_url, primary_model, "test")
-            primary_ok = test_vec is not None
+            probe_vec = await _call_embed_service(primary_url, primary_model, "test")
+            primary_ok = probe_vec is not None
         fallback_ok = False
         if fallback_url and not primary_ok:
-            fb_vec = await _call_embed_service(fallback_url, primary_model, "test")
-            fallback_ok = fb_vec is not None
+            probe_vec = await _call_embed_service(
+                fallback_url, settings.embedding_fallback_model, "test"
+            )
+            fallback_ok = probe_vec is not None
+        # Reachable is not usable (#777): a model whose vectors are not the
+        # index's dimension answers every probe and fails every insert.
+        from homepilot.kb.vector_index import index_dimension
+
+        index_dim = await index_dimension(self.repo.db)
+        model_dim = len(probe_vec) if probe_vec else None
+        dimension_ok = model_dim is None or index_dim is None or model_dim == index_dim
         rows = await self.repo.db.fetchone("SELECT COUNT(*) AS c FROM vec_docs")
         indexed = rows["c"] if rows else 0
         total = 0
@@ -833,7 +980,7 @@ class KBService:
         #   "search_mode": "vector"}` while every query fell through to
         # keyword. A mode is a claim about what will happen to the next query.
         service_ok = primary_ok or fallback_ok
-        if not service_ok or indexed == 0:
+        if not service_ok or indexed == 0 or not dimension_ok:
             mode = "keyword"
         elif indexed < total:
             mode = "vector_partial"
@@ -850,6 +997,12 @@ class KBService:
             # configured (fine, by design) or something is configured and down.
             # A caller that sees only search_mode cannot tell them apart.
             "configured": bool(primary_url or fallback_url),
+            # The answering model's vector size against the index's (#777). A
+            # mismatch means every insert fails and no vector search can run;
+            # a KB reindex rebuilds the index for the model.
+            "model_dimension": model_dim,
+            "index_dimension": index_dim,
+            "dimension_ok": dimension_ok,
             "indexed_with_embeddings": indexed,
             "total_docs": total,
             # How many documents a vector search cannot see. This is the number

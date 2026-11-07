@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ..common import format_validation_error
+
 
 class LifecycleError(Exception):
     pass
@@ -17,6 +19,45 @@ class ConflictError(LifecycleError):
     """Raised when a state transition is invalid (e.g., already in target state)."""
 
     pass
+
+
+class ArtifactBusyError(ConflictError):
+    """A run of this artifact is already in flight (#710).
+
+    One artifact has at most ONE pending/running apply, replay or revoke - the
+    database enforces it (a partial unique index on `tasks`), so it holds across
+    processes and across every transport. Carries the run that holds the slot so
+    every transport can NAME it: an operator told "busy" without a task id has
+    nothing to wait on or cancel.
+    """
+
+    def __init__(self, artifact_id: str, task_id: str, action: str, status: str) -> None:
+        self.artifact_id = artifact_id
+        self.task_id = task_id
+        self.action = action
+        self.status = status
+        super().__init__(
+            f"{artifact_id} already has a {action} run in flight: task {task_id} is "
+            f"{status}. Wait for it to finish, or cancel that task, before starting "
+            "another run of this artifact."
+        )
+
+    def detail(self) -> dict[str, str]:
+        """The structured 409 body: a human sentence plus the facts it names."""
+        return {
+            "message": str(self),
+            "code": "artifact_busy",
+            "artifact_id": self.artifact_id,
+            "task_id": self.task_id,
+            "action": self.action,
+            "status": self.status,
+        }
+
+
+class ApprovalRefusedError(LifecycleError):
+    """The actor has no authority to approve (#681): an assistant credential
+    without a valid human-relayed approval code. Transports map it to 403 (REST)
+    or a tool error (MCP); the message never contains the code."""
 
 
 class ArtifactKind(StrEnum):
@@ -124,6 +165,10 @@ class ArtifactFrontmatter(BaseModel):
     applied_at: str | None = None
     failed_at: str | None = None
     failure_reason: str | None = None
+    # A run's PVE task still running when the run stopped following it (#774):
+    # node, upid, the step, the steps not run. Present means the outcome is
+    # unknown; the next apply/replay settles it from PVE instead of re-running.
+    unsettled_task: dict[str, Any] | None = None
     supersedes: list[str] | None = None
     superseded_by: str | None = None
     rejected_by: RejectedBy | None = None
@@ -281,7 +326,8 @@ def parse_host_provision_spec(body: str) -> HostProvisionSpec:
     try:
         return HostProvisionSpec.model_validate(parsed)
     except ValidationError as exc:
-        raise ValueError(f"invalid host-provision spec: {exc}") from exc
+        # A spec can carry config-file content; name the field, not the value.
+        raise ValueError(f"invalid host-provision spec: {format_validation_error(exc)}") from None
 
 
 _GUEST_NETWORK_FENCE = "guest-network-spec"

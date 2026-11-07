@@ -7,9 +7,10 @@ from typing import Any
 
 import httpx
 
+from ..auth.principal import Principal
 from ..events import emit_event
 from .file_store import ArtifactFileStore
-from .models import ArtifactStatus
+from .models import ApprovalRefusedError, ArtifactStatus
 from .models import ConflictError as ConflictError
 from .models import LifecycleError as LifecycleError
 from .store import ArtifactStore
@@ -129,8 +130,9 @@ class ArtifactLifecycle:
 
             # Mint the approval code AFTER the artifacts row exists. Never logged
             # (it is a human-relay secret); it reaches operators only via the
-            # webhook/SSE payload below, the web review screen, and `hp artifacts
-            # show`, and NO MCP read ever returns it.
+            # outbound webhook POST below, the review screen for an operator
+            # credential, and `hp artifacts show`. No MCP read, no SSE event and
+            # no non-operator REST read returns it (#681).
             try:
                 from .approval_code import ensure_approval_code
 
@@ -163,12 +165,13 @@ class ArtifactLifecycle:
                     "target": fm.get("target"),
                     "idempotence": fm.get("idempotence"),
                     "source": fm.get("produced_by", {}),
-                    # Carried so a configured notification (webhook/SSE) delivers
-                    # the code to a human without them opening the portal. This
-                    # payload never reaches an MCP client.
-                    "approval_code": approval_code,
                 },
                 repo=self.repo,
+                # The code rides ONLY the outbound webhook POST, to an endpoint an
+                # admin configured, so a notification reaches a human without them
+                # opening the portal. Never the SSE stream (read scope: every
+                # read token sees it) and never the stored delivery row (#681).
+                outbound_only={"approval_code": approval_code} if approval_code else None,
             )
         except _NetError:
             logger.warning(
@@ -199,8 +202,78 @@ class ArtifactLifecycle:
 
         return id_str
 
-    async def approve(self, id: str, user: str, reason: str | None = None) -> None:
-        await self._ensure_transitions().approve(id, user, reason)
+    async def _approval_authority(
+        self, id: str, principal: Principal, approval_code: str | None
+    ) -> str:
+        """Decide whether `principal` may approve `id`, and on what authority (#681).
+
+        This is THE approval gate, for every transport - REST, MCP, CLI. It used
+        to live only in the MCP handler, so the same write token could approve
+        over REST with no code at all.
+
+        * An operator credential approves on its own authority ("operator").
+        * Anyone else needs the per-artifact code a human relayed
+          ("relayed-code"): wrong codes count toward the brute-force lock, a
+          locked or absent code refuses. With no live code (already decided, or
+          a failed artifact being re-approved) an assistant has no way in.
+
+        Raises ApprovalRefusedError. The message never contains the code.
+        """
+        if principal.is_operator:
+            return "operator"
+        if approval_code is None or not str(approval_code).strip():
+            raise ApprovalRefusedError(
+                "Approving needs an approval code a human relays to you, or an "
+                "operator credential. Ask the operator to read the code from the "
+                "review screen or `hp artifacts show`."
+            )
+        if self.repo is None:
+            raise ApprovalRefusedError("approval-code store unavailable")
+
+        from .approval_code import LOCK_THRESHOLD, verify_code
+
+        row = await self.repo.get_approval_code_row(id)
+        if row is None:
+            # Either not awaiting approval or already decided. Do not distinguish,
+            # and do not leak whether the id even exists as PROPOSED.
+            raise ApprovalRefusedError(
+                f"Artifact '{id}' is not awaiting a coded approval "
+                "(no approval code is active for it)."
+            )
+        if int(row["locked"]):
+            raise ApprovalRefusedError(
+                f"Approval for '{id}' is locked after too many wrong codes. "
+                "An operator must reset it from the web UI or "
+                "`hp artifacts reset-approval` before it can be approved with a code."
+            )
+        if not verify_code(str(approval_code), str(row["code"])):
+            state = await self.repo.record_failed_approval(id, LOCK_THRESHOLD)
+            if state["locked"]:
+                raise ApprovalRefusedError(
+                    f"Incorrect approval code. Approval for '{id}' is now "
+                    "locked; an operator must reset it before any further attempt."
+                )
+            raise ApprovalRefusedError("Incorrect approval code.")
+        return "relayed-code"
+
+    async def approve(
+        self,
+        id: str,
+        principal: Principal,
+        reason: str | None = None,
+        *,
+        approval_code: str | None = None,
+    ) -> None:
+        # A bare name is not authority: every caller must say WHO is approving as
+        # an authenticated Principal, so a transport that forgets the check
+        # cannot approve by passing a string (#681).
+        if not isinstance(principal, Principal):
+            raise TypeError(
+                "ArtifactLifecycle.approve needs an authenticated Principal, "
+                f"not {type(principal).__name__}"
+            )
+        authority = await self._approval_authority(id, principal, approval_code)
+        await self._ensure_transitions().approve(id, principal.name, reason, authority=authority)
         # The artifact has left PROPOSED, so its approval code is spent: clear it
         # so a replay of the same code cannot re-approve anything (#385 gate 2).
         if self.repo is not None:
@@ -259,6 +332,23 @@ class ArtifactLifecycle:
     async def edit(self, id: str) -> None:
         await self._ensure_transitions().edit(id)
 
+    async def edit_content(
+        self, id: str, new_fm: dict[str, Any], new_body: str, user: str | None = None
+    ) -> dict[str, Any]:
+        result = await self._ensure_transitions().edit_content(id, new_fm, new_body, user)
+        if result.get("changed") and self.repo is not None:
+            # The edited artifact is back in (or still in) review with content
+            # nobody has approved. A code a human read off the OLD content must
+            # not approve the new one (#652), so it is replaced; an approved
+            # artifact sent back to proposed gets one for the same reason.
+            try:
+                from .approval_code import generate_code
+
+                await self.repo.rotate_approval_code(id, generate_code())
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                logger.exception("Rotating the approval code failed for %s", id)
+        return result
+
     async def mark_applied(self, id: str, execution_log: str) -> None:
         await self._ensure_transitions().mark_applied(id, execution_log)
         try:
@@ -300,6 +390,12 @@ class ArtifactLifecycle:
             )
         except _NetError:
             logger.warning("Webhook emission failed for artifact_failed %s", id, exc_info=True)
+
+    async def mark_unsettled(self, id: str, entry: dict[str, Any]) -> None:
+        await self._ensure_transitions().mark_unsettled(id, entry)
+
+    async def clear_unsettled(self, id: str) -> None:
+        await self._ensure_transitions().clear_unsettled(id)
 
     async def supersede(self, old_id: str, new_id: str) -> None:
         await self._ensure_transitions().supersede(old_id, new_id)

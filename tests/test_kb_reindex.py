@@ -41,7 +41,11 @@ def artifact_store(tmp_path: Path) -> ArtifactStore:
 @pytest.fixture
 async def kb_service(repo, artifact_store):
     lc = ArtifactLifecycle(artifact_store, repo)
-    return KBService(repo=repo, store=artifact_store, lifecycle=lc)
+    svc = KBService(repo=repo, store=artifact_store, lifecycle=lc)
+    yield svc
+    # Tests wire the lifecycle back-reference, so a transition starts a
+    # BACKGROUND reindex; finish it before the database closes (#622).
+    await svc.drain()
 
 
 @pytest.fixture

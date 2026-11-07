@@ -1,8 +1,65 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+
+def format_validation_error(exc: Any) -> str:
+    """A pydantic ValidationError as text that names fields, never values (#697).
+
+    ``str(ValidationError)`` includes ``input_value=<what was sent>`` for every
+    error, and this product takes credentials as arguments (a tailnet auth key,
+    an approval code): stringifying the error put the key into the MCP
+    transcript and every log the reply touched. Only ``loc`` and ``msg`` are
+    used - which is all a caller needs to fix the call; the validators in this
+    codebase name the FIELD in their messages rather than quoting the value.
+
+    Every place a ValidationError becomes user-facing text goes through here;
+    tests/test_697_validation_error_no_echo.py holds every MCP tool to it.
+    """
+    parts: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        loc = ".".join(str(p) for p in error.get("loc", ()) if p != "__root__")
+        msg = str(error.get("msg", "invalid value")).removeprefix("Value error, ")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid input"
+
+
+def write_private(path: Path | str, data: bytes | str) -> None:
+    """Write a secret file: 0600 from the moment it exists, and atomically.
+
+    The pattern this replaces - `write_text()` then `chmod(0o600)` - leaves the
+    file readable under the process umask (typically 0644) until the chmod
+    lands, and a crash in that window leaves it that way for good (#690; the
+    same shape was fixed for the vault in #431). A partial write is the other
+    half: the only copy of a key truncated by a crash or a full disk.
+
+    So: a temp file in the SAME directory (os.replace is only atomic within a
+    filesystem), created 0600 by mkstemp, fsync'd, then renamed over the target.
+    The target therefore never exists with any other mode or partial content -
+    including when it already existed with a looser mode, since the rename
+    replaces the inode rather than rewriting it.
+    """
+    target = Path(path)
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(target))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def redact_endpoint(raw: str) -> str:

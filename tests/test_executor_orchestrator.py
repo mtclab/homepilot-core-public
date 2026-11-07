@@ -7,6 +7,7 @@ from homepilot.artifacts.file_store import ArtifactFileStore
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import ArtifactKind
 from homepilot.artifacts.store import ArtifactStore
+from homepilot.auth.principal import Principal
 from homepilot.executor.orchestrator import ArtifactExecutor, ExecutorError, TamperError
 
 ANSIBLE_SPEC_BODY = """\
@@ -106,7 +107,7 @@ class TestFullLifecycleAnsible:
         fm, _ = store.read(aid)
         assert fm["status"] == "proposed"
 
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
         fm, _ = store.read(aid)
         assert fm["status"] == "approved"
 
@@ -144,7 +145,7 @@ class TestFullLifecycleProxmox:
 
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -178,7 +179,7 @@ class TestFullLifecycleShellScript:
 
         spec = _make_spec(kind="shell-script", body=SHELL_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -233,7 +234,7 @@ class TestFullLifecycleHostProvision:
 
         spec = _make_spec(kind="host-provision", body=HOST_PROVISION_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -292,7 +293,7 @@ class TestOrchestratorValidation:
 
         spec = _make_spec(kind="ansible-playbook", body=ANSIBLE_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         _fm, body = store.read(aid)
         store._storage = {}
@@ -331,7 +332,7 @@ class TestOrchestratorValidation:
             replay_safe=False,
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -395,7 +396,7 @@ class TestOrchestratorSnapshot:
 
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -451,7 +452,7 @@ class TestOrchestratorSnapshot:
 
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
 
@@ -462,7 +463,10 @@ class TestOrchestratorSnapshot:
         assert "step" in order
         # The recorded id is the snapshot an operator rolls back TO, not the
         # UPID of the task that took it.
-        assert result.snapshot_id == f"hp-pre-{aid}"
+        # The rollback point's NAME (per run since #709), never the UPID.
+        assert result.snapshot_id is not None
+        assert result.snapshot_id.startswith("hp-pre-")
+        assert result.snapshot_id == mock_proxmox.snapshot.await_args.args[2]
 
     async def test_snapshot_skipped_when_disabled(self, tmp_artifacts_dir):
         store = ArtifactStore(tmp_artifacts_dir)
@@ -491,7 +495,7 @@ class TestOrchestratorSnapshot:
             requires_snapshot=False,
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -530,7 +534,7 @@ class TestOrchestratorSnapshot:
         # No requires_snapshot key => snapshot is required (default).
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert not result.success
@@ -562,7 +566,7 @@ class TestOrchestratorSnapshot:
 
         spec = _make_spec(kind="ansible-playbook", body=ANSIBLE_SPEC_BODY)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert not result.success
@@ -620,7 +624,7 @@ steps:
 """
         spec = _make_spec(kind="proxmox-api-sequence", body=rollback_body, rollback=True)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -653,7 +657,7 @@ steps:
 
         spec = _make_spec(kind="proxmox-api-sequence", body=PROXMOX_SPEC_BODY, rollback=False)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -691,7 +695,7 @@ steps:
             replay_safe=True,
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -724,7 +728,7 @@ steps:
             idempotence="replay-only",
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -763,7 +767,7 @@ steps:
             replay_safe=True,
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -811,7 +815,7 @@ steps:
             replay_safe=True,
         )
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -877,7 +881,7 @@ echo "sub"
             "produced_by": {"session": "s1", "agent": "a1", "user": "u1"},
         }
         sub_aid = await lifecycle.propose(sub_spec)
-        await lifecycle.approve(sub_aid, user="admin")
+        await lifecycle.approve(sub_aid, Principal.operator("admin"))
 
         composite_body = f"""\
 ## Plan
@@ -900,7 +904,7 @@ steps:
             "produced_by": {"session": "s1", "agent": "a1", "user": "u1"},
         }
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -955,7 +959,7 @@ Install nginx
 """
         spec = _make_spec(kind="ansible-playbook", body=rollback_body, rollback=True)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
 
         result = await executor.apply(aid, approved_by="admin")
         assert result.success
@@ -1100,7 +1104,7 @@ class TestSnapshotHitsTheGuestsOwnCollection:
         )
         spec = _make_spec(kind="proxmox-api-sequence", body=body, target=target)
         aid = await lifecycle.propose(spec)
-        await lifecycle.approve(aid, user="admin")
+        await lifecycle.approve(aid, Principal.operator("admin"))
         return await executor.apply(aid, approved_by="admin")
 
     async def test_vm_target_snapshots_the_qemu_collection(self, tmp_artifacts_dir):

@@ -634,7 +634,9 @@ class TestDriftReconciler:
 
         reconciler = DriftReconciler(mock_store, repo, executor=mock_executor, inter_check_delay=0)
         result = await reconciler.run()
-        assert result.success is True
+        # Its only check errored, so the cycle established nothing: NOT a
+        # success (#712 - this used to assert True, defending the defect).
+        assert result.success is False
         assert result.details["errors"] == 1
 
     async def test_run_audit_log_written(self, repo, mock_store, mock_executor):

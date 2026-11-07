@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,11 +23,10 @@ def get_agent_registry() -> AgentRegistry | None:
     return _agent_registry
 
 
-_PVE_TOKEN_RE = re.compile(r"^[^@]+@[^!]+![^=]+=.+$")
-
-
 def _validate_pve_token(token: str) -> bool:
-    if not _PVE_TOKEN_RE.match(token):
+    from .proxmox_config import is_pve_token
+
+    if not is_pve_token(token):
         logger.warning(
             "PVE_API_TOKEN format invalid — expected 'user@realm!tokenid=uuid', got '%s...'",
             token[:12],
@@ -159,53 +157,16 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         )
 
         if proxmox_host:
-            token = ""
-            if vault:
-                from .vault import VaultError
+            # ONE resolver for both tokens (#715): the same answer the settings
+            # report and the SDN/firewall gateway get, validated the same way.
+            from .proxmox_config import resolve_proxmox_tokens
 
-                try:
-                    pve_secret = await vault.get_secret("pve-token")
-                    token = pve_secret.get("token", "")
-                    if token:
-                        if not _validate_pve_token(token):
-                            logger.warning("PVE token from vault has invalid format — skipping")
-                            token = ""
-                        else:
-                            pve_token_source = "vault"
-                except (VaultError, OSError):
-                    logger.debug(
-                        "Vault 'pve-token' unavailable, falling back to env",
-                        exc_info=True,
-                    )
-                if not token:
-                    env_token = os.environ.get("PVE_API_TOKEN", "")
-                    if env_token:
-                        if not _validate_pve_token(env_token):
-                            logger.warning("PVE_API_TOKEN from env has invalid format — skipping")
-                        else:
-                            pve_token_source = "env"
-                            logger.warning(
-                                "PVE_API_TOKEN via env var — use vault for better security"
-                            )
-                            token = env_token
-            elif os.environ.get("PVE_API_TOKEN"):
-                env_token = os.environ["PVE_API_TOKEN"]
-                if _validate_pve_token(env_token):
-                    pve_token_source = "env"
-                    logger.warning("PVE_API_TOKEN via env var — use vault for better security")
-                    token = env_token
+            tokens = await resolve_proxmox_tokens(vault)
+            token, pve_token_source = tokens.token, tokens.token_source
+            if pve_token_source == "env":
+                logger.warning("PVE_API_TOKEN via env var — use vault for better security")
             if token:
-                write_token = ""
-                if vault:
-                    from .vault import VaultError
-
-                    try:
-                        write_secret = await vault.get_secret("pve-write-token")
-                        write_token = write_secret.get("token", "")
-                    except (VaultError, OSError):
-                        logger.debug("Vault 'pve-write-token' unavailable", exc_info=True)
-                if not write_token:
-                    write_token = token
+                write_token = tokens.write_token
                 logger.info("Proxmox adapter initialized (token from %s)", pve_token_source)
                 base_url = f"https://{proxmox_host}:{proxmox_port}"
                 proxmox = ProxmoxClient(

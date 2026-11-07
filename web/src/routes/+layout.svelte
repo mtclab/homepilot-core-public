@@ -8,6 +8,7 @@
 	import { hasCookieSession, getToken, api, sessionStore, refreshSession, setToken } from '$lib/api';
 	
 	import { startEventStream, stopEventStream, streamConnected } from '$lib/events';
+	import { scopeTier } from '$lib/scopeTier';
 
 	// `admin: true` items lead to admin-only endpoints (/agents/, /auth/tokens).
 	// Showing them to a read-only session is a dead end — every button on the
@@ -103,12 +104,14 @@
 		goto(`${base}/login`);
 	}
 
-	function scopeBadge(scope: string | null | undefined): string {
-		if (!scope) return 'text-muted';
-		if (scope === '*' || scope === 'full') return 'text-ok';
-		if (scope === 'admin') return 'text-warn';
-		if (scope === 'read_only') return 'text-accent';
-		return 'text-muted';
+	// The access tier, from the normalized capabilities (#704).
+	$: tier = me ? scopeTier(me.capabilities, me.scope) : null;
+
+	// One answer to "is this the page I am on", for the highlight AND for
+	// assistive tech: the highlight alone told a screen reader nothing (#704).
+	function isCurrent(href: string, path: string): boolean {
+		if (href === '/') return path === base + '/' || path === base;
+		return path.startsWith(base + href);
 	}
 </script>
 
@@ -149,8 +152,9 @@
 			<a
 				href="{base}{href}"
 				on:click={() => (navOpen = false)}
+				aria-current={isCurrent(href, current) ? 'page' : undefined}
 				class="px-4 py-2 text-sm transition-colors
-				       {(href === '/' ? current === base + '/' || current === base : current.startsWith(base + href) && href !== '/')
+				       {isCurrent(href, current)
 				         ? 'text-accent bg-raised border-l-2 border-accent'
 				         : 'text-muted hover:text-ink hover:bg-raised'}"
 			>
@@ -164,9 +168,9 @@
 					<span class="w-2 h-2 rounded-full bg-ok inline-block"></span>
 					<span class="text-xs text-ink truncate">{me.token_label || me.prefix || 'session'}</span>
 				</div>
-				{#if me.scope || me.role}
-					<span class="text-[10px] {scopeBadge(me.scope ?? me.role)}">
-						{me.scope || me.role}
+				{#if tier}
+					<span class="text-[10px] {tier.cls}" title="Access: {tier.label}">
+						{tier.label}
 					</span>
 				{/if}
 				<button class="text-xs text-muted hover:text-danger transition-colors mt-1 block" on:click={handleLogout}>

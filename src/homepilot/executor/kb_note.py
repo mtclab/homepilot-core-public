@@ -157,7 +157,21 @@ async def _store_embedding(repo: Any, doc_id: int, embedding: list[float]) -> No
     The failure was swallowed one frame up and the document kept the OTHER
     document's vector. Replacing is the only correct semantics here: one
     document has one current meaning.
+
+    The vector must fit the index (#777): an empty index takes this vector's
+    dimension; one holding vectors of another dimension refuses it, naming both
+    numbers. The document's old vector goes either way - it is being replaced
+    because it no longer describes the document - so a refusal leaves the
+    document keyword-only, never answering for what it used to say.
     """
+    from homepilot.kb.vector_index import EmbeddingDimensionMismatchError, fit_index_to
+
+    try:
+        await fit_index_to(repo.db, len(embedding))
+    except EmbeddingDimensionMismatchError:
+        await repo.db.conn.execute("DELETE FROM vec_docs WHERE id = ?", (doc_id,))
+        await repo.db.conn.commit()
+        raise
     vec_bytes = b""
     for val in embedding:
         vec_bytes += _float32_to_bytes(val)

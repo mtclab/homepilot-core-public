@@ -9,9 +9,10 @@ from typing import Any
 import httpx
 
 from .app_settings import effective
+from .common import redact_endpoint
 from .config import get_settings
 from .sse import bus as sse_bus
-from .webhooks.send import sign_payload
+from .webhooks.send import describe_failure, sign_payload
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +55,19 @@ async def deliver_with_retry(
                     if db:
                         await db.conn.commit()
                 return True
+            # The endpoint, never the URL: a chat webhook URL is the credential (#690).
             logger.warning(
-                "Webhook returned status=%d for url=%s attempt=%d",
+                "Webhook returned status=%d for endpoint=%s attempt=%d",
                 resp.status_code,
-                url,
+                redact_endpoint(url),
                 attempts,
             )
-        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError):
+        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError) as exc:
             logger.warning(
-                "Webhook delivery failed for url=%s attempt=%d",
-                url,
+                "Webhook delivery failed for endpoint=%s attempt=%d: %s",
+                redact_endpoint(url),
                 attempts,
-                exc_info=True,
+                describe_failure(exc, url),
             )
 
         if delay_index < max_retries and delay_index < len(RETRY_DELAYS):
@@ -76,9 +78,9 @@ async def deliver_with_retry(
         if db:
             await db.conn.commit()
     logger.error(
-        "Webhook delivery failed after %d attempts for url=%s",
+        "Webhook delivery failed after %d attempts for endpoint=%s",
         attempts,
-        url,
+        redact_endpoint(url),
     )
 
     return False
@@ -88,13 +90,24 @@ async def emit_event(
     event_type: str,
     payload: dict[str, object],
     repo: Any = None,
+    *,
+    outbound_only: dict[str, object] | None = None,
 ) -> None:
+    """Publish an event to SSE, the global webhook URL and configured webhooks.
+
+    `outbound_only` fields are added to the outbound webhook POST bodies and to
+    nothing else: not the SSE stream (which any read-scope token can subscribe
+    to) and not the `webhook_deliveries` row stored for the delivery. It exists
+    for the approval code (#681), which must reach an admin-configured endpoint
+    and must not be readable anywhere a non-operator can look.
+    """
+    extra: dict[str, object] = dict(outbound_only or {})
     await sse_bus.publish(event_type, dict(payload))
 
     settings = get_settings()
     url = await effective("events_webhook_url", settings)
     if url:
-        payload_data = {"event": event_type, **payload}
+        payload_data = {"event": event_type, **payload, **extra}
         payload_bytes = json.dumps(payload_data).encode()
         wh_headers: dict[str, str] = {"Content-Type": "application/json"}
         secret = settings.events_webhook_secret
@@ -105,17 +118,17 @@ async def emit_event(
                 resp = await client.post(url, content=payload_bytes, headers=wh_headers)
                 if resp.status_code >= 400:
                     logger.warning(
-                        "Webhook returned status=%d for event=%s url=%s",
+                        "Webhook returned status=%d for event=%s endpoint=%s",
                         resp.status_code,
                         event_type,
-                        url,
+                        redact_endpoint(url),
                     )
-        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError):
+        except (httpx.HTTPError, httpx.TimeoutException, ConnectionError, OSError) as exc:
             logger.warning(
-                "Webhook delivery failed for event=%s url=%s",
+                "Webhook delivery failed for event=%s endpoint=%s: %s",
                 event_type,
-                url,
-                exc_info=True,
+                redact_endpoint(url),
+                describe_failure(exc, url),
             )
 
     if repo is not None:
@@ -127,6 +140,8 @@ async def emit_event(
                 delivery_id = await repo.create_webhook_delivery(
                     webhook_id=config["id"],
                     event_type=event_type,
+                    # Stored WITHOUT the outbound-only fields; the retrying
+                    # sender below works from the in-memory payload.
                     payload=json.dumps(wh_payload),
                     status="pending",
                 )
@@ -134,7 +149,7 @@ async def emit_event(
                 task = asyncio.create_task(
                     deliver_with_retry(
                         url=config["url"],
-                        payload=wh_payload,
+                        payload={**wh_payload, **extra},
                         secret=config.get("secret"),
                         max_retries=config.get("max_retries", 3),
                         delivery_id=delivery_id,

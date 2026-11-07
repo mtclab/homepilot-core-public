@@ -30,6 +30,7 @@ from httpx import ASGITransport, AsyncClient
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.auth.deps import require_token
+from homepilot.auth.principal import Principal
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
@@ -89,7 +90,7 @@ async def env(tmp_path: Path):
 
 async def _applied(lifecycle: ArtifactLifecycle, artifact_id: str, kind: str, body: str) -> None:
     await lifecycle.propose(_spec(artifact_id, kind, body))
-    await lifecycle.approve(artifact_id, user="admin")
+    await lifecycle.approve(artifact_id, Principal.operator("admin"))
     await lifecycle.mark_applied(artifact_id, execution_log="applied")
 
 

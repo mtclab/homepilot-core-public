@@ -31,6 +31,10 @@ class SSEBus:
     def __init__(self, max_subscribers: int = MAX_SUBSCRIBERS) -> None:
         self._subscribers: list[asyncio.Queue[SSEEvent]] = []
         self._max_subscribers = max_subscribers
+        # Subscribers that have had an event dropped (#701). Their view is now
+        # stale with nothing to say so; the stream route ends such a stream so
+        # the client reconnects, and the client re-reads on every reconnect.
+        self._missed: set[int] = set()
 
     async def publish(self, event_type: str, data: dict[str, object]) -> None:
         event = SSEEvent(
@@ -42,7 +46,12 @@ class SSEBus:
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                logger.warning("SSE subscriber queue full, dropping event")
+                logger.warning("SSE subscriber queue full, dropping event; ending that stream")
+                self._missed.add(id(q))
+
+    def missed(self, q: asyncio.Queue[SSEEvent]) -> bool:
+        """Whether an event was dropped for this subscriber."""
+        return id(q) in self._missed
 
     def subscribe(self) -> asyncio.Queue[SSEEvent] | None:
         if len(self._subscribers) >= self._max_subscribers:
@@ -55,6 +64,7 @@ class SSEBus:
     def unsubscribe(self, q: asyncio.Queue[SSEEvent]) -> None:
         with contextlib.suppress(ValueError):
             self._subscribers.remove(q)
+        self._missed.discard(id(q))
 
 
 bus = SSEBus()

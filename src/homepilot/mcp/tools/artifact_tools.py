@@ -225,7 +225,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "runner kept, and `result`, the task's own recorded outcome (a provision's "
             "vmid/ip/tailnet/fence, a tailnet_join's tailnet/tailnet_detail). Pass a task_id, or "
             "an artifact_id to get its most recent task. Without this an agent can start "
-            "work and never learn whether it succeeded. Requires read scope."
+            "work and never learn whether it succeeded. Status 'unknown' means the run "
+            "stopped following a PVE task that was still running (its UPID is in "
+            "`result.unsettled_task`); reading the task again asks PVE and settles it to "
+            "succeeded or failed once that task has ended. Requires read scope."
         ),
         "inputSchema": {
             "type": "object",
@@ -278,8 +281,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": ["boolean", "null"],
                     "description": "true for drifted only, false for non-drifted, null for all",
                 },
-                "limit": {"type": "integer", "description": "Page size (1-1000, default 100)"},
-                "offset": {"type": "integer", "description": "Rows to skip (default 0)"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Page size (1-1000, default 100)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Rows to skip (default 0)",
+                },
             },
         },
         "outputSchema": {
@@ -528,6 +540,8 @@ async def handle_propose_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
         spec = json.loads(spec_str)
     except json.JSONDecodeError as e:
         raise ValueError("spec must be valid JSON") from e
+    if not isinstance(spec, dict):
+        raise ValueError(f"spec must be a JSON object, got {type(spec).__name__}")
 
     if not spec.get("produced_by"):
         spec["produced_by"] = {"session": "mcp", "agent": "mcp-tool", "user": "mcp"}
@@ -567,6 +581,12 @@ async def handle_check_artifact_drift(
     drift_reconciler = ctx.get("drift_reconciler")
     if drift_reconciler is None:
         raise RuntimeError("DriftReconciler not configured")
+    # Resolve the id BEFORE the opaque last-resort handler below: a malformed or
+    # unknown id is the caller's mistake and has a safe, useful answer, and
+    # it came back as the bare "Drift check failed" (#696).
+    store = ctx.get("store")
+    if store is not None and not store.resolve_path(artifact_id).exists():
+        raise ValueError(f"Artifact not found: {artifact_id}")
     try:
         result = await drift_reconciler.check_single(artifact_id)
     except FileNotFoundError:
@@ -602,7 +622,8 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     approval for the artifact after `_APPROVE_LOCK_THRESHOLD` tries, so even a
     weak code cannot be brute-forced over MCP. The refusal never reveals the
     code."""
-    from homepilot.artifacts.approval_code import LOCK_THRESHOLD, verify_code
+    from homepilot.artifacts.models import ApprovalRefusedError
+    from homepilot.auth.principal import Principal
 
     caller_id = ctx.get("_mcp_caller_id", "mcp-stdio")
     _check_approve_ratelimit(caller_id)
@@ -619,42 +640,23 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
             "read the code from the review screen or `hp artifacts show`."
         )
 
-    repo = ctx.get("repo")
-    if repo is None:
+    if ctx.get("repo") is None:
         raise RuntimeError("approval-code store unavailable")
 
-    row = await repo.get_approval_code_row(artifact_id)
-    if row is None:
-        # No live code: either the artifact is not awaiting approval or it was
-        # already decided. Do not distinguish - and do not leak whether the id
-        # even exists as PROPOSED.
-        raise ValueError(
-            f"Artifact '{artifact_id}' is not awaiting a coded approval "
-            "(no approval code is active for it)."
-        )
-    if int(row["locked"]):
-        raise ValueError(
-            f"Approval for '{artifact_id}' is locked after too many wrong codes. "
-            "An operator must reset it from the web UI or "
-            "`hp artifacts reset-approval` before it can be approved over MCP."
-        )
-
-    if not verify_code(str(approval_code), str(row["code"])):
-        state = await repo.record_failed_approval(artifact_id, LOCK_THRESHOLD)
-        # Never echo the code or how close the guess was beyond locked/not.
-        if state["locked"]:
-            raise ValueError(
-                f"Incorrect approval code. Approval for '{artifact_id}' is now "
-                "locked; an operator must reset it before any further attempt."
-            )
-        raise ValueError("Incorrect approval code.")
-
-    # Verified: a human approved. Record the actor as an operator-via-code, not
-    # the assistant. lifecycle.approve clears the (now spent) code.
+    # MCP is the assistant's transport, whatever the token's tier, so the caller
+    # is always an assistant Principal: its only authority is the code. The code
+    # check, the wrong-code count and the lock all live in lifecycle.approve,
+    # the one gate every transport shares (#681). It clears the spent code.
     lifecycle = ctx["lifecycle"]
-    await lifecycle.approve(
-        artifact_id, user="operator-code via MCP", reason="Approved via MCP approval code"
-    )
+    try:
+        await lifecycle.approve(
+            artifact_id,
+            Principal.assistant(str(caller_id)),
+            "Approved via MCP approval code",
+            approval_code=str(approval_code),
+        )
+    except ApprovalRefusedError as exc:
+        raise ValueError(str(exc)) from None
     fm, _ = await asyncio.to_thread(ctx["store"].read, artifact_id)
     logger.info("MCP approve_artifact: %s approved via operator code", artifact_id)
     return {
@@ -739,6 +741,10 @@ async def handle_get_task_result(arguments: dict[str, Any], ctx: dict[str, Any])
             task = await task_repo.get_task(task["id"])
     if task is None:
         raise ValueError(f"Task not found: {task_id or artifact_id}")
+    # An 'unknown' apply is settled from PVE when it is read (#774).
+    runner = ctx.get("task_runner")
+    if runner is not None and task.get("status") == "unknown":
+        task = await runner.settle(task)
 
     execution_log = ""
     result: dict[str, Any] | None = None

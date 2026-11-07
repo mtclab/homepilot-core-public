@@ -193,6 +193,15 @@ async def power(request: Request, host_id: str, body: PowerRequest) -> Any:
     if host is None:
         raise HTTPException(status_code=404, detail="No such machine")
 
+    if host.get("absent_since"):
+        # The machine is GONE, and its VMID may already be somebody else's:
+        # PVE reuses numbers. A power action here reached whoever holds the
+        # number now (#706).
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "this machine no longer exists, so it cannot be powered"},
+        )
+
     proxmox = getattr(request.app.state, "proxmox", None)
     node = host.get("node")
     vmid = host.get("proxmox_id")
@@ -201,6 +210,34 @@ async def power(request: Request, host_id: str, body: PowerRequest) -> Any:
         return JSONResponse(
             status_code=503,
             content={"detail": "power control is not available right now"},
+        )
+
+    # The row can be stale by up to a refresh interval, so the machine at
+    # (node, vmid) is asked who it is BEFORE anything is sent to it (#706): a
+    # different name there is a different machine, and a read that fails is not
+    # a licence to act.
+    try:
+        config = await proxmox.get_vm_config(node, int(vmid))
+    except Exception:
+        logger.warning("guest power %s: could not verify vmid %s on %s", body.action, vmid, node)
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "this machine could not be found where it was, so nothing was sent"},
+        )
+    from ..inventory.service import same_guest
+
+    if not same_guest(host, (config or {}).get("name")):
+        logger.warning(
+            "guest power %s refused: vmid %s on %s is %r, not %r",
+            body.action,
+            vmid,
+            node,
+            (config or {}).get("name"),
+            host.get("hostname"),
+        )
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "this machine no longer exists, so it cannot be powered"},
         )
 
     try:

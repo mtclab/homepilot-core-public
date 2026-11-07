@@ -42,9 +42,50 @@ def _extract_steps(body: str, tag: str) -> list[dict[str, Any]] | None:
     return steps
 
 
+def _pve_firewall_write_refusal(method: str, base_url: str, path: str) -> str | None:
+    """Why this step may not be sent, if it writes a PVE firewall's options (#707).
+
+    http-sequence is a generic HTTP client: pointed at a PVE API with a token
+    from the vault, it would write ``/cluster/firewall/options`` past the
+    lockout guard that ``ProxmoxClient`` runs on every PVE write - the #600
+    lockout through a third door. It cannot run that guard (it does not know it
+    is talking to PVE), so it does not write firewall options at all.
+    """
+    from urllib.parse import urlparse
+
+    from homepilot.adapters.pve_firewall_guard import (
+        PveFirewallLockoutError,
+        addresses_firewall_options,
+    )
+
+    if method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    if "://" in path:
+        url_path = urlparse(path).path
+    else:
+        url_path = f"{urlparse(base_url).path.rstrip('/')}/{path.lstrip('/')}"
+    try:
+        hit = addresses_firewall_options(url_path)
+    except PveFirewallLockoutError as exc:
+        return str(exc)
+    if not hit:
+        return None
+    return (
+        "an http-sequence step may not write PVE firewall options - it cannot run the "
+        "management-lockout guard; use a proxmox-api-sequence step, which does (#600, #707)"
+    )
+
+
 async def _resolve_credential(name: str, vault: Any) -> dict[str, Any]:
+    from homepilot.executor.secrets import SecretResolutionError, check_referenceable
     from homepilot.vault.manager import VaultError, VaultManager
 
+    # A step's `name` is a vault reference like any `{{ vault.x }}`, and meets
+    # the same rule before the vault is read (#684).
+    try:
+        check_referenceable([name])
+    except SecretResolutionError as exc:
+        raise ExecutorError(str(exc)) from None
     vault_mgr: VaultManager = vault
     try:
         return await vault_mgr.get_secret(name)
@@ -177,7 +218,7 @@ async def execute(
             try:
                 cred = await _resolve_credential(cred_name, vault)
             except ExecutorError as e:
-                step_log += f" credential '{cred_name}' not found"
+                step_log += f" credential '{cred_name}': {e}"
                 log_lines.append(step_log)
                 unfinished.append(step_id)
                 if on_error == "halt":
@@ -198,6 +239,18 @@ async def execute(
                     base_url=base_url, headers=headers, verify=verify_tls, timeout=30.0
                 )
             client = client_cache[client_key]
+
+            refusal = _pve_firewall_write_refusal(method, base_url, path)
+            if refusal is not None:
+                # Halts whatever on_error says: this is a safety refusal, not a
+                # step failure a sequence may choose to walk past.
+                step_log += f" {method} {path} -> REFUSED: {refusal}"
+                log_lines.append(step_log)
+                return {
+                    "success": False,
+                    "execution_log": "\n".join(log_lines),
+                    "failure_reason": f"step {step_id}: {refusal}",
+                }
 
             try:
                 kwargs: dict[str, Any] = {}

@@ -74,25 +74,35 @@ class TestQueryInventoryStructured:
 
 
 class TestRefreshInventoryStructured:
-    @pytest.mark.asyncio
-    async def test_returns_dict_with_status(self, ctx):
-        result = await call("refresh_inventory", {}, ctx)
-        assert result["status"] == "refreshed"
-        assert "nodes" in result
-        assert "version" in result
+    """Shape only; the outcome (rows actually upserted) is asserted in
+    tests/test_mcp_refresh_inventory_692.py against a real inventory."""
 
     @pytest.mark.asyncio
-    async def test_raises_when_no_proxmox(self, ctx):
-        ctx["proxmox"] = None
-        with pytest.raises(RuntimeError, match="Proxmox not configured"):
+    async def test_returns_the_sweep_result(self, ctx):
+        from homepilot.inventory.service import InventoryService
+
+        ctx["repo"].get_host_by_hostname = AsyncMock(return_value=None)
+        ctx["repo"].create_host = AsyncMock(return_value="h1")
+        ctx["repo"].mark_hosts_absent = AsyncMock(return_value=0)
+        ctx["proxmox"].read = AsyncMock(return_value={"data": []})
+        ctx["inventory_service"] = InventoryService(repo=ctx["repo"], proxmox=ctx["proxmox"])
+        result = await call("refresh_inventory", {}, ctx)
+        assert result["complete"] is True
+        assert "status" not in result, "the old no-op answered a bare status string"
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_inventory_service(self, ctx):
+        with pytest.raises(RuntimeError, match="Inventory service not configured"):
             await call("refresh_inventory", {}, ctx)
 
     @pytest.mark.asyncio
-    async def test_raises_on_proxmox_error(self, ctx):
+    async def test_raises_when_the_node_list_cannot_be_read(self, ctx):
         from homepilot.adapters.proxmox import ProxmoxError
+        from homepilot.inventory.service import InventoryService
 
-        ctx["proxmox"].read.side_effect = ProxmoxError("GET", "/version", 500, "timeout")
-        with pytest.raises(RuntimeError, match="Proxmox refresh failed"):
+        ctx["proxmox"].read.side_effect = ProxmoxError("GET", "/nodes", 500, "timeout")
+        ctx["inventory_service"] = InventoryService(repo=ctx["repo"], proxmox=ctx["proxmox"])
+        with pytest.raises(RuntimeError, match="Inventory refresh failed"):
             await call("refresh_inventory", {}, ctx)
 
 
@@ -318,6 +328,20 @@ class TestProxmoxApiReadTextOnly:
     async def test_forbidden_token_raises(self, ctx):
         with pytest.raises(ValueError, match="forbidden token"):
             await call("proxmox_api_read", {"path": "/nodes/pve1/execute"}, ctx)
+
+    @pytest.mark.asyncio
+    async def test_guest_agent_file_read_never_reaches_proxmox(self, ctx):
+        """#716: the read tier must not relay a guest-agent file read to PVE."""
+        with pytest.raises(ValueError, match="guest agent"):
+            await call(
+                "proxmox_api_read",
+                {
+                    "path": "/nodes/pve1/qemu/100/agent/file-read",
+                    "query": '{"file": "/etc/homepilot/agent.env"}',
+                },
+                ctx,
+            )
+        ctx["proxmox"].read.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_proxmox_error_propagates(self, ctx):

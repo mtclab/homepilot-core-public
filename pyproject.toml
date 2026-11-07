@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "3.6.24"
+version = "3.6.25"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -32,6 +32,9 @@ dependencies = [
     # future 3.0 can't silently break a fresh build (see the build-reproducibility
     # lesson) — bump deliberately.
     "mcp>=2.0,<3",
+    # MCP tool arguments are validated against each tool's inputSchema (#696).
+    # Already present through mcp; declared because homepilot imports it directly.
+    "jsonschema>=4.20",
     "cryptography>=44.0",
     "pyrage>=0.4",
     "jinja2>=3.1",
@@ -65,6 +68,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-PyYAML>=6.0",
+    "types-jsonschema>=4.20",
     "respx>=0.22",
     "playwright>=1.40",
     "pytest-playwright>=0.5",
@@ -129,10 +133,22 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# This tree's src/ before anything a venv's `.pth` adds (#653): an editable
+# install points at whichever checkout installed it, so a bare `pytest` in a
+# worktree otherwise tests ANOTHER checkout's source and reports green over it.
+# tests/test_gate_tests_this_tree.py asserts the outcome.
+pythonpath = ["src"]
 # Bound every test (and unblock an intermittent async-teardown hang); thread
 # method so a stuck socket/subprocess can't wedge the whole run. See issue #295.
 timeout = 120
 timeout_method = "thread"
+# An exception that kills a background thread is a FAILURE, never a warning
+# (#622). The aiosqlite worker dying with "Event loop is closed" - a background
+# writer that outlived its loop - surfaced as a flaky failure in whichever test
+# happened to be running; as a warning it could also pass unseen.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
 markers = [
     "e2e: end-to-end tests requiring a live HomePilot instance (HP_TEST_TOKEN must be set)",
     "integration: integration tests that exercise multiple components together",

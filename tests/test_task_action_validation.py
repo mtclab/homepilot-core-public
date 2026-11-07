@@ -23,8 +23,10 @@ async def task_repo(db: Database) -> TaskRepository:
 
 class TestCreateTaskActionValidation:
     async def test_valid_actions(self, task_repo: TaskRepository):
+        # One artifact per action: a second in-flight run of ONE artifact is
+        # refused by the database (#710).
         for action in ("apply", "revoke", "replay"):
-            tid = await task_repo.create_task("artifact-1", action)
+            tid = await task_repo.create_task(f"artifact-{action}", action)
             assert tid is not None
 
     async def test_invalid_action_raises_valueerror(self, task_repo: TaskRepository):

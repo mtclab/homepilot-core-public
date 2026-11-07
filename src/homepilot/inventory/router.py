@@ -6,7 +6,7 @@ import json as _json
 import logging
 import re
 import sqlite3
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -15,12 +15,17 @@ from pydantic import BaseModel, field_validator
 from ..adapters.agent import AgentAdapter
 from ..agent_hub.version_skew import control_plane_version as _control_plane_version
 from ..agent_hub.version_skew import is_behind as _is_behind
-from ..auth.deps import require_scope
+from ..auth.deps import require_scope, require_token
+from ..auth.principal import audit_actor
 from .service import InventoryService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The authenticated token, for attribution (#702). FastAPI resolves
+# require_token once per request, so this is the same check the scope made.
+_principal = Depends(require_token)
 
 
 class InventoryError(Exception):
@@ -178,7 +183,10 @@ def _get_service(request: Request) -> InventoryService:
 
 
 class BulkRequest(BaseModel):
-    action: str
+    # A closed set: an unknown action used to be accepted and answered as a
+    # per-host "failed" count, so `action="nuke"` looked like a partial run of
+    # something rather than a request nobody can carry out (#696).
+    action: Literal["adopt", "ignore", "enrich"]
     host_ids: list[str]
 
 
@@ -237,7 +245,9 @@ async def list_inventory(
     return {"items": hosts, "total": total}
 
 
-async def create_manual_host_record(repo: Any, body: HostCreateRequest) -> dict[str, Any]:
+async def create_manual_host_record(
+    repo: Any, body: HostCreateRequest, *, actor: str, source: str
+) -> dict[str, Any]:
     """Add a host HomePilot could not otherwise know about (#445 A5).
 
     Inventory could only ever be filled by a Proxmox sync, so a homelab that is
@@ -280,15 +290,15 @@ async def create_manual_host_record(repo: Any, body: HostCreateRequest) -> dict[
     )
     host = await repo.get_host(host_id)
     await repo.log_audit(
-        user_id="ui",
-        source="ui",
+        user_id=actor,
+        source=source,
         action="host_added",
         target_host=body.hostname,
     )
     return dict(host) if host else {"id": host_id}
 
 
-async def forget_host_record(repo: Any, host_id: str) -> dict[str, Any]:
+async def forget_host_record(repo: Any, host_id: str, *, actor: str, source: str) -> dict[str, Any]:
     """Remove a host from inventory, with its services and observation note.
 
     Refused for a host the hypervisor still reports: deleting it would be undone
@@ -312,8 +322,8 @@ async def forget_host_record(repo: Any, host_id: str) -> dict[str, Any]:
         )
     await repo.delete_host(host_id)
     await repo.log_audit(
-        user_id="ui",
-        source="ui",
+        user_id=actor,
+        source=source,
         action="host_forgotten",
         target_host=str(host.get("hostname") or ""),
     )
@@ -321,17 +331,25 @@ async def forget_host_record(repo: Any, host_id: str) -> dict[str, Any]:
 
 
 @router.post("", status_code=201, dependencies=[Depends(require_scope("write"))])
-async def create_manual_host(request: Request, body: HostCreateRequest) -> dict[str, Any]:
+async def create_manual_host(
+    request: Request, body: HostCreateRequest, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     try:
-        return await create_manual_host_record(request.app.state.repo, body)
+        return await create_manual_host_record(
+            request.app.state.repo, body, actor=audit_actor(token), source="api"
+        )
     except InventoryError as e:
         raise HTTPException(status_code=e.status, detail=e.detail) from e
 
 
 @router.delete("/{host_id}", dependencies=[Depends(require_scope("write"))])
-async def forget_host(request: Request, host_id: str) -> dict[str, Any]:
+async def forget_host(
+    request: Request, host_id: str, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     try:
-        return await forget_host_record(request.app.state.repo, host_id)
+        return await forget_host_record(
+            request.app.state.repo, host_id, actor=audit_actor(token), source="api"
+        )
     except InventoryError as e:
         raise HTTPException(status_code=e.status, detail=e.detail) from e
 

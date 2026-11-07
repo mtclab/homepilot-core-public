@@ -5,30 +5,10 @@ import (
 	"strings"
 )
 
-// CommandAllowlist ports hp_agent.command_executor.CommandAllowlist verbatim —
-// same regexes, same decision order. Security-critical: keep in lockstep.
-
-// shell metacharacters: | ; & ` $ < > ! # ( ) [ ]  (\x60 is backtick)
-var shellMetaRe = regexp.MustCompile("[|;&\x60$<>!#()\\[\\]]")
-
-var safeCommands = map[string]*regexp.Regexp{
-	"cat":      regexp.MustCompile(`^cat\s+[^\s]+$`),
-	"ls":       regexp.MustCompile(`^ls(\s+-[aAlrStZ]+)*(\s+[a-zA-Z0-9_./-]+)*$`),
-	"ps":       regexp.MustCompile(`^ps(\s+[a-zA-Z0-9_-]+)*$`),
-	"hostname": regexp.MustCompile(`^hostname$`),
-	"uname":    regexp.MustCompile(`^uname(\s+-[aAmnrsv]+)*$`),
-	"df":       regexp.MustCompile(`^df(\s+-[hHiTkP]+)*(\s+[a-zA-Z0-9_./-]+)?$`),
-	"free":     regexp.MustCompile(`^free(\s+-[hkmgb]+)*$`),
-	"uptime":   regexp.MustCompile(`^uptime$`),
-	"ip":       regexp.MustCompile(`^ip\s+(addr|link|route|neigh)(\s+[a-zA-Z0-9_./-]+)*$`),
-	"ss":       regexp.MustCompile(`^ss(\s+-[a-zA-Z0-9]+)*(\s+[a-zA-Z0-9_./-]+)?$`),
-	"systemctl": regexp.MustCompile(
-		`^systemctl\s+(status|is-active|is-enabled|daemon-reload)(\s+[a-zA-Z0-9_.-]+(\.service)?)?$`),
-	"journalctl": regexp.MustCompile(`^journalctl(\s+-[a-zA-Z0-9]+(\s+\S+)?)*$`),
-	"dpkg":       regexp.MustCompile(`^dpkg\s+-[lSs](\s+[a-zA-Z0-9_.+-]+)*$`),
-	"docker": regexp.MustCompile(
-		`^docker\s+(ps|images|inspect|logs|stats|version|info)(\s+[a-zA-Z0-9_.:/-]+)*$`),
-}
+// The unprivileged (read-only) command set and the shell-metacharacter filter
+// come from the policy shared with the control plane: see readpolicy.go and
+// readonly_policy.json (#682). The privileged set below is agent-only - the
+// control plane's READ tier never offers it.
 
 var privilegedCommands = map[string]*regexp.Regexp{
 	"apt-get": regexp.MustCompile(
@@ -107,11 +87,6 @@ func dockerRunDeniedFlag(parts []string) string {
 		}
 	}
 	return ""
-}
-
-var catAllowedPrefixes = []string{
-	"/var/log/", "/etc/homepilot/", "/etc/hostname", "/etc/os-release",
-	"/etc/resolv.conf", "/etc/hosts", "/etc/systemd/", "/opt/",
 }
 
 // packageManagers are the privileged allowlist entries that install software.
@@ -201,8 +176,13 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 
 	if re, ok := safeCommands[base]; ok {
 		if re.MatchString(actual) {
-			if base == "cat" {
-				return validateCatPath(actual)
+			if pathCheckedCommands[base] {
+				// `cat` reads through the SAME gate as read_file: resolve, deny,
+				// allowlist. It used to check a prefix list and nothing else, so
+				// it served the agent's own credentials (#682).
+				if _, err := checkReadPath(strings.Fields(actual)[1]); err != nil {
+					return false, base + ": " + err.Error()
+				}
 			}
 			return true, ""
 		}
@@ -213,21 +193,4 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 		return false, "privileged command not in allowlist: " + actual
 	}
 	return false, "command not in allowlist: " + base
-}
-
-func validateCatPath(actual string) (bool, string) {
-	parts := strings.Fields(actual)
-	if len(parts) < 2 {
-		return false, "cat requires a path argument"
-	}
-	p := parts[1]
-	if strings.Contains(p, "..") {
-		return false, "path traversal forbidden: " + p
-	}
-	for _, prefix := range catAllowedPrefixes {
-		if p == prefix || strings.HasPrefix(p, prefix) {
-			return true, ""
-		}
-	}
-	return false, "cat path not in allowed prefixes: " + p
 }

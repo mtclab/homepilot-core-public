@@ -6,6 +6,24 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _health_as_operator(monkeypatch):
+    """These tests read the per-subsystem checks, which /health gives only to an
+    authenticated caller (#687), and change the app state between requests, so
+    each starts with no cached verdict and a clean rate-limit window."""
+    from homepilot import main as main_mod
+
+    async def _authenticated(_request):
+        return True
+
+    monkeypatch.setattr(main_mod, "_is_authenticated", _authenticated)
+    main_mod._health_cache_clear()
+    main_mod._RATE_WINDOW.clear()
+    yield
+    main_mod._health_cache_clear()
+    main_mod._RATE_WINDOW.clear()
+
+
 @pytest.fixture
 def client():
     from homepilot.main import app

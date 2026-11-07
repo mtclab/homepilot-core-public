@@ -193,24 +193,29 @@ class TestRateLimiterExcludesUiRoutes:
         assert calls == ["/ui/inventory"]
         _RATE_WINDOW.clear()
 
-    async def test_health_path_bypasses_rate_limiter(self):
+    async def test_the_loopback_health_probe_bypasses_rate_limiter(self):
+        """The container's own healthcheck (loopback) is never refused - a
+        refused liveness probe gets a healthy container restarted. A REMOTE
+        anonymous /health is rate-limited like any other route (#687)."""
         from homepilot.main import _RATE_WINDOW, rate_limit_middleware
 
         _RATE_WINDOW.clear()
-        calls: list[str] = []
 
         async def call_next(req: MagicMock) -> MagicMock:
-            calls.append(req.url.path)
             from fastapi.responses import JSONResponse
 
             return JSONResponse({"ok": True})
 
-        req = self._make_request("/health")
         import time as _time
 
+        probe = self._make_request("/health")
+        probe.client.host = "127.0.0.1"
+        _RATE_WINDOW["127.0.0.1"] = [_time.time()] * 200
+        assert (await rate_limit_middleware(probe, call_next)).status_code == 200
+
+        remote = self._make_request("/health")
         _RATE_WINDOW["1.2.3.4"] = [_time.time()] * 200
-        resp = await rate_limit_middleware(req, call_next)
-        assert resp.status_code == 200
+        assert (await rate_limit_middleware(remote, call_next)).status_code == 429
         _RATE_WINDOW.clear()
 
     async def test_api_path_still_rate_limited(self):

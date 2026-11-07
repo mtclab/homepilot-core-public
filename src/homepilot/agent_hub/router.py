@@ -24,6 +24,7 @@ from .enrolment_window import (
     payload as window_payload,
 )
 from .registry import AgentRegistry
+from .server import MAX_EXEC_TIMEOUT_S
 
 if TYPE_CHECKING:
     from ..adapters.agent import AgentAdapter
@@ -184,7 +185,7 @@ def _get_agent_adapter() -> AgentAdapter:
 class HostExecRequest(BaseModel):
     host: str
     command: str
-    timeout: int = 30
+    timeout: int = Field(30, ge=1, le=MAX_EXEC_TIMEOUT_S)
 
 
 class HostReadFileRequest(BaseModel):
@@ -350,12 +351,16 @@ class MigrateTLSRequest(BaseModel):
 
 
 async def _enrolment_credential(request: Request) -> None:
-    """Accept the hub's enrolment token, or any valid API token.
+    """Accept the hub's enrolment token, or an unexpired ADMIN API token.
 
     The guest fetching this payload holds exactly the enrolment token and nothing
     else - that is the whole reason the control plane serves it (#464) - so that
     is the credential this route is built around. An API token is also accepted,
-    for the operator running the one-liner by hand.
+    for the operator running the one-liner by hand - held to the same terms as
+    every other enrolment surface (bootstrap, install, the enrolment window are
+    all admin): not expired, and admin scope. It used to be prefix + hash only,
+    so an expired token, or a read-only one, downloaded the installer and the
+    agent binary (#690).
 
     Compared in constant time, and refused outright when the hub has no token
     configured, so a misconfiguration cannot quietly become an open download.
@@ -378,11 +383,22 @@ async def _enrolment_credential(request: Request) -> None:
 
     repo = getattr(request.app.state, "repo", None)
     if repo is not None:
+        from ..auth.deps import token_expired
+        from ..auth.scopes import SCOPE_ADMIN
+        from ..auth.tokens import PREFIX_LENGTH, normalize_scope
         from ..auth.tokens import validate_token as _validate_api_token
 
-        row = await repo.get_token_by_prefix(presented[:16])
+        row = await repo.get_token_by_prefix(presented[:PREFIX_LENGTH])
         if row is not None and _validate_api_token(presented, row["hash"]):
-            return
+            if token_expired(row):
+                raise HTTPException(status_code=401, detail="Enrolment credential expired")
+            scopes = normalize_scope(row.get("scope"), row.get("role"))
+            if "*" in scopes or SCOPE_ADMIN in scopes:
+                return
+            raise HTTPException(
+                status_code=403,
+                detail="Downloading the agent payload with an API token requires admin scope",
+            )
     raise HTTPException(status_code=401, detail="Invalid enrolment credential")
 
 
@@ -726,7 +742,7 @@ async def is_agent_connected(hostname: str) -> dict[str, Any]:
 
 class ExecRequest(BaseModel):
     command: str
-    timeout: int = 30
+    timeout: int = Field(30, ge=1, le=MAX_EXEC_TIMEOUT_S)
 
 
 class WriteFileRequest(BaseModel):

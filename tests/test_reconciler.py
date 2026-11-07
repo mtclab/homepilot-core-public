@@ -160,11 +160,14 @@ class TestInventoryReconciler:
         h2_id = await repo.create_host(hostname="host-b", host_type="node", role="node")
 
         mock_svc = AsyncMock()
+        # The service reports the hosts its sweep actually MARKED absent (#712);
+        # the journal names those, not every host the hypervisor did not list.
         mock_svc.refresh_inventory.return_value = {
             "hosts": 0,
             "services": 0,
             "complete": True,
             "proxmox_host_ids": [],
+            "absent_host_ids": [h1_id, h2_id],
         }
 
         reconciler = InventoryReconciler(
@@ -593,7 +596,7 @@ class TestInventoryReconcilerEdgeCases:
 
     async def test_run_mixed_present_absent_changed(self, repo):
         h1_id = await repo.create_host(hostname="keep-me", host_type="node", role="node")
-        await repo.create_host(hostname="remove-me", host_type="node", role="node")
+        gone_id = await repo.create_host(hostname="remove-me", host_type="node", role="node")
 
         async def refresh_and_update():
             await repo.update_host(h1_id, ip_address="10.0.0.99")
@@ -602,6 +605,7 @@ class TestInventoryReconcilerEdgeCases:
                 "services": 0,
                 "complete": True,
                 "proxmox_host_ids": [h1_id, "brand-new"],
+                "absent_host_ids": [gone_id],
             }
 
         mock_svc = AsyncMock()
