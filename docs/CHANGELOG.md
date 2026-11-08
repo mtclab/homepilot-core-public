@@ -1,5 +1,222 @@
 # Changelog
 
+## 3.9.0 - 2026-11-08
+
+Four pieces of work in one release. You can now start, shut down, reboot and
+stop guests from HomePilot, with guards that refuse an unsafe action and say
+why (B3). The web console has a new look and a new sidebar (UI slices 0 and 1).
+Under the hood, nothing slow runs on the one event loop any more, so a slow git
+push or disk can no longer freeze the API (architecture step 1). Database
+migrations are checked when the app starts, and the schema is pinned in a lock
+file (architecture step 2).
+
+New setting, optional: `HP_LOOP_STALL_MS` (default 500, `0` turns it off)
+logs where the app was stuck whenever the event loop is held that long. Old
+console addresses (Settings tabs, `/tokens`, `/agents`) redirect to their new
+pages, so bookmarks keep working.
+
+### Operator actions
+
+- Migration 39 runs at the first start, after the usual backup
+  (`backups/pre-migration-v38.db`). It adds one empty column,
+  `hosts.protected`. To go back to 3.8.0, restore that backup with
+  `hp db restore`.
+- Check which guests are protected. By default the guest HomePilot runs on and
+  every `env = infra` guest need their name typed to shut down, reboot or stop.
+- MCP clients with a tool allow-list: add `get_guest_power` and `power_guest`
+  if your assistant should have them.
+
+### Migrations cannot drop a version, and the schema is locked (architecture step 2)
+
+Versions 1-38 are untouched: every one runs the
+same statements as in 3.8.0 (each version's statements hash identically, and
+the migrated schema's fingerprint is the same before and after), so an install
+at any schema version upgrades exactly as before. The pre-migration
+`VACUUM INTO` backup is unchanged.
+
+- The migration chain is an ordered tuple of `Migration(version, statements)`
+  instead of a `{version: [...]}` dict literal. A dict literal keeps only the
+  last of two equal keys, so two lanes that each added "the next" version could
+  merge into one that silently dropped the other's DDL (it nearly happened in
+  3.7.0). The module now refuses a repeated version, a gap or a reorder when it
+  is imported, and the runner re-checks the versions it is handed before it
+  touches a database. `tests/test_migrations_contiguous.py` replaces the
+  source-reading check that guarded the dict.
+- `src/homepilot/db/schema.lock` records the schema the chain produces (tables,
+  columns with type, NOT NULL, default and key, foreign keys, indexes, the
+  normalised `CREATE` text) and a content hash of every version.
+  `tests/test_schema_fingerprint.py` rebuilds it from a fresh install and from
+  an upgrade off every older version (0-37), and fails on any change nobody
+  recorded or on an edit to an already recorded version. After an intended
+  schema change: `make schema-lock`; it refuses to rewrite a recorded version's
+  hash unless `--rewrite-history` says the version was never released.
+- An orderly shutdown checkpoints the WAL explicitly
+  (`PRAGMA wal_checkpoint(TRUNCATE)`) once every writer has drained and before
+  the database closes, on its own daemon thread and bounded at 3 s (the #795
+  pattern, now one shared helper). The close then has no checkpoint left to do;
+  a checkpoint that cannot finish leaves the WAL for the close or the next
+  start, which is safe.
+
+### Nothing blocking runs on the event loop (architecture review F1, step 1)
+
+One asyncio loop carries the API, the SSE stream, the MCP transport, the agent
+hub's heartbeats and every reconciler. #795 moved one sqlite close off it after
+a WAL checkpoint froze the app for 16 s; the architecture review found the same
+shape everywhere git was used. Fixed as a class, not a call:
+
+- **`run_blocking(pool, fn, ...)`** (`homepilot/runtime/blocking.py`) runs
+  blocking work on named, bounded thread pools: `git` (ONE thread - every
+  repository operation runs there, in submission order, so commits, pushes and
+  remote changes never interleave), `io` (4: artifact reads and listings, KB
+  file walks, vault key derivation and writes, TLS material, sqlite integrity
+  checks, agent payload hashing) and `net` (4: DNS and socket probes, so a
+  hanging resolver cannot starve disk reads).
+- **Moved off the loop:** every git subprocess of the artifact store (commit,
+  push, pull, remote changes, the preview's `git diff`) and its `time.sleep`
+  lock spin; the blocking per-artifact `flock` - each lifecycle transition's
+  lock-read-check-write now runs as one serialised step on the `git` pool,
+  exactly as atomic as it was on the loop; propose's "id is free" check and
+  write, as one step; every artifact read and full-corpus listing (routes, MCP
+  tools, the executor, task runner, drift/apply/verify reconcilers, KB
+  service); startup's `git init` and store construction, hub certificate
+  generation and loading; the TLS migration's certificate; vault identity
+  creation/migration, passphrase rotation (two PBKDF2 derivations) and secret
+  writes (fsync); the archive push (was on the default pool, racing commits);
+  the agent payload digests (`/agents/dist*` hashed multi-MB binaries per
+  request - presence checks no longer hash at all).
+- Artifact files are now written atomically (temp file + rename): reads run
+  on another thread than writes and must never see half a file.
+- **Loop-stall watchdog** (`HP_LOOP_STALL_MS`, default 500, 0 = off): when one
+  callback holds the loop past the threshold, the loop thread's Python stack
+  is logged WHILE it is blocked, and `/admin/selfcheck` gains a
+  `loop_watchdog` line (a stall in the last 15 minutes reads as a fault).
+  Idle cost: four short wake-ups a second.
+- **Gates:** the test session fails any test whose product code blocks an
+  event loop - every loop in the process, timed per callback
+  (`HP_LOOP_BLOCK_BUDGET_MS`, default 250 ms, garbage collection excluded),
+  with the stack sampled while it blocks and the block attributed to the
+  coroutine running it (a test's own synchronous setup is not product code) -
+  and any product code reaching a blocking primitive (`assert_off_loop` in
+  git, the git lock and the file lock) on a loop however fast it is. The
+  allowlist is empty. A static gate lists every blocking primitive in `src/`
+  by file; a new one fails until it is routed and reviewed.
+- The first-run claim's code file and the claim's local CLI token are written
+  (fsync) off the loop too.
+- Application logging goes through a queue: a log call on the loop only
+  enqueues and one listener thread writes to stderr, so a slow log pipe can
+  no longer stall the loop inside `stream.write` (the detector caught a 359 ms
+  one).
+
+### Operator power controls: start, shut down, reboot, stop (lane B3, #781)
+
+The operator could not start a stopped VM or reboot one so a pending
+cloud-init change applied without writing a `proxmox-api-sequence` by hand or
+leaving for the Proxmox UI. Now, for VMs and containers alike:
+
+- **An operator acts directly.** `POST /api/inventory/{host_id}/power`
+  (admin scope) with `start`, `shutdown`, `reboot` or `stop`; the host page has
+  a Power card and the Hosts row menu a "Power..." entry. No propose/approve
+  round trip; one audit row per action names the actor, the guest, the PVE task
+  and the outcome (refusals are audited too).
+- **The result is honest.** The PVE task is followed to the end and the guest's
+  state read afterwards: `ok`, `failed`, `timed_out` or `unknown`. A shutdown is
+  always sent with `forceStop: 0`; a guest that ignores it ends `timed_out`,
+  still running, with Stop offered - never a silent escalation, never a false
+  success. A reboot is Proxmox's own (pending config applies) and waits for the
+  guest to come back; the pending changes are shown before it.
+- **Guards refuse with a reason and send nothing:** the guest is gone, a
+  template, locked, or another machine now holds its VMID (name checked live);
+  Start, and a Reboot that applies a pending address, would take an address a
+  RUNNING guest holds (the holder is named - the 2026-11-07 incident); Start
+  would open a `/dev/...` passthrough disk a running guest on the same node has
+  attached (the holder is named); shutting down, rebooting or stopping the
+  machine HomePilot runs on, or a protected guest, needs its name typed back.
+- **Protected guests:** new `hosts.protected` (operator-only via
+  `PATCH /api/inventory/{id}`; an assistant token is refused). Unset means the
+  default: the self guest and every `env = infra` machine are protected.
+- **Assistants propose, never power.** MCP `power_guest` runs every guard,
+  then proposes a one-step `guest-power` artifact (new kind, ARTIFACT_SPEC
+  §5.8) and powers nothing; the apply re-runs the guards. Switching off the
+  self guest or a protected one is never proposed. `get_guest_power` reads the
+  state, the pending changes and what each action needs.
+- **Approve and apply in one step** did not exist after 3.8.0, so it is added
+  for this kind only: `POST /api/artifacts/{id}/approve-and-apply` (admin) and
+  "Approve and apply" on the change page. Other kinds keep two steps until the
+  approval UX work settles one rule.
+- **Fix (lane B2's start guard):** a running guest's addresses are now read
+  with `current=1`. PVE's plain config read answers with pending changes
+  applied, so a running guest with a queued ipconfig change was judged by the
+  address it does not hold yet, and the one it does hold went unseen.
+
+### Web UI: the "Instrument" look and the new shell (UI slices 0 and 1)
+
+The first two slices of the console rethink (owner decisions of 2026-11-08:
+direction "Instrument", Monitoring as its own page, Agents under Hosts). Page
+internals are unchanged; they moved and took the new look. No backend change.
+
+**Look (slice 0).**
+- New design tokens in `web/src/app.css`: a neutral near-black **Night** theme
+  (the default) and a cool-grey **Day** theme, one phosphor-lilac accent for
+  what you can touch, and red / amber / green kept for status only. A hollow
+  grey lamp means "no data".
+- A theme control in the sidebar foot: **System / Night / Day**, remembered per
+  browser; System follows the OS live. `static/theme-boot.js` paints the choice
+  before first paint (an external file, because the CSP refuses inline scripts).
+- Self-hosted type under `/ui/fonts` with each family's OFL licence beside it:
+  Instrument Serif (page titles and the wordmark only), Source Serif 4 (reading
+  text), Atkinson Hyperlegible (chrome), JetBrains Mono (numbers, tags, ids).
+  Nothing is fetched from a font service.
+- Denser rows (about 26 px at 12.5 px text), 2 px panels, mono tags with the
+  status colour as their edge, and new `Lamp`, `Tag`, `Panel` and `Icon`
+  components. Every text glyph that stood in for an icon (refresh arrows,
+  crosses, ticks, chevrons, the menu glyph) is an inline SVG icon now.
+- Gates: the token test checks every text pair (WCAG AA) and every boundary
+  (3:1) in **both** themes, that Day redeclares every colour, that every font is
+  self-hosted, present and licensed, and that no gradient is painted; a new
+  glyph gate fails on any arrow, symbol, shape or emoji in rendering code.
+
+**Shell and navigation (slice 1).**
+- The sidebar groups seven nouns as four jobs: Overview; Estate (Hosts,
+  Monitoring, Guests); Change (Changes, Assistants); Record (Records, Settings).
+  Monitoring shows the number of firing alerts and Changes the number of
+  proposals, both from the dashboard summary; a count is absent, never zero,
+  when the summary cannot be read. Guests appears once a guest or an invite
+  exists (admin sessions). The maker's mark moved to the sidebar foot.
+- **Monitoring** is a page: Alerts (the alerts list) and Rules (alert rules,
+  notification channels and webhooks, moved out of Settings).
+- **Hosts > Agents** holds the join requests, the enrol one-liner and the hub
+  token; the fleet list keeps one line naming who is waiting, with the door.
+- **Guests** and **Assistants** are pages. Assistants is the token list for
+  now - naming assistants, limiting their tools and showing their activity are
+  not built yet, and the page says so. Settings keeps Connection, Proxmox,
+  Subsystems and About.
+- Every old address lands on the new home, keeping its query and fragment:
+  `/settings?tab=monitoring` and `#monitoring` / `#alerts` go to
+  `/monitoring/rules`; `/settings?tab=guests` and `#guests` to `/guests`;
+  `/settings?tab=tokens`, `#tokens` and `/tokens` to `/assistants`; `/agents`
+  to `/hosts/agents`; `/monitoring` to `/monitoring/alerts`. The redirects that
+  existed before all stay.
+
+### The lanes together
+
+- **Shutdown order.** When HomePilot stops, it now finishes background jobs
+  first. Then it lets work already handed to the git, disk and network threads
+  finish (up to 10 s), then folds the WAL into the database file, and only
+  then closes the database. Before this, a disk job still reading the database
+  could leave that last step half done.
+- **No slow import at start.** The MCP server module used to be loaded the
+  first time the app started up, on the event loop, holding it for about
+  0.4 s while the agent hub was already running. It is now loaded before the
+  loop starts.
+- **Power controls follow the no-blocking rule.** The new approve-and-apply
+  route reads the change from disk off the event loop, like every other route.
+  The WAL checkpoint's own database call is checked the same way.
+- **The power card follows the new look.** The arrow between a setting's old
+  and new value is an icon now, and a screen reader says "becomes".
+- **Migration 39 is part of the checked chain.** The power controls' new
+  column is entry 39 in the migration list that the app checks at start. The
+  schema lock records it, and every older version's record is unchanged.
+
 ## 3.8.0 - 2026-11-08
 
 Three lanes of the 2026-11 review in one release: HomePilot says when a newer

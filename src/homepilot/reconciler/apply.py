@@ -9,6 +9,7 @@ from typing import Any
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
 from homepilot.executor.orchestrator import ArtifactExecutor, ExecutorError, TamperError
+from homepilot.runtime.blocking import run_blocking
 
 from .base import Reconciler, ReconcilerResult
 
@@ -62,7 +63,7 @@ class ApplyReconciler(Reconciler):
                 details={"skipped": True, "reason": "auto_apply_disabled"},
             )
 
-        approved = self._get_approved_artifacts()
+        approved = await run_blocking("io", self._get_approved_artifacts)
         if not approved:
             return ReconcilerResult(
                 name="apply",

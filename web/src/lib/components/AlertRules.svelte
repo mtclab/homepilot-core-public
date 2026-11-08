@@ -1,8 +1,8 @@
 <script lang="ts">
-	// Alert rules (#514 S4): configuration, so it lives in Settings → Monitoring.
-	// It used to be a toolbar button on the Agents tab, which is how monitoring
-	// config ended up hiding inside a fleet-credential page. Firing alerts still
-	// show where the operator looks: Overview and the affected host.
+	// Alert rules (#514 S4). It used to be a toolbar button on the Agents tab,
+	// then a Settings tab; since UI slice 1 it lives in Monitoring > Rules, next
+	// to the alerts it produces. Firing alerts also show where the operator
+	// looks: Overview and the affected host.
 	import { onMount } from 'svelte';
 	import { api, type AlertComparison, type AlertRule } from '$lib/api';
 	import { notify } from '$lib/stores';
@@ -141,7 +141,7 @@
 		never raises one. A <em>nothing heard</em> rule instead fires when a host with
 		an agent stops reporting at all - "host went dark" - and not for a guest the
 		hypervisor reports stopped. Firing and recovery are kept in the alert history,
-		shown on the Overview and on the affected host, and pushed to the notification
+		shown under Monitoring, on the Overview and on the affected host, and pushed to the notification
 		channels below;
 		with no channel, they reach this console and nowhere else.
 	</p>

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from typing import Any
+
+from homepilot.runtime.blocking import run_blocking
 
 _APPROVE_RATELIMIT_MAX = 10
 _APPROVE_RATELIMIT_WINDOW = 60
@@ -508,7 +509,7 @@ async def handle_query_artifacts(arguments: dict[str, Any], ctx: dict[str, Any])
     status = filter_obj.get("status") if filter_obj else None
     kind = filter_obj.get("kind") if filter_obj else None
     target_filter = filter_obj.get("target") if filter_obj else None
-    results = await asyncio.to_thread(ctx["store"].list, status=status, kind=kind)
+    results = await run_blocking("io", ctx["store"].list, status=status, kind=kind)
     if target_filter:
         filtered = []
         for r in results:
@@ -559,7 +560,7 @@ async def handle_propose_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
         # has no log (#635). Every other refusal on this transport says what it
         # refused and why; this one now does too.
         raise ValueError(str(exc)) from None
-    fm, _ = await asyncio.to_thread(ctx["store"].read, artifact_id)
+    fm, _ = await run_blocking("io", ctx["store"].read, artifact_id)
     msg = (
         f"Artifact {artifact_id} created with status: "
         f"{fm.get('status', 'unknown')}. "
@@ -657,7 +658,7 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
         )
     except ApprovalRefusedError as exc:
         raise ValueError(str(exc)) from None
-    fm, _ = await asyncio.to_thread(ctx["store"].read, artifact_id)
+    fm, _ = await run_blocking("io", ctx["store"].read, artifact_id)
     logger.info("MCP approve_artifact: %s approved via operator code", artifact_id)
     return {
         "id": artifact_id,
@@ -673,7 +674,7 @@ async def handle_get_artifact_status(
 ) -> dict[str, Any]:
     artifact_id = arguments["artifact_id"]
     try:
-        fm, _ = await asyncio.to_thread(ctx["store"].read, artifact_id)
+        fm, _ = await run_blocking("io", ctx["store"].read, artifact_id)
     except FileNotFoundError as exc:
         raise ValueError(f"Artifact not found: {artifact_id}") from exc
     return {
@@ -696,7 +697,7 @@ async def handle_get_artifact(arguments: dict[str, Any], ctx: dict[str, Any]) ->
     """
     artifact_id = arguments["artifact_id"]
     try:
-        fm, body = await asyncio.to_thread(ctx["store"].read, artifact_id)
+        fm, body = await run_blocking("io", ctx["store"].read, artifact_id)
     except FileNotFoundError as exc:
         raise ValueError(f"Artifact not found: {artifact_id}") from exc
 
@@ -839,9 +840,7 @@ async def handle_preview_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     from homepilot.artifacts.router import ArtifactActionError, build_artifact_preview
 
     try:
-        return await asyncio.to_thread(
-            build_artifact_preview, str(arguments["artifact_id"]), store=ctx["store"]
-        )
+        return await build_artifact_preview(str(arguments["artifact_id"]), store=ctx["store"])
     except ArtifactActionError as exc:
         raise ValueError(exc.detail) from exc
 

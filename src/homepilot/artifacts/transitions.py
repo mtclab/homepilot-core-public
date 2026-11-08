@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sqlite3
@@ -130,36 +131,40 @@ class ArtifactTransitionManager:
         role: str | None = None,
         authority: str | None = None,
     ) -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.APPROVED)
+        def _locked() -> tuple[dict[str, Any], list[str]]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.APPROVED)
 
-            current_hash = compute_body_hash(body)
-            if current_hash != fm.get("hash"):
-                raise LifecycleError(f"Hash mismatch for {id}: body was modified after propose")
+                current_hash = compute_body_hash(body)
+                if current_hash != fm.get("hash"):
+                    raise LifecycleError(f"Hash mismatch for {id}: body was modified after propose")
 
-            # ARTIFACT_SPEC §7: "Cascade is atomic - if any sub-artifact fails to
-            # approve (e.g. it was edited and the hash is now stale), the whole
-            # cascade is rolled back and the composite stays `proposed`." So the
-            # subs are CHECKED before the composite is written, and nothing is
-            # written at all if one of them cannot go.
-            cascade = self._composite_cascade(id, fm, body)
+                # ARTIFACT_SPEC §7: "Cascade is atomic - if any sub-artifact fails to
+                # approve (e.g. it was edited and the hash is now stale), the whole
+                # cascade is rolled back and the composite stays `proposed`." So the
+                # subs are CHECKED before the composite is written, and nothing is
+                # written at all if one of them cannot go.
+                cascade = self._composite_cascade(id, fm, body)
 
-            now = utcnow_iso()
-            fm["status"] = ArtifactStatus.APPROVED.value
-            fm["approved_by"] = {"user": user, "at": now}
-            if role:
-                fm["approved_by"]["role"] = role
-            # WHERE the human decision came from (#681): "operator" (an operator
-            # credential approved) or "relayed-code" (a human relayed the code).
-            if authority:
-                fm["approved_by"]["authority"] = authority
-            if reason:
-                fm["approved_by"]["reason"] = reason
+                now = utcnow_iso()
+                fm["status"] = ArtifactStatus.APPROVED.value
+                fm["approved_by"] = {"user": user, "at": now}
+                if role:
+                    fm["approved_by"]["role"] = role
+                # WHERE the human decision came from (#681): "operator" (an operator
+                # credential approved) or "relayed-code" (a human relayed the code).
+                if authority:
+                    fm["approved_by"]["authority"] = authority
+                if reason:
+                    fm["approved_by"]["reason"] = reason
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "approve")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "approve")
+                return fm, cascade
+
+        fm, cascade = await self.file_store.run_serialized(_locked)
         details: dict[str, Any] | None = {"approved_by_role": role} if role else None
         if authority:
             details = dict(details or {})
@@ -242,24 +247,31 @@ class ArtifactTransitionManager:
         role: str | None,
         via: str,
     ) -> None:
-        with self.file_store.file_lock(sub_id):
-            fm, body = self.file_store.read(sub_id)
-            if ArtifactStatus(fm["status"]) is not ArtifactStatus.PROPOSED:
-                return
-            fm["status"] = ArtifactStatus.APPROVED.value
-            fm["approved_by"] = {"user": user, "at": utcnow_iso()}
-            if role:
-                fm["approved_by"]["role"] = role
-            # The composite's reason is copied, per §7, with the composite named
-            # so the audit trail says WHY this artifact was approved without
-            # anyone opening it.
-            fm["approved_by"]["reason"] = (
-                f"{reason} (cascaded from composite {via})"
-                if reason
-                else f"cascaded from composite {via}"
-            )
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(sub_id, fm_yml, body, "approve")
+        def _locked() -> dict[str, Any] | None:
+            with self.file_store.file_lock(sub_id):
+                fm, body = self.file_store.read(sub_id)
+                if ArtifactStatus(fm["status"]) is not ArtifactStatus.PROPOSED:
+                    return None
+                fm["status"] = ArtifactStatus.APPROVED.value
+                fm["approved_by"] = {"user": user, "at": utcnow_iso()}
+                if role:
+                    fm["approved_by"]["role"] = role
+                # The composite's reason is copied, per §7, with the composite named
+                # so the audit trail says WHY this artifact was approved without
+                # anyone opening it.
+                fm["approved_by"]["reason"] = (
+                    f"{reason} (cascaded from composite {via})"
+                    if reason
+                    else f"cascaded from composite {via}"
+                )
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(sub_id, fm_yml, body, "approve")
+                return fm
+
+        fm_or_none = await self.file_store.run_serialized(_locked)
+        if fm_or_none is None:
+            return
+        fm = fm_or_none
         # One audit row per sub-artifact, per §7.
         await self._audit("approve", sub_id, user, {"cascaded_from": via})
         await self._sync_to_db(sub_id, fm)
@@ -272,63 +284,74 @@ class ArtifactTransitionManager:
     async def reject(
         self, id: str, user: str, reason: str | None = None, role: str | None = None
     ) -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.REJECTED)
+        def _locked() -> dict[str, Any]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.REJECTED)
 
-            now = utcnow_iso()
-            fm["status"] = ArtifactStatus.REJECTED.value
-            fm["rejected_by"] = {"user": user, "at": now}
-            if role:
-                fm["rejected_by"]["role"] = role
-            if reason:
-                fm["rejected_by"]["reason"] = reason
+                now = utcnow_iso()
+                fm["status"] = ArtifactStatus.REJECTED.value
+                fm["rejected_by"] = {"user": user, "at": now}
+                if role:
+                    fm["rejected_by"]["role"] = role
+                if reason:
+                    fm["rejected_by"]["reason"] = reason
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "reject")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "reject")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
         details = {"rejected_by_role": role} if role else None
         await self._audit("reject", id, user, details)
         await self._sync_to_db(id, fm)
 
     async def edit(self, id: str) -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
+        def _locked() -> dict[str, Any] | None:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
 
-            terminal = {
-                ArtifactStatus.APPLIED,
-                ArtifactStatus.SUPERSEDED,
-                ArtifactStatus.REVOKED,
-                ArtifactStatus.REJECTED,
-            }
-            if current_status in terminal:
-                raise LifecycleError(
-                    f"Cannot edit artifact in terminal state: {current_status.value}"
-                )
+                terminal = {
+                    ArtifactStatus.APPLIED,
+                    ArtifactStatus.SUPERSEDED,
+                    ArtifactStatus.REVOKED,
+                    ArtifactStatus.REJECTED,
+                }
+                if current_status in terminal:
+                    raise LifecycleError(
+                        f"Cannot edit artifact in terminal state: {current_status.value}"
+                    )
 
-            new_hash = compute_body_hash(body)
+                new_hash = compute_body_hash(body)
 
-            if new_hash == fm.get("hash"):
-                return
+                if new_hash == fm.get("hash"):
+                    return None
 
-            # The same checks propose runs (#652). Refused, the edit is NOT
-            # recorded: the stored hash stays stale, so approve refuses the
-            # file until it is put right.
-            derived = validate_artifact_content(fm, body)
-            if "rollback" in derived:
-                fm["rollback"] = derived["rollback"]
+                # The same checks propose runs (#652). Refused, the edit is NOT
+                # recorded: the stored hash stays stale, so approve refuses the
+                # file until it is put right.
+                derived = validate_artifact_content(fm, body)
+                if "rollback" in derived:
+                    fm["rollback"] = derived["rollback"]
 
-            fm["hash"] = new_hash
-            if current_status in (
-                ArtifactStatus.APPROVED,
-                ArtifactStatus.FAILED,
-            ):
-                fm["status"] = ArtifactStatus.PROPOSED.value
-                fm.pop("approved_by", None)
+                fm["hash"] = new_hash
+                if current_status in (
+                    ArtifactStatus.APPROVED,
+                    ArtifactStatus.FAILED,
+                ):
+                    fm["status"] = ArtifactStatus.PROPOSED.value
+                    fm.pop("approved_by", None)
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "edit")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "edit")
+                return fm
+
+        fm_or_none = await self.file_store.run_serialized(_locked)
+        if fm_or_none is None:
+            return
+        fm = fm_or_none
 
         await self._cascade_invalidate(id)
         await self._sync_to_db(id, fm)
@@ -368,42 +391,50 @@ class ArtifactTransitionManager:
             ArtifactStatus.REVOKED,
             ArtifactStatus.REJECTED,
         }
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            if current_status in terminal:
-                raise ConflictError(
-                    f"Cannot edit artifact in terminal state: {current_status.value}"
-                )
-            changed_owned = sorted(
-                key for key in LIFECYCLE_OWNED_FIELDS if new_fm.get(key) != fm.get(key)
-            )
-            if changed_owned:
-                raise LifecycleError(
-                    "An edit cannot change "
-                    + ", ".join(changed_owned)
-                    + ": the lifecycle writes those. Leave them as they are."
-                )
-            if new_fm == fm and new_body == body:
-                return {"changed": False, "status": current_status.value}
 
-            # Everything propose checks, checked again on what the edit would
-            # store (#652): the edit used to run no validation at all, so every
-            # propose-time refusal could be walked around by proposing something
-            # valid and editing it afterwards. Refused here, nothing is written.
-            derived = validate_artifact_content(new_fm, new_body)
+        def _locked() -> tuple[ArtifactStatus, dict[str, Any] | None]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                if current_status in terminal:
+                    raise ConflictError(
+                        f"Cannot edit artifact in terminal state: {current_status.value}"
+                    )
+                changed_owned = sorted(
+                    key for key in LIFECYCLE_OWNED_FIELDS if new_fm.get(key) != fm.get(key)
+                )
+                if changed_owned:
+                    raise LifecycleError(
+                        "An edit cannot change "
+                        + ", ".join(changed_owned)
+                        + ": the lifecycle writes those. Leave them as they are."
+                    )
+                if new_fm == fm and new_body == body:
+                    return current_status, None
 
-            updated = dict(new_fm)
-            updated["hash"] = compute_body_hash(new_body)
-            updated["mutating"] = derived["mutating"]
-            if "rollback" in derived:
-                updated["rollback"] = derived["rollback"]
-            if current_status in (ArtifactStatus.APPROVED, ArtifactStatus.FAILED):
-                updated["status"] = ArtifactStatus.PROPOSED.value
-                updated.pop("approved_by", None)
-            self.file_store.write(
-                id, self.file_store.serialize_frontmatter(updated), new_body, "edit"
-            )
+                # Everything propose checks, checked again on what the edit would
+                # store (#652): the edit used to run no validation at all, so every
+                # propose-time refusal could be walked around by proposing something
+                # valid and editing it afterwards. Refused here, nothing is written.
+                derived = validate_artifact_content(new_fm, new_body)
+
+                updated = dict(new_fm)
+                updated["hash"] = compute_body_hash(new_body)
+                updated["mutating"] = derived["mutating"]
+                if "rollback" in derived:
+                    updated["rollback"] = derived["rollback"]
+                if current_status in (ArtifactStatus.APPROVED, ArtifactStatus.FAILED):
+                    updated["status"] = ArtifactStatus.PROPOSED.value
+                    updated.pop("approved_by", None)
+                self.file_store.write(
+                    id, self.file_store.serialize_frontmatter(updated), new_body, "edit"
+                )
+                return current_status, updated
+
+        current_status, maybe_updated = await self.file_store.run_serialized(_locked)
+        if maybe_updated is None:
+            return {"changed": False, "status": current_status.value}
+        updated = maybe_updated
 
         await self._cascade_invalidate(id)
         await self._sync_to_db(id, updated)
@@ -421,7 +452,7 @@ class ArtifactTransitionManager:
         if edited_id in visited:
             return
         visited.add(edited_id)
-        all_artifacts = self.file_store.list(
+        all_artifacts = await self.file_store.alist(
             status=ArtifactStatus.APPROVED.value,
             kind=ArtifactKind.COMPOSITE.value,
         )
@@ -431,13 +462,10 @@ class ArtifactTransitionManager:
                 continue
             if cid in visited:
                 continue
-            _, cbody = self.file_store.read(cid)
-            if edited_id in cbody:
-                cfm = candidate.copy()
-                cfm["status"] = ArtifactStatus.PROPOSED.value
-                cfm.pop("approved_by", None)
-                fm_yml = self.file_store.serialize_frontmatter(cfm)
-                self.file_store.write(cid, fm_yml, cbody, "edit")
+            cfm = await self.file_store.run_serialized(
+                functools.partial(self._invalidate_if_referenced, cid, edited_id)
+            )
+            if cfm is not None:
                 await self._audit(
                     "invalidate",
                     cid,
@@ -446,42 +474,64 @@ class ArtifactTransitionManager:
                 await self._sync_to_db(cid, cfm)
                 await self._cascade_invalidate(cid, visited)
 
+    def _invalidate_if_referenced(self, cid: str, edited_id: str) -> dict[str, Any] | None:
+        """Send approved composite `cid` back to proposed if its body names
+        `edited_id`. Runs serialised with every other artifact write, under the
+        file lock, on the CURRENT file (the listing it came from may be stale)."""
+        with self.file_store.file_lock(cid):
+            cfm, cbody = self.file_store.read(cid)
+            if edited_id not in cbody or cfm.get("status") != ArtifactStatus.APPROVED.value:
+                return None
+            cfm["status"] = ArtifactStatus.PROPOSED.value
+            cfm.pop("approved_by", None)
+            fm_yml = self.file_store.serialize_frontmatter(cfm)
+            self.file_store.write(cid, fm_yml, cbody, "edit")
+            return cfm
+
     async def mark_applied(self, id: str, execution_log: str) -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.APPLIED)
+        def _locked() -> dict[str, Any]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.APPLIED)
 
-            body = body.rstrip("\n") + "\n\n## Execution log\n\n" + execution_log + "\n"
+                body = body.rstrip("\n") + "\n\n## Execution log\n\n" + execution_log + "\n"
 
-            fm["status"] = ArtifactStatus.APPLIED.value
-            # A verdict ends an unknown outcome (#774).
-            fm.pop("unsettled_task", None)
-            fm["applied_at"] = utcnow_iso()
-            fm["hash"] = compute_body_hash(body)
+                fm["status"] = ArtifactStatus.APPLIED.value
+                # A verdict ends an unknown outcome (#774).
+                fm.pop("unsettled_task", None)
+                fm["applied_at"] = utcnow_iso()
+                fm["hash"] = compute_body_hash(body)
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "apply")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "apply")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
         await self._audit("apply", id)
         await self._sync_to_db(id, fm)
 
     async def mark_failed(self, id: str, reason: str, partial_log: str = "") -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.FAILED)
+        def _locked() -> dict[str, Any]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.FAILED)
 
-            if partial_log:
-                body = body.rstrip("\n") + "\n\n## Execution log\n\n" + partial_log + "\n"
+                if partial_log:
+                    body = body.rstrip("\n") + "\n\n## Execution log\n\n" + partial_log + "\n"
 
-            fm["status"] = ArtifactStatus.FAILED.value
-            fm.pop("unsettled_task", None)
-            fm["failed_at"] = utcnow_iso()
-            fm["failure_reason"] = reason
-            fm["hash"] = compute_body_hash(body)
+                fm["status"] = ArtifactStatus.FAILED.value
+                fm.pop("unsettled_task", None)
+                fm["failed_at"] = utcnow_iso()
+                fm["failure_reason"] = reason
+                fm["hash"] = compute_body_hash(body)
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "fail")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "fail")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
         await self._audit("fail", id)
         await self._sync_to_db(id, fm)
 
@@ -490,52 +540,68 @@ class ArtifactTransitionManager:
         when the run stopped following it (#774). No status change - the
         artifact is neither applied nor failed until PVE says how the task
         ended - and the body is untouched, so the approval hash still holds."""
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            fm["unsettled_task"] = entry
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "unsettled")
+
+        def _locked() -> None:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                fm["unsettled_task"] = entry
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "unsettled")
+
+        await self.file_store.run_serialized(_locked)
         await self._audit("unsettled", id, details={"upid": entry.get("upid")})
 
     async def clear_unsettled(self, id: str) -> None:
         """Drop the unknown-outcome record without a status change - for a run
         whose verdict does not move the artifact (a replay of an applied one)."""
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            if fm.pop("unsettled_task", None) is None:
-                return
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "settled")
+
+        def _locked() -> None:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                if fm.pop("unsettled_task", None) is None:
+                    return
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "settled")
+
+        await self.file_store.run_serialized(_locked)
 
     async def supersede(self, old_id: str, new_id: str) -> None:
-        with self.file_store.file_lock(old_id):
-            fm, body = self.file_store.read(old_id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.SUPERSEDED)
+        def _locked() -> dict[str, Any]:
+            with self.file_store.file_lock(old_id):
+                fm, body = self.file_store.read(old_id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.SUPERSEDED)
 
-            fm["status"] = ArtifactStatus.SUPERSEDED.value
-            fm["superseded_by"] = new_id
+                fm["status"] = ArtifactStatus.SUPERSEDED.value
+                fm["superseded_by"] = new_id
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(old_id, fm_yml, body, "supersede")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(old_id, fm_yml, body, "supersede")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
         await self._audit("supersede", old_id)
         await self._sync_to_db(old_id, fm)
         await self._forget_drift_verdict(old_id)
 
     async def revoke(self, id: str, user: str, reason: str | None = None) -> None:
-        with self.file_store.file_lock(id):
-            fm, body = self.file_store.read(id)
-            current_status = ArtifactStatus(fm["status"])
-            validate_transition(current_status, ArtifactStatus.REVOKED)
+        def _locked() -> dict[str, Any]:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                current_status = ArtifactStatus(fm["status"])
+                validate_transition(current_status, ArtifactStatus.REVOKED)
 
-            now = utcnow_iso()
-            fm["status"] = ArtifactStatus.REVOKED.value
-            fm["revoked_by"] = {"user": user, "at": now}
-            if reason:
-                fm["revoked_by"]["reason"] = reason
+                now = utcnow_iso()
+                fm["status"] = ArtifactStatus.REVOKED.value
+                fm["revoked_by"] = {"user": user, "at": now}
+                if reason:
+                    fm["revoked_by"]["reason"] = reason
 
-            fm_yml = self.file_store.serialize_frontmatter(fm)
-            self.file_store.write(id, fm_yml, body, "revoke")
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "revoke")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
         await self._audit("revoke", id, user)
         await self._sync_to_db(id, fm)
         await self._forget_drift_verdict(id)

@@ -43,9 +43,11 @@ SCHEMA_3_7_0 = 36
 # * 37 - the fleet model (lane B1): template flag, pool, PVE tags, allocation,
 #   env and the self-guest mark on ``hosts``
 # * 38 - addresses and clashes (lane B2): ``host_addresses``
+# Unreleased:
+# * 39 - operator power controls (lane B3): ``hosts.protected``
 # tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
 # through both.
-SCHEMA_LATEST = 38
+SCHEMA_LATEST = 39
 
 
 async def _version(db: Database) -> int:
@@ -111,6 +113,7 @@ class TestADatabaseFrom3625UpgradesInOneStart:
             "env",
             "env_source",
             "is_self",
+            "protected",
         } <= await _columns(db_3_6_25, "hosts")
         assert "host_addresses" in await _tables(db_3_6_25)
 

@@ -1,17 +1,64 @@
+"""The schema migration chain and the runner that applies it.
+
+The chain is an ordered tuple of `Migration(version, statements)`. Each version
+is the number every install has written to `settings.schema_version` after
+applying it, so it is persisted history: a released version is never
+renumbered, reordered or edited. A new schema change is a new `Migration` at
+the END with the next number.
+
+Why a tuple and not the `{version: [...]}` dict literal this used to be: a dict
+literal keeps only the LAST value of a repeated key, so two lanes that each
+added "the next" version merged into one that silently dropped the other's DDL
+(it nearly lost a whole migration in 3.7.0). A repeated `Migration(39, ...)` in
+a tuple is two entries, and `_index_chain` refuses it - and any gap or
+out-of-order version - when this module is imported, so a broken chain cannot
+even start the backend.
+
+`schema.lock` beside this file records the schema the chain produces and a
+content hash of every version; `tests/test_schema_fingerprint.py` holds the
+chain to it. After an intended schema change, regenerate it with
+`make schema-lock`.
+"""
+
 from __future__ import annotations
 
 import datetime
 import logging
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from .connection import Database
 
 logger = logging.getLogger(__name__)
 
-MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
-    1: [
-        """CREATE TABLE IF NOT EXISTS hosts (
+# A plain SQL statement, or `(sql, table, column)`: an ADD COLUMN that is
+# skipped when `table.column` already exists.
+Statement = str | tuple[str, str, str]
+
+
+class MigrationChainError(RuntimeError):
+    """The migration chain is not 1, 2, 3, ... with each version exactly once."""
+
+
+@dataclass(frozen=True)
+class Migration:
+    """One schema version: what takes a database from `version - 1` to `version`.
+
+    All of `statements` and the `schema_version` bump commit in one
+    transaction, or none of them do.
+    """
+
+    version: int
+    statements: list[Statement]
+
+
+MIGRATION_CHAIN: tuple[Migration, ...] = (
+    Migration(
+        1,
+        [
+            """CREATE TABLE IF NOT EXISTS hosts (
             id              TEXT PRIMARY KEY,
             proxmox_id      INTEGER,
             hostname        TEXT NOT NULL,
@@ -34,11 +81,11 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at      TEXT NOT NULL,
             updated_at      TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
-        """CREATE TABLE IF NOT EXISTS services (
+            "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
+            """CREATE TABLE IF NOT EXISTS services (
             id              TEXT PRIMARY KEY,
             host_id         TEXT NOT NULL REFERENCES hosts(id),
             name            TEXT NOT NULL,
@@ -51,14 +98,14 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             updated_at      TEXT,
             UNIQUE(host_id, name)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_services_host ON services(host_id)",
-        """CREATE TABLE IF NOT EXISTS users (
+            "CREATE INDEX IF NOT EXISTS idx_services_host ON services(host_id)",
+            """CREATE TABLE IF NOT EXISTS users (
             id              TEXT PRIMARY KEY,
             display_name    TEXT,
             auth_source     TEXT NOT NULL DEFAULT 'api_token',
             created_at      TEXT NOT NULL
         )""",
-        """CREATE TABLE IF NOT EXISTS api_tokens (
+            """CREATE TABLE IF NOT EXISTS api_tokens (
             id              TEXT PRIMARY KEY,
             user_id         TEXT NOT NULL REFERENCES users(id),
             token_type      TEXT NOT NULL,
@@ -70,9 +117,9 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             role            TEXT,
             created_at      TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON api_tokens(prefix)",
-        """CREATE TABLE IF NOT EXISTS audit_log (
+            "CREATE INDEX IF NOT EXISTS idx_tokens_user ON api_tokens(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON api_tokens(prefix)",
+            """CREATE TABLE IF NOT EXISTS audit_log (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ')),
             user_id         TEXT NOT NULL,
@@ -87,12 +134,12 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             duration_ms     INTEGER,
             details_json    TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_host ON audit_log(target_host)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp)",
-        "CREATE INDEX IF NOT EXISTS idx_audit_artifact ON audit_log(artifact_id)",
-        """CREATE TABLE IF NOT EXISTS artifacts (
+            "CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_host ON audit_log(target_host)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_artifact ON audit_log(artifact_id)",
+            """CREATE TABLE IF NOT EXISTS artifacts (
             id              TEXT PRIMARY KEY,
             kind            TEXT NOT NULL,
             intent          TEXT NOT NULL,
@@ -119,10 +166,10 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at      TEXT NOT NULL,
             updated_at      TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status)",
-        "CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind)",
-        "CREATE INDEX IF NOT EXISTS idx_artifacts_target ON artifacts(target_json)",
-        """CREATE TABLE IF NOT EXISTS artifact_dependencies (
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind)",
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_target ON artifacts(target_json)",
+            """CREATE TABLE IF NOT EXISTS artifact_dependencies (
             composite_id    TEXT NOT NULL REFERENCES artifacts(id),
             sub_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
             depends_on      TEXT,
@@ -130,8 +177,8 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             step_order      INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (composite_id, sub_artifact_id)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_deps_sub ON artifact_dependencies(sub_artifact_id)",
-        """CREATE TABLE IF NOT EXISTS doc_metadata (
+            "CREATE INDEX IF NOT EXISTS idx_deps_sub ON artifact_dependencies(sub_artifact_id)",
+            """CREATE TABLE IF NOT EXISTS doc_metadata (
             id              INTEGER PRIMARY KEY,
             source          TEXT NOT NULL,
             kind            TEXT NOT NULL DEFAULT 'note',
@@ -142,50 +189,62 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             version         TEXT,
             embedded_at     TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_docs_kind ON doc_metadata(kind)",
-        "CREATE INDEX IF NOT EXISTS idx_docs_target ON doc_metadata(target)",
-        (
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_docs "
-            "USING vec0(id INTEGER PRIMARY KEY, embedding float[768])"
-        ),
-        """CREATE TABLE IF NOT EXISTS settings (
+            "CREATE INDEX IF NOT EXISTS idx_docs_kind ON doc_metadata(kind)",
+            "CREATE INDEX IF NOT EXISTS idx_docs_target ON doc_metadata(target)",
+            (
+                "CREATE VIRTUAL TABLE IF NOT EXISTS vec_docs "
+                "USING vec0(id INTEGER PRIMARY KEY, embedding float[768])"
+            ),
+            """CREATE TABLE IF NOT EXISTS settings (
             key         TEXT PRIMARY KEY,
             value       TEXT NOT NULL,
             updated_at  TEXT NOT NULL
         )""",
-    ],
-    2: [
-        """CREATE TABLE IF NOT EXISTS drift_checks (
+        ],
+    ),
+    Migration(
+        2,
+        [
+            """CREATE TABLE IF NOT EXISTS drift_checks (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             artifact_id     TEXT NOT NULL UNIQUE,
             drifted         INTEGER NOT NULL DEFAULT 0,
             checked_at      TEXT NOT NULL,
             details_json    TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_drift_checks_artifact ON drift_checks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_drift_checks_drifted ON drift_checks(drifted)",
-    ],
-    3: [
-        (
-            "CREATE TABLE IF NOT EXISTS tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT NOT NULL, "
-            "action TEXT NOT NULL CHECK(action IN ('apply', 'revoke', 'replay')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-    ],
-    4: [
-        "ALTER TABLE api_tokens ADD COLUMN role TEXT",
-    ],
-    5: [
-        """CREATE TABLE IF NOT EXISTS webhook_configs (
+            "CREATE INDEX IF NOT EXISTS idx_drift_checks_artifact ON drift_checks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_drift_checks_drifted ON drift_checks(drifted)",
+        ],
+    ),
+    Migration(
+        3,
+        [
+            (
+                "CREATE TABLE IF NOT EXISTS tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT NOT NULL, "
+                "action TEXT NOT NULL CHECK(action IN ('apply', 'revoke', 'replay')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ],
+    ),
+    Migration(
+        4,
+        [
+            "ALTER TABLE api_tokens ADD COLUMN role TEXT",
+        ],
+    ),
+    Migration(
+        5,
+        [
+            """CREATE TABLE IF NOT EXISTS webhook_configs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL,
             event_types TEXT NOT NULL,
@@ -194,7 +253,7 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             max_retries INTEGER NOT NULL DEFAULT 3,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""",
-        """CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            """CREATE TABLE IF NOT EXISTS webhook_deliveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             webhook_id INTEGER NOT NULL,
             event_type TEXT NOT NULL,
@@ -205,73 +264,91 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (webhook_id) REFERENCES webhook_configs(id)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_wh_cfg_enabled ON webhook_configs(enabled)",
-        "CREATE INDEX IF NOT EXISTS idx_wh_del_status ON webhook_deliveries(status)",
-        "CREATE INDEX IF NOT EXISTS idx_wh_del_wh_id ON webhook_deliveries(webhook_id)",
-    ],
-    6: [
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_metadata_source ON doc_metadata(source)",
-    ],
-    7: [
-        ("ALTER TABLE api_tokens ADD COLUMN label TEXT", "api_tokens", "label"),
-    ],
-    8: [
-        ("ALTER TABLE api_tokens ADD COLUMN fingerprint TEXT", "api_tokens", "fingerprint"),
-    ],
-    9: [
-        """CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+            "CREATE INDEX IF NOT EXISTS idx_wh_cfg_enabled ON webhook_configs(enabled)",
+            "CREATE INDEX IF NOT EXISTS idx_wh_del_status ON webhook_deliveries(status)",
+            "CREATE INDEX IF NOT EXISTS idx_wh_del_wh_id ON webhook_deliveries(webhook_id)",
+        ],
+    ),
+    Migration(
+        6,
+        [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_metadata_source ON doc_metadata(source)",
+        ],
+    ),
+    Migration(
+        7,
+        [
+            ("ALTER TABLE api_tokens ADD COLUMN label TEXT", "api_tokens", "label"),
+        ],
+    ),
+    Migration(
+        8,
+        [
+            ("ALTER TABLE api_tokens ADD COLUMN fingerprint TEXT", "api_tokens", "fingerprint"),
+        ],
+    ),
+    Migration(
+        9,
+        [
+            """CREATE TABLE IF NOT EXISTS bootstrap_tokens (
             token_hash     TEXT PRIMARY KEY,
             expires_at     REAL NOT NULL
         )""",
-    ],
-    10: [
-        "ALTER TABLE hosts ADD COLUMN pve_status TEXT",
-        (
+        ],
+    ),
+    Migration(
+        10,
+        [
+            "ALTER TABLE hosts ADD COLUMN pve_status TEXT",
             (
-                "ALTER TABLE hosts ADD COLUMN source TEXT NOT NULL "
-                "DEFAULT 'discovered' CHECK(source IN ('hp_created','discovered','imported'))"
+                (
+                    "ALTER TABLE hosts ADD COLUMN source TEXT NOT NULL "
+                    "DEFAULT 'discovered' CHECK(source IN ('hp_created','discovered','imported'))"
+                ),
+                "hosts",
+                "source",
             ),
-            "hosts",
-            "source",
-        ),
-        ("ALTER TABLE hosts ADD COLUMN description TEXT", "hosts", "description"),
-        ("ALTER TABLE hosts ADD COLUMN artifact_id TEXT", "hosts", "artifact_id"),
-        (
+            ("ALTER TABLE hosts ADD COLUMN description TEXT", "hosts", "description"),
+            ("ALTER TABLE hosts ADD COLUMN artifact_id TEXT", "hosts", "artifact_id"),
             (
-                "ALTER TABLE hosts ADD COLUMN import_state TEXT "
-                "CHECK(import_state IN ('pending','adopted','ignored'))"
+                (
+                    "ALTER TABLE hosts ADD COLUMN import_state TEXT "
+                    "CHECK(import_state IN ('pending','adopted','ignored'))"
+                ),
+                "hosts",
+                "import_state",
             ),
-            "hosts",
-            "import_state",
-        ),
-        (
             (
-                "ALTER TABLE hosts ADD COLUMN role_source TEXT DEFAULT 'inferred' "
-                "CHECK(role_source IN ('inferred','user','artifact'))"
+                (
+                    "ALTER TABLE hosts ADD COLUMN role_source TEXT DEFAULT 'inferred' "
+                    "CHECK(role_source IN ('inferred','user','artifact'))"
+                ),
+                "hosts",
+                "role_source",
             ),
-            "hosts",
-            "role_source",
-        ),
-        (
             (
-                "ALTER TABLE hosts ADD COLUMN ip_source TEXT "
-                "CHECK(ip_source IN ('pve','dhcp','user','dns'))"
+                (
+                    "ALTER TABLE hosts ADD COLUMN ip_source TEXT "
+                    "CHECK(ip_source IN ('pve','dhcp','user','dns'))"
+                ),
+                "hosts",
+                "ip_source",
             ),
-            "hosts",
-            "ip_source",
-        ),
-        "UPDATE hosts SET pve_status = status WHERE pve_status IS NULL",
-        "UPDATE hosts SET source = 'hp_created' WHERE managed = 1",
-        "UPDATE hosts SET role_source = 'user' WHERE role != 'guest'",
-        "UPDATE hosts SET status = 'unknown'",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
-    ],
-    11: [
-        # Persist the agent registry so connected agents survive a backend
-        # restart/update: the Agents view + coverage show last-known agents
-        # (reconnecting) instead of flapping to empty until each agent redials.
-        """CREATE TABLE IF NOT EXISTS agents (
+            "UPDATE hosts SET pve_status = status WHERE pve_status IS NULL",
+            "UPDATE hosts SET source = 'hp_created' WHERE managed = 1",
+            "UPDATE hosts SET role_source = 'user' WHERE role != 'guest'",
+            "UPDATE hosts SET status = 'unknown'",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
+        ],
+    ),
+    Migration(
+        11,
+        [
+            # Persist the agent registry so connected agents survive a backend
+            # restart/update: the Agents view + coverage show last-known agents
+            # (reconnecting) instead of flapping to empty until each agent redials.
+            """CREATE TABLE IF NOT EXISTS agents (
             agent_id        TEXT PRIMARY KEY,
             hostname        TEXT NOT NULL,
             system_info     TEXT,
@@ -282,26 +359,32 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             last_heartbeat  TEXT,
             disconnected_at TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_agents_hostname ON agents(hostname)",
-        "CREATE INDEX IF NOT EXISTS idx_agents_connected ON agents(connected)",
-    ],
-    12: [
-        # Per-agent credentials (#362 slice 2): each agent is issued a unique
-        # durable token whose sha256 hash is stored here (never the raw token),
-        # bound to its agent_id. Replaces the shared fleet token as the
-        # steady-state per-connection credential. `revoked_at` fails a
-        # credential so a compromised/retired agent cannot reconnect until it is
-        # re-enrolled with a bootstrap/shared token.
-        ("ALTER TABLE agents ADD COLUMN credential_hash TEXT", "agents", "credential_hash"),
-        ("ALTER TABLE agents ADD COLUMN credential_set_at TEXT", "agents", "credential_set_at"),
-        ("ALTER TABLE agents ADD COLUMN revoked_at TEXT", "agents", "revoked_at"),
-    ],
-    13: [
-        # Durable, attributable agent-hub audit trail (#381). The agent hub is a
-        # fleet-root command channel; its audit must survive a backend restart and
-        # record WHO issued each command/lifecycle event — the in-memory deque in
-        # AuditLog evaporated on restart and carried no caller attribution.
-        """CREATE TABLE IF NOT EXISTS agent_audit (
+            "CREATE INDEX IF NOT EXISTS idx_agents_hostname ON agents(hostname)",
+            "CREATE INDEX IF NOT EXISTS idx_agents_connected ON agents(connected)",
+        ],
+    ),
+    Migration(
+        12,
+        [
+            # Per-agent credentials (#362 slice 2): each agent is issued a unique
+            # durable token whose sha256 hash is stored here (never the raw token),
+            # bound to its agent_id. Replaces the shared fleet token as the
+            # steady-state per-connection credential. `revoked_at` fails a
+            # credential so a compromised/retired agent cannot reconnect until it is
+            # re-enrolled with a bootstrap/shared token.
+            ("ALTER TABLE agents ADD COLUMN credential_hash TEXT", "agents", "credential_hash"),
+            ("ALTER TABLE agents ADD COLUMN credential_set_at TEXT", "agents", "credential_set_at"),
+            ("ALTER TABLE agents ADD COLUMN revoked_at TEXT", "agents", "revoked_at"),
+        ],
+    ),
+    Migration(
+        13,
+        [
+            # Durable, attributable agent-hub audit trail (#381). The agent hub is a
+            # fleet-root command channel; its audit must survive a backend restart and
+            # record WHO issued each command/lifecycle event — the in-memory deque in
+            # AuditLog evaporated on restart and carried no caller attribution.
+            """CREATE TABLE IF NOT EXISTS agent_audit (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             ts         TEXT,
             agent_id   TEXT,
@@ -312,97 +395,108 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             exit_code  INTEGER,
             caller     TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_agent_audit_ts ON agent_audit(ts)",
-    ],
-    14: [
-        # Task cancellation (#376): widen the tasks.status CHECK to admit
-        # 'cancelled'. SQLite can't ALTER a CHECK constraint, so rebuild the
-        # table (rename → recreate → copy → drop). Indexes ride the rename onto
-        # the old table and are dropped with it, so recreate them AFTER the drop
-        # (a CREATE INDEX IF NOT EXISTS while the old-named index still exists
-        # would be a silent no-op and leave the new table unindexed).
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT NOT NULL, "
-            "action TEXT NOT NULL CHECK(action IN ('apply', 'revoke', 'replay')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-    ],
-    15: [
-        # Provision-from-template (#442 stage 1). Two independent changes:
-        #
-        # 1. tasks: admit the 'provision' action and make artifact_id NULLABLE.
-        #    A provision task has no artifact — it creates infrastructure rather
-        #    than applying authored intent — and it must stay OUT of the
-        #    artifact-scoped dedup/active-task queries, which a NULL artifact_id
-        #    guarantees (`WHERE artifact_id = ?` never matches NULL). Same
-        #    rebuild dance as migration 14 (CHECK constraints and column
-        #    nullability are not ALTERable in SQLite): rename → recreate → copy
-        #    → drop → recreate the indexes AFTER the drop, because the old
-        #    indexes ride the rename and only vanish with the old table.
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT, "
-            "action TEXT NOT NULL "
-            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-        # 2. hosts.owner: who asked for this guest. Recorded at provision time
-        #    and never derived from Proxmox, so an inventory refresh cannot
-        #    overwrite it.
-        ("ALTER TABLE hosts ADD COLUMN owner TEXT", "hosts", "owner"),
-    ],
-    16: [
-        # Invite-based self-service provisioning (#442 stage 2).
-        #
-        # The token is NEVER stored: only its 16-char prefix (the lookup key) and
-        # the sha256 of the whole token, exactly as api_tokens does — a database
-        # copy must not let anyone redeem an invite.
-        #
-        # bound_cn is the client-certificate CN the invite is minted FOR. It is
-        # the whole point of the binding: the portal refuses a redemption whose
-        # proxy-asserted CN differs, so a leaked URL is useless without the cert.
-        #
-        # The caps columns (template_vmid .. ipconfig0) are chosen by the OPERATOR
-        # at mint time and are the only values that ever reach ProvisionService.
-        # Nothing the redeemer submits can widen them.
-        #
-        # redeemed_at is the single-use latch: redemption claims the row with
-        # `UPDATE ... WHERE redeemed_at IS NULL` and trusts rowcount, so two
-        # simultaneous posts can never both provision.
-        """CREATE TABLE IF NOT EXISTS invites (
+            "CREATE INDEX IF NOT EXISTS idx_agent_audit_ts ON agent_audit(ts)",
+        ],
+    ),
+    Migration(
+        14,
+        [
+            # Task cancellation (#376): widen the tasks.status CHECK to admit
+            # 'cancelled'. SQLite can't ALTER a CHECK constraint, so rebuild the
+            # table (rename → recreate → copy → drop). Indexes ride the rename onto
+            # the old table and are dropped with it, so recreate them AFTER the drop
+            # (a CREATE INDEX IF NOT EXISTS while the old-named index still exists
+            # would be a silent no-op and leave the new table unindexed).
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT NOT NULL, "
+                "action TEXT NOT NULL CHECK(action IN ('apply', 'revoke', 'replay')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ],
+    ),
+    Migration(
+        15,
+        [
+            # Provision-from-template (#442 stage 1). Two independent changes:
+            #
+            # 1. tasks: admit the 'provision' action and make artifact_id NULLABLE.
+            #    A provision task has no artifact — it creates infrastructure rather
+            #    than applying authored intent — and it must stay OUT of the
+            #    artifact-scoped dedup/active-task queries, which a NULL artifact_id
+            #    guarantees (`WHERE artifact_id = ?` never matches NULL). Same
+            #    rebuild dance as migration 14 (CHECK constraints and column
+            #    nullability are not ALTERable in SQLite): rename → recreate → copy
+            #    → drop → recreate the indexes AFTER the drop, because the old
+            #    indexes ride the rename and only vanish with the old table.
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT, "
+                "action TEXT NOT NULL "
+                "CHECK(action IN ('apply', 'revoke', 'replay', 'provision')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+            # 2. hosts.owner: who asked for this guest. Recorded at provision time
+            #    and never derived from Proxmox, so an inventory refresh cannot
+            #    overwrite it.
+            ("ALTER TABLE hosts ADD COLUMN owner TEXT", "hosts", "owner"),
+        ],
+    ),
+    Migration(
+        16,
+        [
+            # Invite-based self-service provisioning (#442 stage 2).
+            #
+            # The token is NEVER stored: only its 16-char prefix (the lookup key) and
+            # the sha256 of the whole token, exactly as api_tokens does — a database
+            # copy must not let anyone redeem an invite.
+            #
+            # bound_cn is the client-certificate CN the invite is minted FOR. It is
+            # the whole point of the binding: the portal refuses a redemption whose
+            # proxy-asserted CN differs, so a leaked URL is useless without the cert.
+            #
+            # The caps columns (template_vmid .. ipconfig0) are chosen by the OPERATOR
+            # at mint time and are the only values that ever reach ProvisionService.
+            # Nothing the redeemer submits can widen them.
+            #
+            # redeemed_at is the single-use latch: redemption claims the row with
+            # `UPDATE ... WHERE redeemed_at IS NULL` and trusts rowcount, so two
+            # simultaneous posts can never both provision.
+            """CREATE TABLE IF NOT EXISTS invites (
             id                TEXT PRIMARY KEY,
             token_prefix      TEXT NOT NULL,
             token_hash        TEXT NOT NULL,
@@ -424,24 +518,27 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             resulting_task_id TEXT,
             revoked_at        TEXT
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_invites_prefix ON invites(token_prefix)",
-        "CREATE INDEX IF NOT EXISTS idx_invites_expires ON invites(expires_at)",
-    ],
-    17: [
-        # First-run claim (#458 S1). ONE row, ever: `CHECK (id = 1)` makes a
-        # second instance-claim row impossible at the storage layer rather than
-        # by convention, so no query has to pick "the right" row.
-        #
-        # A dedicated table rather than a settings key/value row because the
-        # single-use latch is a conditional UPDATE whose rowcount is the whole
-        # guarantee (`WHERE id = 1 AND claimed_at IS NULL`, the invites.claim
-        # pattern). Packing four fields into settings.value as JSON would make
-        # that latch a read-modify-write, which two simultaneous POSTs both win.
-        #
-        # code_hash is the sha256 of the WHOLE code (auth/tokens.py scheme); the
-        # code itself is never stored here. code_prefix is for log correlation
-        # only - with a single row there is nothing to look up by.
-        """CREATE TABLE IF NOT EXISTS instance_claim (
+            "CREATE INDEX IF NOT EXISTS idx_invites_prefix ON invites(token_prefix)",
+            "CREATE INDEX IF NOT EXISTS idx_invites_expires ON invites(expires_at)",
+        ],
+    ),
+    Migration(
+        17,
+        [
+            # First-run claim (#458 S1). ONE row, ever: `CHECK (id = 1)` makes a
+            # second instance-claim row impossible at the storage layer rather than
+            # by convention, so no query has to pick "the right" row.
+            #
+            # A dedicated table rather than a settings key/value row because the
+            # single-use latch is a conditional UPDATE whose rowcount is the whole
+            # guarantee (`WHERE id = 1 AND claimed_at IS NULL`, the invites.claim
+            # pattern). Packing four fields into settings.value as JSON would make
+            # that latch a read-modify-write, which two simultaneous POSTs both win.
+            #
+            # code_hash is the sha256 of the WHOLE code (auth/tokens.py scheme); the
+            # code itself is never stored here. code_prefix is for log correlation
+            # only - with a single row there is nothing to look up by.
+            """CREATE TABLE IF NOT EXISTS instance_claim (
             id                  INTEGER PRIMARY KEY CHECK (id = 1),
             code_prefix         TEXT NOT NULL,
             code_hash           TEXT NOT NULL,
@@ -450,62 +547,69 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             claimed_label       TEXT,
             minted_token_prefix TEXT
         )""",
-    ],
-    18: [
-        # Zero-touch agent rollout (#458 S4): the tasks CHECK constraint must
-        # admit the 'install_agent' action. Artifactless like 'provision' - it
-        # enrols a host rather than applying authored intent - so it relies on
-        # the same NULL artifact_id to stay out of the artifact-scoped
-        # dedup/active-task queries.
-        #
-        # Same rebuild dance as migrations 14 and 15 (a CHECK constraint is not
-        # ALTERable in SQLite): rename -> recreate -> copy -> drop -> recreate
-        # the indexes AFTER the drop, because the old indexes ride the rename
-        # and only vanish with the old table.
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT, "
-            "action TEXT NOT NULL "
-            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-    ],
-    19: [
-        # Native metrics (#458 S5, ADR-004). Raw samples only - NO rollups: the
-        # ADR says measure a week of real data before deciding whether they earn
-        # their complexity.
-        #
-        # WITHOUT ROWID with PRIMARY KEY (hostname, metric, ts) is the whole
-        # storage design. One b-tree holds the data in exactly the order the
-        # only read pattern wants ("this host, this metric, this window"), so
-        # that query is a range scan over a key prefix and never touches another
-        # host's rows. A rowid table would need the same three columns duplicated
-        # into a secondary index PLUS a rowid b-tree - roughly double the bytes
-        # for the same answer. The PK doubles as the dedupe key: a re-sent batch
-        # (the agent re-sends anything the hub did not ack) is an INSERT OR
-        # REPLACE onto the same key, not a duplicate point.
-        #
-        # The series is keyed by HOSTNAME, not agent_id: a reinstalled agent gets
-        # a new agent_id but is the same machine, and an operator asking "what did
-        # this host do last night" means the machine. agent_id is recorded as a
-        # plain column so the reporter is still known.
-        """CREATE TABLE IF NOT EXISTS metrics (
+        ],
+    ),
+    Migration(
+        18,
+        [
+            # Zero-touch agent rollout (#458 S4): the tasks CHECK constraint must
+            # admit the 'install_agent' action. Artifactless like 'provision' - it
+            # enrols a host rather than applying authored intent - so it relies on
+            # the same NULL artifact_id to stay out of the artifact-scoped
+            # dedup/active-task queries.
+            #
+            # Same rebuild dance as migrations 14 and 15 (a CHECK constraint is not
+            # ALTERable in SQLite): rename -> recreate -> copy -> drop -> recreate
+            # the indexes AFTER the drop, because the old indexes ride the rename
+            # and only vanish with the old table.
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT, "
+                "action TEXT NOT NULL "
+                "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ],
+    ),
+    Migration(
+        19,
+        [
+            # Native metrics (#458 S5, ADR-004). Raw samples only - NO rollups: the
+            # ADR says measure a week of real data before deciding whether they earn
+            # their complexity.
+            #
+            # WITHOUT ROWID with PRIMARY KEY (hostname, metric, ts) is the whole
+            # storage design. One b-tree holds the data in exactly the order the
+            # only read pattern wants ("this host, this metric, this window"), so
+            # that query is a range scan over a key prefix and never touches another
+            # host's rows. A rowid table would need the same three columns duplicated
+            # into a secondary index PLUS a rowid b-tree - roughly double the bytes
+            # for the same answer. The PK doubles as the dedupe key: a re-sent batch
+            # (the agent re-sends anything the hub did not ack) is an INSERT OR
+            # REPLACE onto the same key, not a duplicate point.
+            #
+            # The series is keyed by HOSTNAME, not agent_id: a reinstalled agent gets
+            # a new agent_id but is the same machine, and an operator asking "what did
+            # this host do last night" means the machine. agent_id is recorded as a
+            # plain column so the reporter is still known.
+            """CREATE TABLE IF NOT EXISTS metrics (
             hostname  TEXT NOT NULL,
             metric    TEXT NOT NULL,
             ts        INTEGER NOT NULL,
@@ -513,14 +617,14 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             agent_id  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (hostname, metric, ts)
         ) WITHOUT ROWID""",
-        # Retention prunes by AGE across every series, which the PK cannot serve
-        # (ts is its last column). Without this the hourly pruner is a full scan
-        # of the whole table.
-        "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
-        # Alert rules. `for_seconds` is the point of the feature: a rule fires
-        # only when its condition held for that whole span, so a single spike
-        # cannot page anyone.
-        """CREATE TABLE IF NOT EXISTS alert_rules (
+            # Retention prunes by AGE across every series, which the PK cannot serve
+            # (ts is its last column). Without this the hourly pruner is a full scan
+            # of the whole table.
+            "CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts)",
+            # Alert rules. `for_seconds` is the point of the feature: a rule fires
+            # only when its condition held for that whole span, so a single spike
+            # cannot page anyone.
+            """CREATE TABLE IF NOT EXISTS alert_rules (
             id           TEXT PRIMARY KEY,
             name         TEXT NOT NULL,
             host_filter  TEXT NOT NULL DEFAULT '*',
@@ -532,12 +636,12 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at   TEXT NOT NULL,
             updated_at   TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled)",
-        # One row per (rule, host) the rule has ever evaluated. firing_since is
-        # the latch: NULL means not firing, a timestamp means "firing since".
-        # It is what makes a fire notify ONCE rather than every evaluation, and
-        # what lets a recovery be detected at all.
-        """CREATE TABLE IF NOT EXISTS alert_state (
+            "CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled ON alert_rules(enabled)",
+            # One row per (rule, host) the rule has ever evaluated. firing_since is
+            # the latch: NULL means not firing, a timestamp means "firing since".
+            # It is what makes a fire notify ONCE rather than every evaluation, and
+            # what lets a recovery be detected at all.
+            """CREATE TABLE IF NOT EXISTS alert_state (
             rule_id      TEXT NOT NULL,
             hostname     TEXT NOT NULL,
             firing_since TEXT,
@@ -545,54 +649,60 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             last_eval    TEXT NOT NULL,
             PRIMARY KEY (rule_id, hostname)
         )""",
-    ],
-    20: [
-        # Why an agent is not here (#430). Every reason the hub refuses or drops
-        # an agent - a revoked credential, a hostname-bound token presented from
-        # elsewhere, a replayed register, an identity already claimed, a banned
-        # peer, a plain socket drop - was `logger.warning` only. None of it
-        # reached the database, the audit trail or the API, so a revoked agent,
-        # a banned agent, a duplicate-identity clash and a powered-off box were
-        # pixel-identical grey dots in the UI.
-        #
-        # Two columns rather than a table: this is the LAST reason, the one an
-        # operator looking at a dark host needs, and it is overwritten on each
-        # new one. The history of rejections belongs in - and now goes to - the
-        # audit log, which already has a durable append-only shape.
-        ("ALTER TABLE agents ADD COLUMN last_error TEXT", "agents", "last_error"),
-        ("ALTER TABLE agents ADD COLUMN last_error_at TEXT", "agents", "last_error_at"),
-    ],
-    21: [
-        # A guest that no longer exists in Proxmox (#445 A5). The refresh only
-        # ever wrote what it FOUND, so a destroyed VM kept its last-known row and
-        # its last-known status forever - it simply stopped being updated, which
-        # from the inventory looks exactly like a machine that is merely powered
-        # off. The reconciler already computed the absent set and spent it on an
-        # audit counter; nothing reached the host or the UI.
-        #
-        # A timestamp rather than a flag: "gone since Tuesday" is what decides
-        # whether this is a deletion or a hypervisor that was briefly
-        # unreachable, and clearing it on the next sighting is one write either
-        # way.
-        ("ALTER TABLE hosts ADD COLUMN absent_since TEXT", "hosts", "absent_since"),
-        # Widen hosts.source to admit 'manual' (#445 A5). A CHECK constraint is
-        # not ALTERable in SQLite, so it is the same rebuild dance as migrations
-        # 14/15/18: rename -> recreate -> copy -> drop -> recreate the indexes
-        # AFTER the drop, because the old indexes ride the rename and only vanish
-        # with the old table.
-        #
-        # 'manual' is not cosmetic: it is what tells the absence sweep that
-        # Proxmox never looked for this machine, so a sync must never declare it
-        # gone.
-        # NOTE the shape of this rebuild: build-copy-drop-RENAME, not the
-        # rename-first dance migrations 14/15/18 use for `tasks`. `services.host_id`
-        # REFERENCES hosts(id), and modern SQLite REWRITES that reference to
-        # follow a rename - so renaming `hosts` out of the way first leaves
-        # `services` pointing at `hosts_old`, and dropping it breaks every later
-        # write to services with "no such table: main.hosts_old". Renaming the
-        # NEW table into place instead leaves the reference text untouched,
-        # pointing at the name that exists again by the end.
-        """CREATE TABLE hosts_new (
+        ],
+    ),
+    Migration(
+        20,
+        [
+            # Why an agent is not here (#430). Every reason the hub refuses or drops
+            # an agent - a revoked credential, a hostname-bound token presented from
+            # elsewhere, a replayed register, an identity already claimed, a banned
+            # peer, a plain socket drop - was `logger.warning` only. None of it
+            # reached the database, the audit trail or the API, so a revoked agent,
+            # a banned agent, a duplicate-identity clash and a powered-off box were
+            # pixel-identical grey dots in the UI.
+            #
+            # Two columns rather than a table: this is the LAST reason, the one an
+            # operator looking at a dark host needs, and it is overwritten on each
+            # new one. The history of rejections belongs in - and now goes to - the
+            # audit log, which already has a durable append-only shape.
+            ("ALTER TABLE agents ADD COLUMN last_error TEXT", "agents", "last_error"),
+            ("ALTER TABLE agents ADD COLUMN last_error_at TEXT", "agents", "last_error_at"),
+        ],
+    ),
+    Migration(
+        21,
+        [
+            # A guest that no longer exists in Proxmox (#445 A5). The refresh only
+            # ever wrote what it FOUND, so a destroyed VM kept its last-known row and
+            # its last-known status forever - it simply stopped being updated, which
+            # from the inventory looks exactly like a machine that is merely powered
+            # off. The reconciler already computed the absent set and spent it on an
+            # audit counter; nothing reached the host or the UI.
+            #
+            # A timestamp rather than a flag: "gone since Tuesday" is what decides
+            # whether this is a deletion or a hypervisor that was briefly
+            # unreachable, and clearing it on the next sighting is one write either
+            # way.
+            ("ALTER TABLE hosts ADD COLUMN absent_since TEXT", "hosts", "absent_since"),
+            # Widen hosts.source to admit 'manual' (#445 A5). A CHECK constraint is
+            # not ALTERable in SQLite, so it is the same rebuild dance as migrations
+            # 14/15/18: rename -> recreate -> copy -> drop -> recreate the indexes
+            # AFTER the drop, because the old indexes ride the rename and only vanish
+            # with the old table.
+            #
+            # 'manual' is not cosmetic: it is what tells the absence sweep that
+            # Proxmox never looked for this machine, so a sync must never declare it
+            # gone.
+            # NOTE the shape of this rebuild: build-copy-drop-RENAME, not the
+            # rename-first dance migrations 14/15/18 use for `tasks`. `services.host_id`
+            # REFERENCES hosts(id), and modern SQLite REWRITES that reference to
+            # follow a rename - so renaming `hosts` out of the way first leaves
+            # `services` pointing at `hosts_old`, and dropping it breaks every later
+            # write to services with "no such table: main.hosts_old". Renaming the
+            # NEW table into place instead leaves the reference text untouched,
+            # pointing at the name that exists again by the end.
+            """CREATE TABLE hosts_new (
             id              TEXT PRIMARY KEY,
             proxmox_id      INTEGER,
             hostname        TEXT NOT NULL,
@@ -626,7 +736,7 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             owner           TEXT,
             absent_since    TEXT
         )""",
-        """INSERT INTO hosts_new (
+            """INSERT INTO hosts_new (
             id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
             tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
             disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
@@ -639,72 +749,84 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             source, description, artifact_id, import_state, role_source, ip_source,
             owner, absent_since
         FROM hosts""",
-        "DROP TABLE hosts",
-        "ALTER TABLE hosts_new RENAME TO hosts",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
-    ],
-    22: [
-        # Drift is tri-state (#425). `drifted` was a boolean, so every path that
-        # could not check - no spec, no host, no executor, a timeout, an error,
-        # and the whole (dead) ansible verifier - stored `drifted = 0`, which the
-        # UI rendered as a green "in spec" for something nobody had looked at.
-        #
-        # The column carries 'in_spec' | 'drifted' | 'unknown'. Existing rows are
-        # backfilled to 'unknown' rather than 'in_spec': what a pre-migration
-        # `drifted = 0` row actually means is unknowable, and guessing "fine"
-        # would carry the exact defect across the upgrade. A real check overwrites
-        # it within one reconciler cycle.
-        ("ALTER TABLE drift_checks ADD COLUMN state TEXT", "drift_checks", "state"),
-        "UPDATE drift_checks SET state = 'drifted' WHERE drifted = 1 AND state IS NULL",
-        "UPDATE drift_checks SET state = 'unknown' WHERE state IS NULL",
-    ],
-    23: [
-        # What a host looked like before a host-provision artifact touched it
-        # (#426). Without this there is nothing to invert TO: after the apply the
-        # prior file bytes are gone, and "was this package already installed"
-        # cannot be reconstructed from anywhere.
-        #
-        # One row per artifact, replaced on re-apply: the useful capture is the
-        # state before the LAST apply, which is what a revoke now undoes. Keeping
-        # a history would invite restoring a host to a state two applies ago.
-        """CREATE TABLE IF NOT EXISTS host_state_captures (
+            "DROP TABLE hosts",
+            "ALTER TABLE hosts_new RENAME TO hosts",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
+        ],
+    ),
+    Migration(
+        22,
+        [
+            # Drift is tri-state (#425). `drifted` was a boolean, so every path that
+            # could not check - no spec, no host, no executor, a timeout, an error,
+            # and the whole (dead) ansible verifier - stored `drifted = 0`, which the
+            # UI rendered as a green "in spec" for something nobody had looked at.
+            #
+            # The column carries 'in_spec' | 'drifted' | 'unknown'. Existing rows are
+            # backfilled to 'unknown' rather than 'in_spec': what a pre-migration
+            # `drifted = 0` row actually means is unknowable, and guessing "fine"
+            # would carry the exact defect across the upgrade. A real check overwrites
+            # it within one reconciler cycle.
+            ("ALTER TABLE drift_checks ADD COLUMN state TEXT", "drift_checks", "state"),
+            "UPDATE drift_checks SET state = 'drifted' WHERE drifted = 1 AND state IS NULL",
+            "UPDATE drift_checks SET state = 'unknown' WHERE state IS NULL",
+        ],
+    ),
+    Migration(
+        23,
+        [
+            # What a host looked like before a host-provision artifact touched it
+            # (#426). Without this there is nothing to invert TO: after the apply the
+            # prior file bytes are gone, and "was this package already installed"
+            # cannot be reconstructed from anywhere.
+            #
+            # One row per artifact, replaced on re-apply: the useful capture is the
+            # state before the LAST apply, which is what a revoke now undoes. Keeping
+            # a history would invite restoring a host to a state two applies ago.
+            """CREATE TABLE IF NOT EXISTS host_state_captures (
             artifact_id  TEXT PRIMARY KEY,
             captured_at  TEXT NOT NULL,
             items_json   TEXT NOT NULL
         )""",
-    ],
-    24: [
-        # Fields an OPERATOR set, which automation must not overwrite (#424).
-        #
-        # `role_source` / `ip_source` were the only provenance guards and they
-        # covered two fields out of the several an operator can write. Worse, the
-        # node refresh FORGED `role_source = "user"` from automation, which
-        # defeated the #416 fix and hid the UI's "inferred" badge - a lie about
-        # who decided a value.
-        #
-        # One JSON list per host rather than a `*_source` column per field: the
-        # question is always "did a person set this", the answer is the same
-        # shape for every field, and a new operator-writable field then needs no
-        # migration - only the PATCH that writes it.
-        ("ALTER TABLE hosts ADD COLUMN pinned_fields TEXT", "hosts", "pinned_fields"),
-    ],
-    25: [
-        # One noun: Host (#514 S1). A machine carrying a connected agent was not
-        # a host in the product's own model - Inventory said "No hosts" and
-        # Coverage said 0% while an enrolled agent sat one tab over. Enrolment
-        # now creates-or-links a host row, which needs (a) 'agent' as a legal
-        # `source`, and (b) an explicit `agent_id` link so the join is a fact,
-        # not a hostname coincidence.
-        #
-        # Table rebuild because the source CHECK cannot be altered in place.
-        # Same rename-into-place dance as migration 21, for the same
-        # services.host_id foreign-key reason documented there.
-        """CREATE TABLE hosts_new (
+        ],
+    ),
+    Migration(
+        24,
+        [
+            # Fields an OPERATOR set, which automation must not overwrite (#424).
+            #
+            # `role_source` / `ip_source` were the only provenance guards and they
+            # covered two fields out of the several an operator can write. Worse, the
+            # node refresh FORGED `role_source = "user"` from automation, which
+            # defeated the #416 fix and hid the UI's "inferred" badge - a lie about
+            # who decided a value.
+            #
+            # One JSON list per host rather than a `*_source` column per field: the
+            # question is always "did a person set this", the answer is the same
+            # shape for every field, and a new operator-writable field then needs no
+            # migration - only the PATCH that writes it.
+            ("ALTER TABLE hosts ADD COLUMN pinned_fields TEXT", "hosts", "pinned_fields"),
+        ],
+    ),
+    Migration(
+        25,
+        [
+            # One noun: Host (#514 S1). A machine carrying a connected agent was not
+            # a host in the product's own model - Inventory said "No hosts" and
+            # Coverage said 0% while an enrolled agent sat one tab over. Enrolment
+            # now creates-or-links a host row, which needs (a) 'agent' as a legal
+            # `source`, and (b) an explicit `agent_id` link so the join is a fact,
+            # not a hostname coincidence.
+            #
+            # Table rebuild because the source CHECK cannot be altered in place.
+            # Same rename-into-place dance as migration 21, for the same
+            # services.host_id foreign-key reason documented there.
+            """CREATE TABLE hosts_new (
             id              TEXT PRIMARY KEY,
             proxmox_id      INTEGER,
             hostname        TEXT NOT NULL,
@@ -741,7 +863,7 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             pinned_fields   TEXT,
             agent_id        TEXT
         )""",
-        """INSERT INTO hosts_new (
+            """INSERT INTO hosts_new (
             id, proxmox_id, hostname, node, host_type, role, ip_address, fqdn, status,
             tags, managed_by, managed, storage_pool, os_info, cpu_cores, memory_mb,
             disk_gb, network_bridge, vlan_id, created_at, updated_at, pve_status,
@@ -754,23 +876,23 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             source, description, artifact_id, import_state, role_source, ip_source,
             owner, absent_since, pinned_fields
         FROM hosts""",
-        "DROP TABLE hosts",
-        "ALTER TABLE hosts_new RENAME TO hosts",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_hosts_agent ON hosts(agent_id)",
-        # Backfill: machines whose agent enrolled BEFORE this migration. Link by
-        # exact hostname where that is unambiguous; where a hostname matches no
-        # host, create the row the enrolment would have created.
-        """UPDATE hosts SET agent_id = (
+            "DROP TABLE hosts",
+            "ALTER TABLE hosts_new RENAME TO hosts",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_proxmox ON hosts(proxmox_id)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_managed ON hosts(managed)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_role ON hosts(role)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_status ON hosts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_source ON hosts(source)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_artifact ON hosts(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_hosts_agent ON hosts(agent_id)",
+            # Backfill: machines whose agent enrolled BEFORE this migration. Link by
+            # exact hostname where that is unambiguous; where a hostname matches no
+            # host, create the row the enrolment would have created.
+            """UPDATE hosts SET agent_id = (
             SELECT a.agent_id FROM agents a WHERE a.hostname = hosts.hostname
         ) WHERE agent_id IS NULL
           AND (SELECT COUNT(*) FROM agents a WHERE a.hostname = hosts.hostname) = 1""",
-        """INSERT INTO hosts (id, hostname, host_type, role, status, managed_by,
+            """INSERT INTO hosts (id, hostname, host_type, role, status, managed_by,
                               managed, source, role_source, agent_id,
                               created_at, updated_at)
             SELECT lower(hex(randomblob(16))), a.hostname, 'physical', 'guest',
@@ -779,15 +901,18 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
                    COALESCE(a.first_seen, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             FROM agents a
             WHERE NOT EXISTS (SELECT 1 FROM hosts h WHERE h.hostname = a.hostname)""",
-    ],
-    26: [
-        # Per-guest resource quotas (#442 G1.5). An invite caps ONE machine;
-        # the quota caps the GUEST - the total a friend's machines may consume
-        # across cores/memory/disk and how many they may hold at once.
-        # Enforced at provision time; visible to the guest in their portal.
-        # No row for a CN = no quota (invites alone gate), so quotas are
-        # opt-in per friend.
-        """CREATE TABLE IF NOT EXISTS guest_quotas (
+        ],
+    ),
+    Migration(
+        26,
+        [
+            # Per-guest resource quotas (#442 G1.5). An invite caps ONE machine;
+            # the quota caps the GUEST - the total a friend's machines may consume
+            # across cores/memory/disk and how many they may hold at once.
+            # Enforced at provision time; visible to the guest in their portal.
+            # No row for a CN = no quota (invites alone gate), so quotas are
+            # opt-in per friend.
+            """CREATE TABLE IF NOT EXISTS guest_quotas (
             cn             TEXT PRIMARY KEY,
             max_vms        INTEGER,
             max_cores      INTEGER,
@@ -796,20 +921,23 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at     TEXT NOT NULL,
             updated_at     TEXT NOT NULL
         )""",
-    ],
-    27: [
-        # Per-artifact approval codes (human-relay MCP approval, #385 follow-up).
-        # The code is the EXTRA gate that lets a human approve THROUGH the
-        # assistant without opening the portal: they read it from an operator
-        # surface and relay it, and approve_artifact verifies it server-side.
-        #
-        # It lives in its OWN table, NOT in the artifacts row and NEVER in the
-        # artifact FILE, because get_artifact / query_artifacts over MCP read the
-        # file (and the API mirror), and the code must be unreachable from every
-        # MCP surface - otherwise the assistant could read the very secret that is
-        # meant to prove a human acted. failed_attempts + locked implement the
-        # brute-force lock; one row per artifact, cleared when it leaves PROPOSED.
-        """CREATE TABLE IF NOT EXISTS artifact_approval_codes (
+        ],
+    ),
+    Migration(
+        27,
+        [
+            # Per-artifact approval codes (human-relay MCP approval, #385 follow-up).
+            # The code is the EXTRA gate that lets a human approve THROUGH the
+            # assistant without opening the portal: they read it from an operator
+            # surface and relay it, and approve_artifact verifies it server-side.
+            #
+            # It lives in its OWN table, NOT in the artifacts row and NEVER in the
+            # artifact FILE, because get_artifact / query_artifacts over MCP read the
+            # file (and the API mirror), and the code must be unreachable from every
+            # MCP surface - otherwise the assistant could read the very secret that is
+            # meant to prove a human acted. failed_attempts + locked implement the
+            # brute-force lock; one row per artifact, cleared when it leaves PROPOSED.
+            """CREATE TABLE IF NOT EXISTS artifact_approval_codes (
             artifact_id     TEXT PRIMARY KEY,
             code            TEXT NOT NULL,
             failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -817,249 +945,276 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             created_at      TEXT NOT NULL,
             updated_at      TEXT NOT NULL
         )""",
-    ],
-    28: [
-        # Guest-template creation (#594): the tasks CHECK constraint must admit
-        # the 'create_guest_template' action. Artifactless like 'provision' and
-        # 'install_agent' - it BUILDS the template provisioning clones rather
-        # than applying authored intent - so it relies on the same NULL
-        # artifact_id to stay out of the artifact-scoped dedup/active-task
-        # queries.
-        #
-        # Same rebuild dance as migrations 14, 15 and 18 (a CHECK constraint is
-        # not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
-        # recreate the indexes AFTER the drop, because the old indexes ride the
-        # rename and only vanish with the old table.
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT, "
-            "action TEXT NOT NULL "
-            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
-            "'create_guest_template')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-    ],
-    29: [
-        # Target storage as an invite cap (#618). NULLable, and NULL means
-        # "inherit the template's storage" - the behaviour of every invite
-        # minted before this column existed, so nothing about them changes.
-        #
-        # A cap column rather than a value read at redemption time, for the
-        # reason the whole caps table exists: what an invite promises is frozen
-        # at mint. An operator who repoints provision_default_storage next week
-        # must not silently re-target a machine somebody was already invited to
-        # build.
-        (
-            "ALTER TABLE invites ADD COLUMN storage TEXT",
-            "invites",
-            "storage",
-        ),
-    ],
-    30: [
-        # The tailnet re-join a redeemer can start for themselves (#628).
-        #
-        # First the tasks CHECK constraint, which must admit the 'tailnet_join'
-        # action. Artifactless like 'provision' and 'create_guest_template' - it
-        # runs one command inside one existing guest and authors nothing - so it
-        # relies on the same NULL artifact_id to stay out of the artifact-scoped
-        # dedup/active-task queries.
-        #
-        # Same rebuild dance as migrations 14, 15, 18 and 28 (a CHECK constraint
-        # is not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
-        # recreate the indexes AFTER the drop, because the old indexes ride the
-        # rename and only vanish with the old table.
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT, "
-            "action TEXT NOT NULL "
-            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
-            "'create_guest_template', 'tailnet_join')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-        #
-        # Its own column rather than reusing resulting_task_id: that one holds
-        # the PROVISION, whose result is what the status page renders (the name,
-        # the VM id, the address, the login). Overwriting it with a re-join task
-        # would blank the machine's own details from the page that exists to
-        # show them.
-        #
-        # NULL means "no re-join has ever been started from this invite", which
-        # is every invite that existed before the column did.
-        (
-            "ALTER TABLE invites ADD COLUMN rejoin_task_id TEXT",
-            "invites",
-            "rejoin_task_id",
-        ),
-    ],
-    31: [
-        # What a rule is ACTUALLY watching (#648 tranche 5).
-        #
-        # A rule whose host_filter matches no host, or whose metric no agent in
-        # the fleet reports, was accepted, listed and shown enabled while being
-        # skipped on every cycle. Nothing anywhere distinguished it from a rule
-        # standing guard over the whole fleet - so "no alerts" read as "all
-        # well" when it meant "nothing is being looked at".
-        #
-        # Two columns written by the evaluator on every pass: when it last
-        # looked, and how many hosts the rule matched when it did. NULL/0 for
-        # every rule that existed before this migration, which is honest - we
-        # do not know what they matched until the evaluator next runs, and it
-        # runs a minute after boot.
-        (
-            "ALTER TABLE alert_rules ADD COLUMN last_eval_at TEXT",
-            "alert_rules",
-            "last_eval_at",
-        ),
-        (
-            "ALTER TABLE alert_rules ADD COLUMN hosts_matched INTEGER",
-            "alert_rules",
-            "hosts_matched",
-        ),
-    ],
-    32: [
-        # Drop embeddings that belong to documents which no longer exist
-        # (#648 tranche 6).
-        #
-        # `delete_doc_metadata` removed the row and left the `vec_docs` entry.
-        # `doc_metadata.id` is a plain `INTEGER PRIMARY KEY`, so SQLite reuses
-        # rowids: the next document to take that id was silently indexed under
-        # the DELETED document's vector and returned, at full score, as the
-        # answer to questions about a note the operator had removed. The insert
-        # that should have replaced it failed with `UNIQUE constraint failed on
-        # vec_docs primary key` and was swallowed at WARNING.
-        #
-        # The code no longer strands them. This clears the ones already there,
-        # because they are actively wrong answers, not dead weight. Every
-        # document that loses its embedding this way is picked up by the next
-        # reindex sweep, which embeds anything missing one.
-        "DELETE FROM vec_docs WHERE id NOT IN (SELECT id FROM doc_metadata)",
-    ],
-    33: [
-        # A task whose outcome is UNKNOWN (#774).
-        #
-        # An apply that spawned a PVE task and stopped following it while PVE
-        # still reported it running (a 13-minute vzdump against a 600 s wait)
-        # had two words to choose from, and both were false: it was recorded
-        # 'failed', and the backup then finished OK. 'unknown' is the honest
-        # third: this run is over, the work it started is not, and the verdict
-        # is settled from PVE later (the artifact carries the UPID).
-        #
-        # Same rebuild dance as migrations 14, 15, 18, 28 and 30 (a CHECK
-        # constraint is not ALTERable in SQLite): rename -> recreate -> copy ->
-        # drop -> recreate the indexes AFTER the drop.
-        "ALTER TABLE tasks RENAME TO tasks_old",
-        (
-            "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, "
-            "artifact_id TEXT, "
-            "action TEXT NOT NULL "
-            "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
-            "'create_guest_template', 'tailnet_join')), "
-            "status TEXT NOT NULL DEFAULT 'pending' "
-            "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled', "
-            "'unknown')), "
-            "result_json TEXT, "
-            "created_at TEXT NOT NULL, "
-            "finished_at TEXT, "
-            "error TEXT)"
-        ),
-        (
-            "INSERT INTO tasks "
-            "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
-            "SELECT id, artifact_id, action, status, result_json, created_at, finished_at, error "
-            "FROM tasks_old"
-        ),
-        "DROP TABLE tasks_old",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
-        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-    ],
-    34: [
-        # One in-flight run per artifact, enforced by the DATABASE (#710).
-        #
-        # The runner checked for an active task and then inserted one with an
-        # await in between, so two replays (or two revokes) of one artifact both
-        # started; auto-apply re-dispatched an apply that was still running. A
-        # check in Python only serialises one process - the CLI, a second
-        # worker or a stdio MCP server each have their own. A partial UNIQUE
-        # index makes a second pending/running row for the same artifact an
-        # IntegrityError no matter who writes it.
-        #
-        # First retire any duplicates already there, keeping the NEWEST active
-        # row per artifact (the one `get_active_task` already reports): the
-        # index cannot be built over them. They are marked failed with a reason
-        # that says why, never deleted - they are history.
-        (
-            "UPDATE tasks SET status = 'failed', "
-            "error = 'superseded_duplicate_active_run', "
-            "finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
-            "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running') "
-            "AND EXISTS (SELECT 1 FROM tasks newer "
-            "WHERE newer.artifact_id = tasks.artifact_id "
-            "AND newer.status IN ('pending', 'running') "
-            "AND (newer.created_at > tasks.created_at "
-            "OR (newer.created_at = tasks.created_at AND newer.id > tasks.id)))"
-        ),
-        # Any future rebuild of `tasks` (the rename dance of 14/15/18/28/30/33)
-        # must recreate this index after the drop, like the other two.
-        (
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_per_artifact "
-            "ON tasks(artifact_id) "
-            "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running')"
-        ),
-    ],
-    35: [
-        # "Nobody was told" (#660, lane A2 of the 2026-11 review).
-        #
-        # 1. What KIND of condition a rule is. Every rule so far is a threshold
-        #    on a metric; `nodata` fires when an enrolled host stops reporting
-        #    at all, which no threshold can express (a silent host drops out of
-        #    every threshold rule's candidate set by design). Existing rows are
-        #    thresholds, which is exactly what the default says.
-        (
-            "ALTER TABLE alert_rules ADD COLUMN kind TEXT NOT NULL DEFAULT 'threshold'",
-            "alert_rules",
-            "kind",
-        ),
-        # 2. Alert HISTORY. `alert_state` is a latch - `firing_since` is nulled
-        #    on recovery - so an alert that fired and resolved overnight left no
-        #    record anywhere. One append-only row per transition (not per
-        #    evaluation). The rule's name and metric are copied in, so the
-        #    history of a rule still reads after the rule is deleted. Pruned on
-        #    the operational-history horizon (`retention_days`), not the
-        #    metrics one: this is history, not a time series.
-        """CREATE TABLE IF NOT EXISTS alert_events (
+        ],
+    ),
+    Migration(
+        28,
+        [
+            # Guest-template creation (#594): the tasks CHECK constraint must admit
+            # the 'create_guest_template' action. Artifactless like 'provision' and
+            # 'install_agent' - it BUILDS the template provisioning clones rather
+            # than applying authored intent - so it relies on the same NULL
+            # artifact_id to stay out of the artifact-scoped dedup/active-task
+            # queries.
+            #
+            # Same rebuild dance as migrations 14, 15 and 18 (a CHECK constraint is
+            # not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
+            # recreate the indexes AFTER the drop, because the old indexes ride the
+            # rename and only vanish with the old table.
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT, "
+                "action TEXT NOT NULL "
+                "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+                "'create_guest_template')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ],
+    ),
+    Migration(
+        29,
+        [
+            # Target storage as an invite cap (#618). NULLable, and NULL means
+            # "inherit the template's storage" - the behaviour of every invite
+            # minted before this column existed, so nothing about them changes.
+            #
+            # A cap column rather than a value read at redemption time, for the
+            # reason the whole caps table exists: what an invite promises is frozen
+            # at mint. An operator who repoints provision_default_storage next week
+            # must not silently re-target a machine somebody was already invited to
+            # build.
+            (
+                "ALTER TABLE invites ADD COLUMN storage TEXT",
+                "invites",
+                "storage",
+            ),
+        ],
+    ),
+    Migration(
+        30,
+        [
+            # The tailnet re-join a redeemer can start for themselves (#628).
+            #
+            # First the tasks CHECK constraint, which must admit the 'tailnet_join'
+            # action. Artifactless like 'provision' and 'create_guest_template' - it
+            # runs one command inside one existing guest and authors nothing - so it
+            # relies on the same NULL artifact_id to stay out of the artifact-scoped
+            # dedup/active-task queries.
+            #
+            # Same rebuild dance as migrations 14, 15, 18 and 28 (a CHECK constraint
+            # is not ALTERable in SQLite): rename -> recreate -> copy -> drop ->
+            # recreate the indexes AFTER the drop, because the old indexes ride the
+            # rename and only vanish with the old table.
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT, "
+                "action TEXT NOT NULL "
+                "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+                "'create_guest_template', 'tailnet_join')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+            #
+            # Its own column rather than reusing resulting_task_id: that one holds
+            # the PROVISION, whose result is what the status page renders (the name,
+            # the VM id, the address, the login). Overwriting it with a re-join task
+            # would blank the machine's own details from the page that exists to
+            # show them.
+            #
+            # NULL means "no re-join has ever been started from this invite", which
+            # is every invite that existed before the column did.
+            (
+                "ALTER TABLE invites ADD COLUMN rejoin_task_id TEXT",
+                "invites",
+                "rejoin_task_id",
+            ),
+        ],
+    ),
+    Migration(
+        31,
+        [
+            # What a rule is ACTUALLY watching (#648 tranche 5).
+            #
+            # A rule whose host_filter matches no host, or whose metric no agent in
+            # the fleet reports, was accepted, listed and shown enabled while being
+            # skipped on every cycle. Nothing anywhere distinguished it from a rule
+            # standing guard over the whole fleet - so "no alerts" read as "all
+            # well" when it meant "nothing is being looked at".
+            #
+            # Two columns written by the evaluator on every pass: when it last
+            # looked, and how many hosts the rule matched when it did. NULL/0 for
+            # every rule that existed before this migration, which is honest - we
+            # do not know what they matched until the evaluator next runs, and it
+            # runs a minute after boot.
+            (
+                "ALTER TABLE alert_rules ADD COLUMN last_eval_at TEXT",
+                "alert_rules",
+                "last_eval_at",
+            ),
+            (
+                "ALTER TABLE alert_rules ADD COLUMN hosts_matched INTEGER",
+                "alert_rules",
+                "hosts_matched",
+            ),
+        ],
+    ),
+    Migration(
+        32,
+        [
+            # Drop embeddings that belong to documents which no longer exist
+            # (#648 tranche 6).
+            #
+            # `delete_doc_metadata` removed the row and left the `vec_docs` entry.
+            # `doc_metadata.id` is a plain `INTEGER PRIMARY KEY`, so SQLite reuses
+            # rowids: the next document to take that id was silently indexed under
+            # the DELETED document's vector and returned, at full score, as the
+            # answer to questions about a note the operator had removed. The insert
+            # that should have replaced it failed with `UNIQUE constraint failed on
+            # vec_docs primary key` and was swallowed at WARNING.
+            #
+            # The code no longer strands them. This clears the ones already there,
+            # because they are actively wrong answers, not dead weight. Every
+            # document that loses its embedding this way is picked up by the next
+            # reindex sweep, which embeds anything missing one.
+            "DELETE FROM vec_docs WHERE id NOT IN (SELECT id FROM doc_metadata)",
+        ],
+    ),
+    Migration(
+        33,
+        [
+            # A task whose outcome is UNKNOWN (#774).
+            #
+            # An apply that spawned a PVE task and stopped following it while PVE
+            # still reported it running (a 13-minute vzdump against a 600 s wait)
+            # had two words to choose from, and both were false: it was recorded
+            # 'failed', and the backup then finished OK. 'unknown' is the honest
+            # third: this run is over, the work it started is not, and the verdict
+            # is settled from PVE later (the artifact carries the UPID).
+            #
+            # Same rebuild dance as migrations 14, 15, 18, 28 and 30 (a CHECK
+            # constraint is not ALTERable in SQLite): rename -> recreate -> copy ->
+            # drop -> recreate the indexes AFTER the drop.
+            "ALTER TABLE tasks RENAME TO tasks_old",
+            (
+                "CREATE TABLE tasks ("
+                "id TEXT PRIMARY KEY, "
+                "artifact_id TEXT, "
+                "action TEXT NOT NULL "
+                "CHECK(action IN ('apply', 'revoke', 'replay', 'provision', 'install_agent', "
+                "'create_guest_template', 'tailnet_join')), "
+                "status TEXT NOT NULL DEFAULT 'pending' "
+                "CHECK(status IN ('pending', 'running', 'succeeded', 'failed', 'cancelled', "
+                "'unknown')), "
+                "result_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "finished_at TEXT, "
+                "error TEXT)"
+            ),
+            (
+                "INSERT INTO tasks "
+                "(id, artifact_id, action, status, result_json, created_at, finished_at, error) "
+                "SELECT id, artifact_id, action, status, result_json, "
+                "created_at, finished_at, error "
+                "FROM tasks_old"
+            ),
+            "DROP TABLE tasks_old",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_artifact ON tasks(artifact_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        ],
+    ),
+    Migration(
+        34,
+        [
+            # One in-flight run per artifact, enforced by the DATABASE (#710).
+            #
+            # The runner checked for an active task and then inserted one with an
+            # await in between, so two replays (or two revokes) of one artifact both
+            # started; auto-apply re-dispatched an apply that was still running. A
+            # check in Python only serialises one process - the CLI, a second
+            # worker or a stdio MCP server each have their own. A partial UNIQUE
+            # index makes a second pending/running row for the same artifact an
+            # IntegrityError no matter who writes it.
+            #
+            # First retire any duplicates already there, keeping the NEWEST active
+            # row per artifact (the one `get_active_task` already reports): the
+            # index cannot be built over them. They are marked failed with a reason
+            # that says why, never deleted - they are history.
+            (
+                "UPDATE tasks SET status = 'failed', "
+                "error = 'superseded_duplicate_active_run', "
+                "finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+                "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running') "
+                "AND EXISTS (SELECT 1 FROM tasks newer "
+                "WHERE newer.artifact_id = tasks.artifact_id "
+                "AND newer.status IN ('pending', 'running') "
+                "AND (newer.created_at > tasks.created_at "
+                "OR (newer.created_at = tasks.created_at AND newer.id > tasks.id)))"
+            ),
+            # Any future rebuild of `tasks` (the rename dance of 14/15/18/28/30/33)
+            # must recreate this index after the drop, like the other two.
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_one_active_per_artifact "
+                "ON tasks(artifact_id) "
+                "WHERE artifact_id IS NOT NULL AND status IN ('pending', 'running')"
+            ),
+        ],
+    ),
+    Migration(
+        35,
+        [
+            # "Nobody was told" (#660, lane A2 of the 2026-11 review).
+            #
+            # 1. What KIND of condition a rule is. Every rule so far is a threshold
+            #    on a metric; `nodata` fires when an enrolled host stops reporting
+            #    at all, which no threshold can express (a silent host drops out of
+            #    every threshold rule's candidate set by design). Existing rows are
+            #    thresholds, which is exactly what the default says.
+            (
+                "ALTER TABLE alert_rules ADD COLUMN kind TEXT NOT NULL DEFAULT 'threshold'",
+                "alert_rules",
+                "kind",
+            ),
+            # 2. Alert HISTORY. `alert_state` is a latch - `firing_since` is nulled
+            #    on recovery - so an alert that fired and resolved overnight left no
+            #    record anywhere. One append-only row per transition (not per
+            #    evaluation). The rule's name and metric are copied in, so the
+            #    history of a rule still reads after the rule is deleted. Pruned on
+            #    the operational-history horizon (`retention_days`), not the
+            #    metrics one: this is history, not a time series.
+            """CREATE TABLE IF NOT EXISTS alert_events (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             rule_id          TEXT NOT NULL,
             rule_name        TEXT NOT NULL,
@@ -1074,16 +1229,16 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             delivered_to     TEXT,
             at               TEXT NOT NULL
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_alert_events_at ON alert_events(at)",
-        "CREATE INDEX IF NOT EXISTS idx_alert_events_host ON alert_events(hostname, at)",
-        # 3. Native notification channels (ntfy first). The target URL is NOT
-        #    stored here: an ntfy topic URL is a capability - whoever holds it
-        #    can read and post the topic - so it lives in the vault under
-        #    `secret_ref`, like every other credential. This row holds only
-        #    what may be shown: the kind, a name, the endpoint as
-        #    scheme://host[:port], and the outcome of the last delivery, which
-        #    is what makes "is anyone being told?" answerable.
-        """CREATE TABLE IF NOT EXISTS notification_channels (
+            "CREATE INDEX IF NOT EXISTS idx_alert_events_at ON alert_events(at)",
+            "CREATE INDEX IF NOT EXISTS idx_alert_events_host ON alert_events(hostname, at)",
+            # 3. Native notification channels (ntfy first). The target URL is NOT
+            #    stored here: an ntfy topic URL is a capability - whoever holds it
+            #    can read and post the topic - so it lives in the vault under
+            #    `secret_ref`, like every other credential. This row holds only
+            #    what may be shown: the kind, a name, the endpoint as
+            #    scheme://host[:port], and the outcome of the last delivery, which
+            #    is what makes "is anyone being told?" answerable.
+            """CREATE TABLE IF NOT EXISTS notification_channels (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             kind             TEXT NOT NULL CHECK(kind IN ('ntfy')),
             name             TEXT NOT NULL,
@@ -1098,19 +1253,22 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             last_error       TEXT,
             last_error_at    TEXT
         )""",
-    ],
-    36: [
-        # Agents that knock and are turned away (lane A3, review 05/3).
-        #
-        # A host refused at the hub - no enrolment window open, a wrong token -
-        # was visible only in the host's journal and the audit trail, and
-        # `record_agent_error` rightly writes nothing for a hostname the fleet
-        # has never seen. So the one host an operator is waiting for was the one
-        # host no page showed. One row per claimed hostname + peer address,
-        # UPDATED per attempt (never appended), bounded in code (row cap + age
-        # out, agent_hub/join_requests.py) so a token-guessing flood cannot grow
-        # it. No token column: what a refused peer presented is never stored.
-        """CREATE TABLE IF NOT EXISTS enrolment_attempts (
+        ],
+    ),
+    Migration(
+        36,
+        [
+            # Agents that knock and are turned away (lane A3, review 05/3).
+            #
+            # A host refused at the hub - no enrolment window open, a wrong token -
+            # was visible only in the host's journal and the audit trail, and
+            # `record_agent_error` rightly writes nothing for a hostname the fleet
+            # has never seen. So the one host an operator is waiting for was the one
+            # host no page showed. One row per claimed hostname + peer address,
+            # UPDATED per attempt (never appended), bounded in code (row cap + age
+            # out, agent_hub/join_requests.py) so a token-guessing flood cannot grow
+            # it. No token column: what a refused peer presented is never stored.
+            """CREATE TABLE IF NOT EXISTS enrolment_attempts (
             hostname     TEXT NOT NULL,
             peer         TEXT NOT NULL,
             reason_code  TEXT NOT NULL,
@@ -1121,81 +1279,90 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             attempts     INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (hostname, peer)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_enrolment_attempts_last_seen "
-        "ON enrolment_attempts(last_seen)",
-        # Pending bootstrap tokens become listable: when each was minted and by
-        # whom, beside the expiry the table already had. Still hash-only.
-        (
-            "ALTER TABLE bootstrap_tokens ADD COLUMN created_at REAL",
-            "bootstrap_tokens",
-            "created_at",
-        ),
-        (
-            "ALTER TABLE bootstrap_tokens ADD COLUMN minted_by TEXT",
-            "bootstrap_tokens",
-            "minted_by",
-        ),
-    ],
-    37: [
-        # The fleet model (lane B1, review 02 steps 1-3). All additive.
-        #
-        # 1. What Proxmox already knows about each guest, read from
-        #    /cluster/resources by the sync. A template is a provisioning input,
-        #    not a fleet member: it can never run, so it sat in the adoption
-        #    queue as an "offline" guest and was counted in both. Pool, PVE tags
-        #    and the allocated size are the operator's own grouping and sizing,
-        #    shown instead of asked for again.
-        (
-            "ALTER TABLE hosts ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
-            "hosts",
-            "is_template",
-        ),
-        ("ALTER TABLE hosts ADD COLUMN pool TEXT", "hosts", "pool"),
-        ("ALTER TABLE hosts ADD COLUMN pve_tags TEXT", "hosts", "pve_tags"),
-        ("ALTER TABLE hosts ADD COLUMN maxcpu INTEGER", "hosts", "maxcpu"),
-        ("ALTER TABLE hosts ADD COLUMN maxmem_mb INTEGER", "hosts", "maxmem_mb"),
-        ("ALTER TABLE hosts ADD COLUMN maxdisk_gb REAL", "hosts", "maxdisk_gb"),
-        # 2. Which part of the estate a machine belongs to - orthogonal to the
-        #    function `role` guesses. `env_source` says who decided: a PVE tag
-        #    (`hp-env-<value>`), the template flag, or an operator (pinned, so a
-        #    later sync leaves it alone).
-        (
-            "ALTER TABLE hosts ADD COLUMN env TEXT CHECK (env IS NULL OR env IN "
-            "('prod', 'dev', 'infra', 'friend', 'lab', 'template'))",
-            "hosts",
-            "env",
-        ),
-        (
-            "ALTER TABLE hosts ADD COLUMN env_source TEXT CHECK (env_source IS NULL OR "
-            "env_source IN ('pve_tag', 'pve_template', 'user'))",
-            "hosts",
-            "env_source",
-        ),
-        "CREATE INDEX IF NOT EXISTS idx_hosts_env ON hosts(env)",
-        # 3. The machine HomePilot itself runs on, as confirmed by an operator.
-        #    At most one row: the database refuses a second, whoever writes it.
-        #    Any future rebuild of `hosts` (the rename dance of 10/25) must
-        #    recreate this index after the drop.
-        (
-            "ALTER TABLE hosts ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0",
-            "hosts",
-            "is_self",
-        ),
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts_one_self ON hosts(is_self) WHERE is_self = 1",
-    ],
-    38: [
-        # Every address a host holds, with where it came from (lane B2, review
-        # 02/4). `hosts.ip_address` is ONE address per host with no age and no
-        # provenance, so two guests configured onto one address - and a start
-        # that took a running guest's address over - were invisible. One row per
-        # (host, source, interface, address); the sources are documented in
-        # inventory/addresses.py. `observed_at` is when that source last said so.
-        #
-        # No `REFERENCES hosts(id)`: a future hosts rebuild drops the old table,
-        # and with foreign keys on that DROP would cascade into this one.
-        # `Repository.delete_host` removes a host's rows explicitly instead, the
-        # way it already does for services.
-        """CREATE TABLE IF NOT EXISTS host_addresses (
+            "CREATE INDEX IF NOT EXISTS idx_enrolment_attempts_last_seen "
+            "ON enrolment_attempts(last_seen)",
+            # Pending bootstrap tokens become listable: when each was minted and by
+            # whom, beside the expiry the table already had. Still hash-only.
+            (
+                "ALTER TABLE bootstrap_tokens ADD COLUMN created_at REAL",
+                "bootstrap_tokens",
+                "created_at",
+            ),
+            (
+                "ALTER TABLE bootstrap_tokens ADD COLUMN minted_by TEXT",
+                "bootstrap_tokens",
+                "minted_by",
+            ),
+        ],
+    ),
+    Migration(
+        37,
+        [
+            # The fleet model (lane B1, review 02 steps 1-3). All additive.
+            #
+            # 1. What Proxmox already knows about each guest, read from
+            #    /cluster/resources by the sync. A template is a provisioning input,
+            #    not a fleet member: it can never run, so it sat in the adoption
+            #    queue as an "offline" guest and was counted in both. Pool, PVE tags
+            #    and the allocated size are the operator's own grouping and sizing,
+            #    shown instead of asked for again.
+            (
+                "ALTER TABLE hosts ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+                "hosts",
+                "is_template",
+            ),
+            ("ALTER TABLE hosts ADD COLUMN pool TEXT", "hosts", "pool"),
+            ("ALTER TABLE hosts ADD COLUMN pve_tags TEXT", "hosts", "pve_tags"),
+            ("ALTER TABLE hosts ADD COLUMN maxcpu INTEGER", "hosts", "maxcpu"),
+            ("ALTER TABLE hosts ADD COLUMN maxmem_mb INTEGER", "hosts", "maxmem_mb"),
+            ("ALTER TABLE hosts ADD COLUMN maxdisk_gb REAL", "hosts", "maxdisk_gb"),
+            # 2. Which part of the estate a machine belongs to - orthogonal to the
+            #    function `role` guesses. `env_source` says who decided: a PVE tag
+            #    (`hp-env-<value>`), the template flag, or an operator (pinned, so a
+            #    later sync leaves it alone).
+            (
+                "ALTER TABLE hosts ADD COLUMN env TEXT CHECK (env IS NULL OR env IN "
+                "('prod', 'dev', 'infra', 'friend', 'lab', 'template'))",
+                "hosts",
+                "env",
+            ),
+            (
+                "ALTER TABLE hosts ADD COLUMN env_source TEXT CHECK (env_source IS NULL OR "
+                "env_source IN ('pve_tag', 'pve_template', 'user'))",
+                "hosts",
+                "env_source",
+            ),
+            "CREATE INDEX IF NOT EXISTS idx_hosts_env ON hosts(env)",
+            # 3. The machine HomePilot itself runs on, as confirmed by an operator.
+            #    At most one row: the database refuses a second, whoever writes it.
+            #    Any future rebuild of `hosts` (the rename dance of 10/25) must
+            #    recreate this index after the drop.
+            (
+                "ALTER TABLE hosts ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0",
+                "hosts",
+                "is_self",
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts_one_self ON hosts(is_self) "
+                "WHERE is_self = 1"
+            ),
+        ],
+    ),
+    Migration(
+        38,
+        [
+            # Every address a host holds, with where it came from (lane B2, review
+            # 02/4). `hosts.ip_address` is ONE address per host with no age and no
+            # provenance, so two guests configured onto one address - and a start
+            # that took a running guest's address over - were invisible. One row per
+            # (host, source, interface, address); the sources are documented in
+            # inventory/addresses.py. `observed_at` is when that source last said so.
+            #
+            # No `REFERENCES hosts(id)`: a future hosts rebuild drops the old table,
+            # and with foreign keys on that DROP would cascade into this one.
+            # `Repository.delete_host` removes a host's rows explicitly instead, the
+            # way it already does for services.
+            """CREATE TABLE IF NOT EXISTS host_addresses (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             host_id      TEXT NOT NULL,
             address      TEXT NOT NULL,
@@ -1210,10 +1377,63 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             observed_at  TEXT NOT NULL,
             UNIQUE (host_id, source, iface, address)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_host_addresses_address ON host_addresses(address)",
-        "CREATE INDEX IF NOT EXISTS idx_host_addresses_host ON host_addresses(host_id)",
-    ],
-}
+            "CREATE INDEX IF NOT EXISTS idx_host_addresses_address ON host_addresses(address)",
+            "CREATE INDEX IF NOT EXISTS idx_host_addresses_host ON host_addresses(host_id)",
+        ],
+    ),
+    Migration(
+        39,
+        [
+            # A guest the operator protects (lane B3, #781): shutting it down,
+            # rebooting it or stopping it from HomePilot takes the guest's name typed
+            # back. NULL is "not decided", which means the default rule (the self
+            # guest and every `env = infra` machine are protected); 0/1 is the
+            # operator's own answer, pinned like any other operator field.
+            (
+                "ALTER TABLE hosts ADD COLUMN protected INTEGER "
+                "CHECK (protected IS NULL OR protected IN (0, 1))",
+                "hosts",
+                "protected",
+            ),
+        ],
+    ),
+)
+
+
+def _check_contiguous(versions: Sequence[int]) -> None:
+    """Refuse anything but 1, 2, ..., N in that order, each exactly once."""
+    seen: dict[int, int] = {}
+    for position, version in enumerate(versions, start=1):
+        if version in seen:
+            raise MigrationChainError(
+                f"schema version {version} is defined twice (entries {seen[version]} and "
+                f"{position}). Two changes took the same number; the second would "
+                "never run on an install that already has the first. Give the "
+                "unreleased one the next free number."
+            )
+        seen[version] = position
+        if version != position:
+            raise MigrationChainError(
+                f"entry {position} of the migration chain is version {version}, expected "
+                f"{position}: versions run 1, 2, 3, ... in order with no gap, because "
+                "an install applies every number above its own exactly once."
+            )
+
+
+def _index_chain(chain: Sequence[Migration]) -> dict[int, list[Statement]]:
+    """The chain as `{version: statements}`, or MigrationChainError at import."""
+    _check_contiguous([m.version for m in chain])
+    for m in chain:
+        if not m.statements:
+            raise MigrationChainError(f"schema version {m.version} has no statements")
+    return {m.version: m.statements for m in chain}
+
+
+# What the runner applies. Derived from MIGRATION_CHAIN - never written by hand.
+# Tests narrow it (patch.dict / delitem) to stand up a database at an older
+# version; `run_migrations` re-checks that whatever it is handed is still
+# contiguous before it touches a database.
+MIGRATIONS: dict[int, list[Statement]] = _index_chain(MIGRATION_CHAIN)
 
 
 _SCHEMA_VERSION_UPSERT = (
@@ -1284,7 +1504,7 @@ async def _backup_before_migration(db: Database, current_version: int) -> Path |
     return backup_path
 
 
-async def _apply_statement(db: Database, entry: str | tuple[str, str, str]) -> None:
+async def _apply_statement(db: Database, entry: Statement) -> None:
     if isinstance(entry, tuple):
         sql, table, column = entry
         cols = await db.fetchall(f"PRAGMA table_info({table})")
@@ -1357,6 +1577,9 @@ async def run_migrations(db: Database) -> None:
     except sqlite3.OperationalError:
         current_version = 0
 
+    # MIGRATIONS is indexed from a checked chain at import, but it is a mutable
+    # dict: refuse a gap here too rather than run around it.
+    _check_contiguous(sorted(MIGRATIONS))
     target_version = max(MIGRATIONS.keys())
     if current_version > target_version:
         # Name the REMEDY, not just the file. The old wording pointed at

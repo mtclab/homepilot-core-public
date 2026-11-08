@@ -23,6 +23,7 @@
 	import { pruneSelection } from '$lib/selection';
 	import { base } from '$app/paths';
 	import ApprovalCodePanel from '$lib/components/ApprovalCodePanel.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let items: Artifact[] = [];
 	let history: Artifact[] = [];
@@ -280,7 +281,7 @@
 				>
 			{/if}
 			<span class="text-muted text-xs">{items.length} proposed</span>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Refresh</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Refresh</button>
 		</div>
 	</div>
 
@@ -318,11 +319,11 @@
 				{:else}
 					{#if canApprove}
 						<button class="btn btn-success text-xs" on:click={() => (bulkConfirm = 'approve')}
-							>✓ Approve selected</button
+							><Icon name="check" />Approve selected</button
 						>
 					{/if}
 					<button class="btn btn-danger text-xs" on:click={() => (bulkConfirm = 'reject')}
-						>✗ Reject selected</button
+						><Icon name="close" />Reject selected</button
 					>
 				{/if}
 			{/if}
@@ -335,7 +336,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load the review queue.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if items.length === 0}
 		<div class="card text-center py-10">
@@ -384,13 +385,13 @@
 									<button
 										class="btn btn-success text-xs"
 										disabled={working[a.id]}
-										on:click={() => approve(a.id)}>✓ Approve</button
+										on:click={() => approve(a.id)}><Icon name="check" />Approve</button
 									>
 								{/if}
 								<button
 									class="btn btn-danger text-xs"
 									disabled={working[a.id]}
-									on:click={() => reject(a.id)}>✗ Reject</button
+									on:click={() => reject(a.id)}><Icon name="close" />Reject</button
 								>
 							</div>
 						{/if}
@@ -404,7 +405,7 @@
 							aria-expanded={expanded === a.id}
 							on:click={() => toggleExpand(a.id)}
 						>
-							{expanded === a.id ? '▾' : '▸'} What this changes
+							<Icon name={expanded === a.id ? 'chevron-down' : 'chevron-right'} /> What this changes
 						</button>
 						<span class="text-xs text-muted" data-testid="plan-availability"
 							>{planAvailability(a.id)}</span
@@ -440,7 +441,7 @@
 													<td class="col-primary font-mono">{item.name}</td>
 													<td class="col-secondary">{item.observed}</td>
 													<td class="col-secondary">
-														{#if item.changes}→ {item.desired}{:else}unchanged{/if}
+														{#if item.changes}<Icon name="arrow-right" label="becomes" /> {item.desired}{:else}unchanged{/if}
 													</td>
 												</tr>
 											{/each}
@@ -506,13 +507,13 @@
 				<button
 					class="btn btn-ghost text-xs"
 					disabled={queuePage === 0}
-					on:click={() => setQueuePage(queuePage - 1)}>← Newer</button
+					on:click={() => setQueuePage(queuePage - 1)}><Icon name="arrow-left" />Newer</button
 				>
 				<span class="text-muted">Page {queuePage + 1} of {queuePages}</span>
 				<button
 					class="btn btn-ghost text-xs"
 					disabled={queuePage >= queuePages - 1}
-					on:click={() => setQueuePage(queuePage + 1)}>Older →</button
+					on:click={() => setQueuePage(queuePage + 1)}>Older<Icon name="arrow-right" /></button
 				>
 			</div>
 		{/if}
@@ -560,13 +561,13 @@
 					<button
 						class="btn btn-ghost text-xs"
 						disabled={historyPage === 0}
-						on:click={() => (historyPage -= 1)}>← Newer</button
+						on:click={() => (historyPage -= 1)}><Icon name="arrow-left" />Newer</button
 					>
 					<span class="text-muted">Page {historyPage + 1} of {historyPages}</span>
 					<button
 						class="btn btn-ghost text-xs"
 						disabled={historyPage >= historyPages - 1}
-						on:click={() => (historyPage += 1)}>Older →</button
+						on:click={() => (historyPage += 1)}>Older<Icon name="arrow-right" /></button
 					>
 				</div>
 			{/if}

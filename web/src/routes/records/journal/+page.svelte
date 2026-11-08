@@ -5,6 +5,7 @@
 	import { base } from '$app/paths';
 	import { debounce } from '$lib/debounce';
 	import { groupByDay } from '$lib/grouping';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let entries: AuditEntry[] = [];
 	let loading = true;
@@ -213,7 +214,7 @@
 <div class="page-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Journal</h1>
-		<button class="btn btn-ghost text-xs" on:click={load}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Refresh</button>
 	</div>
 
 	<div class="flex gap-3 flex-wrap items-center">
@@ -255,7 +256,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load the journal.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if entries.length === 0 && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
@@ -287,7 +288,7 @@
 									<span class={sourceClass(e.source)}>{e.source}</span>
 									<span class="text-muted truncate">{summaryOf(e)}</span>
 									<span class="text-muted ml-auto pl-2" aria-hidden="true"
-									>{openId === e.id ? '▾' : '▸'}</span>
+									><Icon name={openId === e.id ? 'chevron-down' : 'chevron-right'} /></span>
 								</button>
 								{#if e.artifact_id}
 									<a
@@ -317,9 +318,9 @@
 		{/each}
 
 		<div class="flex gap-3 items-center">
-			<button class="btn btn-ghost text-xs" disabled={!hasPrev} on:click={() => { page--; load(); }}>← Prev</button>
+			<button class="btn btn-ghost text-xs" disabled={!hasPrev} on:click={() => { page--; load(); }}><Icon name="arrow-left" />Prev</button>
 			<span class="text-muted text-xs">Page {page + 1} of {totalPages || 1}</span>
-			<button class="btn btn-ghost text-xs" disabled={!hasNext} on:click={() => { page++; load(); }}>Next →</button>
+			<button class="btn btn-ghost text-xs" disabled={!hasNext} on:click={() => { page++; load(); }}>Next<Icon name="arrow-right" /></button>
 		</div>
 	{/if}
 </div>

@@ -454,9 +454,10 @@ describe('Overview: a read that did not come back', () => {
 			'href',
 			'/ui/hosts',
 		);
+		// Firing alerts are Monitoring's since UI slice 1, so that is the door.
 		expect(zone.getByText(/could not read firing alerts/i).closest('a')).toHaveAttribute(
 			'href',
-			'/ui/hosts',
+			'/ui/monitoring/alerts',
 		);
 		expect(zone.getByText(/could not read the journal/i).closest('a')).toHaveAttribute(
 			'href',
@@ -1002,7 +1003,7 @@ describe('Overview: the Phase A lanes together', () => {
 		expect(typo.textContent).toContain('check the metric name');
 	});
 
-	it('says how many hosts are waiting to join, and links to Hosts', async () => {
+	it('says how many hosts are waiting to join, and links to Hosts > Agents', async () => {
 		getEnrolmentRequests.mockResolvedValue(knocking());
 		seed({});
 
@@ -1011,7 +1012,8 @@ describe('Overview: the Phase A lanes together', () => {
 
 		const line = zone.getByRole('link', { name: /waiting to join/i });
 		expect(line.textContent).toContain('1 host is waiting to join');
-		expect(line).toHaveAttribute('href', '/ui/hosts');
+		// The join panel lives on Hosts > Agents since UI slice 1.
+		expect(line).toHaveAttribute('href', '/ui/hosts/agents');
 		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
 	});
 

@@ -31,6 +31,8 @@ vi.mock('$app/stores', async () => {
 
 import ChangesLayout from './changes/+layout.svelte';
 import RecordsLayout from './records/+layout.svelte';
+import HostsLayout from './hosts/+layout.svelte';
+import MonitoringLayout from './monitoring/+layout.svelte';
 
 function at(path: string): void {
 	held.page!.set({ url: new URL('http://localhost' + path) });
@@ -120,4 +122,69 @@ describe('Records tab bar', () => {
 		expect(screen.getByRole('tablist', { name: 'Records views' })).toBeInTheDocument();
 		expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'tab-kb');
 	});
+});
+
+// UI slice 1: two more sections carry views. Teeth: make a Hosts tab
+// non-exact and the host page grows a tab bar it does not own; reorder or drop
+// a view and the order cases fail.
+
+describe('Hosts tab bar', () => {
+	it('has Fleet and Agents, at their URLs', () => {
+		at('/ui/hosts');
+		render(HostsLayout);
+		expect(screen.getAllByRole('tab').map((t) => [t.textContent, t.getAttribute('href')])).toEqual(
+			[
+				['Fleet', '/ui/hosts'],
+				['Agents', '/ui/hosts/agents'],
+			],
+		);
+	});
+
+	for (const [path, label] of [
+		['/ui/hosts', 'Fleet'],
+		['/ui/hosts/agents', 'Agents'],
+	] as Array<[string, string]>) {
+		it(`${path} marks "${label}" current`, () => {
+			at(path);
+			render(HostsLayout);
+			const selected = screen
+				.getAllByRole('tab')
+				.filter((t) => t.getAttribute('aria-selected') === 'true');
+			expect(selected.map((t) => t.textContent)).toEqual([label]);
+		});
+	}
+
+	it('a host page is neither view and carries no Hosts tab bar', () => {
+		at('/ui/hosts/a1b2c3');
+		render(HostsLayout);
+		expect(screen.queryByRole('tablist', { name: 'Hosts views' })).toBeNull();
+	});
+});
+
+describe('Monitoring tab bar', () => {
+	it('has Alerts then Rules, at their URLs, under one page title', () => {
+		at('/ui/monitoring/alerts');
+		render(MonitoringLayout);
+		expect(screen.getByRole('heading', { level: 1, name: 'Monitoring' })).toBeInTheDocument();
+		expect(screen.getAllByRole('tab').map((t) => [t.textContent, t.getAttribute('href')])).toEqual(
+			[
+				['Alerts', '/ui/monitoring/alerts'],
+				['Rules', '/ui/monitoring/rules'],
+			],
+		);
+	});
+
+	for (const [path, label] of [
+		['/ui/monitoring/alerts', 'Alerts'],
+		['/ui/monitoring/rules', 'Rules'],
+	] as Array<[string, string]>) {
+		it(`${path} marks "${label}" current`, () => {
+			at(path);
+			render(MonitoringLayout);
+			const selected = screen
+				.getAllByRole('tab')
+				.filter((t) => t.getAttribute('aria-selected') === 'true');
+			expect(selected.map((t) => t.textContent)).toEqual([label]);
+		});
+	}
 });

@@ -12,6 +12,7 @@
 	import { base } from '$app/paths';
 	import { api, type GuestOverview } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let data: GuestOverview | null = null;
 	let loading = true;
@@ -291,7 +292,7 @@
 				<p id="guest-invite-template-note" class="prose-note prose-measure text-xs">
 					The Proxmox template the machine is cloned from. Leave it empty to use
 					this instance's Provisioning default
-					(<a class="text-accent hover:underline" href="{base}/settings?tab=subsystems">Subsystems → Provisioning defaults</a>).
+					(<a class="text-accent hover:underline" href="{base}/settings?tab=subsystems">Settings &gt; Subsystems: Provisioning defaults</a>).
 				</p>
 			</div>
 

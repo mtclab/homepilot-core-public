@@ -234,6 +234,11 @@ class TestApproveAuditIncludesRole:
 
         fs.file_lock = _mock_file_lock
 
+        async def _run_serialized(fn):
+            return fn()
+
+        fs.run_serialized = _run_serialized
+
         tm = ArtifactTransitionManager(
             file_store=fs,
             audit_fn=mock_audit,

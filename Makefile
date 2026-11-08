@@ -37,7 +37,7 @@ HP_GO_BIN := $(shell command -v $(GO_BIN) 2>/dev/null)
 GOCACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/homepilot-gate/go-build
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security gate-mirror
+.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security gate-mirror schema-lock
 
 gate: gate-py gate-web gate-go gate-go-race gate-security gate-mirror
 
@@ -137,3 +137,12 @@ gate-go-race:
 
 gate-image:
 	bash scripts/smoke-image.sh
+
+# Regenerate src/homepilot/db/schema.lock after an INTENDED schema change (a new
+# migration). tests/test_schema_fingerprint.py fails on any schema the lock does
+# not record. Refuses to change a recorded version's hash: a released migration
+# is applied history (pass --rewrite-history by hand only for a version that was
+# never released).
+schema-lock: export PYTHONPATH := $(CURDIR)/src
+schema-lock:
+	$(VENV)/python -m homepilot.db.schema_fingerprint --write

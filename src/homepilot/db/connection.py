@@ -4,12 +4,16 @@ import asyncio
 import contextlib
 import logging
 import os
+import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 import sqlite_vec
+
+from ..runtime.blocking import assert_off_loop
 
 try:  # the value aiosqlite's worker thread breaks its own loop on
     from aiosqlite.core import _STOP_RUNNING_SENTINEL
@@ -113,6 +117,114 @@ class Database:
     # 10s.
     _HANDLE_CLOSE_SECONDS = 3.0
 
+    # How long an orderly shutdown waits for the WAL checkpoint before it closes
+    # anyway. Not part of close()'s own budget: main.lifespan runs the checkpoint
+    # first, outside the guard it puts around close().
+    _CHECKPOINT_SECONDS = 3.0
+
+    async def checkpoint(self) -> bool:
+        """Fold the WAL into the database file and truncate it: off the loop, bounded.
+
+        Closing the last connection to a WAL database checkpoints it implicitly,
+        which is unbounded disk I/O inside close() - the cost #795 measured
+        (checkpoint first, and the close takes about a millisecond). An orderly
+        shutdown calls this once nothing writes any more, so the checkpoint is
+        explicit, timed and logged, and close() has nothing left to do.
+
+        Runs `PRAGMA wal_checkpoint(TRUNCATE)` on a SEPARATE short-lived sqlite3
+        connection, on its own daemon thread - the #795 pattern: never on the
+        event loop, never on the default executor (joined at exit), and never
+        through aiosqlite's worker, where a slow checkpoint would queue close()
+        behind it. The aiosqlite handle is not shared with another thread.
+        Waits at most `_CHECKPOINT_SECONDS`; a checkpoint still running then
+        finishes in the background, and one that never finishes is safe - the
+        WAL stays and the next start (or the close) folds it in.
+
+        Returns True when the WAL was fully checkpointed and truncated.
+        """
+        if self._connection is None or self._is_memory():
+            return False
+        path = self.db_path
+        outcome: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                outcome["row"] = self._checkpoint_file(path, self._CHECKPOINT_SECONDS)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        if not await self._on_daemon_thread(work, "hp-db-checkpoint", self._CHECKPOINT_SECONDS):
+            logger.warning(
+                "WAL checkpoint still running after %.0fs (slow disk). Closing anyway; "
+                "it finishes in the background.",
+                self._CHECKPOINT_SECONDS,
+            )
+            return False
+        if "error" in outcome:
+            logger.warning("WAL checkpoint before close failed: %s", outcome["error"])
+            return False
+        busy, log_frames, checkpointed = outcome["row"]
+        if busy:
+            # Something still holds a read or write transaction: the WAL is only
+            # partly folded in. The close does the rest.
+            logger.warning(
+                "WAL checkpoint before close was blocked (%d of %d frames written back)",
+                checkpointed,
+                log_frames,
+            )
+            return False
+        logger.info("WAL checkpointed and truncated before close")
+        return True
+
+    def _is_memory(self) -> bool:
+        return self.db_path == ":memory:" or "mode=memory" in self.db_path
+
+    @staticmethod
+    def _checkpoint_file(db_path: str, busy_seconds: float) -> tuple[int, int, int]:
+        """`PRAGMA wal_checkpoint(TRUNCATE)` on its own connection. Blocking: never on the loop.
+
+        A second connection, so the aiosqlite handle is never touched from this
+        thread; it is not the last one to the file, so closing it does no
+        checkpoint of its own.
+        """
+        # Reported (a test failure in the suite) if a caller ever runs it on a
+        # loop instead of through `checkpoint`'s daemon thread (#801).
+        assert_off_loop("sqlite WAL checkpoint")
+        conn = sqlite3.connect(db_path, timeout=busy_seconds, isolation_level=None)
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]), int(row[1]), int(row[2])
+
+    @staticmethod
+    async def _on_daemon_thread(work: Callable[[], None], name: str, timeout: float) -> bool:
+        """Run blocking `work` on a dedicated daemon thread; wait for it at most `timeout`.
+
+        Not the default executor: its threads are joined at interpreter exit,
+        so work still blocked in disk I/O would hold the process up. Returns
+        True when the work finished within `timeout`; otherwise it carries on
+        in the background and the caller stops waiting.
+        """
+        loop = asyncio.get_running_loop()
+        finished = loop.create_future()
+
+        def resolve() -> None:
+            if not finished.done():
+                finished.set_result(None)
+
+        def run() -> None:
+            try:
+                work()
+            finally:
+                # The loop may be gone by the time slow work returns.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(resolve)
+
+        threading.Thread(target=run, name=name, daemon=True).start()
+        _done, pending = await asyncio.wait({finished}, timeout=timeout)
+        return not pending
+
     async def close(self) -> None:
         """Close the connection. This never hangs, and it always shuts the handle.
 
@@ -212,24 +324,9 @@ class Database:
         conn._running = False
         if raw is None:
             return
-        loop = asyncio.get_running_loop()
-        finished = loop.create_future()
-
-        def resolve() -> None:
-            if not finished.done():
-                finished.set_result(None)
-
-        def shut() -> None:
-            try:
-                self._close_handle(conn, raw)
-            finally:
-                # The loop may be gone by the time a slow close returns.
-                with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(resolve)
-
-        threading.Thread(target=shut, name="hp-db-force-close", daemon=True).start()
-        _done, pending = await asyncio.wait({finished}, timeout=self._HANDLE_CLOSE_SECONDS)
-        if pending:
+        if not await self._on_daemon_thread(
+            lambda: self._close_handle(conn, raw), "hp-db-force-close", self._HANDLE_CLOSE_SECONDS
+        ):
             logger.warning(
                 "Closing the sqlite3 handle is still running after %.0fs (slow disk "
                 "I/O in its WAL checkpoint). It finishes in the background.",

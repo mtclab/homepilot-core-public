@@ -11,6 +11,7 @@ from .db.connection import Database
 from .db.migrations import run_migrations
 from .db.repository import Repository
 from .notifications import Notifier
+from .runtime.blocking import run_blocking
 
 if TYPE_CHECKING:
     from .agent_hub.registry import AgentRegistry
@@ -79,6 +80,39 @@ class AppState:
     # Why the hub is not running despite being enabled, in the operator's words.
     # Empty when the hub is off by configuration or running normally.
     agent_hub_disabled_reason: str = ""
+
+
+def _init_artifacts_repo(artifacts_dir: Path) -> None:
+    """`git init` the artifacts directory if it is not a repository yet.
+
+    Blocking (subprocesses): startup runs it with ``run_blocking("git", ...)``.
+    """
+    if not (artifacts_dir / ".git").exists():
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["git", "init"],
+                cwd=str(artifacts_dir),
+                capture_output=True,
+                check=False,
+            )
+            if (
+                subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    cwd=str(artifacts_dir),
+                    capture_output=True,
+                ).returncode
+                != 0
+            ):
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=str(artifacts_dir),
+                    capture_output=True,
+                    check=False,
+                )
+        except FileNotFoundError:
+            logger.warning("git not found — artifacts directory will not be versioned")
 
 
 async def create_app_state(settings: Any | None = None) -> AppState:
@@ -250,37 +284,15 @@ async def create_app_state(settings: Any | None = None) -> AppState:
         )
     if not artifacts_dir.is_dir():
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-    if not (artifacts_dir / ".git").exists():
-        try:
-            import subprocess
-
-            subprocess.run(
-                ["git", "init"],
-                cwd=str(artifacts_dir),
-                capture_output=True,
-                check=False,
-            )
-            if (
-                subprocess.run(
-                    ["git", "rev-parse", "--is-inside-work-tree"],
-                    cwd=str(artifacts_dir),
-                    capture_output=True,
-                ).returncode
-                != 0
-            ):
-                subprocess.run(
-                    ["git", "init"],
-                    cwd=str(artifacts_dir),
-                    capture_output=True,
-                    check=False,
-                )
-        except FileNotFoundError:
-            logger.warning("git not found — artifacts directory will not be versioned")
+    await run_blocking("git", _init_artifacts_repo, artifacts_dir)
 
     from .artifacts.lifecycle import ArtifactLifecycle
     from .artifacts.store import ArtifactStore
 
-    artifact_store = ArtifactStore(
+    # The constructor runs `git init`/`git config` and commits the seed files.
+    artifact_store = await run_blocking(
+        "git",
+        ArtifactStore,
         artifacts_dir,
         remote=settings.artifacts_remote,
         ssh_key=settings.artifacts_ssh_key,
@@ -363,7 +375,10 @@ async def create_app_state(settings: Any | None = None) -> AppState:
                     # No operator-supplied material: generate once and reuse, so the
                     # fail-closed transport check passes on its own merits rather
                     # than being weakened or overridden (ADR-004 S3).
-                    _cert_path, _key_path = ensure_hub_certificate(
+                    # Key generation + file writes: off the loop.
+                    _cert_path, _key_path = await run_blocking(
+                        "io",
+                        ensure_hub_certificate,
                         data_dir,
                         extra_hosts=(settings.agent_hub_advertise_host, settings.agent_hub_host),
                     )
@@ -374,14 +389,18 @@ async def create_app_state(settings: Any | None = None) -> AppState:
                 )
             ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
             if not hub_material_error:
-                ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-                hub_cert_fingerprint = certificate_fingerprint(Path(cert_file))
+                await run_blocking(
+                    "io", ssl_ctx.load_cert_chain, certfile=cert_file, keyfile=key_file
+                )
+                hub_cert_fingerprint = await run_blocking(
+                    "io", certificate_fingerprint, Path(cert_file)
+                )
             if hub_material_error:
                 pass
             elif settings.agent_hub_tls_ca:
                 # Mutual TLS: verify each connecting agent's client certificate
                 # against the configured CA.
-                ssl_ctx.load_verify_locations(settings.agent_hub_tls_ca)
+                await run_blocking("io", ssl_ctx.load_verify_locations, settings.agent_hub_tls_ca)
                 ssl_ctx.verify_mode = _ssl.CERT_REQUIRED
                 logger.info("Agent hub TLS enabled with mutual client-cert verification")
             else:

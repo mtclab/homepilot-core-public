@@ -9,11 +9,14 @@
 	export let to: string;
 	// Carry the query string: /inventory?q=web01 must land on /hosts?q=web01.
 	// A target that already carries a query (a `?tab=` sector) joins with `&`,
-	// or the carried query would be lost behind a second `?`.
+	// or the carried query would be lost behind a second `?`. The fragment
+	// travels too: it is the part of a link that says WHERE on the page the
+	// sender meant (UI slice 1: redirects preserve intent).
 	onMount(() => {
 		const qs = typeof window !== 'undefined' ? window.location.search : '';
+		const hash = typeof window !== 'undefined' ? window.location.hash : '';
 		const carried = qs ? (to.includes('?') ? '&' + qs.slice(1) : qs) : '';
-		void goto(`${base}${to}${carried}`, { replaceState: true });
+		void goto(`${base}${to}${carried}${hash}`, { replaceState: true });
 	});
 </script>
 

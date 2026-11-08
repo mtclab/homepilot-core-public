@@ -23,6 +23,7 @@
 	import StatCard from '$lib/components/StatCard.svelte';
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
 	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 
 	// Overview is the operator's morning glance (#549 F2). Three zones, in
 	// priority order, no tabs:
@@ -156,7 +157,7 @@
 				unread.push({
 					key: 'unread:alerts',
 					text: 'Could not read firing alerts, so this page cannot say whether anything is alerting',
-					href: `${base}/hosts`,
+					href: `${base}/monitoring/alerts`,
 				});
 			if (taskRes.status === 'rejected')
 				unread.push({
@@ -174,7 +175,7 @@
 				unread.push({
 					key: 'unread:joining',
 					text: 'Could not read enrolment requests, so a host waiting to join cannot be reported here',
-					href: `${base}/hosts`,
+					href: `${base}/hosts/agents`,
 				});
 			if (auditRes.status === 'rejected')
 				unread.push({
@@ -480,8 +481,8 @@
 				key: 'agents:waiting',
 				severity: 'warning',
 				label: 'wants to join',
-				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts to let ${waiting === 1 ? 'it' : 'them'} in`,
-				href: `${base}/hosts`,
+				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts > Agents to let ${waiting === 1 ? 'it' : 'them'} in`,
+				href: `${base}/hosts/agents`,
 				meta: '',
 			});
 		}
@@ -605,7 +606,7 @@
 				severity: 'warning',
 				label: 'not watched',
 				text: 'No alert rule is enabled, so nothing raises an alert however bad it gets',
-				href: `${base}/settings#monitoring`,
+				href: `${base}/monitoring/rules`,
 				meta: '',
 			});
 		} else if (summary.metrics.rules_watching_nothing > 0 && !fleetDark) {
@@ -621,7 +622,7 @@
 					severity: 'warning',
 					label: 'not watched',
 					text: `${plural(thresholdInert, 'alert rule matches', 'alert rules match')} no host - check the metric name and the host filter`,
-					href: `${base}/settings#monitoring`,
+					href: `${base}/monitoring/rules`,
 					meta: '',
 				});
 			if (darkInert > 0)
@@ -853,7 +854,7 @@
 <div class="page-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Overview</h1>
-		<button class="btn btn-ghost text-xs" on:click={() => load(true)} disabled={loading}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => load(true)} disabled={loading}><Icon name="refresh" />Refresh</button>
 	</div>
 
 	{#if loading && !d}
@@ -882,7 +883,7 @@
 						<li class="flex items-start gap-3">
 							<span
 								class="mt-0.5 shrink-0 {step.done ? 'text-ok' : 'text-muted'}"
-								aria-hidden="true">{step.done ? '✓' : `${i + 1}.`}</span
+								aria-hidden="true">{#if step.done}<Icon name="check" />{:else}{i + 1}.{/if}</span
 							>
 							<span class="space-y-0.5">
 								<span class="block text-sm {step.done ? 'text-muted line-through' : 'text-ink'}">
@@ -893,7 +894,7 @@
 									<span class="block prose-note text-xs">{step.detail}</span>
 									{#if step.key === nextStep?.key}
 										<a class="btn btn-primary text-xs mt-1 inline-block" href="{base}{step.href}"
-											>Do this next →</a
+											>Do this next <Icon name="arrow-right" /></a
 										>
 									{/if}
 								{/if}
@@ -1008,7 +1009,7 @@
 						: d.agents.connected === 0
 							? 'danger'
 							: 'warn'}
-					href="{base}/agents"
+					href="{base}/hosts"
 				/>
 			</div>
 
@@ -1016,7 +1017,7 @@
 				<div class="card section-stack">
 					<div class="flex items-center justify-between">
 						<div class="section-title">Hosts</div>
-						<a class="text-accent text-xs" href="{base}/hosts">All hosts →</a>
+						<a class="text-accent text-xs" href="{base}/hosts">All hosts <Icon name="arrow-right" /></a>
 					</div>
 					<div class="flex flex-wrap gap-1.5">
 						{#each fleet as h (h.id)}
@@ -1080,7 +1081,7 @@
 		<section class="card section-stack" aria-labelledby="recent-movement">
 			<div class="flex items-center justify-between">
 				<h2 class="section-title" id="recent-movement">Recent movement</h2>
-				<a class="text-accent text-xs" href="{base}/records">Records →</a>
+				<a class="text-accent text-xs" href="{base}/records">Records <Icon name="arrow-right" /></a>
 			</div>
 			{#if movement.length}
 				<ul class="flex flex-col">

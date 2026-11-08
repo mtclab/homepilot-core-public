@@ -4,6 +4,7 @@
 	import { notify } from '$lib/stores';
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { groupByKind } from '$lib/grouping';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let query = '';
 	let filterKind = '';
@@ -356,7 +357,7 @@
 								{/if}
 								<span class="text-ink truncate">{summaryOf(entry)}</span>
 								<span class="text-muted ml-auto pl-2" aria-hidden="true"
-								>{openId === entry.id ? '▾' : '▸'}</span>
+								><Icon name={openId === entry.id ? 'chevron-down' : 'chevron-right'} /></span>
 							</button>
 							{#if openId === entry.id}
 								<div class="px-3 pb-3 space-y-2">

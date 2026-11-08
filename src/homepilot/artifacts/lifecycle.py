@@ -9,6 +9,7 @@ import httpx
 
 from ..auth.principal import Principal
 from ..events import emit_event
+from ..runtime.blocking import run_blocking
 from .file_store import ArtifactFileStore
 from .models import ApprovalRefusedError, ArtifactStatus
 from .models import ConflictError as ConflictError
@@ -89,10 +90,17 @@ class ArtifactLifecycle:
         validate_transition(current, target)
 
     async def propose(self, spec: dict[str, Any]) -> str:
-        fm, event = validate_propose_spec(spec, self.store)
-        body: str = spec.get("body", "")
-        fm_yml: str = self._file_store.serialize_frontmatter(fm)
-        self._file_store.write(spec["id"], fm_yml, body, event)
+        def _validate_and_write() -> dict[str, Any]:
+            # One serialised step, as it was on the loop: the "id is free" check
+            # inside the validation and the write that takes the id cannot be
+            # split by another propose of the same id.
+            fm, event = validate_propose_spec(spec, self.store)
+            body: str = spec.get("body", "")
+            fm_yml: str = self._file_store.serialize_frontmatter(fm)
+            self._file_store.write(spec["id"], fm_yml, body, event)
+            return fm
+
+        fm = await self._file_store.run_serialized(_validate_and_write)
         id_str: str = spec["id"]
         # Approval code: generated at PROPOSE and surfaced to operators only. Set
         # below once the artifacts row exists; stays None when there is no repo
@@ -282,7 +290,7 @@ class ArtifactLifecycle:
             except (sqlite3.OperationalError, sqlite3.IntegrityError):
                 logger.exception("Clearing approval code failed for %s", id)
         try:
-            fm, _ = self.store.read(id)
+            fm, _ = await run_blocking("io", self.store.read, id)
             await emit_event(
                 "artifact_approved",
                 {
@@ -310,7 +318,7 @@ class ArtifactLifecycle:
             except (sqlite3.OperationalError, sqlite3.IntegrityError):
                 logger.exception("Clearing approval code failed for %s", id)
         try:
-            fm, _ = self.store.read(id)
+            fm, _ = await run_blocking("io", self.store.read, id)
             await emit_event(
                 "artifact_rejected",
                 {
@@ -352,7 +360,7 @@ class ArtifactLifecycle:
     async def mark_applied(self, id: str, execution_log: str) -> None:
         await self._ensure_transitions().mark_applied(id, execution_log)
         try:
-            fm, _ = self.store.read(id)
+            fm, _ = await run_blocking("io", self.store.read, id)
             if fm.get("kind") == "kb-note":
                 try:
                     kb_service = getattr(self, "_kb_service", None)
@@ -377,7 +385,7 @@ class ArtifactLifecycle:
     async def mark_failed(self, id: str, reason: str, partial_log: str = "") -> None:
         await self._ensure_transitions().mark_failed(id, reason, partial_log)
         try:
-            fm, _ = self.store.read(id)
+            fm, _ = await run_blocking("io", self.store.read, id)
             await emit_event(
                 "artifact_failed",
                 {
@@ -400,7 +408,7 @@ class ArtifactLifecycle:
     async def supersede(self, old_id: str, new_id: str) -> None:
         await self._ensure_transitions().supersede(old_id, new_id)
         try:
-            fm, _ = self.store.read(old_id)
+            fm, _ = await run_blocking("io", self.store.read, old_id)
             if fm.get("kind") == "kb-note":
                 try:
                     kb_service = getattr(self, "_kb_service", None)
@@ -432,7 +440,7 @@ class ArtifactLifecycle:
     async def revoke(self, id: str, user: str, reason: str | None = None) -> None:
         await self._ensure_transitions().revoke(id, user, reason)
         try:
-            fm, _ = self.store.read(id)
+            fm, _ = await run_blocking("io", self.store.read, id)
             if fm.get("kind") == "kb-note":
                 try:
                     kb_service = getattr(self, "_kb_service", None)

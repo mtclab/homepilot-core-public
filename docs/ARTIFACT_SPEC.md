@@ -86,7 +86,7 @@ YAML. Keys are stable; do not rename without a version bump.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string | Matches the filename basename |
-| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `kb-note` |
+| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `host-provision`, `guest-network`, `guest-power`, `kb-note` |
 | `intent` | string | One-line human description, ≤ 200 chars |
 | `status` | enum | One of: `proposed`, `approved`, `rejected`, `applied`, `failed`, `superseded`, `revoked` |
 | `mutating` | bool | `true` for all kinds except `kb-note` |
@@ -677,6 +677,59 @@ nftables `proxmox-firewall` stack. On the legacy iptables stack PVE stores them
 and does not apply them to vnet forward traffic - the fence that holds there is
 the per-VM rule set written at provision time. See
 [docs/guest-portal.md](guest-portal.md).
+
+---
+
+### 5.8 `kind: guest-power`
+
+One power action on one VM or container (#781): `start`, `shutdown`
+(graceful), `reboot` (a Proxmox reboot, which applies pending config such as a
+cloud-init `ipconfigN`) or `stop` (forced). It is how an ASSISTANT asks for a
+power action: the `power_guest` MCP tool proposes it and sends nothing to
+Proxmox. An operator powers a guest directly from the Hosts page instead
+(`POST /api/inventory/{host_id}/power`), with no artifact.
+
+**Body structure** (the tool writes it; `render_guest_power_body`):
+
+````markdown
+## Power action: reboot web-01
+
+Proxmox reboot (shutdown, then start): pending config ... is applied.
+
+## Spec
+
+```yaml guest-power-spec
+action: reboot        # start | shutdown | reboot | stop
+timeout_s: 120        # shutdown/reboot only: 10-600, default 120
+```
+````
+
+**Frontmatter rules, refused at propose:** `target.kind` is `vm` or `lxc` and
+`target.host` names the guest; `idempotence: replay-only` (a second run is a
+second power action); `requires_snapshot: false` (a power action changes no
+disk). No rollback.
+
+**Executor:** finds the inventory row by VMID, node AND name, then runs the same
+`PowerService` the operator's route runs, so every guard is checked again at
+apply time: the guest is gone or another machine now holds the VMID, it is not
+in a state the action applies to, it is locked, a RUNNING guest holds one of the
+addresses it would boot with (start, and a reboot applying a pending address),
+or a running guest on the same node has its `/dev/...` passthrough disk
+attached. A shutdown, reboot or stop of the machine HomePilot runs on, or of a
+protected guest, is refused outright on this path: their guard is a name a
+person types on the Hosts page, which an approval is not.
+
+**Outcome:** `ok` applies the artifact; `failed` and `timed_out` (a guest that
+did not shut down within its timeout - nothing is forced) fail it with the
+reason; a PVE task still running when the run stopped following it leaves the
+outcome unknown (`unsettled_task`, #774).
+
+**Approve and apply in one step:** an operator may run `POST
+/api/artifacts/{id}/approve-and-apply` (admin scope; "Approve and apply" on the
+change page) on a `guest-power` proposal. Every other kind keeps approve, then
+apply.
+
+**Drift:** none - a power action is a moment, not a state.
 
 ---
 

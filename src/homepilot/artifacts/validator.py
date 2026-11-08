@@ -14,6 +14,7 @@ from .models import (
     compute_body_hash,
     extract_composite_steps,
     parse_guest_network_spec,
+    parse_guest_power_spec,
     parse_host_provision_spec,
     utcnow_iso,
     validate_artifact_id,
@@ -54,6 +55,39 @@ def validate_host_provision_spec(body: str) -> None:
         parse_host_provision_spec(body)
     except ValueError as exc:
         raise LifecycleError(str(exc)) from exc
+
+
+def validate_guest_power_spec(spec: Mapping[str, Any], body: str) -> None:
+    """A guest-power artifact: one action on one VM or container (#781).
+
+    It cannot be replayed (a second reboot is a second reboot), cannot be
+    rolled back, and never takes a snapshot first - a power action changes no
+    disk, so a snapshot would only add a lock and a delay.
+    """
+    try:
+        parse_guest_power_spec(body)
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from exc
+    t_kind = (spec.get("target") or {}).get("kind")
+    if t_kind not in ("vm", "lxc"):
+        raise LifecycleError(
+            "a guest-power artifact targets a guest: target.kind must be vm or lxc"
+        )
+    if not (spec.get("target") or {}).get("host"):
+        raise LifecycleError(
+            "a guest-power artifact must name the guest (target.host): the apply checks that "
+            "the machine at that VMID is still the one named before it sends anything"
+        )
+    if spec.get("idempotence") != "replay-only":
+        raise LifecycleError(
+            "a guest-power artifact is idempotence: replay-only - running it twice is a "
+            "second power action"
+        )
+    if spec.get("requires_snapshot") is not False:
+        raise LifecycleError(
+            "a guest-power artifact sets requires_snapshot: false - a power action changes "
+            "no disk, and a snapshot first would only lock the guest"
+        )
 
 
 def validate_guest_network_spec(body: str) -> None:
@@ -231,6 +265,9 @@ def validate_artifact_content(spec: Mapping[str, Any], body: str) -> dict[str, A
 
     if kind == ArtifactKind.GUEST_NETWORK:
         validate_guest_network_spec(body)
+
+    if kind == ArtifactKind.GUEST_POWER:
+        validate_guest_power_spec(spec, body)
 
     derived: dict[str, Any] = {"kind": kind, "mutating": kind != ArtifactKind.KB_NOTE}
 

@@ -137,6 +137,13 @@ from .tools.ops_tools import (
     handle_list_tasks,
     handle_test_proxmox_connection,
 )
+from .tools.power_tools import (
+    TOOL_DEFINITIONS as POWER_TOOL_DEFS,
+)
+from .tools.power_tools import (
+    handle_get_guest_power,
+    handle_power_guest,
+)
 from .tools.settings_tools import (
     TOOL_DEFINITIONS as SETTINGS_TOOL_DEFS,
 )
@@ -182,6 +189,7 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + ARTIFACT_TOOL_DEFS
     + GUEST_TOOL_DEFS
     + GUEST_NETWORK_TOOL_DEFS
+    + POWER_TOOL_DEFS
     + AGENT_TOOL_DEFS
     + MONITORING_TOOL_DEFS
     + OPS_TOOL_DEFS
@@ -224,6 +232,10 @@ _MUTATING_TOOLS = frozenset(
         # admin - it needs an approved/applied artifact (the runner enforces the
         # transition) and cannot grant approval, exactly like apply/replay.
         "revoke_artifact",
+        # Guest power (#781): PROPOSES a guest-power artifact and sends nothing
+        # to Proxmox, so it is a propose, at the propose tier. The direct power
+        # route is operator-only and has no MCP twin.
+        "power_guest",
     }
 )
 
@@ -365,6 +377,8 @@ _READ_ONLY_TOOLS = frozenset(
         # host, so read_only is their exact tier (they compute a plan/diff only).
         "plan_artifact",
         "preview_artifact",
+        # GET /inventory/{host_id}/power (#781): reads Proxmox, sends nothing.
+        "get_guest_power",
     }
 )
 
@@ -580,6 +594,8 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "get_host_metrics": handle_get_host_metrics,
     "get_host_metrics_series": handle_get_host_metrics_series,
     "get_host": handle_get_host,
+    "get_guest_power": handle_get_guest_power,
+    "power_guest": handle_power_guest,
     "list_tasks": handle_list_tasks,
     "get_dashboard_summary": handle_get_dashboard_summary,
     "get_update_status": handle_get_update_status,

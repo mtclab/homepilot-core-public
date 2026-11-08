@@ -48,6 +48,7 @@ _HOST_COLUMN_TYPES: dict[str, type] = {
     "env": str,
     "env_source": str,
     "is_self": int,
+    "protected": int,
 }
 
 _SERVICE_COLUMN_TYPES: dict[str, type] = {
@@ -107,6 +108,7 @@ _HOST_COLUMNS: frozenset[str] = frozenset(
         "maxdisk_gb",
         "env",
         "env_source",
+        "protected",
         # Not `is_self`: only set_self_host() may write it, because it has to
         # clear the previous holder in the same transaction.
     }

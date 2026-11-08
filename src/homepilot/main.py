@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import ipaddress
 import logging
+import logging.handlers
 import os
+import queue
 import signal
 import time
 from collections import defaultdict
@@ -34,6 +37,18 @@ from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
 from .instance_lock import InstanceLock
+
+# Loaded with this module - before uvicorn starts the event loop - and not
+# first inside the lifespan: importing the MCP server (and the SDK under it)
+# takes ~0.4 s of CPU, which inside the lifespan ran ON the loop at every
+# start, with the agent hub and the loop watchdog already up (3.9.0: #801's
+# detector caught it on #800's shutdown journey). The lifespan's own
+# `from .mcp.server import ...` is then a lookup, and a test that patches that
+# module still reaches it. tests/test_no_blocking_on_loop.py holds every
+# lifespan import to this.
+from .mcp import server as _mcp_server  # noqa: F401
+from .runtime.blocking import shutdown_pools
+from .runtime.loop_watchdog import LoopStallWatchdog
 from .selfcheck import (
     agent_hub_listening,
     mcp_transport_running,
@@ -140,19 +155,57 @@ def configure_logging(level: str) -> None:
         logging.getLogger(__name__).warning(
             "HP_LOG_LEVEL=%r is not a level name; using INFO", level
         )
+    # Through a queue: a log line written on the event loop must not wait on
+    # stderr. A slow or full log pipe (a stalled `docker logs` reader, a busy
+    # disk under a file redirect) otherwise blocks the loop inside
+    # `stream.write` - measured at 359 ms by the suite's loop-block detector.
+    # The handler only enqueues; one listener thread does the writing.
+    global _log_listener
+    stream = logging.StreamHandler()
+    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    listener = logging.handlers.QueueListener(log_queue, stream, respect_handler_level=False)
     logging.basicConfig(
         level=resolved,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.handlers.QueueHandler(log_queue)],
         force=True,
     )
+    listener.start()
+    if _log_listener is not None:
+        _log_listener.stop()  # flushes what the previous configuration queued
+    else:
+        atexit.register(_stop_log_listener)
+    _log_listener = listener
     logging.getLogger("homepilot").setLevel(resolved)
+
+
+_log_listener: logging.handlers.QueueListener | None = None
+
+
+def _stop_log_listener() -> None:
+    """Flush the queued log lines at interpreter exit (the listener's thread is a daemon)."""
+    if _log_listener is not None:
+        _log_listener.stop()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     configure_logging(settings.log_level)
-    state = await create_app_state(settings)
+    # First, so it also watches startup. Off-loop blocking is the rule
+    # (runtime/blocking.py); this is how a breach names itself in the log.
+    loop_watchdog = (
+        LoopStallWatchdog(settings.loop_stall_ms) if settings.loop_stall_ms > 0 else None
+    )
+    if loop_watchdog is not None:
+        loop_watchdog.start()
+    app.state.loop_watchdog = loop_watchdog
+    try:
+        state = await create_app_state(settings)
+    except BaseException:
+        if loop_watchdog is not None:
+            await loop_watchdog.stop()
+        raise
 
     for cidr in (settings.trusted_proxies or _HP_TRUSTED_PROXIES_ENV).split(","):
         cidr = cidr.strip()
@@ -738,6 +791,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             except Exception as exc:
                 logger.warning("%s drain error: %s", label, exc)
 
+        # Then the work those services handed to the blocking pools (git, io,
+        # net): a commit nobody awaits any more, or the integrity check's sqlite
+        # read - a read transaction still open would leave the checkpoint below
+        # busy. Bounded; queued work is finished, never cancelled.
+        try:
+            await shutdown_pools(timeout=10.0)
+        except Exception as exc:
+            logger.warning("Blocking pool shutdown error: %s", exc)
+
+        # Fold the WAL into the database file now that nothing writes any more,
+        # so the close below has no checkpoint left to do (closing the last
+        # connection otherwise runs one implicitly: unbounded disk I/O, #795).
+        # Off the loop and bounded by Database.checkpoint itself; one that cannot
+        # finish leaves the WAL for the close or the next start, which is safe.
+        try:
+            await state.database.checkpoint()
+        except Exception as exc:
+            logger.warning("WAL checkpoint before close failed: %s", exc)
+
         try:
             await asyncio.wait_for(state.database.close(), timeout=10.0)
         except TimeoutError:
@@ -755,6 +827,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Released LAST: while it is held, nothing else may start against this
         # data directory and run the orphan sweep over our tasks.
         instance_lock.release()
+        if loop_watchdog is not None:
+            await loop_watchdog.stop()
         logger.info("HomePilot v2 shut down")
 
 

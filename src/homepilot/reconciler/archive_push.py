@@ -16,11 +16,11 @@ synchronous, so it runs in a worker thread rather than blocking the loop.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
 from homepilot.db.repository import now
+from homepilot.runtime.blocking import run_blocking
 
 from .base import Reconciler, ReconcilerResult
 
@@ -52,9 +52,9 @@ class ArchivePushReconciler(Reconciler):
                     details={"pushed": False, "skipped": "no artifacts remote configured"},
                 )
             if remote != getattr(self._store, "remote", ""):
-                await asyncio.to_thread(self._store.set_remote, remote)
+                await run_blocking("git", self._store.set_remote, remote)
         try:
-            output = await asyncio.to_thread(self._store.push, "origin")
+            output = await run_blocking("git", self._store.push, "origin")
             await self._repo.set_setting(LAST_PUSH_AT, now())
             await self._repo.set_setting(LAST_PUSH_OK, "1")
             await self._repo.set_setting(LAST_PUSH_ERROR, "")

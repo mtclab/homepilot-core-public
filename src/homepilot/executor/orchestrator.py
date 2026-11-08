@@ -22,11 +22,13 @@ from homepilot.artifacts.models import (
 )
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
+from homepilot.runtime.blocking import run_blocking
 from homepilot.vault.manager import VaultManager
 
 from .ansible import execute as ansible_execute
 from .composite import execute as composite_execute
 from .guest_network import execute as guest_network_execute
+from .guest_power import execute as guest_power_execute
 from .host_provision import execute as host_provision_execute
 from .http_sequence import execute as http_sequence_execute
 from .kb_note import execute as kb_note_execute
@@ -85,6 +87,12 @@ def snapshot_run_tag(now: datetime | None = None) -> str:
 # other kind used to have that request silently dropped, with nothing said to the
 # operator who read `requires_snapshot: true` on the review screen (#642 A7).
 SNAPSHOTTABLE_TARGET_KINDS = ("vm", "lxc")
+
+# Kinds that never take a pre-apply snapshot, whatever `requires_snapshot`
+# says: a power action changes no disk, so a rollback point would only lock the
+# guest and delay the action (#781). Propose refuses `requires_snapshot: true`
+# for them as well.
+_NEVER_SNAPSHOT_KINDS = frozenset({ArtifactKind.GUEST_POWER})
 
 # How long the pre-apply snapshot is followed. A snapshot that saves RAM state
 # writes the guest's whole memory out, which outlasts the general 600 s on a big
@@ -164,7 +172,7 @@ class ArtifactExecutor:
         return self.agent
 
     async def apply(self, artifact_id: str, approved_by: str) -> ExecutionResult:
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
         status = ArtifactStatus(fm["status"])
 
@@ -198,7 +206,11 @@ class ArtifactExecutor:
         target_kind = target_data.get("kind", "")
 
         try:
-            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
+            if (
+                mutating
+                and target_kind in SNAPSHOTTABLE_TARGET_KINDS
+                and kind not in _NEVER_SNAPSHOT_KINDS
+            ):
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -240,7 +252,7 @@ class ArtifactExecutor:
         return result
 
     async def replay(self, artifact_id: str) -> ExecutionResult:
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
         status = ArtifactStatus(fm["status"])
 
@@ -275,7 +287,11 @@ class ArtifactExecutor:
         mutating = fm.get("mutating", True)
 
         try:
-            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
+            if (
+                mutating
+                and target_kind in SNAPSHOTTABLE_TARGET_KINDS
+                and kind not in _NEVER_SNAPSHOT_KINDS
+            ):
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -361,7 +377,7 @@ class ArtifactExecutor:
         as it stands now: still unknown while PVE says the task runs, else the
         verdict, which is also written onto the artifact.
         """
-        fm, _ = self.store.read(artifact_id)
+        fm, _ = await run_blocking("io", self.store.read, artifact_id)
         if not fm.get("unsettled_task"):
             return None
         return await self._settle(artifact_id, fm)
@@ -450,7 +466,7 @@ class ArtifactExecutor:
         outcome now rides back to the caller and into the audit row, because
         "reversed" and "relabelled" are different facts about a host.
         """
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         if fm.get("unsettled_task"):
             # A PVE task from the last apply/replay was still running when the
             # run stopped following it (#774). Rolling back underneath it would
@@ -462,7 +478,7 @@ class ArtifactExecutor:
                     f"cannot revoke {artifact_id} yet: {settled.failure_reason}. "
                     "Wait for that task to finish, then revoke again."
                 )
-            fm, body = self.store.read(artifact_id)
+            fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
 
         outcome = RevokeResult(rolled_back=False, reason="no rollback for this artifact")
@@ -528,6 +544,8 @@ class ArtifactExecutor:
             result = await guest_network_execute(
                 fm, body, target, self.proxmox, self.settings_source, self.sdn_gateway
             )
+        elif kind == ArtifactKind.GUEST_POWER:
+            result = await guest_power_execute(fm, body, target, self.repo, self.proxmox)
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:

@@ -68,6 +68,7 @@ class ArtifactKind(StrEnum):
     SHELL_SCRIPT = "shell-script"
     HOST_PROVISION = "host-provision"
     GUEST_NETWORK = "guest-network"
+    GUEST_POWER = "guest-power"
     KB_NOTE = "kb-note"
 
 
@@ -404,6 +405,88 @@ def parse_guest_network_spec(body: str, defaults: Any = None) -> Any:
         return DesiredGuestNetwork(**merged)
     except GuestNetworkError as exc:
         raise ValueError(f"invalid guest-network spec: {exc}") from exc
+
+
+_GUEST_POWER_FENCE = "guest-power-spec"
+
+
+class GuestPowerSpec(BaseModel):
+    """One power action on the artifact's target guest (lane B3, #781)."""
+
+    model_config = {"extra": "forbid"}
+
+    action: str
+    # Only for shutdown/reboot: how long the guest gets to shut down before the
+    # result says "timed out". Never forces anything.
+    timeout_s: int | None = None
+
+    @field_validator("action")
+    @classmethod
+    def _validate_action(cls, v: str) -> str:
+        from homepilot.inventory.power import POWER_ACTIONS
+
+        if v not in POWER_ACTIONS:
+            raise ValueError(f"action must be one of: {', '.join(POWER_ACTIONS)}")
+        return v
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _validate_timeout(cls, v: int | None) -> int | None:
+        from homepilot.inventory.power import MAX_SHUTDOWN_TIMEOUT_S, MIN_SHUTDOWN_TIMEOUT_S
+
+        if v is not None and not MIN_SHUTDOWN_TIMEOUT_S <= v <= MAX_SHUTDOWN_TIMEOUT_S:
+            raise ValueError(
+                f"timeout_s must be from {MIN_SHUTDOWN_TIMEOUT_S} to {MAX_SHUTDOWN_TIMEOUT_S}"
+            )
+        return v
+
+
+def parse_guest_power_spec(body: str) -> GuestPowerSpec:
+    """Parse the ```yaml guest-power-spec``` block; ValueError names what is wrong."""
+    import yaml as _yaml
+    from pydantic import ValidationError
+
+    pattern = re.compile(rf"```yaml\s+{_GUEST_POWER_FENCE}\s*\n(.*?)```", re.DOTALL)
+    m = pattern.search(body)
+    if not m:
+        raise ValueError(f"missing ```yaml {_GUEST_POWER_FENCE}``` block")
+    try:
+        parsed = _yaml.safe_load(m.group(1).strip())
+    except _yaml.YAMLError as exc:
+        raise ValueError(f"guest-power spec is not valid YAML: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("guest-power spec must be a YAML mapping")
+    try:
+        return GuestPowerSpec.model_validate(parsed)
+    except ValidationError as exc:
+        raise ValueError(f"invalid guest-power spec: {format_validation_error(exc)}") from None
+
+
+def render_guest_power_body(action: str, hostname: str, timeout_s: int | None = None) -> str:
+    """The body of a guest-power artifact: what a reviewer reads, and the spec."""
+    from homepilot.inventory.power import DEFAULT_SHUTDOWN_TIMEOUT_S
+
+    words = {
+        "start": "Start the guest. Refused at apply if a running guest holds one of its "
+        "addresses or has one of its passthrough disks attached.",
+        "shutdown": "Shut the guest down gracefully (ACPI / guest agent). If it has not "
+        "stopped when the timeout runs out it is left running and the apply fails as "
+        "timed out - nothing is forced.",
+        "reboot": "Proxmox reboot (shutdown, then start): pending config such as a "
+        "cloud-init ipconfig is applied. Refused at apply if a pending address change "
+        "would take a running guest's address.",
+        "stop": "Stop the guest FORCED, like pulling the power: unsaved state in the "
+        "guest is lost.",
+    }[action]
+    lines = [f"## Power action: {action} {hostname}", "", words, ""]
+    if action in ("shutdown", "reboot"):
+        lines += [
+            f"Shutdown timeout: {timeout_s or DEFAULT_SHUTDOWN_TIMEOUT_S}s.",
+            "",
+        ]
+    spec = f"action: {action}\n" + (f"timeout_s: {timeout_s}\n" if timeout_s else "")
+    lines += ["## Spec", "", f"```yaml {_GUEST_POWER_FENCE}", spec + "```", ""]
+    return "\n".join(lines)
 
 
 VALID_TRANSITIONS: dict[ArtifactStatus, set[ArtifactStatus]] = {

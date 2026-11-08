@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -15,6 +14,7 @@ from pyrage import encrypt as age_encrypt
 from pyrage import x25519
 
 from ..common import write_private
+from ..runtime.blocking import run_blocking
 
 
 class VaultError(Exception):
@@ -124,27 +124,32 @@ class VaultManager:
         if protected_file.exists():
             # Off the event loop: the cold unwrap is PBKDF2 at 600k rounds, and
             # the agent hub and every request share this loop (#687).
-            identity_data = await asyncio.to_thread(self._load_master_identity_data)
+            identity_data = await run_blocking("io", self._load_master_identity_data)
             self._master_identity = self._parse_public_key(identity_data)
             return self._master_identity
 
+        # Migrating a legacy identity or creating the first one wraps it with
+        # the same 600k-round PBKDF2 and fsyncs the result: off the loop too.
         if identity_file.exists():
-            identity_data = identity_file.read_bytes()
-            self._master_identity = self._parse_public_key(identity_data)
-            salt = os.urandom(16)
-            protected_data = self._protect_identity(identity_data, salt)
-            _atomic_write(protected_file, protected_data)
-            identity_file.unlink()
-            self._master_identity_data = identity_data
-            return self._master_identity
-
-        identity_data = self._generate_identity()
-        salt = os.urandom(16)
-        protected_data = self._protect_identity(identity_data, salt)
-        _atomic_write(protected_file, protected_data)
+            identity_data = await run_blocking("io", self._migrate_legacy_identity, identity_file)
+        else:
+            identity_data = await run_blocking("io", self._create_identity, protected_file)
         self._master_identity = self._parse_public_key(identity_data)
         self._master_identity_data = identity_data
         return self._master_identity
+
+    def _migrate_legacy_identity(self, identity_file: Path) -> bytes:
+        identity_data = identity_file.read_bytes()
+        self._parse_public_key(identity_data)  # refuse an unparsable one before rewrapping
+        protected_data = self._protect_identity(identity_data, os.urandom(16))
+        _atomic_write(self._identities_dir / "master.protected", protected_data)
+        identity_file.unlink()
+        return identity_data
+
+    def _create_identity(self, protected_file: Path) -> bytes:
+        identity_data = self._generate_identity()
+        _atomic_write(protected_file, self._protect_identity(identity_data, os.urandom(16)))
+        return identity_data
 
     @staticmethod
     def _generate_identity() -> bytes:
@@ -187,7 +192,7 @@ class VaultManager:
         else:
             # Cold path: the ~234ms PBKDF2 derivation runs off the event loop so
             # it doesn't block other coroutines; the result is then cached.
-            identity_data = await asyncio.to_thread(self._load_master_identity_data)
+            identity_data = await run_blocking("io", self._load_master_identity_data)
         private_key = self._extract_private_key(identity_data)
         try:
             identity = x25519.Identity.from_str(private_key)
@@ -210,7 +215,7 @@ class VaultManager:
         recipient = await self.ensure_master_identity()
         encrypted = await self.encrypt(json.dumps(value), recipient)
         secret_file = self._secrets_dir / f"{name}.age"
-        _atomic_write(secret_file, encrypted)
+        await run_blocking("io", _atomic_write, secret_file, encrypted)  # fsyncs
 
     async def get_secret(self, name: str) -> dict[str, Any]:
         self._validate_secret_name(name)
@@ -236,6 +241,15 @@ class VaultManager:
         return [f.stem for f in self._secrets_dir.glob("*.age")]
 
     async def rotate_passphrase(self, new_passphrase: str) -> None:
+        # Two 600k-round PBKDF2 derivations and three fsync'd writes: off the loop.
+        identity_data = await run_blocking("io", self._rewrap_identity, new_passphrase)
+        # The identity bytes are unchanged by rotation (only the wrapping key
+        # changed), so refresh the cache directly rather than re-deriving.
+        self._master_identity = None
+        self._master_identity_data = identity_data
+        await self.ensure_master_identity()
+
+    def _rewrap_identity(self, new_passphrase: str) -> bytes:
         old_protected = self._identities_dir / "master.protected"
         if not old_protected.exists():
             raise VaultError("No master identity to rotate")
@@ -261,8 +275,4 @@ class VaultManager:
             raise
         finally:
             backup.unlink(missing_ok=True)
-        # The identity bytes are unchanged by rotation (only the wrapping key
-        # changed), so refresh the cache directly rather than re-deriving.
-        self._master_identity = None
-        self._master_identity_data = identity_data
-        await self.ensure_master_identity()
+        return identity_data

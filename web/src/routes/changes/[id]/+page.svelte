@@ -9,6 +9,7 @@
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import { isTerminalStatus } from '$lib/taskStatus';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let detail: ArtifactDetail | null = null;
 	let loading = true;
@@ -60,6 +61,11 @@
 		switch (status) {
 			case 'proposed':
 				return [
+					// A guest-power proposal is one action, re-guarded at apply:
+					// the owner approves and runs it in one tap (#781).
+					...(canApprove && detail?.frontmatter.kind === 'guest-power'
+						? [{ label: 'Approve and apply', cls: 'btn-success', fn: doApproveAndApply }]
+						: []),
 					...(canApprove ? [{ label: 'Approve', cls: 'btn-success', fn: doApprove }] : []),
 					{ label: 'Reject', cls: 'btn-danger', fn: doReject, destructive: true },
 				];
@@ -133,6 +139,20 @@
 		try {
 			await api.rejectArtifact(id);
 			notify('Rejected');
+			await load();
+		} catch (e) {
+			notify(String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
+	async function doApproveAndApply() {
+		working = true;
+		try {
+			const res = await api.approveAndApplyArtifact(id);
+			notify('Approved - apply queued');
+			startPolling(res.task_id);
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
@@ -297,7 +317,7 @@
 
 <div class="space-y-5">
 	<div class="flex items-center gap-3">
-		<a href="{base}/changes" class="text-muted hover:text-ink text-xs">← Artifacts</a>
+		<a href="{base}/changes" class="text-muted hover:text-ink text-xs"><Icon name="arrow-left" />Artifacts</a>
 		<h1 class="page-title">
 			{detail?.frontmatter.intent ?? id}
 		</h1>

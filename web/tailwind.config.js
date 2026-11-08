@@ -40,8 +40,11 @@ export default {
 				note: 'var(--color-note)',
 				'note-tint': 'var(--color-note-tint)',
 				'note-border': 'var(--color-note-border)',
+				nodata: 'var(--color-nodata)',
 			},
 			fontFamily: {
+				// Page titles and the wordmark only (Instrument Serif).
+				display: 'var(--font-display)',
 				serif: 'var(--font-serif)',
 				sans: 'var(--font-sans)',
 				mono: 'var(--font-mono)',

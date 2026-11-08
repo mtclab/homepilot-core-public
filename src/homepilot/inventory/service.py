@@ -13,6 +13,7 @@ import httpx
 from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
+from homepilot.runtime.blocking import run_blocking
 
 from .addresses import (
     GUEST_CONFIG_SOURCES,
@@ -157,9 +158,7 @@ def node_pve_status(raw_status: str | None) -> str:
 async def _guess_ip(hostname: str) -> str | None:
     """Resolve hostname to IP via DNS. Returns None on failure."""
     try:
-        loop = asyncio.get_event_loop()
-        ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
-        return ip
+        return await run_blocking("net", socket.gethostbyname, hostname)
     except socket.gaierror as exc:
         logger.debug("DNS resolution failed for %s: %s", hostname, exc)
         return None

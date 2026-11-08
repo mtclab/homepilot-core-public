@@ -132,6 +132,38 @@ jobs:
             echo "No PROVENANCE in this tree - skipping (pre-provenance export)."
           fi
 
+      # The release body starts with this version's docs/CHANGELOG.md section
+      # (heading "## <version> - <date>"). HomePilot's update notice reads the
+      # release body, including its "Operator actions" subsection, so a body
+      # without the changelog showed "update available" with nothing to do.
+      # A missing section warns and still releases: the image is already pushed.
+      - name: Assemble release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            $0 ~ "^## " && found { exit }
+            $0 ~ "^## " v "( |$)" { found = 1; next }
+            found { print }
+          ' docs/CHANGELOG.md > dist/CHANGES.md
+          if [ ! -s dist/CHANGES.md ]; then
+            echo "::warning::No '## $VERSION' section in docs/CHANGELOG.md - release notes carry no changelog text."
+            echo "See docs/CHANGELOG.md." > dist/CHANGES.md
+          fi
+          {
+            cat dist/CHANGES.md
+            printf '\n## Docker\n\n```bash\ndocker pull ghcr.io/mtclab/homepilot-core-public:%s\n```\n\n' "$TAG"
+            printf 'Or with docker compose - set `HP_IMAGE_TAG=%s` in your `.env`.\n\n' "$TAG"
+            printf '## Agent Binary\n\nDownload the `hp-agent` binary for your managed hosts:\n\n```bash\n# Linux amd64\n'
+            printf 'curl -LO https://github.com/mtclab/homepilot-core-public/releases/download/%s/hp-agent-linux-amd64\n' "$TAG"
+            printf 'chmod +x hp-agent-linux-amd64\nsudo mv hp-agent-linux-amd64 /usr/local/bin/hp-agent\n\n# Or use the install script\n'
+            printf 'curl -fsSL https://raw.githubusercontent.com/mtclab/homepilot-core-public/main/scripts/install-agent.sh | bash\n```\n'
+          } > dist/RELEASE_NOTES.md
+          rm dist/CHANGES.md
+          echo "Release notes: $(wc -l < dist/RELEASE_NOTES.md) lines"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
@@ -141,25 +173,4 @@ jobs:
             dist/SHA256SUMS
             dist/PROVENANCE
             scripts/install-agent.sh
-          body: |
-            ## Docker
-
-            ```bash
-            docker pull ghcr.io/mtclab/homepilot-core-public:${{ github.ref_name }}
-            ```
-
-            Or with docker compose — set `HP_IMAGE_TAG=${{ github.ref_name }}` in your `.env`.
-
-            ## Agent Binary
-
-            Download the `hp-agent` binary for your managed hosts:
-
-            ```bash
-            # Linux amd64
-            curl -LO https://github.com/mtclab/homepilot-core-public/releases/download/${{ github.ref_name }}/hp-agent-linux-amd64
-            chmod +x hp-agent-linux-amd64
-            sudo mv hp-agent-linux-amd64 /usr/local/bin/hp-agent
-
-            # Or use the install script
-            curl -fsSL https://raw.githubusercontent.com/mtclab/homepilot-core-public/main/scripts/install-agent.sh | bash
-            ```
+          body_path: dist/RELEASE_NOTES.md

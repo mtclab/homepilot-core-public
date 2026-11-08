@@ -4,9 +4,9 @@
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { ENVS, envClass, envSourceLabel } from '$lib/fleet';
 	import { notify } from '$lib/stores';
-	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
-	import JoinRequests from '$lib/components/JoinRequests.svelte';
 	import RowMenu from '$lib/components/RowMenu.svelte';
+	import Icon from '$lib/components/Icon.svelte';
+	import Lamp from '$lib/components/Lamp.svelte';
 	import { pruneSelection } from '$lib/selection';
 	import { addressCell } from '$lib/addresses';
 	import { debounce } from '$lib/debounce';
@@ -60,10 +60,29 @@
 		'worker',
 	];
 	let selectedIds: Set<string> = new Set();
-	// Enrolment panels, folded in from the retired Agents tab (#514 S4).
-	let enrollShow: 'bootstrap' | 'hub' | null = null;
-	// Hosts knocking on the hub and refused, and unused bootstrap tokens (A3).
-	let joinRequests: JoinRequests | null = null;
+	// Who is knocking on the agent hub (A3). The panels themselves moved to
+	// Hosts > Agents (UI slice 1); the fleet list keeps ONE line naming how
+	// many are waiting, with the door, so the table is not pushed down on
+	// every visit when nobody is. `null` = not read yet; a failed read says
+	// so rather than going quiet.
+	let joining: { waiting: number; refused: number } | null = null;
+	let joiningUnread = false;
+	function joiningSentence(j: { waiting: number; refused: number }): string {
+		const parts: string[] = [];
+		if (j.waiting > 0) parts.push(`${j.waiting} host${j.waiting === 1 ? '' : 's'} waiting to join`);
+		if (j.refused > 0) parts.push(`${j.refused} refused`);
+		return parts.join(', ');
+	}
+	async function loadJoining() {
+		try {
+			const r = await api.getEnrolmentRequests();
+			joining = { waiting: r.summary.wants_to_join, refused: r.summary.refused };
+			joiningUnread = false;
+		} catch {
+			joining = null;
+			joiningUnread = true;
+		}
+	}
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
@@ -244,7 +263,7 @@
 	async function load() {
 		loading = true;
 		loadError = '';
-		void joinRequests?.load();
+		void loadJoining();
 		try {
 			const res = await api.listInventory({
 				role: filterRole || undefined,
@@ -479,21 +498,13 @@
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Hosts</h1>
 		<div class="flex gap-2">
-			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}>↻ Reload</button>
+			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}><Icon name="refresh" />Reload</button>
 			{#if canWrite}
 				<button class="btn btn-primary text-xs" on:click={() => (showAdd = !showAdd)}>
-					{showAdd ? 'Cancel' : '+ Add host'}
+					{#if showAdd}Cancel{:else}<Icon name="plus" />Add host{/if}
 				</button>
 				<button class="btn btn-ghost text-xs" on:click={sync} disabled={syncing}>
-					{syncing ? 'Syncing…' : '⟳ Sync from Proxmox'}
-				</button>
-				<button class="btn btn-ghost text-xs"
-					on:click={() => (enrollShow = enrollShow === 'bootstrap' ? null : 'bootstrap')}>
-					{enrollShow === 'bootstrap' ? 'Cancel' : 'Enroll agent'}
-				</button>
-				<button class="btn btn-ghost text-xs"
-					on:click={() => (enrollShow = enrollShow === 'hub' ? null : 'hub')}>
-					{enrollShow === 'hub' ? 'Hide' : 'Hub token'}
+					{#if syncing}Syncing…{:else}<Icon name="refresh" />Sync from Proxmox{/if}
 				</button>
 			{/if}
 		</div>
@@ -663,13 +674,19 @@
 		</span>
 	</div>
 
-	<JoinRequests
-		bind:this={joinRequests}
-		{canWrite}
-		on:enrolWithBootstrap={() => (enrollShow = 'bootstrap')}
-	/>
-
-	<EnrollAgent show={enrollShow} />
+	{#if joining && joining.waiting + joining.refused > 0}
+		<p class="text-xs flex flex-wrap items-center gap-x-s-2" data-testid="joining-strip">
+			<Lamp state={joining.waiting > 0 ? 'warn' : 'off'} />
+			<span class="text-ink">{joiningSentence(joining)}</span>
+			<a class="text-accent hover:underline" href="{base}/hosts/agents">Open Agents</a>
+		</p>
+	{:else if joiningUnread}
+		<p class="text-xs flex flex-wrap items-center gap-x-s-2" data-testid="joining-strip">
+			<Lamp state="off" />
+			<span class="text-muted">Could not read who is waiting to join the agent hub.</span>
+			<a class="text-accent hover:underline" href="{base}/hosts/agents">Open Agents</a>
+		</p>
+	{/if}
 
 	{#if items.some((h) => h.agent_id && !h.agent_connected)}
 		<div class="flex justify-end">
@@ -706,7 +723,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load hosts.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if items.length === 0 && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
@@ -718,7 +735,8 @@
 			<p class="prose-note text-sm">No hosts yet.</p>
 			<p class="prose-note text-xs">
 				Sync from Proxmox to discover guests, add a host by hand, or enroll an
-				agent — any of the three puts a machine on this page.
+				agent on <a class="text-accent hover:underline" href="{base}/hosts/agents">Agents</a> —
+				any of the three puts a machine on this page.
 			</p>
 		</div>
 	{:else}
@@ -757,8 +775,7 @@
 										class="btn btn-ghost btn-xs"
 										aria-expanded={!collapsed[g.id]}
 										on:click={() => toggleGroup(g.id)}
-									><span aria-hidden="true" class="mr-1">{collapsed[g.id] ? '▸' : '▾'}</span
-										>{g.label} ({g.hosts.length})</button>
+									><Icon name={collapsed[g.id] ? 'chevron-right' : 'chevron-down'} class="mr-1" />{g.label} ({g.hosts.length})</button>
 								{:else}
 									<span class="section-title">{g.label} ({g.hosts.length})</span>
 								{/if}
@@ -873,6 +890,14 @@
 													title="Open this host's recent metrics"
 													on:click={close}>Metrics</a>
 											{/if}
+											{#if canAdmin && (h.host_type === 'qemu' || h.host_type === 'lxc') && !h.is_template && !h.absent_since}
+												<a
+													role="menuitem"
+													class="btn btn-ghost btn-xs text-left"
+													href="{base}/hosts/{h.id}?tab=overview#power"
+													title="Start, shut down, reboot or stop this guest"
+													on:click={close}>Power…</a>
+											{/if}
 											{#if h.proxmox_url}
 												<a
 													role="menuitem"
@@ -881,7 +906,7 @@
 													target="_blank"
 													rel="noopener noreferrer"
 													title="This host's page in the Proxmox web UI"
-													on:click={close}>Open in Proxmox ↗</a>
+													on:click={close}>Open in Proxmox <Icon name="external-link" size={12} /></a>
 											{/if}
 											{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored' && !h.is_template}
 												<button
@@ -941,7 +966,7 @@
 					on:click={() => {
 						page -= 1;
 						load();
-					}}>← Previous</button
+					}}><Icon name="arrow-left" />Previous</button
 				>
 				<span class="text-xs text-muted">
 					Page {page + 1} of {Math.ceil(total / PAGE_SIZE)}
@@ -952,7 +977,7 @@
 					on:click={() => {
 						page += 1;
 						load();
-					}}>Next →</button
+					}}>Next<Icon name="arrow-right" /></button
 				>
 			</div>
 		{/if}

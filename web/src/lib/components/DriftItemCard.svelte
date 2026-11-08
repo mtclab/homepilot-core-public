@@ -8,6 +8,7 @@
 	import { base } from '$app/paths';
 	import type { DriftItem } from '$lib/drift';
 	import { timeAgo } from '$lib/relativeTime';
+	import Icon from '$lib/components/Icon.svelte';
 
 	export let item: DriftItem;
 	/** Prefix for the summary line, e.g. "Not established:". */
@@ -55,7 +56,7 @@
 			<span class="text-muted text-xs animate-pulse shrink-0">checking…</span>
 		{:else}
 			<button class="btn btn-ghost text-xs shrink-0" on:click={() => onRecheck(item.artifact.id)}
-				>↻ Recheck</button
+				><Icon name="refresh" />Recheck</button
 			>
 		{/if}
 	</div>

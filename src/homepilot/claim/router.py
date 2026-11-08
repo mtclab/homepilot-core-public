@@ -14,6 +14,7 @@ from ..auth.tokens import generate_api_token
 from ..common import SlidingWindowLimiter, write_private
 from ..config import get_settings
 from ..db.repository import Repository
+from ..runtime.blocking import run_blocking
 from .repository import ClaimRepository
 from .startup import clear_claim_code
 from .tokens import validate_token
@@ -121,7 +122,8 @@ async def _store_local_cli_token(request: Request, db: Repository, user_id: str)
         )
         path = _data_dir(request) / "api-token"
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_private(path, full_token + "\n")
+        # An fsync'd write: off the loop.
+        await run_blocking("io", write_private, path, full_token + "\n")
         logger.info("Local CLI admin token autocreated (prefix=%s) at %s", prefix, path)
         await audit_credential_event(
             db,
@@ -264,7 +266,7 @@ async def claim_instance(request: Request, body: ClaimRequest) -> dict[str, Any]
         logger.exception("Claim failed after the latch was taken - claim released")
         raise
 
-    clear_claim_code(_data_dir(request))
+    await run_blocking("io", clear_claim_code, _data_dir(request))
     # The one action that creates the first fleet-root credential (#686): the
     # claim itself, and the mint it made, both on the durable trail. After the
     # claim is final, so a failing audit write is logged loudly but cannot

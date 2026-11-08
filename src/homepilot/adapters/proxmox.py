@@ -21,6 +21,9 @@ GUEST_TYPES = ("qemu", "lxc")
 # spellings map to themselves so a caller may pass either vocabulary.
 TARGET_KIND_GUEST_TYPES = {"vm": "qemu", "qemu": "qemu", "lxc": "lxc"}
 
+# The power actions PVE offers both collections under `status/<action>` (#781).
+GUEST_POWER_ACTIONS = ("start", "shutdown", "reboot", "stop")
+
 
 # PVE's own verdict for a task that SUCCEEDED but logged warnings: pve-common's
 # upid_status_is_error() treats exactly "OK" and "WARNINGS: <n>" as success. A
@@ -503,16 +506,23 @@ class ProxmoxClient:
             body["sshkeys"] = quote(str(body["sshkeys"]), safe="")
         return await self.call("POST", f"/nodes/{node}/qemu/{vmid}/config", body=body)
 
-    async def get_vm_config(self, node: str, vmid: int, guest_type: str = "qemu") -> dict[str, Any]:
+    async def get_vm_config(
+        self, node: str, vmid: int, guest_type: str = "qemu", *, current: bool = False
+    ) -> dict[str, Any]:
         """One guest's configuration as PVE stores it (#630).
 
         `guest_type` because an LXC container's config lives in a different
         collection and states its address on the NIC line rather than on a
         cloud-init one - and a container on the guest wire holds an address
         just as firmly as a VM does.
+
+        `current`: PVE answers a plain GET with the PENDING changes already
+        applied - the config the guest will boot with next, not the one it is
+        running. ``current=True`` asks for what is really attached now (#781).
         """
         collection = "lxc" if guest_type == "lxc" else "qemu"
-        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/config")
+        query = {"current": 1} if current else None
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/config", query)
         data = result.get("data", result)
         return data if isinstance(data, dict) else {}
 
@@ -540,6 +550,55 @@ class ProxmoxClient:
 
     async def get_vm_current(self, node: str, vmid: int) -> dict[str, Any]:
         return await self.read(f"/nodes/{node}/qemu/{vmid}/status/current")
+
+    async def power_guest(
+        self,
+        node: str,
+        vmid: int,
+        action: str,
+        *,
+        guest_type: str = "qemu",
+        timeout_s: int | None = None,
+    ) -> str | None:
+        """Send one power action to a VM or a container; the task's UPID, or None.
+
+        The operator power controls (#781), for both collections. ``shutdown``
+        is sent with ``forceStop: 0`` ALWAYS: a guest that does not shut down
+        within ``timeout_s`` stays running and its task fails, so the caller
+        can say "timed out" - never a silent escalation to a hard stop.
+        ``reboot`` is PVE's own (shutdown, then start the guest again), which
+        is what applies pending config such as a cloud-init ``ipconfigN``.
+        """
+        if action not in GUEST_POWER_ACTIONS:
+            raise ValueError(f"unknown power action {action!r}")
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        body: dict[str, Any] = {}
+        if action in ("shutdown", "reboot") and timeout_s is not None:
+            body["timeout"] = int(timeout_s)
+        if action == "shutdown":
+            body["forceStop"] = 0
+        result = await self.call(
+            "POST", f"/nodes/{node}/{collection}/{vmid}/status/{action}", body=body or None
+        )
+        return self.upid_of(result)
+
+    async def get_guest_status(
+        self, node: str, vmid: int, guest_type: str = "qemu"
+    ) -> dict[str, Any]:
+        """A VM's or container's live status (``status``, ``name``, ``lock``...)."""
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/status/current")
+        data = result.get("data", result)
+        return data if isinstance(data, dict) else {}
+
+    async def get_guest_pending(
+        self, node: str, vmid: int, guest_type: str = "qemu"
+    ) -> list[dict[str, Any]]:
+        """PVE's ``/pending`` rows: ``{key, value[, pending][, delete]}`` per config key."""
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/pending")
+        data = result.get("data", result)
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
 
     async def get_vm_agent_network(self, node: str, vmid: int) -> dict[str, Any] | None:
         """Guest-agent interface list, or None when the agent cannot answer.

@@ -133,6 +133,42 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 	return s ? `?${s}` : '';
 }
 
+export type PowerAction = 'start' | 'shutdown' | 'reboot' | 'stop';
+
+export interface PendingChange {
+	key: string;
+	current?: unknown;
+	pending?: unknown;
+	delete?: boolean;
+}
+
+export interface GuestPowerState {
+	host_id: string;
+	hostname: string;
+	vmid: number | null;
+	node: string | null;
+	guest_type: string | null;
+	is_self: boolean;
+	protected: boolean;
+	protected_reason: string | null;
+	status: string;
+	pending: PendingChange[];
+	actions: Partial<
+		Record<PowerAction, { available: boolean; reason: string | null; needs_typed_confirmation: boolean }>
+	>;
+	error: string | null;
+}
+
+export interface GuestPowerResult {
+	action: PowerAction;
+	outcome: 'ok' | 'failed' | 'timed_out' | 'unknown';
+	message: string;
+	upid: string | null;
+	status_after: string | null;
+	next_actions: PowerAction[];
+	pending_after: PendingChange[] | null;
+}
+
 export interface Artifact {
 	id: string;
 	status: string;
@@ -1044,6 +1080,13 @@ export const api = {
 			body: JSON.stringify({ reason }),
 		});
 	},
+	/** The owner's one tap for a guest-power proposal: approve, then apply (#781). */
+	approveAndApplyArtifact(id: string) {
+		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(
+			`/artifacts/${id}/approve-and-apply`,
+			{ method: 'POST', body: JSON.stringify({}) },
+		);
+	},
 	applyArtifact(id: string) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}/apply`, {
 			method: 'POST',
@@ -1174,6 +1217,17 @@ export const api = {
 	},
 	getHostNetwork(id: string) {
 		return req<HostNetwork>(`/inventory/${id}/network`);
+	},
+	/** A guest's live power state, pending changes, and what each action needs (#781). */
+	getGuestPower(id: string) {
+		return req<GuestPowerState>(`/inventory/${id}/power`);
+	},
+	/** Power a guest DIRECTLY (operator session). 200 = sent; read `outcome`. */
+	powerGuest(id: string, data: { action: PowerAction; confirm_name?: string; timeout_s?: number }) {
+		return req<GuestPowerResult>(`/inventory/${id}/power`, {
+			method: 'POST',
+			body: JSON.stringify(data),
+		});
 	},
 	/** `env: ''` withdraws the operator's env, so the Proxmox tag applies again. */
 	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean; import_state?: string; status?: string; env?: string }) {

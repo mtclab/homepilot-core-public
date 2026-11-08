@@ -10,6 +10,7 @@ from ..artifacts.models import ArtifactBusyError, ArtifactStatus
 from ..artifacts.store import ArtifactStore
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..executor.orchestrator import ArtifactExecutor
+from ..runtime.blocking import run_blocking
 from .repository import TERMINAL_TASK_STATUSES, TaskRepository
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ class TaskRunner:
         # (executor.apply raises, the APPLIED→FAILED transition also raises, and
         # the task never leaves 'running'), blocking all future apply/revoke.
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
@@ -114,7 +115,7 @@ class TaskRunner:
         self, artifact_id: str, user: str = "system", reason: str | None = None
     ) -> dict[str, Any]:
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
@@ -145,7 +146,7 @@ class TaskRunner:
         to have exactly one way in.
         """
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 

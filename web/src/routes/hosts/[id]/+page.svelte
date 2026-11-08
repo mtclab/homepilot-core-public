@@ -33,10 +33,12 @@
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
 	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
 	import HostNetwork from '$lib/components/HostNetwork.svelte';
+	import GuestPower from '$lib/components/GuestPower.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
 	import { formatMetricValue, metricLabel } from '$lib/sparkline';
 	import { queryTabs, activeQueryTab } from '$lib/tabs';
 	import { HOST_TABS, hostTabFromHash } from '$lib/hostTabs';
+	import Icon from '$lib/components/Icon.svelte';
 
 	type HostDetail = Host & { services: Service[]; agent?: AgentOnHost };
 
@@ -539,9 +541,9 @@
 				{/if}
 				{#if host.proxmox_url}
 					<a class="btn btn-ghost text-xs" href={host.proxmox_url} target="_blank" rel="noopener noreferrer"
-						title="This host's page in the Proxmox web UI">Open in Proxmox ↗</a>
+						title="This host's page in the Proxmox web UI">Open in Proxmox <Icon name="external-link" size={12} /></a>
 				{/if}
-				<a class="btn btn-ghost text-xs" href="{base}/hosts">← All hosts</a>
+				<a class="btn btn-ghost text-xs" href="{base}/hosts"><Icon name="arrow-left" />All hosts</a>
 			</div>
 		</div>
 
@@ -549,7 +551,7 @@
 			<p class="prose-note text-xs">
 				Agent install: <span class="text-ink">{installTask.status}</span>
 				{#if installTask.error}<span class="text-danger">— {installTask.error}</span>{/if}
-				· <a class="text-accent" href="{base}/records/tasks">Tasks ↗</a>
+				· <a class="text-accent" href="{base}/records/tasks">Tasks <Icon name="arrow-right" size={12} /></a>
 			</p>
 		{:else if canWrite && eligibility && !eligibility.eligible && !agent}
 			<p class="prose-note text-xs">No agent install from here: {eligibility.message}</p>
@@ -584,6 +586,10 @@
 				     host with an agent can raise one, so a bare host shows none. -->
 				{#if host.agent_id}
 					<AlertsPanel hostname={host.hostname} />
+				{/if}
+				<!-- Operator power controls (#781): an admin session acts directly. -->
+				{#if canAdmin && (host.host_type === 'qemu' || host.host_type === 'lxc') && !host.is_template && !host.absent_since}
+					<GuestPower hostId={host.id} />
 				{/if}
 				<!-- ── Facts: ONE definition-list pattern, left-anchored ──────────── -->
 				<div class="card p-4">
@@ -674,7 +680,7 @@
 					<div class="card p-4 space-y-2">
 						<div class="flex items-baseline justify-between">
 							<h2 class="section-title">Now</h2>
-							<a class="text-accent text-xs" href={metricsTabHref}>Metrics →</a>
+							<a class="text-accent text-xs" href={metricsTabHref}>Metrics <Icon name="arrow-right" /></a>
 						</div>
 						<dl class="grid gap-x-8 gap-y-1.5 text-sm" style="grid-template-columns: max-content 1fr;">
 							{#each latest as m (m.metric)}
@@ -744,7 +750,7 @@
 					{#if !host.agent_id}
 						<p class="text-muted text-sm">
 							No agent on this host, so nothing reports metrics. Enroll one from the
-							<a class="text-accent" href="{base}/agents">fleet page</a> to see load, memory and disk here.
+							<a class="text-accent" href="{base}/hosts/agents">Agents page</a> to see load, memory and disk here.
 						</p>
 					{:else if metricsError}
 						<p class="text-danger text-sm">
@@ -883,7 +889,7 @@
 						{/if}
 					{:else}
 						<p class="text-muted text-sm">
-							No agent is enrolled on this host. <a class="text-accent" href="{base}/agents">Enroll one</a>
+							No agent is enrolled on this host. <a class="text-accent" href="{base}/hosts/agents">Enroll one</a>
 							to get a live channel, metrics and native actions.
 						</p>
 					{/if}

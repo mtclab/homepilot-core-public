@@ -204,6 +204,11 @@ class Settings(BaseSettings):
     # 2026-08-29 an OOM kill corrupted a database mid-write and nothing said so
     # until data was gone. 0 turns the check off.
     db_integrity_interval_seconds: int = 21600
+    # Loop-stall watchdog (runtime/loop_watchdog.py): when one callback holds the
+    # event loop longer than this, the loop thread's stack is logged while it is
+    # still stuck, and the stall is counted in the self-check. Every request, the
+    # agent hub and every reconciler share that one loop (#795). 0 turns it off.
+    loop_stall_ms: int = 500
     # Host management is the product, so the hub is on unless an operator turned
     # it off (ADR-004 S3). Everything it needs that an operator would otherwise
     # have to decide - the shared token below, the TLS certificate - generates

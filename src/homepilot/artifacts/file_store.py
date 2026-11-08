@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import builtins
 import fcntl
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
 
+from ..runtime.blocking import assert_off_loop, run_blocking
 from .store import ArtifactStore
+
+_T = TypeVar("_T")
 
 
 @contextmanager
@@ -26,6 +30,8 @@ def _file_lock(path: Any) -> Generator[None, None, None]:
     A `.lock` sidecar gives the same mutual exclusion without the artifact path
     ever being created as a side effect of reading it.
     """
+    # LOCK_EX waits as long as another holder keeps it: never on the loop.
+    assert_off_loop("artifact file lock (blocking flock)")
     lock_path = Path(f"{path}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
@@ -73,6 +79,28 @@ class ArtifactFileStore:
 
     def list(self, status: str | None = None, kind: str | None = None) -> list[dict[str, Any]]:
         return self.store.list(status=status, kind=kind)
+
+    async def aread(self, id: str) -> tuple[dict[str, Any], str]:
+        return await run_blocking("io", self.store.read, id)
+
+    async def awrite(self, id: str, fm_yml: str, body: str, event: str) -> None:
+        await run_blocking("git", self.store.write, id, fm_yml, body, event)
+
+    async def alist(
+        self, status: str | None = None, kind: str | None = None
+    ) -> builtins.list[dict[str, Any]]:
+        return await run_blocking("io", self.store.list, status=status, kind=kind)
+
+    async def run_serialized(self, fn: Callable[[], _T]) -> _T:
+        """Run a read-modify-write of artifact files off the event loop.
+
+        `fn` runs on the single-thread "git" pool - the same thread every store
+        write and git command runs on - so the whole critical section (file
+        lock, read, check, write, commit) is serialised with every other
+        artifact mutation, exactly as it was when it ran on the loop with no
+        await inside it. `fn` must be synchronous and must not await.
+        """
+        return await run_blocking("git", fn)
 
     @staticmethod
     def serialize_frontmatter(fm: dict[str, Any]) -> str:
