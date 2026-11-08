@@ -109,10 +109,16 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # second tool would be a second name for one number.
     "/dashboard/summary": "get_dashboard_summary",
     "/dashboard/config": "get_dashboard_summary",
+    # The release check (review A+). Also inside the summary as `updates`; the
+    # route of its own is what an operator script polls.
+    "/dashboard/updates": "get_update_status",
     # Inventory
     "/inventory": "query_inventory",
     "/inventory/{host_id}": "get_host",
     "/inventory/{host_id}/doc": "get_environment_doc",
+    # The Network tab's read (lane B2); get_host carries the same addresses and
+    # clashes as `addresses` / `address_conflicts`, from one service method.
+    "/inventory/{host_id}/network": "get_host",
     # KB
     "/kb": "list_kb",
     "/kb/search": "search_kb",
@@ -133,6 +139,12 @@ ROUTE_TO_TOOL: dict[str, str] = {
 }
 
 EXCLUDED_GET_ROUTES: dict[str, str] = {
+    # ── The self-guest prompt (lane B1). ─────────────────────────────────────
+    "/inventory/self-guest": (
+        "an operator confirmation prompt built from the address the browser reached "
+        "the API at; the fact itself reaches MCP as `is_self` on every host "
+        "(get_host, query_inventory)"
+    ),
     # ── Secrets. Owner rule: these never travel over MCP. ────────────────────
     "/agents/token": (
         "returns the hub's shared enrolment token - a credential that provisions "
@@ -329,6 +341,18 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
+    # ── The self-guest mark (lane B1). ──
+    ("PUT", "/inventory/self-guest"): (
+        "marks the machine HomePilot runs on - the guard later power actions check. "
+        "An assistant must not be able to move the guard on its own control plane; "
+        "it is an admin action at the web UI only"
+    ),
+    ("DELETE", "/inventory/self-guest"): (
+        "clears the self-guest guard; same reason as PUT /inventory/self-guest"
+    ),
+    ("POST", "/inventory/self-guest/dismiss"): (
+        "answers the web UI's self-guest proposal; same reason as PUT /inventory/self-guest"
+    ),
     # ── Operator hand-edit of an artifact file (#693). ──
     ("POST", "/artifacts/{artifact_id}/edit"): (
         "the route `hp artifacts edit` submits an operator's $EDITOR session to. The "
@@ -1088,6 +1112,17 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
             "artifact",
         ]
 
+    async def test_get_update_status(self, api, ctx) -> None:
+        route = await _get(api, "/dashboard/updates")
+        tool = await _handle_tool("get_update_status", {}, ctx)
+        assert tool == route
+        # Nothing checked yet in this estate: the honest state, and no claim.
+        assert tool["state"] in ("not_checked", "off")
+        assert tool["update_available"] is False
+        # And the Overview's copy is the same verdict.
+        summary = await _handle_tool("get_dashboard_summary", {}, ctx)
+        assert summary["updates"] == tool
+
     async def test_dashboard_summary_carries_what_dashboard_config_serves(self, api, ctx) -> None:
         """/dashboard/config maps to this tool; prove the field really is here."""
         config = await _get(api, "/dashboard/config")
@@ -1299,6 +1334,7 @@ class TestReadOnlyScopeCanCallEveryReadTool:
             ("list_tasks", {}),
             ("get_audit_log", {}),
             ("get_dashboard_summary", {}),
+            ("get_update_status", {}),
             ("list_kb", {}),
             ("get_fleet_drift", {}),
         ],

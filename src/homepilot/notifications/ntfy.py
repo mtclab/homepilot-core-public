@@ -26,6 +26,8 @@ MAX_TOKEN_LENGTH = 512
 PRIORITY_FIRING = 4
 PRIORITY_RESOLVED = 3
 PRIORITY_TEST = 3
+# A release is news, not an incident: no sound beyond the default.
+PRIORITY_UPDATE = 3
 
 
 def split_topic_url(raw: str) -> tuple[str, str]:
@@ -62,16 +64,26 @@ def split_topic_url(raw: str) -> tuple[str, str]:
 
 
 def build_message(
-    *, topic: str, title: str, message: str, priority: int, tags: list[str]
+    *,
+    topic: str,
+    title: str,
+    message: str,
+    priority: int,
+    tags: list[str],
+    click: str | None = None,
 ) -> dict[str, Any]:
-    """The JSON body ntfy's publish endpoint takes."""
-    return {
+    """The JSON body ntfy's publish endpoint takes. ``click`` is the URL a tap on
+    the notification opens (the release notes, for an update)."""
+    body: dict[str, Any] = {
         "topic": topic,
         "title": title,
         "message": message,
         "priority": int(priority),
         "tags": list(tags),
     }
+    if click:
+        body["click"] = click
+    return body
 
 
 def headers_for(token: str | None) -> dict[str, str]:

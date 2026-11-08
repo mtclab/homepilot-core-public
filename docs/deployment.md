@@ -182,7 +182,8 @@ and restart to manage the setting from the product instead.
 
 Editable today: `HP_ARTIFACTS_REMOTE`, `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS`,
 `HP_EMBEDDING_SERVICE_URL`, `HP_EMBEDDING_MODEL`, `HP_RETENTION_DAYS`,
-`HP_METRICS_RETENTION_DAYS`, `HP_EVENTS_WEBHOOK_URL` and the provisioning
+`HP_METRICS_RETENTION_DAYS`, `HP_EVENTS_WEBHOOK_URL`, `HP_UPDATE_CHECK_ENABLED`,
+`HP_UPDATE_CHECK_INTERVAL_SECONDS` and the provisioning
 defaults of 2.2 below. Each is re-read at use time - the next push, the next
 prune, the next event, the next provision - so a change takes effect
 on the next cycle without a restart. **Secrets are not on this surface at all**:
@@ -1220,7 +1221,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.7.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.8.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1277,6 +1278,8 @@ forward.
 | `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` | `3600` | How often the artifact store is pushed to `HP_ARTIFACTS_REMOTE` (only when a remote is set) |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |
+| `HP_UPDATE_CHECK_ENABLED` | `1` | Look for a newer HomePilot release on the public mirror (one unauthenticated GitHub API request per check). A newer release raises an Overview line and one `update_available` event; nothing is ever upgraded automatically. `0` switches it off, e.g. on an install with no internet access |
+| `HP_UPDATE_CHECK_INTERVAL_SECONDS` | `86400` | How often the release check runs (minimum `3600`); the first check runs about two minutes after boot, and a failed one is retried after an hour |
 | `HP_PORTAL_CN_HEADER` | `ssl-client-subject-dn` | Header the mTLS proxy sets with the client-certificate subject DN (see [portal.md](portal.md)) |
 | `HP_PORTAL_VERIFY_HEADER` | `ssl-client-verify` | Header that must equal `SUCCESS` for the certificate to be trusted |
 | `HP_PORTAL_TRUSTED_PROXY` | — | Address/CIDR(s) `/invite/*` requests must arrive from; unset = portal 503s |

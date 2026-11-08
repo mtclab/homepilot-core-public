@@ -59,6 +59,11 @@ in any language survive):
 | firing | `Alert: <rule> on <host>` | 4 (high) | `homepilot`, `firing` |
 | resolved | `Resolved: <rule> on <host>` | 3 (default) | `homepilot`, `resolved` |
 | test | `HomePilot test notification` | 3 | `homepilot`, `test` |
+| update available | `HomePilot <version> is available` | 3 | `homepilot`, `update` |
+
+Besides alerts, a channel receives `update_available` - ONCE per new HomePilot
+release, never daily (see "Updates available" below); tapping it opens the
+release notes.
 
 The body is one sentence built by the backend, e.g. `web01 went dark: nothing
 heard for 6 min (Host went dark)` or `Disk almost full on web01: disk.free_gb is
@@ -99,8 +104,31 @@ Create more in Settings -> Monitoring -> Alert rules by choosing *Nothing heard
 `{"name": "...", "kind": "nodata", "for_seconds": 600, "host_filter": "db-*"}`
 (no metric, comparison or threshold; at least 120 s).
 
+## Updates available
+
+Once shortly after boot and then daily (`HP_UPDATE_CHECK_INTERVAL_SECONDS`, at
+least an hour), HomePilot asks GitHub for the public mirror's latest release -
+one unauthenticated request, revalidated with its ETag. Pre-releases are never
+offered. When the release is newer than the running version:
+
+- the Overview shows ONE notice line, "HomePilot X.Y.Z is available - you run
+  A.B.C", linking to the release notes, with the release's operator actions
+  (`**Upgrade:**` / `**Operator action...:**` paragraphs and "Upgrade notes"
+  sections of the notes) listed under it; the line goes away as soon as this
+  install runs that version;
+- one `update_available` event goes to the channels, the events webhook and the
+  n8n flow - once per version: the announced version is stored, so neither the
+  daily check nor a restart repeats it.
+
+Nothing is ever upgraded automatically. `GET /dashboard/updates` and the MCP
+tool `get_update_status` return the same verdict. The self-check line
+`update_check` says when the check is off or failing (for example on an install
+with no internet access: one line and one log warning, then an hourly retry).
+Switch it off with `HP_UPDATE_CHECK_ENABLED=0` or in Settings -> Subsystems ->
+Release check.
+
 ## The n8n flow
 
 `n8n/artifact-notification.json` (workflow "HomePilot Event Notifications")
 remains an optional router to Matrix and Telegram for every event, alerts
-included. ntfy needs no n8n.
+and `update_available` included. ntfy needs no n8n.

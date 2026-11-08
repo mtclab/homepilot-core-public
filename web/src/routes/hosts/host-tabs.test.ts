@@ -61,13 +61,14 @@ describe('Host page tab addressing', () => {
 		});
 	});
 
-	it('offers the five sectors, in order, each as its own URL', async () => {
+	it('offers the six sectors, in order, each as its own URL', async () => {
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 
 		expect(screen.getAllByRole('tab').map((t) => [t.textContent, t.getAttribute('href')])).toEqual(
 			[
 				['Overview', '/ui/hosts/h-1?tab=overview'],
+				['Network', '/ui/hosts/h-1?tab=network'],
 				['Metrics', '/ui/hosts/h-1?tab=metrics'],
 				['Changes', '/ui/hosts/h-1?tab=changes'],
 				['Activity', '/ui/hosts/h-1?tab=activity'],
@@ -94,14 +95,14 @@ describe('Host page tab addressing', () => {
 		it(`?tab=${t.id} lands on ${t.label}`, async () => {
 			at(`?tab=${t.id}`);
 			render(HostPage);
-			await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+			await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 			expect(currentTab()).toBe(t.label);
 		});
 	}
 
 	it('an absent or unrecognised tab lands on Overview, never on nothing', async () => {
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 		expect(currentTab()).toBe('Overview');
 
 		cleanup();
@@ -109,7 +110,7 @@ describe('Host page tab addressing', () => {
 		// real sector rather than rendering an empty panel.
 		at('?tab=retired-section');
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 		expect(currentTab()).toBe('Overview');
 		expect(screen.getByText('Needs attention')).toBeTruthy();
 	});
@@ -117,7 +118,7 @@ describe('Host page tab addressing', () => {
 	it('keeps any other query the URL is carrying when switching sector', async () => {
 		at('?from=overview');
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 		expect(screen.getByRole('tab', { name: 'Metrics' })).toHaveAttribute(
 			'href',
 			'/ui/hosts/h-1?from=overview&tab=metrics',
@@ -140,7 +141,7 @@ describe('Host page tab addressing', () => {
 	it('leaves a fragment it does not recognise alone', async () => {
 		at('#some-users-own-anchor');
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 		// No invented sector, no history churn - Overview answers, as it does for
 		// any address that names no tab.
 		expect(goto).not.toHaveBeenCalled();
@@ -150,7 +151,7 @@ describe('Host page tab addressing', () => {
 	it('does not override an explicit ?tab= with a stale fragment', async () => {
 		at('?tab=changes#agent');
 		render(HostPage);
-		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(5));
+		await waitFor(() => expect(screen.getAllByRole('tab').length).toBe(6));
 		expect(goto).not.toHaveBeenCalled();
 		expect(currentTab()).toBe('Changes');
 	});

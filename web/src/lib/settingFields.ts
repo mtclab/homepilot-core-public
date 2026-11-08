@@ -14,6 +14,7 @@ export const SUBSYSTEM_SETTINGS: Record<string, string[]> = {
 	artifacts_remote: ['artifacts_remote', 'artifacts_push_interval_seconds'],
 	embeddings: ['embedding_service_url', 'embedding_model'],
 	events_webhook: ['events_webhook_url'],
+	update_check: ['update_check_enabled', 'update_check_interval_seconds'],
 };
 
 /**
@@ -55,6 +56,8 @@ const FIELD_LABELS: Record<string, string> = {
 	events_webhook_url: 'Webhook URL',
 	retention_days: 'Operational history (days)',
 	metrics_retention_days: 'Metric samples (days)',
+	update_check_enabled: 'Check for new releases (1 = on)',
+	update_check_interval_seconds: 'Check interval (seconds, at least 3600)',
 	provision_default_node: 'Node',
 	provision_default_template_vmid: 'Template VMID (0 = none)',
 	provision_default_pool: 'Pool',

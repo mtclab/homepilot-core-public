@@ -1136,6 +1136,83 @@ MIGRATIONS: dict[int, list[str | tuple[str, str, str]]] = {
             "minted_by",
         ),
     ],
+    37: [
+        # The fleet model (lane B1, review 02 steps 1-3). All additive.
+        #
+        # 1. What Proxmox already knows about each guest, read from
+        #    /cluster/resources by the sync. A template is a provisioning input,
+        #    not a fleet member: it can never run, so it sat in the adoption
+        #    queue as an "offline" guest and was counted in both. Pool, PVE tags
+        #    and the allocated size are the operator's own grouping and sizing,
+        #    shown instead of asked for again.
+        (
+            "ALTER TABLE hosts ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+            "hosts",
+            "is_template",
+        ),
+        ("ALTER TABLE hosts ADD COLUMN pool TEXT", "hosts", "pool"),
+        ("ALTER TABLE hosts ADD COLUMN pve_tags TEXT", "hosts", "pve_tags"),
+        ("ALTER TABLE hosts ADD COLUMN maxcpu INTEGER", "hosts", "maxcpu"),
+        ("ALTER TABLE hosts ADD COLUMN maxmem_mb INTEGER", "hosts", "maxmem_mb"),
+        ("ALTER TABLE hosts ADD COLUMN maxdisk_gb REAL", "hosts", "maxdisk_gb"),
+        # 2. Which part of the estate a machine belongs to - orthogonal to the
+        #    function `role` guesses. `env_source` says who decided: a PVE tag
+        #    (`hp-env-<value>`), the template flag, or an operator (pinned, so a
+        #    later sync leaves it alone).
+        (
+            "ALTER TABLE hosts ADD COLUMN env TEXT CHECK (env IS NULL OR env IN "
+            "('prod', 'dev', 'infra', 'friend', 'lab', 'template'))",
+            "hosts",
+            "env",
+        ),
+        (
+            "ALTER TABLE hosts ADD COLUMN env_source TEXT CHECK (env_source IS NULL OR "
+            "env_source IN ('pve_tag', 'pve_template', 'user'))",
+            "hosts",
+            "env_source",
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_hosts_env ON hosts(env)",
+        # 3. The machine HomePilot itself runs on, as confirmed by an operator.
+        #    At most one row: the database refuses a second, whoever writes it.
+        #    Any future rebuild of `hosts` (the rename dance of 10/25) must
+        #    recreate this index after the drop.
+        (
+            "ALTER TABLE hosts ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0",
+            "hosts",
+            "is_self",
+        ),
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts_one_self ON hosts(is_self) WHERE is_self = 1",
+    ],
+    38: [
+        # Every address a host holds, with where it came from (lane B2, review
+        # 02/4). `hosts.ip_address` is ONE address per host with no age and no
+        # provenance, so two guests configured onto one address - and a start
+        # that took a running guest's address over - were invisible. One row per
+        # (host, source, interface, address); the sources are documented in
+        # inventory/addresses.py. `observed_at` is when that source last said so.
+        #
+        # No `REFERENCES hosts(id)`: a future hosts rebuild drops the old table,
+        # and with foreign keys on that DROP would cascade into this one.
+        # `Repository.delete_host` removes a host's rows explicitly instead, the
+        # way it already does for services.
+        """CREATE TABLE IF NOT EXISTS host_addresses (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id      TEXT NOT NULL,
+            address      TEXT NOT NULL,
+            prefixlen    INTEGER,
+            iface        TEXT NOT NULL DEFAULT '',
+            mac          TEXT,
+            bridge       TEXT,
+            vlan         INTEGER,
+            source       TEXT NOT NULL CHECK(source IN (
+                             'qemu-ipconfig', 'lxc-net', 'pve-node', 'manual',
+                             'guest-agent', 'arp')),
+            observed_at  TEXT NOT NULL,
+            UNIQUE (host_id, source, iface, address)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_host_addresses_address ON host_addresses(address)",
+        "CREATE INDEX IF NOT EXISTS idx_host_addresses_host ON host_addresses(host_id)",
+    ],
 }
 
 

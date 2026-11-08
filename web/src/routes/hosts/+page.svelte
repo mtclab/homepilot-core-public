@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, hostMetricsUrl, sessionStore, type Host } from '$lib/api';
-	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { api, hostMetricsUrl, sessionStore, type Host, type SelfGuestStatus } from '$lib/api';
+	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
+	import { ENVS, envClass, envSourceLabel } from '$lib/fleet';
 	import { notify } from '$lib/stores';
 	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
 	import JoinRequests from '$lib/components/JoinRequests.svelte';
 	import RowMenu from '$lib/components/RowMenu.svelte';
 	import { pruneSelection } from '$lib/selection';
+	import { addressCell } from '$lib/addresses';
 	import { debounce } from '$lib/debounce';
 	import { base } from '$app/paths';
 	import {
@@ -33,6 +35,12 @@
 	let filterStatus = '';
 	let filterSource = '';
 	let filterImportState = '';
+	// Which part of the estate (lane B1): "which VMs are dev" is one filter.
+	let filterEnv = '';
+	// Proxmox templates are provisioning inputs, not fleet members: hidden
+	// unless asked for, and the number hidden is always on screen.
+	let showTemplates = false;
+	let templatesHidden = 0;
 	// Searched on the SERVER: the list is paginated, so a filter applied in the
 	// browser could only ever search the page already on screen (#445 A4).
 	let search = '';
@@ -59,6 +67,9 @@
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+	// Moving the self-guest mark is admin-only server-side (a later stop button
+	// is guarded by it), so only an admin is offered Confirm.
+	$: canAdmin = capIsAdmin($sessionStore?.capabilities);
 
 	// ── Grouping (#549 F3): attention first, then managed, then discovered.
 	// The rows are the same rows and the same selection; what changes is that
@@ -95,17 +106,25 @@
 	// The counts come from the dashboard summary because they are FLEET-wide:
 	// counting `items` would silently describe page one of a paged list.
 	let roleCounts: Array<[string, number]> = [];
+	// The same line by env (lane B1): "which VMs are dev" answered and opened
+	// in one click. `unset` is counted too - an estate half-labelled says so.
+	let envCounts: Array<[string, number]> = [];
+
+	function countsOf(by: Record<string, number> | undefined): Array<[string, number]> {
+		return Object.entries(by ?? {})
+			.filter(([, n]) => n > 0)
+			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+	}
 
 	async function loadRoleCounts() {
 		try {
 			const d = await api.getDashboard();
-			const by = d?.inventory?.by_role ?? {};
-			roleCounts = Object.entries(by)
-				.filter(([, n]) => n > 0)
-				.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+			roleCounts = countsOf(d?.inventory?.by_role);
+			envCounts = countsOf(d?.inventory?.by_env);
 		} catch {
 			// A breakdown is context, not the page. Losing it must not blank the fleet.
 			roleCounts = [];
+			envCounts = [];
 		}
 	}
 
@@ -113,6 +132,47 @@
 		filterRole = filterRole === role ? '' : role;
 		page = 0;
 		void load();
+	}
+
+	function filterToEnv(env: string) {
+		filterEnv = filterEnv === env ? '' : env;
+		page = 0;
+		void load();
+	}
+
+	// ── The self-guest (lane B1): HomePilot proposes which row is the machine
+	// it runs on; an operator confirms once. Nothing is marked on a guess.
+	let selfGuest: SelfGuestStatus | null = null;
+	let selfWorking = false;
+
+	async function loadSelfGuest() {
+		try {
+			selfGuest = await api.getSelfGuest();
+		} catch {
+			// The proposal is a convenience; the fleet stands without it.
+			selfGuest = null;
+		}
+	}
+
+	async function answerSelfGuest(confirm: boolean) {
+		const proposal = selfGuest?.proposal;
+		if (!proposal) return;
+		selfWorking = true;
+		try {
+			selfGuest = confirm
+				? await api.confirmSelfGuest(proposal.host_id)
+				: await api.dismissSelfGuest(proposal.host_id);
+			notify(
+				confirm
+					? `${proposal.hostname} is marked as the host HomePilot runs on`
+					: `HomePilot will not propose ${proposal.hostname} again`,
+			);
+			if (confirm) await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			selfWorking = false;
+		}
 	}
 
 	// Forgetting is irreversible (services and the observation note go with the
@@ -191,12 +251,15 @@
 				status: filterStatus || undefined,
 				source: filterSource || undefined,
 				import_state: filterImportState || undefined,
+				env: filterEnv || undefined,
+				templates: showTemplates ? 'include' : 'exclude',
 				q: search.trim() || undefined,
 				limit: PAGE_SIZE,
 				offset: page * PAGE_SIZE,
 			});
 			items = res.items;
 			total = res.total;
+			templatesHidden = res.templates_hidden ?? 0;
 			// The selection must never outlive the rows it was made on: a filter
 			// change used to leave off-screen hosts selected, so "3 selected →
 			// Adopt" acted on hosts the user could not see.
@@ -259,6 +322,7 @@
 		filterStatus !== '' ||
 		filterSource !== '' ||
 		filterImportState !== '' ||
+		filterEnv !== '' ||
 		search.trim() !== '';
 
 	function clearFilters() {
@@ -266,6 +330,7 @@
 		filterStatus = '';
 		filterSource = '';
 		filterImportState = '';
+		filterEnv = '';
 		search = '';
 		page = 0;
 		load();
@@ -406,7 +471,7 @@
 
 	onMount(async () => {
 		await load();
-		await loadRoleCounts();
+		await Promise.all([loadRoleCounts(), loadSelfGuest()]);
 	});
 </script>
 
@@ -449,6 +514,51 @@
 					on:click={() => filterToRole(role)}>{role} <span class="num-inline text-ink">{n}</span></button>
 			{/each}
 		</p>
+	{/if}
+	{#if envCounts.length}
+		<p class="text-xs text-muted flex flex-wrap items-baseline gap-x-s-2 gap-y-1">
+			<span>Hosts by env</span>
+			{#each envCounts as [env, n] (env)}
+				{#if env === 'unset'}
+					<span title="No env set here or by an hp-env-* tag in Proxmox">unset <span class="num-inline text-ink">{n}</span></span>
+				{:else}
+					<button
+						type="button"
+						class="hover:text-ink {filterEnv === env ? 'text-accent' : ''}"
+						aria-pressed={filterEnv === env}
+						title={filterEnv === env ? `Clear the ${env} filter` : `Show only ${env} hosts`}
+						on:click={() => filterToEnv(env)}>{env} <span class="num-inline text-ink">{n}</span></button>
+				{/if}
+			{/each}
+		</p>
+	{/if}
+
+	{#if selfGuest?.proposal && !selfGuest.confirmed}
+		<!-- HomePilot proposes, the operator confirms (review 02 Q3): an address
+		     the control plane answers on can be a proxy's, so nothing is marked
+		     on a match alone. -->
+		<div class="card section-stack" role="region" aria-label="HomePilot's own host">
+			<p class="text-sm text-ink">
+				HomePilot looks like it runs on
+				<a class="text-accent font-mono" href="{base}/hosts/{selfGuest.proposal.host_id}"
+					>{selfGuest.proposal.hostname}</a
+				>{#if selfGuest.proposal.proxmox_id != null}&nbsp;(VMID {selfGuest.proposal.proxmox_id}){/if}.
+			</p>
+			<p class="prose-note text-xs">
+				Why: {selfGuest.proposal.evidence}. Once confirmed, the row is marked and later power
+				actions treat it as the machine HomePilot would go down with.
+			</p>
+			{#if canAdmin}
+				<div class="flex gap-2">
+					<button class="btn btn-primary text-xs" disabled={selfWorking}
+						on:click={() => answerSelfGuest(true)}>Yes, this is HomePilot's host</button>
+					<button class="btn btn-ghost text-xs" disabled={selfWorking}
+						on:click={() => answerSelfGuest(false)}>Not this one</button>
+				</div>
+			{:else}
+				<p class="prose-note text-xs">An admin can confirm it.</p>
+			{/if}
+		</div>
 	{/if}
 
 	{#if showAdd}
@@ -533,6 +643,14 @@
 			<option value="adopted">Adopted</option>
 			<option value="ignored">Ignored</option>
 		</select>
+		<select class="input text-xs" bind:value={filterEnv} on:change={firstPage} aria-label="Filter by env">
+			<option value="">All envs</option>
+			{#each ENVS.filter((e) => e !== 'template') as env}<option value={env}>{env}</option>{/each}
+		</select>
+		<label class="flex items-center gap-1 text-xs text-muted self-center">
+			<input type="checkbox" bind:checked={showTemplates} on:change={firstPage} />
+			Show templates{#if !showTemplates && templatesHidden > 0}&nbsp;<span class="num-inline">({templatesHidden} hidden)</span>{/if}
+		</label>
 		{#if hasActiveFilters}
 			<button class="btn btn-ghost text-xs self-center" on:click={clearFilters}>Clear filters</button>
 		{/if}
@@ -620,7 +738,9 @@
 								checked={selectedIds.size > 0 && selectedIds.size === items.length} />
 						</th>
 						<th class="text-left col-primary">Host</th>
-						<th class="text-left col-secondary">IP</th>
+						<th class="num col-secondary">VMID</th>
+						<th class="text-left col-secondary">Env</th>
+						<th class="text-left col-secondary">Addresses</th>
 						<th class="text-left col-secondary">Role</th>
 						<th class="text-left col-secondary">Source</th>
 						<th class="text-left col-secondary">Node</th>
@@ -630,7 +750,7 @@
 				{#each groups as g (g.id)}
 					<tbody data-group={g.id}>
 						<tr class="bg-raised">
-							<th colspan="7" scope="colgroup" class="text-left py-s-1">
+							<th colspan="9" scope="colgroup" class="text-left py-s-1">
 								{#if isCollapsible(g.id)}
 									<button
 										type="button"
@@ -663,7 +783,17 @@
 												href="{base}/hosts/{h.id}"
 												class="text-accent hover:text-accent-strong font-mono"
 											>{h.hostname}</a>
-											<span class="badge {statusChip(h.status)}">{h.status ?? 'unknown'}</span>
+											{#if h.is_self}
+												<!-- The machine HomePilot runs on, as an operator confirmed. -->
+												<span class="badge bg-accent-tint text-accent-strong"
+													title="HomePilot runs on this host">HomePilot</span>
+											{/if}
+											{#if h.is_template}
+												<!-- A template never runs: "offline" would be noise. -->
+												<span class="badge bg-raised text-muted" title="Proxmox template: a provisioning input">template</span>
+											{:else}
+												<span class="badge {statusChip(h.status)}">{h.status ?? 'unknown'}</span>
+											{/if}
 											{#if h.agent_id}
 												<span
 													class="badge {h.agent_connected
@@ -687,7 +817,30 @@
 											{/if}
 										</span>
 									</td>
-									<td class="col-secondary font-mono">{h.ip_address || '—'}</td>
+									<td class="num col-secondary font-mono">{h.proxmox_id ?? '—'}</td>
+									<td class="col-secondary">
+										{#if h.env}
+											<span class="badge {envClass(h.env)}" title={envSourceLabel(h.env_source)}>{h.env}</span>
+										{:else}
+											—
+										{/if}
+									</td>
+									<td class="col-secondary font-mono">
+										<!-- Every address it holds (lane B2); a clashing one is
+										     marked and says so to a screen reader too. -->
+										{#if h.addresses?.length}
+											{#each addressCell(h.addresses) as a, i (a.text)}
+												{#if i > 0}<span aria-hidden="true">, </span>{/if}
+												<span
+													class={a.conflict ? 'text-danger' : ''}
+													title={a.conflict ? 'Another machine holds this address too' : undefined}
+													>{a.text}{#if a.conflict}<span class="sr-only"> - address clash</span>{/if}</span
+												>
+											{/each}
+										{:else}
+											{h.ip_address || '—'}
+										{/if}
+									</td>
 									<td class="col-secondary">
 										{h.role ?? '—'}
 										{#if h.role_source === 'inferred'}<span class="text-warn" title="Inferred">?</span>{/if}
@@ -720,7 +873,17 @@
 													title="Open this host's recent metrics"
 													on:click={close}>Metrics</a>
 											{/if}
-											{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored'}
+											{#if h.proxmox_url}
+												<a
+													role="menuitem"
+													class="btn btn-ghost btn-xs text-left"
+													href={h.proxmox_url}
+													target="_blank"
+													rel="noopener noreferrer"
+													title="This host's page in the Proxmox web UI"
+													on:click={close}>Open in Proxmox ↗</a>
+											{/if}
+											{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored' && !h.is_template}
 												<button
 													type="button"
 													role="menuitem"

@@ -104,6 +104,14 @@ class Database:
     # After forcing the handle shut, how long aiosqlite's own close is given to
     # notice and unwind before we stop caring about it.
     _FORCE_GRACE_SECONDS = 1.0
+    # How long the caller waits for a forced handle close before it stops
+    # caring. Closing the last connection to a WAL database checkpoints the WAL
+    # into the database file and fsyncs it: disk I/O with no upper bound under
+    # I/O pressure. So the forced close runs on its own daemon thread, never on
+    # the event loop (it blocked the loop for 16s once), and this bounds the
+    # wait. Worst case of the whole close: 5 + 3 + 1 = 9s, inside main.lifespan's
+    # 10s.
+    _HANDLE_CLOSE_SECONDS = 3.0
 
     async def close(self) -> None:
         """Close the connection. This never hangs, and it always shuts the handle.
@@ -129,10 +137,10 @@ class Database:
 
         So the close is never cancelled. It is given a bounded chance to finish
         politely, and if it cannot, the sqlite3 handle is interrupted and closed
-        from here - which is only possible because `connect()` opens it with
-        `check_same_thread=False`. Forcing the handle shut also unblocks the
-        polite close: the worker's next operation fails against a closed
-        database instead of waiting forever.
+        directly, on a daemon thread - which is only possible because
+        `connect()` opens it with `check_same_thread=False`. Forcing the handle
+        shut also unblocks the polite close: the worker's next operation fails
+        against a closed database instead of waiting forever.
         """
         conn = self._connection
         if conn is None:
@@ -148,7 +156,7 @@ class Database:
                 "event loop was closed under it), so its queue will never drain. "
                 "Closing the sqlite3 handle directly."
             )
-            self._force_close(conn, raw)
+            await self._force_close(conn, raw)
             return
 
         bridge = asyncio.wrap_future(asyncio.run_coroutine_threadsafe(conn.close(), _closer()))
@@ -164,7 +172,7 @@ class Database:
             "through the connection. Interrupting it and closing the handle.",
             self._CLOSE_TIMEOUT_SECONDS,
         )
-        self._force_close(conn, raw)
+        await self._force_close(conn, raw)
         # The forced close makes the polite one fail rather than wait, so it can
         # usually finish now - and finishing is what ends aiosqlite's worker
         # thread, which is NON-DAEMON and would otherwise hold up interpreter
@@ -185,16 +193,58 @@ class Database:
             with contextlib.suppress(Exception):
                 conn._tx.put_nowait((None, lambda: _STOP_RUNNING_SENTINEL))
 
+    async def _force_close(self, conn: Any, raw: Any) -> None:
+        """Interrupt and close the sqlite3 handle - on a daemon thread, never here.
+
+        `raw.close()` is not a cheap call. Closing the last connection to a WAL
+        database checkpoints the WAL into the database file, fsyncs it and
+        removes the WAL: synchronous disk I/O that runs as long as the disk
+        makes it. Run on the event loop, that I/O freezes everything the loop
+        serves, and with it every timeout meant to bound this close - which is
+        how a forced close budgeted at 6s took 22s under a busy disk.
+
+        So the handle work goes to a dedicated daemon thread and this waits for
+        it for at most `_HANDLE_CLOSE_SECONDS`. Not the default executor: its
+        threads are joined at interpreter exit, so a close still in its fsync
+        would hold the process up. A close that outlasts the wait carries on
+        in the background; sqlite's WAL makes an exit in the middle of it safe.
+        """
+        conn._running = False
+        if raw is None:
+            return
+        loop = asyncio.get_running_loop()
+        finished = loop.create_future()
+
+        def resolve() -> None:
+            if not finished.done():
+                finished.set_result(None)
+
+        def shut() -> None:
+            try:
+                self._close_handle(conn, raw)
+            finally:
+                # The loop may be gone by the time a slow close returns.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(resolve)
+
+        threading.Thread(target=shut, name="hp-db-force-close", daemon=True).start()
+        _done, pending = await asyncio.wait({finished}, timeout=self._HANDLE_CLOSE_SECONDS)
+        if pending:
+            logger.warning(
+                "Closing the sqlite3 handle is still running after %.0fs (slow disk "
+                "I/O in its WAL checkpoint). It finishes in the background.",
+                self._HANDLE_CLOSE_SECONDS,
+            )
+
     @staticmethod
-    def _force_close(conn: Any, raw: Any) -> None:
-        """Interrupt and close the sqlite3 handle from this thread.
+    def _close_handle(conn: Any, raw: Any) -> None:
+        """Interrupt and close the sqlite3 handle. Blocking: never call on the loop.
 
         `interrupt()` is documented as safe to call from another thread and
         aborts a statement in progress, which is what lets a wedged worker's
         `close()` return instead of blocking. Both calls are best-effort: a
         handle we cannot close is still better reported than waited on.
         """
-        conn._running = False
         if raw is not None:
             with contextlib.suppress(Exception):
                 raw.interrupt()

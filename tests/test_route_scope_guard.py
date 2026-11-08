@@ -278,6 +278,7 @@ class TestReadRoutesEnforceReadScope:
         app.state.repo = MagicMock()
         app.state.repo.list_hosts = AsyncMock(return_value=[])
         app.state.repo.count_hosts = AsyncMock(return_value=0)
+        app.state.repo.list_address_rows = AsyncMock(return_value=[])
         app.state.inventory_service = MagicMock()
         return app
 

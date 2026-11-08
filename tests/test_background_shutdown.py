@@ -31,6 +31,7 @@ TEETH (verified by reverting):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import sqlite3
 import subprocess
@@ -193,7 +194,12 @@ class TestACloseAlwaysReturns:
             released.set()
         elapsed = time.monotonic() - started
 
-        budget = Database._CLOSE_TIMEOUT_SECONDS + Database._FORCE_GRACE_SECONDS + 5
+        budget = (
+            Database._CLOSE_TIMEOUT_SECONDS
+            + Database._HANDLE_CLOSE_SECONDS
+            + Database._FORCE_GRACE_SECONDS
+            + 5
+        )
         assert elapsed < budget, (
             f"close took {elapsed:.1f}s: it waited for the wedged worker instead of interrupting it"
         )
@@ -213,6 +219,150 @@ class TestACloseAlwaysReturns:
         _assert_writable_by_someone_else(db.db_path)
         with pytest.raises(RuntimeError):
             _ = db.conn
+
+
+class _SlowCloseConnection(sqlite3.Connection):
+    """A sqlite3 handle whose close takes as long as a real one on a busy disk.
+
+    Closing the last connection to a WAL database checkpoints the WAL into the
+    database file and fsyncs it. Under I/O pressure (a full gate run beside
+    another) that took 16s once - on the event loop thread, which froze the
+    loop and every timeout meant to bound the close. A sleep is the honest
+    stand-in: like the real close it blocks the calling thread without holding
+    the GIL. Only the first close is slow; later ones are the no-ops they are on
+    a closed handle.
+    """
+
+    CLOSE_SECONDS = 2.0
+
+    def close(self) -> None:
+        if not getattr(self, "_slow_close_done", False):
+            self._slow_close_done = True
+            time.sleep(self.CLOSE_SECONDS)
+        super().close()
+
+
+class _LoopStallDetector:
+    """Measures the longest the running event loop went without a turn.
+
+    A heartbeat task asks for a turn every `TICK` seconds; the largest gap
+    between asking and getting it is how long something synchronous held the
+    loop. A loop that is merely idle answers at once.
+    """
+
+    TICK = 0.02
+
+    def __init__(self) -> None:
+        self.worst = 0.0
+        self._task: asyncio.Task[None] | None = None
+
+    async def _beat(self) -> None:
+        while True:
+            asked = time.monotonic()
+            await asyncio.sleep(self.TICK)
+            self.worst = max(self.worst, time.monotonic() - asked - self.TICK)
+
+    async def __aenter__(self) -> _LoopStallDetector:
+        self._task = asyncio.create_task(self._beat())
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self._task is not None
+        # Give the heartbeat its overdue turn before stopping it. A block that
+        # never yields - a close that returns without one await - ends right
+        # here, and cancelling first would throw away the only measurement
+        # of it.
+        await asyncio.sleep(self.TICK * 3)
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+
+
+class TestTheForcedCloseNeverBlocksTheLoop:
+    """The forced close is the shutdown's last resort, and it ran its blocking
+    sqlite3 close ON THE EVENT LOOP. A WAL checkpoint stalled by a busy disk
+    then froze the loop: a close budgeted at 6s took 22.5s, every `wait_for`
+    above it (main.lifespan's 10s guard included) was frozen with it, and the
+    server answered nothing while it waited. It surfaced as
+    `test_a_close_outlasts_a_worker_that_is_alive_but_stuck` failing about one
+    gate run in thirty.
+
+    The class forbidden here: any blocking handle work - close, checkpoint,
+    fsync - on the loop thread during a forced close, on either path into it.
+
+    TEETH (verified by reverting): call `_close_handle` synchronously from
+    `close()` again, as the old `_force_close` did, and both cases stall the
+    loop for the full slow close.
+    """
+
+    # Far above scheduler noise on a loaded box, far below the slow close.
+    _STALL_LIMIT = 0.5
+
+    @pytest.fixture
+    def slow_close_handles(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from homepilot.db import connection as connection_mod
+
+        real_connect = connection_mod.aiosqlite.connect
+
+        def connect(*args: object, **kwargs: object):
+            kwargs["factory"] = _SlowCloseConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(connection_mod.aiosqlite, "connect", connect)
+
+    @pytest.mark.parametrize("path", ["wedged_worker", "dead_worker"])
+    async def test_a_slow_handle_close_does_not_stall_the_loop(
+        self, tmp_path: Path, slow_close_handles: None, path: str
+    ) -> None:
+        db = Database(str(tmp_path / f"{path}.db"))
+        await db.connect()
+        await run_migrations(db)
+        raw = db._connection._connection
+        assert isinstance(raw, _SlowCloseConnection), "the slow handle was not installed"
+
+        released = threading.Event()
+        if path == "wedged_worker":
+            db._connection._tx.put_nowait((None, lambda: released.wait(120)))
+            await asyncio.sleep(0.2)
+            assert db._connection._thread.is_alive(), "the worker died - wrong scenario"
+        else:
+            _kill_worker_by_closing_its_loop(db._connection)
+            assert not db._connection._thread.is_alive(), "the worker survived - wrong scenario"
+
+        try:
+            async with _LoopStallDetector() as stalls:
+                await asyncio.wait_for(db.close(), timeout=60)
+        finally:
+            released.set()
+
+        assert stalls.worst < self._STALL_LIMIT, (
+            f"the event loop was blocked for {stalls.worst:.1f}s during a forced close - "
+            "the sqlite3 handle was closed on the loop thread"
+        )
+        # Not blocking the loop by abandoning the close is no fix either.
+        _assert_handle_is_closed(raw)
+
+    async def test_the_worst_case_close_fits_the_shutdown_that_waits_for_it(self) -> None:
+        """main.lifespan cancels the database close at its own timeout. A close
+        whose worst case outlasts that is cut off before it gets to force the
+        handle shut - the guard and the budgets have to agree."""
+        import re
+
+        lifespan = (REPO_ROOT / "src/homepilot/main.py").read_text()
+        found = re.search(
+            r"wait_for\(\s*state\.database\.close\(\),\s*timeout=([0-9.]+)\s*\)", lifespan
+        )
+        assert found, "main.lifespan no longer guards database.close() the way this gate reads"
+        worst_case = (
+            Database._CLOSE_TIMEOUT_SECONDS
+            + Database._HANDLE_CLOSE_SECONDS
+            + Database._FORCE_GRACE_SECONDS
+        )
+        assert worst_case < float(found.group(1)), (
+            f"Database.close can take {worst_case}s but main.lifespan cancels it at "
+            f"{found.group(1)}s"
+        )
 
 
 class TestTheProcessCanStillExit:
@@ -265,7 +415,12 @@ class TestTheProcessCanStillExit:
             print("EXITED-CLEANLY")
             """
         )
-        budget = Database._CLOSE_TIMEOUT_SECONDS + Database._FORCE_GRACE_SECONDS + 20
+        budget = (
+            Database._CLOSE_TIMEOUT_SECONDS
+            + Database._HANDLE_CLOSE_SECONDS
+            + Database._FORCE_GRACE_SECONDS
+            + 20
+        )
         try:
             done = subprocess.run(
                 [sys.executable, "-c", script],

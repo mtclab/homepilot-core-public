@@ -95,6 +95,7 @@ class TestStockInstallIsHonest:
             "artifacts_remote",
             "reconcilers",
             "agent_versions",
+            "update_check",
         }
         for name, entry in entries.items():
             assert entry["configured"] is False, (

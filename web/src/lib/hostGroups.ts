@@ -10,13 +10,16 @@
 //   2. MANAGED - adopted and behaving. Rolled up, collapsible, still there.
 //   3. DISCOVERED - seen but not adopted (pending or deliberately ignored).
 //      A decision queue, not a fault.
+//   4. TEMPLATES - Proxmox templates, only when the operator asked to see them
+//      (lane B1). A template cannot run and cannot be adopted, so it belongs to
+//      neither the queue nor the faults.
 //
 // Kept as pure functions rather than inline `{#if}` chains on the page so the
 // ORDER and the membership rules can be asserted without mounting a table.
 
 import type { Host } from './api';
 
-export type HostGroupId = 'attention' | 'managed' | 'discovered';
+export type HostGroupId = 'attention' | 'managed' | 'discovered' | 'templates';
 
 export interface HostGroup {
 	id: HostGroupId;
@@ -49,6 +52,8 @@ export function isUnadopted(h: Host): boolean {
  * artifacts, raises it there instead.
  */
 export function attentionReason(h: Host): string {
+	// A template is never running and never will be: "offline" is its nature.
+	if (h.is_template) return '';
 	if (isUnadopted(h)) return '';
 	// Ordered by how final the news is: gone outranks offline outranks a dead
 	// agent channel, and a row shows exactly one reason.
@@ -59,6 +64,7 @@ export function attentionReason(h: Host): string {
 }
 
 export function groupOf(h: Host): HostGroupId {
+	if (h.is_template) return 'templates';
 	if (isUnadopted(h)) return 'discovered';
 	return attentionReason(h) ? 'attention' : 'managed';
 }
@@ -67,6 +73,7 @@ const LABELS: Record<HostGroupId, string> = {
 	attention: 'Needs attention',
 	managed: 'Managed',
 	discovered: 'Discovered',
+	templates: 'Templates',
 };
 
 /**
@@ -75,8 +82,13 @@ const LABELS: Record<HostGroupId, string> = {
  * Membership order inside a group is the server's order, untouched.
  */
 export function groupHosts(hosts: Host[]): HostGroup[] {
-	const order: HostGroupId[] = ['attention', 'managed', 'discovered'];
-	const buckets: Record<HostGroupId, Host[]> = { attention: [], managed: [], discovered: [] };
+	const order: HostGroupId[] = ['attention', 'managed', 'discovered', 'templates'];
+	const buckets: Record<HostGroupId, Host[]> = {
+		attention: [],
+		managed: [],
+		discovered: [],
+		templates: [],
+	};
 	for (const h of hosts) buckets[groupOf(h)].push(h);
 	return order
 		.filter((id) => buckets[id].length > 0)

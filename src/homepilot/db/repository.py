@@ -39,6 +39,15 @@ _HOST_COLUMN_TYPES: dict[str, type] = {
     "owner": str,
     "absent_since": str,
     "pinned_fields": str,
+    "is_template": int,
+    "pool": str,
+    "pve_tags": str,
+    "maxcpu": int,
+    "maxmem_mb": int,
+    "maxdisk_gb": float,
+    "env": str,
+    "env_source": str,
+    "is_self": int,
 }
 
 _SERVICE_COLUMN_TYPES: dict[str, type] = {
@@ -90,6 +99,16 @@ _HOST_COLUMNS: frozenset[str] = frozenset(
         "owner",
         "absent_since",
         "pinned_fields",
+        "is_template",
+        "pool",
+        "pve_tags",
+        "maxcpu",
+        "maxmem_mb",
+        "maxdisk_gb",
+        "env",
+        "env_source",
+        # Not `is_self`: only set_self_host() may write it, because it has to
+        # clear the previous holder in the same transaction.
     }
 )
 
@@ -152,6 +171,11 @@ _HOST_SEARCH_COLUMNS: tuple[str, ...] = (
     "description",
     "owner",
     "os_info",
+    # The operator's own Proxmox grouping (lane B1): typing a pool, a PVE tag or
+    # an env finds the machines carrying it.
+    "pool",
+    "pve_tags",
+    "env",
 )
 
 
@@ -904,6 +928,8 @@ class Repository:
         limit: int = 100,
         offset: int = 0,
         q: str | None = None,
+        env: str | None = None,
+        is_template: bool | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(limit, 1000)
         offset = max(offset, 0)
@@ -915,6 +941,8 @@ class Repository:
             import_state=import_state,
             pve_status=pve_status,
             q=q,
+            env=env,
+            is_template=is_template,
         )
         params.extend([limit, offset])
         rows = await self.db.fetchall(f"SELECT * FROM hosts{where} LIMIT ? OFFSET ?", params)
@@ -930,6 +958,8 @@ class Repository:
         import_state: str | None = None,
         pve_status: str | None = None,
         q: str | None = None,
+        env: str | None = None,
+        is_template: bool | None = None,
     ) -> tuple[str, list[Any]]:
         """The filter clauses, in ONE place, for both the list and the count.
 
@@ -957,6 +987,12 @@ class Repository:
         if pve_status is not None:
             clauses.append("pve_status = ?")
             params.append(pve_status)
+        if env is not None:
+            clauses.append("env = ?")
+            params.append(env)
+        if is_template is not None:
+            clauses.append("is_template = ?")
+            params.append(int(is_template))
         if q:
             # Free text over what an operator types when looking for a machine:
             # its name, where it lives, what it is for. Searched in SQL rather
@@ -1064,7 +1100,7 @@ class Repository:
     # accepts it - enrich re-derived it every cycle, which made that PATCH field
     # a lie (#424).
     PINNABLE_HOST_FIELDS: frozenset[str] = frozenset(
-        {"role", "ip_address", "description", "status", "tags", "owner", "fqdn"}
+        {"role", "ip_address", "description", "status", "tags", "owner", "fqdn", "env"}
     )
 
     async def pin_host_fields(self, host_id: str, fields: set[str]) -> None:
@@ -1084,6 +1120,52 @@ class Repository:
             (_json.dumps(merged), now(), host_id),
         )
         await self.db.conn.commit()
+
+    async def unpin_host_fields(self, host_id: str, fields: set[str]) -> None:
+        """Hand these fields back to automation: the operator withdrew their value."""
+        import json as _json
+
+        host = await self.get_host(host_id)
+        if host is None:
+            return
+        current = self._pinned_fields(host)
+        remaining = sorted(current - set(fields))
+        if remaining == sorted(current):
+            return
+        await self.db.execute(
+            "UPDATE hosts SET pinned_fields = ?, updated_at = ? WHERE id = ?",
+            (_json.dumps(remaining) if remaining else None, now(), host_id),
+        )
+        await self.db.conn.commit()
+
+    async def get_self_host(self) -> dict[str, Any] | None:
+        """The row an operator confirmed as the machine HomePilot runs on, if any."""
+        row = await self.db.fetchone("SELECT * FROM hosts WHERE is_self = 1")
+        return dict(row) if row is not None else None
+
+    async def set_self_host(self, host_id: str | None) -> None:
+        """Make ``host_id`` the one self row (``None`` clears it), in one transaction.
+
+        The partial UNIQUE index (migration 37) refuses a second `is_self = 1`
+        row, so the previous holder is cleared first, inside the same
+        transaction: a reader never sees two machines claiming to be HomePilot,
+        and never sees none when the operator only moved the mark.
+        """
+        await self.db.conn.commit()
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            ts = now()
+            await self.db.execute(
+                "UPDATE hosts SET is_self = 0, updated_at = ? WHERE is_self = 1", (ts,)
+            )
+            if host_id is not None:
+                await self.db.execute(
+                    "UPDATE hosts SET is_self = 1, updated_at = ? WHERE id = ?", (ts, host_id)
+                )
+            await self.db.conn.commit()
+        except BaseException:
+            await self.db.conn.rollback()
+            raise
 
     @staticmethod
     def _pinned_fields(host: dict[str, Any]) -> set[str]:
@@ -1168,6 +1250,9 @@ class Repository:
         if hostname:
             await self.db.execute("DELETE FROM alert_state WHERE hostname = ?", (hostname,))
         await self.db.execute("DELETE FROM services WHERE host_id = ?", (host_id,))
+        # Its addresses (lane B2): a forgotten machine must not go on "holding"
+        # an address and raising a clash nobody can open.
+        await self.db.execute("DELETE FROM host_addresses WHERE host_id = ?", (host_id,))
         # The as-found observation note is keyed `introspect:<host_id>` in its
         # SOURCE (its target is the hostname), so that is what identifies it -
         # matching on the hostname alone would take out unrelated notes about a
@@ -1242,6 +1327,129 @@ class Repository:
             )
         await self.db.conn.commit()
         return newly_absent
+
+    # ── Host addresses (lane B2) ────────────────────────────────────────────
+    #
+    # Every address a host holds, one row per (source, interface, address).
+    # Each SOURCE is replaced as a set whenever that source is read, so an
+    # address a config no longer names disappears with the next read - and a
+    # source that could NOT be read is simply not called, leaving its last
+    # answer (and its observed_at, which says how old that answer is).
+
+    _ADDRESS_ROW_SQL = (
+        "SELECT a.host_id, a.address, a.prefixlen, a.iface, a.mac, a.bridge, a.vlan, "
+        "a.source, a.observed_at, h.hostname, h.proxmox_id, h.node, h.host_type, "
+        "h.pve_status, h.absent_since, h.source AS host_source, h.import_state "
+        "FROM host_addresses a JOIN hosts h ON h.id = a.host_id"
+    )
+
+    async def replace_host_addresses(
+        self,
+        host_id: str,
+        sources: tuple[str, ...],
+        addresses: list[Any],
+        observed_at: str | None = None,
+    ) -> None:
+        """Replace this host's rows for ``sources`` with ``addresses``, in one commit.
+
+        ``addresses`` are ``NicAddress``-shaped (``as_row()``) or plain dicts;
+        each must carry a ``source`` that is one of ``sources``.
+        """
+        if not sources:
+            return
+        ts = observed_at or now()
+        marks = ", ".join("?" for _ in sources)
+        await self.db.execute(
+            f"DELETE FROM host_addresses WHERE host_id = ? AND source IN ({marks})",  # nosec B608
+            (host_id, *sources),
+        )
+        for item in addresses:
+            row = item.as_row() if hasattr(item, "as_row") else dict(item)
+            if row["source"] not in sources:
+                raise ValueError(f"address source {row['source']!r} is not one being replaced")
+            await self.db.execute(
+                "INSERT OR REPLACE INTO host_addresses "
+                "(host_id, address, prefixlen, iface, mac, bridge, vlan, source, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    host_id,
+                    row["address"],
+                    row.get("prefixlen"),
+                    row.get("iface") or "",
+                    row.get("mac"),
+                    row.get("bridge"),
+                    row.get("vlan"),
+                    row["source"],
+                    ts,
+                ),
+            )
+        await self.db.conn.commit()
+
+    async def list_host_addresses(self, host_id: str) -> list[dict[str, Any]]:
+        """One host's addresses, every source, configured claims first."""
+        rows = await self.db.fetchall(
+            "SELECT address, prefixlen, iface, mac, bridge, vlan, source, observed_at "
+            "FROM host_addresses WHERE host_id = ? "
+            "ORDER BY CASE source WHEN 'qemu-ipconfig' THEN 0 WHEN 'lxc-net' THEN 0 "
+            "WHEN 'pve-node' THEN 0 WHEN 'manual' THEN 1 WHEN 'guest-agent' THEN 2 ELSE 3 END, "
+            "iface, address",
+            (host_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def list_address_rows(self) -> list[dict[str, Any]]:
+        """Every address row joined with its host, for the conflict scan."""
+        rows = await self.db.fetchall(self._ADDRESS_ROW_SQL + " ORDER BY a.address, h.hostname")
+        return [dict(r) for r in rows]
+
+    async def hosts_with_address(
+        self, address: str, include_absent: bool = False
+    ) -> list[dict[str, Any]]:
+        """Which hosts hold ``address``, by any source (the reverse lookup).
+
+        For a caller matching an address it already knows - the control plane's
+        own, when finding the VM HomePilot runs on - against the fleet. Absent
+        hosts hold nothing unless asked for.
+        """
+        clause = "" if include_absent else " AND h.absent_since IS NULL"
+        rows = await self.db.fetchall(
+            self._ADDRESS_ROW_SQL + f" WHERE a.address = ?{clause} ORDER BY h.hostname, a.source",
+            (address,),
+        )
+        return [dict(r) for r in rows]
+
+    async def sync_operator_address(self, host_id: str) -> None:
+        """Mirror an operator-typed ``ip_address`` into the address table.
+
+        A manual device's address, or an address an operator pinned on a host
+        (``ip_source='user'``), is a CONFIGURED claim with source ``manual``. A
+        value that is a DNS name rather than an address claims nothing here.
+        """
+        from homepilot.inventory.addresses import SOURCE_MANUAL, NicAddress, normalise_address
+
+        host = await self.get_host(host_id)
+        if host is None:
+            return
+        address = (
+            normalise_address(host.get("ip_address")) if host.get("ip_source") == "user" else None
+        )
+        rows = [NicAddress(address=address, source=SOURCE_MANUAL)] if address else []
+        current = await self.db.fetchall(
+            "SELECT address FROM host_addresses WHERE host_id = ? AND source = ?",
+            (host_id, SOURCE_MANUAL),
+        )
+        if [r["address"] for r in current] == [r.address for r in rows]:
+            return  # unchanged: keep the observed_at of when it was typed
+        await self.replace_host_addresses(host_id, (SOURCE_MANUAL,), rows)
+
+    async def sync_operator_addresses(self) -> None:
+        """``sync_operator_address`` for every host that has or had one."""
+        rows = await self.db.fetchall(
+            "SELECT id FROM hosts WHERE ip_source = 'user' "
+            "UNION SELECT host_id FROM host_addresses WHERE source = 'manual'"
+        )
+        for r in rows:
+            await self.sync_operator_address(str(r["id"]))
 
     async def create_service(
         self,

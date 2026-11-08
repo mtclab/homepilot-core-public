@@ -7,11 +7,22 @@ import sqlite3
 from typing import Any
 
 from homepilot.db.repository import Repository
+from homepilot.inventory.addresses import (
+    NO_PROBE,
+    AddressConflict,
+    NeighbourProbe,
+    find_conflicts,
+    record_probe_answers,
+)
 from homepilot.inventory.service import InventoryService
 
 from .base import Reconciler, ReconcilerResult
 
 logger = logging.getLogger(__name__)
+
+# The conflicts already written to the journal, so each one is journaled when it
+# appears and when it clears - not every five minutes while it stands.
+ADDRESS_CONFLICTS_KEY = "inventory.address_conflicts"
 
 
 class InventoryReconciler(Reconciler):
@@ -19,9 +30,13 @@ class InventoryReconciler(Reconciler):
         self,
         inventory_service: InventoryService,
         repo: Repository,
+        neighbour_probe: NeighbourProbe = NO_PROBE,
     ) -> None:
         self.inventory_service = inventory_service
         self.repo = repo
+        # The active ARP probe (lane B2): a seam with no implementation yet,
+        # see inventory/addresses.py NeighbourProbe.
+        self.neighbour_probe = neighbour_probe
 
     # One page's worth per round-trip; the reconciler needs every host, and a
     # single unbounded SELECT on a large estate is the other way to get this
@@ -45,6 +60,13 @@ class InventoryReconciler(Reconciler):
             # with more than a hundred hosts the absent/changed sets below were
             # computed from an arbitrary first page (#428).
             existing_hosts = await self._all_hosts()
+            # Operator-typed addresses into the address table, every cycle: it
+            # is idempotent, it backfills an upgraded install, and it does not
+            # need Proxmox - a manual device's address is a claim either way.
+            try:
+                await self.repo.sync_operator_addresses()
+            except sqlite3.Error:
+                logger.warning("InventoryReconciler operator address sync failed", exc_info=True)
             pre_ids: set[str] = {h["id"] for h in existing_hosts}
             pre_checksums: dict[str, str] = {
                 h["id"]: self._host_checksum(h) for h in existing_hosts
@@ -98,6 +120,15 @@ class InventoryReconciler(Reconciler):
             except Exception:
                 logger.warning("InventoryReconciler enrichment pass failed", exc_info=True)
 
+            # Address clashes (lane B2): probe if a probe exists, then journal
+            # every clash that appeared or cleared since the last cycle.
+            address_conflicts: int | None = None
+            try:
+                await record_probe_answers(self.repo, self.neighbour_probe)
+                address_conflicts = await self._journal_address_conflicts()
+            except (sqlite3.Error, ValueError, TypeError):
+                logger.warning("InventoryReconciler address conflict pass failed", exc_info=True)
+
             proxmox_ids: set[str] = set(result.get("proxmox_host_ids", []))
 
             # The hosts the sweep actually MARKED absent this cycle (#712). The
@@ -124,6 +155,8 @@ class InventoryReconciler(Reconciler):
                 "new_hosts": len(new_ids),
                 "changed_hosts": len(changed_ids),
             }
+            if address_conflicts is not None:
+                details["address_conflicts"] = address_conflicts
 
             if absent_ids:
                 details["absent_host_ids"] = sorted(absent_ids)
@@ -155,6 +188,54 @@ class InventoryReconciler(Reconciler):
                 details={"error": str(exc)},
             )
 
+    async def _journal_address_conflicts(self) -> int:
+        """Journal each address clash once when it appears and once when it clears.
+
+        Returns how many clashes stand now. The set already journaled is kept
+        in the settings table, so a restart does not re-announce standing ones.
+        """
+        conflicts = find_conflicts(await self.repo.list_address_rows())
+        current: dict[str, AddressConflict] = {_conflict_key(c): c for c in conflicts}
+        stored = await self.repo.get_setting(ADDRESS_CONFLICTS_KEY)
+        try:
+            previous = dict(json.loads(stored["value"])) if stored and stored["value"] else {}
+        except (ValueError, TypeError):
+            previous = {}
+        for key, conflict in current.items():
+            if key in previous:
+                continue
+            for holder in conflict.holders:
+                await self.repo.log_audit(
+                    user_id="system",
+                    source="reconciler:inventory",
+                    action="address_conflict",
+                    target_host=holder.hostname,
+                    details_json=json.dumps(
+                        {
+                            "address": conflict.address,
+                            "kind": conflict.kind,
+                            "summary": conflict.summary,
+                            "remedy": conflict.remedy,
+                        }
+                    ),
+                )
+        for key, summary in previous.items():
+            if key in current:
+                continue
+            address = key.split("|", 1)[0]
+            await self.repo.log_audit(
+                user_id="system",
+                source="reconciler:inventory",
+                action="address_conflict_resolved",
+                details_json=json.dumps({"address": address, "was": summary}),
+            )
+        if set(current) != set(previous):
+            await self.repo.set_setting(
+                ADDRESS_CONFLICTS_KEY,
+                json.dumps(sorted((k, c.summary) for k, c in current.items())),
+            )
+        return len(current)
+
     @staticmethod
     def _host_checksum(host: dict[str, Any]) -> str:
         # Exclude derived/timestamp fields: enrichment changes must not trigger
@@ -163,3 +244,8 @@ class InventoryReconciler(Reconciler):
         relevant = {k: v for k, v in host.items() if k not in excluded}
         serialized = json.dumps(relevant, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode()).hexdigest()[:16]
+
+
+def _conflict_key(conflict: AddressConflict) -> str:
+    """One clash's identity: the address and WHO holds it, not how it is worded."""
+    return f"{conflict.address}|{','.join(sorted(conflict.host_ids))}"

@@ -177,9 +177,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "update_host",
         "description": (
             "Edit one host's fields by its inventory id (managed, tags, role, "
-            "ip_address, description, import_state, status). Only the fields you pass "
+            "ip_address, description, import_state, status, env). Only the fields you pass "
             "are changed, and every field you set is PINNED so the next Proxmox sync or "
-            "enrich pass leaves it alone. Passing no recognised field is an error. "
+            "enrich pass leaves it alone. env is one of prod, dev, infra, friend, lab, "
+            'template; env "" withdraws the operator value so the Proxmox tag '
+            "(hp-env-<value>) applies again. Passing no recognised field is an error. "
             "Returns the updated host."
         ),
         "inputSchema": {
@@ -196,6 +198,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": "One of: pending, adopted, ignored",
                 },
                 "status": {"type": ["string", "null"]},
+                "env": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "One of: prod, dev, infra, friend, lab, template; empty string "
+                        "clears the operator value"
+                    ),
+                },
             },
             "required": ["host_id"],
         },

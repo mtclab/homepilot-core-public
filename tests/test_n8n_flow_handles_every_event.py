@@ -111,6 +111,12 @@ def test_every_emitted_event_has_its_own_formatter(flow, event):
         assert "$json.body.hostname" in text and "$json.body.message" in text
     if event.startswith("artifact_"):
         assert "Artifact" in text
+    if event == "update_available":
+        # The release notice carries its version, the running one, and the
+        # message that holds the release-notes link and the operator actions.
+        assert "Artifact" not in text, f"{event} is formatted as an artifact: {text!r}"
+        for field in ("version", "running_version", "message"):
+            assert f"$json.body.{field}" in text, f"{event} formatter drops {field}"
 
 
 def test_the_fallback_is_honest_not_an_artifact(flow):

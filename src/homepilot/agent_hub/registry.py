@@ -24,6 +24,17 @@ def _conn_is_live(writer: asyncio.StreamWriter | None) -> bool:
     return writer is not None and not writer.is_closing()
 
 
+def _peer_host(writer: Any) -> str | None:
+    """The remote address of an agent's connection, or None when it is not known."""
+    if writer is None:
+        return None
+    try:
+        peer = writer.get_extra_info("peername")
+    except Exception:
+        return None
+    return str(peer[0]) if isinstance(peer, tuple) and peer else None
+
+
 @dataclass
 class ConnectedAgent:
     agent_id: str
@@ -366,6 +377,10 @@ class AgentRegistry:
                 {
                     "agent_id": agent.agent_id,
                     "hostname": agent.hostname,
+                    # The address this agent's connection arrives from, as the
+                    # hub's socket sees it (the self-guest proposal compares it
+                    # with this container's default gateway).
+                    "peer": _peer_host(agent.writer),
                     "system_info": agent.system_info,
                     "state": agent.state,
                     "connected_at": agent.connected_at.isoformat(),

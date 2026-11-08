@@ -17,6 +17,16 @@ from ..agent_hub.version_skew import control_plane_version as _control_plane_ver
 from ..agent_hub.version_skew import is_behind as _is_behind
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import audit_actor
+from .addresses import find_conflicts
+from .fleet_model import ENV_SOURCE_USER, ENVS, imported_env, parse_pve_tags, proxmox_ui_url
+from .self_guest import (
+    DISMISSED_KEY,
+    colocated_agents,
+    control_plane_addresses,
+    default_gateway,
+    running_in_container,
+    self_guest_status,
+)
 from .service import InventoryService
 
 logger = logging.getLogger(__name__)
@@ -105,6 +115,20 @@ class HostPatchRequest(BaseModel):
     description: str | None = None
     import_state: str | None = None
     status: str | None = None
+    # Which part of the estate (lane B1). A value pins it against later syncs;
+    # an EMPTY string withdraws the operator's value and hands the field back
+    # to what Proxmox says (its `hp-env-*` tag, or `template`).
+    env: str | None = None
+
+    @field_validator("env")
+    @classmethod
+    def validate_env(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if v and v not in ENVS:
+            raise ValueError(f"env must be one of: {', '.join(ENVS)} (or empty to clear)")
+        return v
 
     @field_validator("tags")
     @classmethod
@@ -199,12 +223,20 @@ async def list_inventory(
     source: str | None = Query(None),
     import_state: str | None = Query(None),
     pve_status: str | None = Query(None),
+    env: str | None = Query(None, description="Only hosts in this environment"),
+    templates: Literal["include", "exclude", "only"] = Query(
+        "include",
+        description=(
+            "Proxmox templates are provisioning inputs, not fleet members: "
+            "`exclude` leaves them out (the fleet list does), `only` lists just them"
+        ),
+    ),
     q: str | None = Query(None, description="Free text over hostname, address, role, tags"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     repo = request.app.state.repo
-    filters = {
+    filters: dict[str, Any] = {
         "q": q,
         "managed": managed,
         "role": role,
@@ -212,12 +244,22 @@ async def list_inventory(
         "import_state": import_state,
         "pve_status": pve_status,
         "status": status,
+        "env": env or None,
+        "is_template": {"include": None, "exclude": False, "only": True}[templates],
     }
     hosts = await repo.list_hosts(limit=limit, offset=offset, **filters)
     # A real COUNT, not the page size (#428). `len(hosts)` capped the UI at 100
     # with no way to reach page 2 and told the operator their estate was smaller
     # than it is.
     total = await repo.count_hosts(**filters)
+    # How many the filter left out for being templates, so a hidden population
+    # is a number with a "show" next to it, never silently missing.
+    templates_hidden = (
+        await repo.count_hosts(**{**filters, "is_template": True}) if templates == "exclude" else 0
+    )
+    proxmox = getattr(getattr(request.app.state, "inventory_service", None), "proxmox", None)
+    for h in hosts:
+        h["proxmox_url"] = proxmox_ui_url(proxmox, h)
     # The agent is a property of the host (#514 S1): a fleet list that cannot
     # say "this machine has a live channel" forces a second tab to answer it.
     agent_ids = [h["agent_id"] for h in hosts if h.get("agent_id")]
@@ -266,7 +308,125 @@ async def list_inventory(
                 # An agent older than the control plane is not running the code
                 # that shipped. `None` = could not be told, never "fine".
                 h["agent_behind"] = _is_behind(h["agent_version"], _control_plane_version())
-    return {"items": hosts, "total": total}
+    # Every address a host holds, with its provenance, and whether any of them
+    # clashes (lane B2). One read of the address table for the whole page: the
+    # clash scan needs every host's rows anyway, not just this page's.
+    address_rows = await repo.list_address_rows()
+    clashing = {(hid, c.address) for c in find_conflicts(address_rows) for hid in c.host_ids}
+    by_host: dict[str, list[dict[str, Any]]] = {}
+    for r in address_rows:
+        by_host.setdefault(str(r["host_id"]), []).append(r)
+    for h in hosts:
+        h["addresses"] = _host_address_list(by_host.get(str(h["id"]), []), clashing, h["id"])
+    return {"items": hosts, "total": total, "templates_hidden": templates_hidden}
+
+
+# ── The self-guest (lane B1, review 02 step 3) ───────────────────────────────
+# Declared BEFORE the `/{host_id}` routes: those would otherwise read
+# "self-guest" as a host id.
+
+
+class SelfGuestRequest(BaseModel):
+    host_id: str
+
+
+async def _self_guest_answer(request: Request) -> dict[str, Any]:
+    from ..app_state import get_agent_registry
+    from ..config import get_settings
+
+    cp = await control_plane_addresses(
+        get_settings(), request.url.hostname, request.headers.get("x-forwarded-host")
+    )
+    # A default install runs in a container with no advertise address, so no
+    # address above is one a guest holds; the agent dialling in from the
+    # container's gateway is what names the machine (3.8.0-rc1 dev walk).
+    registry = getattr(request.app.state, "agent_registry", None) or get_agent_registry()
+    connected = registry.list_connected() if registry is not None else []
+    colocated = colocated_agents(connected, default_gateway(), running_in_container())
+    return await self_guest_status(request.app.state.repo, cp, colocated)
+
+
+@router.get("/self-guest", dependencies=[Depends(require_scope("read"))])
+async def get_self_guest(request: Request) -> dict[str, Any]:
+    """Which host HomePilot runs on: the confirmed one, else HomePilot's proposal.
+
+    Nothing is marked until an operator confirms: an address the control plane
+    answers on can belong to a proxy or a NAT box in front of it, and a wrong
+    marker would guard the wrong machine.
+    """
+    return await _self_guest_answer(request)
+
+
+@router.put("/self-guest", dependencies=[Depends(require_scope("admin"))])
+async def confirm_self_guest(
+    request: Request, body: SelfGuestRequest, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    """An operator says: this row is the machine HomePilot runs on.
+
+    Admin scope: the mark is what a later stop/power action is guarded by, so
+    moving or clearing it is not a routine inventory edit.
+    """
+    repo = request.app.state.repo
+    host = await repo.get_host(body.host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {body.host_id}")
+    if host.get("is_template"):
+        raise HTTPException(
+            status_code=409, detail=f"{host.get('hostname')} is a Proxmox template; it cannot run"
+        )
+    await repo.set_self_host(body.host_id)
+    await repo.log_audit(
+        user_id=audit_actor(token),
+        source="api",
+        action="self_guest_confirmed",
+        target_host=str(host.get("hostname") or ""),
+    )
+    return await _self_guest_answer(request)
+
+
+@router.delete("/self-guest", dependencies=[Depends(require_scope("admin"))])
+async def clear_self_guest(request: Request, token: dict[str, Any] = _principal) -> dict[str, Any]:
+    """Withdraw the mark: HomePilot no longer claims to know which host it runs on."""
+    repo = request.app.state.repo
+    current = await repo.get_self_host()
+    await repo.set_self_host(None)
+    if current is not None:
+        await repo.log_audit(
+            user_id=audit_actor(token),
+            source="api",
+            action="self_guest_cleared",
+            target_host=str(current.get("hostname") or ""),
+        )
+    return await _self_guest_answer(request)
+
+
+@router.post("/self-guest/dismiss", dependencies=[Depends(require_scope("admin"))])
+async def dismiss_self_guest(request: Request, body: SelfGuestRequest) -> dict[str, Any]:
+    """ "Not this one": stop proposing this host. A different match is still proposed."""
+    repo = request.app.state.repo
+    if await repo.get_host(body.host_id) is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {body.host_id}")
+    await repo.set_setting(DISMISSED_KEY, body.host_id)
+    return await _self_guest_answer(request)
+
+
+def _host_address_list(
+    rows: list[dict[str, Any]], clashing: set[tuple[str, str]], host_id: str
+) -> list[dict[str, Any]]:
+    """One entry per distinct address, configured provenance first."""
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        entry = out.setdefault(
+            r["address"],
+            {
+                "address": r["address"],
+                "sources": [],
+                "conflict": (host_id, r["address"]) in clashing,
+            },
+        )
+        if r["source"] not in entry["sources"]:
+            entry["sources"].append(r["source"])
+    return list(out.values())
 
 
 async def create_manual_host_record(
@@ -312,6 +472,9 @@ async def create_manual_host_record(
         ip_source="user" if body.ip_address else None,
         status="unknown",
     )
+    # A device's address is a claim like a guest's (lane B2): recorded now,
+    # so a clash with it is raised on the next read, not the next sync.
+    await repo.sync_operator_address(host_id)
     host = await repo.get_host(host_id)
     await repo.log_audit(
         user_id=actor,
@@ -397,6 +560,19 @@ async def refresh_inventory(request: Request) -> Any:
     return result
 
 
+@router.get("/{host_id}/network", dependencies=[Depends(require_scope("read"))])
+async def get_host_network(request: Request, host_id: str) -> dict[str, Any]:
+    """Every address this host holds, by source and age, and every clash it is in.
+
+    Read-only (lane B2): the Network tab on the host page. A clash names the
+    other machines, so the operator can see who else answers for the address.
+    """
+    host = await request.app.state.repo.get_host(host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+    return await _get_service(request).host_network(host_id)
+
+
 @router.get("/{host_id}/doc", dependencies=[Depends(require_scope("read"))])
 async def get_host_doc(request: Request, host_id: str) -> dict[str, Any]:
     repo = request.app.state.repo
@@ -436,13 +612,30 @@ async def update_host_record(repo: Any, host_id: str, body: HostPatchRequest) ->
         updates["import_state"] = body.import_state
     if body.status is not None:
         updates["status"] = body.status
-    if not updates:
+    clear_env = body.env == ""
+    if body.env:
+        updates["env"] = body.env
+        updates["env_source"] = ENV_SOURCE_USER
+    if not updates and not clear_env:
         raise InventoryError(400, "No valid fields to update")
-    await repo.update_host(host_id, **updates)
-    # A PATCH is an operator deciding, so the fields it wrote are PINNED: the
-    # next sync or enrich pass leaves them alone (#424). Without this, editing a
-    # description or a status in the UI lasted until the next reconciler cycle.
-    await repo.pin_host_fields(host_id, set(updates))
+    if updates:
+        await repo.update_host(host_id, **updates)
+        # A PATCH is an operator deciding, so the fields it wrote are PINNED:
+        # the next sync or enrich pass leaves them alone (#424). Without this,
+        # editing a description or a status in the UI lasted until the next
+        # reconciler cycle.
+        await repo.pin_host_fields(host_id, set(updates))
+        if "ip_address" in updates:
+            await repo.sync_operator_address(host_id)
+    if clear_env:
+        # The operator withdrew their env: Proxmox's answer applies again, from
+        # the tags and template flag the last sync stored - now, not after the
+        # next sync, so the page does not show a blank in the meantime.
+        env, source = imported_env(
+            parse_pve_tags(host.get("pve_tags")), bool(host.get("is_template"))
+        )
+        await repo.update_host(host_id, env=env, env_source=source)
+        await repo.unpin_host_fields(host_id, {"env"})
     updated = await repo.get_host(host_id)
     return dict(updated)
 
@@ -458,6 +651,7 @@ async def adopt_host_record(
     host = await repo.get_host(host_id)
     if host is None:
         raise InventoryError(404, f"Host not found: {host_id}")
+    _refuse_template(host)
     await repo.update_host(host_id, managed=1, source="imported", import_state="adopted")
     updated = await repo.get_host(host_id)
     result = dict(updated)
@@ -465,6 +659,16 @@ async def adopt_host_record(
     if summary is not None:
         result["introspection"] = summary
     return result
+
+
+def _refuse_template(host: dict[str, Any]) -> None:
+    """A Proxmox template is a provisioning input, never a machine to manage."""
+    if host.get("is_template"):
+        raise InventoryError(
+            409,
+            f"{host.get('hostname')} is a Proxmox template: it cannot run, so there is "
+            "nothing to adopt. Clone it into a guest and adopt that.",
+        )
 
 
 async def ignore_host_record(repo: Any, host_id: str) -> dict[str, Any]:
@@ -518,6 +722,10 @@ async def bulk_host_action_record(
                 failed += 1
                 continue
             if body.action == "adopt":
+                if host.get("is_template"):
+                    # Counted as failed like any host that cannot be adopted.
+                    failed += 1
+                    continue
                 await repo.update_host(
                     host_id,
                     managed=1,

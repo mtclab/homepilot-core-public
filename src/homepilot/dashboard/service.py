@@ -14,6 +14,7 @@ from typing import Any
 
 from ..app_settings import effective
 from ..config import get_settings
+from ..inventory.addresses import find_conflicts
 
 # The statuses whose reality can disagree with the artifact - the drift
 # universe. MUST equal ACTIVE_STATUSES in web/src/lib/drift.ts: the Overview's
@@ -81,22 +82,53 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         return out
 
     # ── Inventory ────────────────────────────────────────────────────────────
-    hosts_total = (await db.fetchone("SELECT COUNT(*) c FROM hosts"))["c"]
-    by_status = await grouped("SELECT status, COUNT(*) FROM hosts GROUP BY status")
-    by_role = await grouped("SELECT role, COUNT(*) FROM hosts GROUP BY role")
-    by_type = await grouped("SELECT host_type, COUNT(*) FROM hosts GROUP BY host_type")
+    # Every fleet number counts `is_template = 0` rows only: a Proxmox template is a
+    # provisioning input, not a machine. It can never run, so counted it was an
+    # "offline" guest forever and a "pending adoption" nobody can adopt (lane B1).
+    hosts_total = (await db.fetchone("SELECT COUNT(*) c FROM hosts WHERE is_template = 0"))["c"]
+    templates = (await db.fetchone("SELECT COUNT(*) c FROM hosts WHERE is_template = 1"))["c"]
+    by_status = await grouped(
+        "SELECT status, COUNT(*) FROM hosts WHERE is_template = 0 GROUP BY status"
+    )
+    by_role = await grouped("SELECT role, COUNT(*) FROM hosts WHERE is_template = 0 GROUP BY role")
+    by_type = await grouped(
+        "SELECT host_type, COUNT(*) FROM hosts WHERE is_template = 0 GROUP BY host_type"
+    )
+    by_env = await grouped(
+        "SELECT COALESCE(env, 'unset'), COUNT(*) FROM hosts WHERE is_template = 0 GROUP BY env"
+    )
     # A host with a linked agent IS managed for coverage purposes (#514 S1):
     # HomePilot has a live channel onto it, which is what "covered" means to an
     # operator. The `managed` flag keeps its adoption semantics elsewhere.
     managed = (
-        await db.fetchone("SELECT COUNT(*) c FROM hosts WHERE managed = 1 OR agent_id IS NOT NULL")
+        await db.fetchone(
+            "SELECT COUNT(*) c FROM hosts WHERE is_template = 0 "
+            "AND (managed = 1 OR agent_id IS NOT NULL)"
+        )
     )["c"]
     # "uncovered" = a discovered guest still pending adoption (not yet managed).
     uncovered = (
         await db.fetchone(
-            "SELECT COUNT(*) c FROM hosts WHERE source = 'discovered' AND import_state = 'pending'"
+            "SELECT COUNT(*) c FROM hosts WHERE is_template = 0 "
+            "AND source = 'discovered' AND import_state = 'pending'"
         )
     )["c"]
+    # The machine HomePilot runs on, once an operator confirmed it (lane B1).
+    # "Its own host has no agent" is the line the Overview raises from this.
+    self_row = await db.fetchone(
+        "SELECT id, hostname, proxmox_id, agent_id, absent_since FROM hosts WHERE is_self = 1"
+    )
+    self_guest = (
+        {
+            "host_id": self_row["id"],
+            "hostname": self_row["hostname"],
+            "proxmox_id": self_row["proxmox_id"],
+            "has_agent": self_row["agent_id"] is not None,
+            "absent": self_row["absent_since"] is not None,
+        }
+        if self_row is not None
+        else None
+    )
     coverage_pct = round(100 * managed / hosts_total) if hosts_total else 0
 
     # ── Drift ────────────────────────────────────────────────────────────────
@@ -190,6 +222,13 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             or (datetime.now(UTC) - quiet_from).total_seconds() >= FLEET_OFFLINE_GRACE_SECONDS
         )
 
+    # ── Address clashes (lane B2) ────────────────────────────────────────────
+    # Two machines configured onto one address, or one holding an address
+    # configured on another. Computed from the address table the inventory
+    # reconciler keeps, so it is as fresh as the last sync - the live check is
+    # the start precondition's job, this one is the standing warning.
+    address_conflicts = [c.as_dict() for c in find_conflicts(await repo.list_address_rows())]
+
     # ── First-run path (#445 A7) ──────────────────────────────────────────────
     # Derived entirely from values this endpoint already computed: no extra
     # query, and - more importantly - no separate notion of "have you done the
@@ -231,7 +270,17 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         },
     ]
 
+    # ── Updates available (review A+) ────────────────────────────────────────
+    # The release check's verdict, through the same function GET
+    # /dashboard/updates and get_update_status answer from - the Overview's one
+    # "X.Y.Z is available" line and those two cannot disagree. A settings-row
+    # read: no network on this path.
+    from ..updates.checker import update_status
+
+    updates = await update_status(repo)
+
     return {
+        "updates": updates,
         "onboarding": {
             "steps": onboarding_steps,
             "complete": all(step["done"] for step in onboarding_steps),
@@ -244,6 +293,11 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             "by_status": by_status,
             "by_role": by_role,
             "by_type": by_type,
+            "by_env": by_env,
+            # Templates are not in any number above; this says how many were
+            # left out, so "12 hosts" and the 14 rows Proxmox lists reconcile.
+            "templates": templates,
+            "self_guest": self_guest,
         },
         "drift": {
             "total": drift_total,
@@ -259,6 +313,7 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         },
         "artifacts": artifacts_by_status,
         "tasks": tasks_by_status,
+        "addresses": {"conflicts": address_conflicts},
         "agents": {
             "known": agents_known,
             "connected": agents_connected,

@@ -136,6 +136,23 @@ in the alert history and pushed to the notification channels - see
 | `alert_event_id`   | int           | The history row |
 | `resolved_at`, `duration_seconds`, `reason` | | `alert_resolved` only; `reason` says why a `nodata` alert resolved without the host speaking (e.g. it was stopped) |
 
+### `update_available`
+
+A HomePilot release newer than the running version was published on the public
+mirror. Emitted ONCE per new version - the announced version is persisted, so
+the daily check and restarts never repeat it - and pushed to the notification
+channels too. Notify only: nothing is upgraded. Off when
+`HP_UPDATE_CHECK_ENABLED=0`.
+
+| Field              | Type          | Description |
+|--------------------|---------------|-------------|
+| `version`, `tag`   | string        | The release, e.g. `3.8.0` / `v3.8.0` (final releases only, never a pre-release) |
+| `running_version`  | string        | The version this install runs |
+| `url`              | string        | The release notes |
+| `published_at`     | string        | ISO time GitHub published it (may be null) |
+| `operator_actions` | list[string]  | Upgrade instructions found in the release notes (`**Upgrade:**` / `**Operator action...:**` paragraphs, "Upgrade notes" sections); empty when none were found |
+| `message`          | string        | The notice in plain words, with the actions |
+
 ## SSE Streaming
 
 Clients connect to `GET /artifacts/events/stream` (read scope) to receive events in real time via Server-Sent Events. Each SSE message has `event` (the type), `data` (JSON payload), and `id` fields.

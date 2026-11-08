@@ -242,6 +242,14 @@ class Settings(BaseSettings):
     metrics_prune_interval_seconds: int = 3600
     metrics_alert_interval_seconds: int = 60
 
+    # ── Updates available (review A+) ────────────────────────────────────────
+    # A daily look at the public mirror's latest release; a newer one raises an
+    # Overview line and ONE update_available event. Notify only - nothing is
+    # ever upgraded. 0 switches the check off (an offline install). Both are
+    # operator settings (app_settings), re-read every cycle.
+    update_check_enabled: int = 1
+    update_check_interval_seconds: int = 86400
+
     # ── Invite portal (#442 stage 2) ─────────────────────────────────────────
     # The /invite/* pages trust a client-certificate identity ONLY when all
     # three of these are set and the request satisfies all three: it arrives

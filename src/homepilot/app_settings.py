@@ -236,6 +236,17 @@ def _zero_or_one(raw: Any) -> int:
     raise SettingError("expected 0 or 1")
 
 
+def _update_interval(raw: Any) -> int:
+    """The release check's period: a whole number of seconds, at least an hour.
+
+    Refused below the floor rather than clamped, so the value an operator reads
+    back is the one in force (the checker clamps an env value the same way)."""
+    value = _positive_int(raw)
+    if value < 3600:
+        raise SettingError("must be at least 3600 (one hour)")
+    return value
+
+
 def _parse_cidr_list(raw: Any) -> str:
     """A comma-separated list of IPv4 CIDRs, normalised, or the empty string.
 
@@ -352,6 +363,28 @@ REGISTRY: dict[str, SettingSpec] = {
             ),
             hot_reloadable=True,
             parse=_positive_int,
+        ),
+        SettingSpec(
+            key="update_check_enabled",
+            type_="int",
+            description=(
+                "1 looks for a newer HomePilot release on the public mirror (one "
+                "unauthenticated GitHub request a day) and says so on the Overview and "
+                "in one update_available event. Notify only: nothing is ever upgraded. "
+                "0 switches it off - for an install with no internet access."
+            ),
+            hot_reloadable=True,
+            parse=_zero_or_one,
+        ),
+        SettingSpec(
+            key="update_check_interval_seconds",
+            type_="int",
+            description=(
+                "How often the release check runs, at least 3600: every install shares "
+                "GitHub's unauthenticated budget of 60 requests an hour per address."
+            ),
+            hot_reloadable=True,
+            parse=_update_interval,
         ),
         SettingSpec(
             key="events_webhook_url",

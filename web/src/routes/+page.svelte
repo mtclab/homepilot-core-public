@@ -122,7 +122,8 @@
 			d = await api.getDashboard();
 			const selfcheckFresh = !force && selfcheck && Date.now() - selfcheckAt < SELFCHECK_TTL_MS;
 			const [inv, alerts, taskRes, auditRes, checkRes, joinRes] = await Promise.allSettled([
-				api.listInventory({ limit: INVENTORY_PAGE }),
+				// Templates are provisioning inputs, not machines of the fleet (B1).
+				api.listInventory({ limit: INVENTORY_PAGE, templates: 'exclude' }),
 				api.listFiringAlerts(),
 				api.listTasks(undefined, TASK_PAGE, 0),
 				api.listAudit({ limit: 20 }),
@@ -259,6 +260,10 @@
 		meta: string;
 		/** A gone host the operator may remove from inventory from this line. */
 		forget?: Host;
+		/** The fix is outside the console (release notes): open it in a new tab. */
+		external?: boolean;
+		/** What this line's one subject asks of the operator (operator actions). */
+		details?: string[];
 	}
 
 	// A running task that has outlived this is stuck, not busy. Deliberately
@@ -440,6 +445,29 @@
 			});
 		}
 
+		// Two machines on one address (lane B2): the one that starts second takes
+		// it over on the LAN, and nothing else on this screen would say so until
+		// something stopped answering. One line per address, naming every holder;
+		// the server words it, so the host's Network tab and this line agree.
+		const clashes = summary.addresses?.conflicts ?? [];
+		out.push(
+			...capped(
+				clashes.map((c) => {
+					const first = c.host_ids[0];
+					return {
+						key: `address:${c.address}`,
+						severity: 'critical' as const,
+						label: 'address clash',
+						text: `${c.summary}. ${c.remedy}`,
+						href: first ? `${base}/hosts/${first}?tab=network` : `${base}/hosts`,
+						meta: '',
+					};
+				}),
+				'address clashes',
+				`${base}/hosts`,
+			),
+		);
+
 		// Hosts whose agent holds a genuine token and is refused only because no
 		// enrolment window is open (lane A3). Counted by hostname - the panel
 		// keeps one row per hostname + address - and only while the window is
@@ -454,6 +482,30 @@
 				label: 'wants to join',
 				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts to let ${waiting === 1 ? 'it' : 'them'} in`,
 				href: `${base}/hosts`,
+				meta: '',
+			});
+		}
+
+		// HomePilot's own host (lane B1), once an operator confirmed which it is.
+		// With no agent there, the machine everything else depends on is the
+		// one HomePilot can neither measure nor maintain.
+		const me = summary.inventory.self_guest;
+		if (me?.absent) {
+			out.push({
+				key: 'self:gone',
+				severity: 'warning',
+				label: 'own host',
+				text: `The host marked as HomePilot's own (${me.hostname}) is gone from Proxmox - confirm which host it runs on now`,
+				href: `${base}/hosts`,
+				meta: '',
+			});
+		} else if (me && !me.has_agent) {
+			out.push({
+				key: 'self:no_agent',
+				severity: 'warning',
+				label: 'own host',
+				text: `HomePilot's own host ${me.hostname} has no agent, so it can be neither measured nor maintained from here`,
+				href: `${base}/hosts/${me.host_id}`,
 				meta: '',
 			});
 		}
@@ -677,6 +729,24 @@
 				meta: '',
 			});
 		}
+
+		// A newer HomePilot (review A+): ONE line while it is true - the server
+		// compares against the version running now, so it is gone after the
+		// upgrade - with the release's notes as the door and its operator actions
+		// under it. News, not a fault: a notice, last. Nothing upgrades itself.
+		const upd = summary.updates;
+		if (upd?.update_available && upd.latest) {
+			out.push({
+				key: 'update:available',
+				severity: 'notice',
+				label: 'update',
+				text: `HomePilot ${upd.latest.version} is available - you run ${upd.running_version}`,
+				href: upd.latest.url,
+				external: true,
+				meta: ago(upd.latest.published_at),
+				details: upd.latest.operator_actions ?? [],
+			});
+		}
 		return out;
 	}
 
@@ -728,6 +798,8 @@
 		drift_check: 'badge-notice',
 		host_added: 'badge-approved',
 		host_forgotten: 'badge-revoked',
+		address_conflict: 'badge-critical',
+		address_conflict_resolved: 'badge-approved',
 	};
 
 	/** The chip for a journal action; an action with none says nothing (#704). */
@@ -880,6 +952,8 @@
 								text={item.text}
 								href={item.href}
 								meta={item.meta}
+								external={item.external ?? false}
+								details={item.details ?? []}
 							/>
 						{/if}
 					{/each}

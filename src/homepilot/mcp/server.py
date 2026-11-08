@@ -133,6 +133,7 @@ from .tools.ops_tools import (
     handle_get_dashboard_summary,
     handle_get_proxmox_settings,
     handle_get_selfcheck,
+    handle_get_update_status,
     handle_list_tasks,
     handle_test_proxmox_connection,
 )
@@ -350,6 +351,8 @@ _READ_ONLY_TOOLS = frozenset(
         "get_host",
         "list_tasks",
         "get_dashboard_summary",
+        # Review A+: the release check's verdict (GET /dashboard/updates).
+        "get_update_status",
         "get_audit_log",
         "list_kb",
         "get_kb_doc",
@@ -579,6 +582,7 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "get_host": handle_get_host,
     "list_tasks": handle_list_tasks,
     "get_dashboard_summary": handle_get_dashboard_summary,
+    "get_update_status": handle_get_update_status,
     "get_audit_log": handle_get_audit_log,
     "list_kb": handle_list_kb,
     "get_kb_doc": handle_get_kb_doc,

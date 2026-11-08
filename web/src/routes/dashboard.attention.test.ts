@@ -141,6 +141,33 @@ describe('Overview: needs attention', () => {
 		expect(screen.queryByText(/nothing needs you/i)).not.toBeInTheDocument();
 	});
 
+	it("says when HomePilot's own host has no agent, and leaves templates off the fleet strip", async () => {
+		// Lane B1: the operator confirmed which VM HomePilot runs on; it has no
+		// agent, so the machine everything depends on is the one HomePilot can
+		// neither measure nor maintain.
+		seed({
+			summary: {
+				inventory: {
+					...summary().inventory,
+					self_guest: {
+						host_id: 'h-self',
+						hostname: 'hp-core',
+						proxmox_id: 107,
+						has_agent: false,
+						absent: false,
+					},
+				},
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const line = zone.getByRole('link', { name: /own host hp-core has no agent/i });
+		expect(line).toHaveAttribute('href', '/ui/hosts/h-self');
+		expect(listInventory.mock.calls[0][0].templates).toBe('exclude');
+	});
+
 	it('links a firing alert to the host that is firing it', async () => {
 		seed({
 			hosts: [HEALTHY_HOST],
@@ -1005,5 +1032,188 @@ describe('Overview: the Phase A lanes together', () => {
 		render(Overview);
 		const zone = within(await attentionZone());
 		expect(zone.getByText(/a host waiting to join cannot be reported here/i)).toBeInTheDocument();
+	});
+
+	// Lane B2. Teeth: drop the address-clash block from buildAttention and this
+	// fails on the missing line; render it as a warning and it fails on the chip.
+	it('says two guests on one address as ONE critical line naming both, with the fix', async () => {
+		const clash = {
+			address: '192.0.2.10',
+			kind: 'configured',
+			severity: 'critical',
+			summary:
+				'192.0.2.10 is configured on 2 machines: web-01 (VM 101, running) and db-01 (VM 102, stopped)',
+			remedy:
+				'Whichever starts second takes the address over on the LAN. Give one of them another address (its cloud-init ipconfig, or the container\'s net ip=) and restart it.',
+			host_ids: ['h1', 'h2'],
+			holders: [],
+		};
+		seed({ summary: { addresses: { conflicts: [clash] } } });
+
+		render(Overview);
+		const zone = within(await attentionZone());
+		const lines = zone.getAllByRole('link', { name: /192\.0\.2\.10 is configured on 2 machines/i });
+		expect(lines).toHaveLength(1);
+		const line = lines[0];
+		expect(line.textContent).toContain('web-01 (VM 101, running)');
+		expect(line.textContent).toContain('db-01 (VM 102, stopped)');
+		expect(line.textContent).toContain('takes the address over');
+		expect(line.querySelector('.badge')).toHaveClass('badge-critical');
+		expect(line.querySelector('.badge')?.textContent).toBe('address clash');
+		// The door is the first holder's Network tab, where every holder is listed.
+		expect(line).toHaveAttribute('href', '/ui/hosts/h1?tab=network');
+	});
+
+	it('says nothing about addresses on a backend that does not report them', async () => {
+		seed({});
+		render(Overview);
+		await screen.findByText(/nothing needs you/i);
+		expect(screen.queryByText(/address clash/i)).not.toBeInTheDocument();
+	});
+});
+
+/**
+ * Review A+: a newer HomePilot is ONE notice line, linked to its release notes,
+ * with the operator actions under it - and nothing at all when the server says
+ * no update is available (after an upgrade, or with the check switched off).
+ *
+ * Teeth (each verified by reverting the behaviour):
+ *   - drop the update block from buildAttention and the first test finds no line;
+ *   - drop `external` and the link opens in this tab (target assertion);
+ *   - read `latest` alone instead of `update_available` and the "no update"
+ *     test finds a line for the release this install already runs.
+ */
+describe('Overview: updates available', () => {
+	const RELEASE = {
+		version: '3.8.0',
+		tag: 'v3.8.0',
+		name: 'v3.8.0',
+		url: 'https://github.com/mtclab/homepilot-core-public/releases/tag/v3.8.0',
+		published_at: '2026-12-01T10:00:00Z',
+		operator_actions: ['Upgrade: one migration runs.', 'Set HP_EXAMPLE first.'],
+	};
+
+	function updates(over: Record<string, unknown> = {}) {
+		return {
+			enabled: true,
+			state: 'ok',
+			running_version: '3.7.0',
+			update_available: true,
+			latest: RELEASE,
+			checked_at: '2026-12-02T10:00:00Z',
+			last_ok_at: '2026-12-02T10:00:00Z',
+			last_error: null,
+			consecutive_failures: 0,
+			rate_limited_until: null,
+			notified_version: '3.8.0',
+			notified_at: '2026-12-02T10:00:00Z',
+			interval_seconds: 86400,
+			releases_url: 'https://github.com/mtclab/homepilot-core-public/releases',
+			...over,
+		};
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		getSelfcheck.mockResolvedValue({ timeout_seconds: 2, counts: {}, subsystems: [] });
+		(api.getEnrolmentRequests as ReturnType<typeof vi.fn>).mockResolvedValue({
+			attempts: [],
+			pending_tokens: [],
+			window: { open: false, expires_at: null, seconds_remaining: 0, fleet_empty: false },
+			summary: { wants_to_join: 0, refused: 0, pending_tokens: 0, expired_unused_tokens: 0 },
+		});
+	});
+
+	it('is one notice line linking to the release notes, with the operator actions', async () => {
+		seed({ summary: { updates: updates() } });
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const lines = zone.getAllByRole('link', { name: /is available/i });
+		expect(lines).toHaveLength(1);
+		const line = lines[0];
+		expect(line.textContent).toContain('HomePilot 3.8.0 is available - you run 3.7.0');
+		expect(line).toHaveAttribute('href', RELEASE.url);
+		expect(line).toHaveAttribute('target', '_blank');
+		expect(line).toHaveAttribute('rel', 'noopener noreferrer');
+		expect(line.querySelector('.badge')).toHaveClass('badge-notice');
+		const actions = within(line).getAllByRole('listitem').map((li) => li.textContent);
+		expect(actions).toEqual(RELEASE.operator_actions);
+	});
+
+	it('says nothing when no update is available, even with a release known', async () => {
+		seed({
+			summary: {
+				updates: updates({
+					running_version: '3.8.0',
+					update_available: false,
+				}),
+			},
+		});
+
+		render(Overview);
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+		expect(screen.queryByText(/is available/i)).toBeNull();
+	});
+
+	it('release 3.8.0: the update, an address clash and the own-host line render together, each in its own shape', async () => {
+		// The three 3.8.0 lanes all add Overview lines through one AttentionItem;
+		// A+ gave it `external` and `details`. Only the release line may open a
+		// new tab or carry a list: the clash (B2) and own-host (B1) lines are
+		// doors inside the console.
+		const clash = {
+			address: '192.0.2.10',
+			kind: 'configured',
+			severity: 'critical',
+			summary: '192.0.2.10 is configured on 2 machines: web-01 (VM 101, running) and db-01 (VM 102, stopped)',
+			remedy: 'Give one of them another address and restart it.',
+			host_ids: ['h1', 'h2'],
+			holders: [],
+		};
+		seed({
+			summary: {
+				updates: updates(),
+				addresses: { conflicts: [clash] },
+				inventory: {
+					...summary().inventory,
+					self_guest: { host_id: 'h-self', hostname: 'hp-core', proxmox_id: 107, has_agent: false, absent: false },
+				},
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		const update = zone.getAllByRole('link', { name: /is available/i });
+		const clashes = zone.getAllByRole('link', { name: /192\.0\.2\.10 is configured on 2 machines/i });
+		const own = zone.getAllByRole('link', { name: /own host hp-core has no agent/i });
+		expect([update.length, clashes.length, own.length]).toEqual([1, 1, 1]);
+
+		expect(update[0]).toHaveAttribute('target', '_blank');
+		expect(within(update[0]).getAllByRole('listitem').map((li) => li.textContent)).toEqual(
+			RELEASE.operator_actions,
+		);
+		for (const [line, href, chip] of [
+			[clashes[0], '/ui/hosts/h1?tab=network', 'badge-critical'],
+			[own[0], '/ui/hosts/h-self', 'badge-warning'],
+		] as const) {
+			expect(line).toHaveAttribute('href', href);
+			expect(line).not.toHaveAttribute('target');
+			expect(line).not.toHaveAttribute('rel');
+			expect(line.querySelector('ul')).toBeNull();
+			expect(line.querySelector('.badge')).toHaveClass(chip);
+		}
+	});
+
+	it('says nothing while the check is off', async () => {
+		seed({
+			summary: {
+				updates: updates({ enabled: false, state: 'off', update_available: false }),
+			},
+		});
+
+		render(Overview);
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
 	});
 });
