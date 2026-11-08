@@ -39,6 +39,13 @@ from homepilot.notifications.service import ChannelStore
 # exactly those builds the database a 3.6.25 install has on disk.
 SCHEMA_3_6_25 = 34
 SCHEMA_3_7_0 = 36
+# Appended after 3.7.0 (release 3.8.0), and walked in the same one start:
+# * 37 - the fleet model (lane B1): template flag, pool, PVE tags, allocation,
+#   env and the self-guest mark on ``hosts``
+# * 38 - addresses and clashes (lane B2): ``host_addresses``
+# tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
+# through both.
+SCHEMA_LATEST = 38
 
 
 async def _version(db: Database) -> int:
@@ -87,13 +94,25 @@ async def db_3_6_25(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 class TestADatabaseFrom3625UpgradesInOneStart:
     async def test_one_start_reaches_the_release_schema(self, db_3_6_25):
-        assert max(MIGRATIONS) == SCHEMA_3_7_0, (
-            "a migration was added after 3.7.0: extend this test to cover it"
+        assert max(MIGRATIONS) == SCHEMA_LATEST, (
+            "a migration was added after this test was last extended: extend it to cover it"
         )
         # One sequence, no gaps: run_migrations walks range(current + 1, max + 1).
-        assert sorted(MIGRATIONS) == list(range(1, SCHEMA_3_7_0 + 1))
+        assert sorted(MIGRATIONS) == list(range(1, SCHEMA_LATEST + 1))
         await run_migrations(db_3_6_25)
-        assert await _version(db_3_6_25) == SCHEMA_3_7_0
+        assert await _version(db_3_6_25) == SCHEMA_LATEST
+        assert {
+            "is_template",
+            "pool",
+            "pve_tags",
+            "maxcpu",
+            "maxmem_mb",
+            "maxdisk_gb",
+            "env",
+            "env_source",
+            "is_self",
+        } <= await _columns(db_3_6_25, "hosts")
+        assert "host_addresses" in await _tables(db_3_6_25)
 
         tables = await _tables(db_3_6_25)
         assert {"alert_events", "notification_channels", "enrolment_attempts"} <= tables

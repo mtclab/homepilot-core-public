@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import socket
+import sqlite3
 from typing import Any
 
 import httpx
@@ -13,6 +14,19 @@ from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
 
+from .addresses import (
+    GUEST_CONFIG_SOURCES,
+    SOURCE_GUEST_AGENT,
+    SOURCE_PVE_NODE,
+    AddressGuard,
+    Holder,
+    NicAddress,
+    find_conflicts,
+    normalise_address,
+    parse_agent_interfaces,
+    parse_guest_config,
+)
+from .fleet_model import env_update, guest_facts, proxmox_ui_url
 from .introspect import introspect_host
 
 logger = logging.getLogger(__name__)
@@ -196,6 +210,13 @@ def _target_names(target_json: str | None, target: str) -> bool:
     return False
 
 
+def _vmid_key(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def same_guest(row: dict[str, Any], pve_name: Any) -> bool:
     """Is the row for this VMID the machine PVE now reports under it? (#706)
 
@@ -284,6 +305,13 @@ class InventoryService:
         host_dict = dict(host)
         services = await self.repo.list_services(host_id=host_id)
         host_dict["services"] = [dict(s) for s in services]
+        # Here, not in the route, so the MCP `get_host` tool carries it too.
+        host_dict["proxmox_url"] = proxmox_ui_url(self.proxmox, host_dict)
+        # Every address it holds, with provenance and age, and every clash it
+        # is in (lane B2) - the same answer as its Network tab.
+        network = await self.host_network(host_id)
+        host_dict["addresses"] = network["addresses"]
+        host_dict["address_conflicts"] = network["conflicts"]
         if host_dict.get("agent_id"):
             agent = await self.repo.db.fetchone(
                 "SELECT agent_id, hostname, connected, first_seen, connected_at, "
@@ -321,16 +349,35 @@ class InventoryService:
                 }
         return host_dict
 
-    async def _get_guest_description(
+    async def host_network(self, host_id: str) -> dict[str, Any]:
+        """One host's addresses and the clashes it is in (lane B2).
+
+        The single implementation behind GET /inventory/{id}/network (the
+        Network tab) and the ``addresses`` / ``address_conflicts`` that
+        ``get_host`` carries, so the console and the assistant cannot disagree.
+        """
+        conflicts = find_conflicts(await self.repo.list_address_rows())
+        return {
+            "host_id": host_id,
+            "addresses": await self.repo.list_host_addresses(host_id),
+            "conflicts": [c.as_dict() for c in conflicts if host_id in c.host_ids],
+        }
+
+    async def _get_guest_config(
         self, node_name: str, guest_type: str, vmid: int
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
+        """A guest's PVE config, or None when it could not be read.
+
+        Read once per guest per sweep: the description and the configured
+        addresses (lane B2) both come out of it.
+        """
         if self.proxmox is None:
             return None
         try:
             result = await self.proxmox.read(f"/nodes/{node_name}/{guest_type}/{vmid}/config")
             data = result.get("data", result)
             if isinstance(data, dict):
-                return data.get("description") or None
+                return data
         except (httpx.HTTPError, ConnectionError, OSError) as exc:
             logger.debug(
                 "Could not fetch config for %s/%s/%s: %s",
@@ -341,46 +388,72 @@ class InventoryService:
             )
         return None
 
-    async def _fetch_node_ip(self, node_name: str) -> str:
-        """Try GET /nodes/{node}/network to find the primary non-loopback IP."""
-        if self.proxmox is None:
-            return ""
-        try:
-            result = await self.proxmox.read(f"/nodes/{node_name}/network")
-            ifaces = result.get("data", result)
-            if not isinstance(ifaces, list):
-                return ""
-            for iface in ifaces:
-                addr = str(iface.get("address", ""))
-                iface_type = str(iface.get("type", ""))
-                if addr and iface_type not in ("loopback",) and not addr.startswith("127."):
-                    return addr
-        except (httpx.HTTPError, ConnectionError, OSError) as exc:
-            logger.debug("Could not fetch network info for node %s: %s", node_name, exc)
-        return ""
-
-    async def _try_qemu_agent_ip(
-        self, node_name: str, vmid: int, timeout: float = 3.0
-    ) -> str | None:
+    async def _read_node_network(self, node_name: str) -> list[dict[str, Any]] | None:
+        """GET /nodes/{node}/network, or None when it could not be read."""
         if self.proxmox is None:
             return None
         try:
-            result = await asyncio.wait_for(
+            result = await self.proxmox.read(f"/nodes/{node_name}/network")
+            ifaces = result.get("data", result)
+            return ifaces if isinstance(ifaces, list) else None
+        except (httpx.HTTPError, ConnectionError, OSError) as exc:
+            logger.debug("Could not fetch network info for node %s: %s", node_name, exc)
+        return None
+
+    @staticmethod
+    def _first_node_address(ifaces: list[dict[str, Any]] | None) -> str:
+        for iface in ifaces or []:
+            addr = str(iface.get("address", ""))
+            iface_type = str(iface.get("type", ""))
+            if addr and iface_type not in ("loopback",) and not addr.startswith("127."):
+                return addr
+        return ""
+
+    async def _fetch_node_ip(self, node_name: str) -> str:
+        """Try GET /nodes/{node}/network to find the primary non-loopback IP."""
+        return self._first_node_address(await self._read_node_network(node_name))
+
+    @staticmethod
+    def _node_addresses(ifaces: list[dict[str, Any]]) -> list[NicAddress]:
+        """Every address the node's own interfaces carry, with the bridge it is on.
+
+        A guest configured with a node's address takes the hypervisor off the
+        LAN when it starts, so node addresses are claims like any other.
+        """
+        out: list[NicAddress] = []
+        for iface in ifaces:
+            iface_type = str(iface.get("type", ""))
+            if iface_type in ("loopback",):
+                continue
+            name = str(iface.get("iface") or "")
+            for key, cidr_key in (("address", "cidr"), ("address6", "cidr6")):
+                address = normalise_address(iface.get(key))
+                if address is None:
+                    continue
+                cidr = str(iface.get(cidr_key) or "")
+                prefix = cidr.split("/", 1)[1] if "/" in cidr else ""
+                out.append(
+                    NicAddress(
+                        address=address,
+                        prefixlen=int(prefix) if prefix.isdigit() else None,
+                        iface=name,
+                        # The node sits on the wire its bridge is; a plain
+                        # NIC's address is on no bridge a guest can join.
+                        bridge=name if iface_type == "bridge" else None,
+                        source=SOURCE_PVE_NODE,
+                    )
+                )
+        return out
+
+    async def _qemu_agent_interfaces(self, node_name: str, vmid: int, timeout: float = 3.0) -> Any:
+        """The guest agent's raw interface list, or None when it did not answer."""
+        if self.proxmox is None:
+            return None
+        try:
+            return await asyncio.wait_for(
                 self.proxmox.read(f"/nodes/{node_name}/qemu/{vmid}/agent/network-get-interfaces"),
                 timeout=timeout,
             )
-            data = result.get("data", result)
-            if isinstance(data, dict):
-                ifaces = data.get("result", data)
-                if isinstance(ifaces, list):
-                    for iface in ifaces:
-                        if iface.get("name") == "lo":
-                            continue
-                        addrs = iface.get("ip-addresses", [])
-                        for addr in addrs:
-                            ip = str(addr.get("ip-address", ""))
-                            if ip and not ip.startswith("127.") and ":" not in ip:
-                                return ip
         except (
             TimeoutError,
             httpx.HTTPStatusError,
@@ -388,6 +461,85 @@ class InventoryService:
         ) as exc:
             logger.debug("QEMU agent IP failed for %s/%s: %s", node_name, vmid, exc)
         return None
+
+    async def _cluster_guest_resources(
+        self,
+    ) -> tuple[dict[tuple[str, int], dict[str, Any]], bool]:
+        """Every guest's /cluster/resources row by (type, vmid), and whether the read worked."""
+        if self.proxmox is None:
+            return {}, False
+        try:
+            result = await self.proxmox.read("/cluster/resources", {"type": "vm"})
+        except Exception as exc:
+            # Logged and carried on: the facts it holds are additive.
+            logger.warning("Could not read /cluster/resources for guest facts: %s", exc)
+            return {}, False
+        rows = result.get("data", result) if isinstance(result, dict) else result
+        if not isinstance(rows, list):
+            logger.warning("Could not read /cluster/resources for guest facts: unexpected shape")
+            return {}, False
+        out: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = _vmid_key(row.get("vmid"))
+            if key is None:
+                continue
+            out[(str(row.get("type") or ""), key)] = row
+        if not out:
+            # An empty answer from a cluster whose node listings carry guests
+            # is not "no guest is in a pool"; it is an answer that says nothing.
+            return {}, False
+        return out, True
+
+    @staticmethod
+    def _first_agent_ipv4(result: Any) -> str | None:
+        data = result.get("data", result) if isinstance(result, dict) else None
+        if isinstance(data, dict):
+            ifaces = data.get("result", data)
+            if isinstance(ifaces, list):
+                for iface in ifaces:
+                    if iface.get("name") == "lo":
+                        continue
+                    addrs = iface.get("ip-addresses", [])
+                    for addr in addrs:
+                        ip = str(addr.get("ip-address", ""))
+                        if ip and not ip.startswith("127.") and ":" not in ip:
+                            return ip
+        return None
+
+    async def _record_agent_addresses(self, host: dict[str, Any], result: Any) -> None:
+        """File what a guest agent reported as observed addresses (lane B2).
+
+        The config is re-read for its NIC MACs, which is how an observed
+        address learns which bridge it sits on. Best effort: a failure here
+        leaves the previous observation, whose age says how old it is.
+        """
+        node = str(host.get("node") or "")
+        vmid = int(host["proxmox_id"])
+        config = await self._get_guest_config(node, "qemu", vmid)
+        observed = parse_agent_interfaces(result, config)
+        await self.repo.replace_host_addresses(str(host["id"]), (SOURCE_GUEST_AGENT,), observed)
+
+    async def address_conflicts_for_start(
+        self, host: dict[str, Any] | str, addresses: list[NicAddress] | None = None
+    ) -> list[Holder]:
+        """The RUNNING machines holding an address this guest would claim on start.
+
+        The precondition the power controls (#781) call before a Start, or a
+        Reboot that applies a pending ``ipconfig``: an empty list means nobody's
+        address is taken. ``host`` is a host row or its id. Raises
+        ``AddressCheckError`` when it cannot be established - refuse then.
+        See ``addresses.AddressGuard``.
+        """
+        from .addresses import AddressCheckError
+
+        row = await self.repo.get_host(host) if isinstance(host, str) else host
+        if row is None:
+            raise AddressCheckError(f"no host {host!r} in inventory")
+        return await AddressGuard(self.repo, self.proxmox).address_conflicts_for_start(
+            row, addresses
+        )
 
     async def refresh_inventory(self, scope: str | None = None) -> dict[str, Any]:
         # `complete` starts FALSE and is earned. Callers subtract this sweep's
@@ -429,6 +581,11 @@ class InventoryService:
             return refreshed
 
         try:
+            # Template flag, pool, PVE tags and sizes for every guest, in the
+            # one read Proxmox answers them all from (lane B1). Additive: a
+            # failure here costs those facts for one cycle and nothing else -
+            # it is not a listing the absent sweep depends on.
+            resources, resources_read = await self._cluster_guest_resources()
             nodes = await self.proxmox.read("/nodes")
             node_list = nodes.get("data", nodes)
             if not isinstance(node_list, list):
@@ -448,13 +605,17 @@ class InventoryService:
                     continue
                 matched_scope = True
 
+                # Read once: the primary IP and every address (lane B2) both
+                # come out of the node's interface list.
+                node_network = await self._read_node_network(node_name)
                 node_ip = (
                     node_info.get("ip", "")
-                    or await self._fetch_node_ip(node_name)
+                    or self._first_node_address(node_network)
                     or await _guess_ip(node_name)
                     or self.proxmox_host
                     or ""
                 )
+                node_addresses = self._node_addresses(node_network or [])
                 existing = await self.repo.get_host_by_hostname(node_name)
                 # Observe the node's real liveness from /nodes rather than
                 # assuming every node is up: an offline/unknown node must not be
@@ -477,6 +638,7 @@ class InventoryService:
                 if existing:
                     await self.repo.update_host_from_automation(existing["id"], **data)
                     refreshed["proxmox_host_ids"].append(existing["id"])
+                    node_row_id = str(existing["id"])
                 else:
                     new_id = await self.repo.create_host(
                         hostname=node_name,
@@ -490,6 +652,13 @@ class InventoryService:
                         ip_source="pve",
                     )
                     refreshed["proxmox_host_ids"].append(new_id)
+                    node_row_id = str(new_id)
+                if node_network is not None:
+                    # Only when the network read answered: an unanswered read
+                    # keeps the last known set rather than erasing it.
+                    await self.repo.replace_host_addresses(
+                        node_row_id, (SOURCE_PVE_NODE,), node_addresses
+                    )
 
                 for guest_type in ("qemu", "lxc"):
                     try:
@@ -501,9 +670,14 @@ class InventoryService:
                             vmid = guest.get("vmid")
                             g_hostname = guest.get("name", f"{guest_type}-{vmid}")
                             g_status = guest.get("status", "unknown")
-                            g_description = await self._get_guest_description(
-                                node_name, guest_type, vmid
+                            g_key = _vmid_key(vmid)
+                            g_facts = guest_facts(
+                                guest,
+                                resources.get((guest_type, g_key)) if g_key is not None else None,
+                                resources_read,
                             )
+                            g_config = await self._get_guest_config(node_name, guest_type, vmid)
+                            g_description = (g_config or {}).get("description") or None
                             # The row that IS this machine: the one with its
                             # name, whatever order the rows of earlier
                             # occupants sort in. Failing that, the newest row
@@ -551,10 +725,19 @@ class InventoryService:
                                 imp = g_existing.get("import_state")
                                 if src == "discovered" and not imp:
                                     data["import_state"] = "pending"
+                                data.update(g_facts)
+                                data.update(
+                                    env_update(
+                                        g_existing,
+                                        g_facts,
+                                        self.repo._pinned_fields(g_existing),
+                                    )
+                                )
                                 await self.repo.update_host_from_automation(
                                     g_existing["id"], **data
                                 )
                                 refreshed["proxmox_host_ids"].append(g_existing["id"])
+                                g_row_id = str(g_existing["id"])
                             else:
                                 g_new_id = await self.repo.create_host(
                                     hostname=g_hostname,
@@ -570,7 +753,27 @@ class InventoryService:
                                     role_source="inferred",
                                     ip_source=None,
                                 )
+                                await self.repo.update_host_from_automation(
+                                    g_new_id, **g_facts, **env_update(None, g_facts, set())
+                                )
                                 refreshed["proxmox_host_ids"].append(g_new_id)
+                                g_row_id = str(g_new_id)
+                            if g_config is not None:
+                                # What the guest's config claims, replaced as
+                                # one set (lane B2). A template's ipconfig is a
+                                # provisioning input, never a held address:
+                                # it cannot run, so it records none.
+                                # The template flag is the config's own, or
+                                # the one the sync read for this guest (lane
+                                # B1) - either is enough.
+                                claims = (
+                                    []
+                                    if g_config.get("template") or g_facts.get("is_template")
+                                    else parse_guest_config(g_config, guest_type)
+                                )
+                                await self.repo.replace_host_addresses(
+                                    g_row_id, GUEST_CONFIG_SOURCES, claims
+                                )
                             refreshed["hosts"] += 1
                     except Exception as e:
                         logger.warning("Failed to refresh %s on %s: %s", guest_type, node_name, e)
@@ -708,12 +911,30 @@ class InventoryService:
         new_ip: str | None = None
         ip_source_val: str | None = None
 
+        node = host.get("node")
+        vmid = host.get("proxmox_id")
+        host_type = host.get("host_type")
+        # The guest agent is asked once and answers two questions: the
+        # primary IP (only when the operator has not pinned one) and every
+        # address the guest holds right now (lane B2, always - a pinned IP
+        # does not stop the guest holding others).
+        agent_result: Any = None
+        if (
+            node
+            and vmid
+            and host_type == "qemu"
+            and (ip_source != "user" or pve_status == "running")
+        ):
+            agent_result = await self._qemu_agent_interfaces(node, int(vmid))
+            if agent_result is not None:
+                try:
+                    await self._record_agent_addresses(host, agent_result)
+                except (sqlite3.Error, ValueError, TypeError) as exc:
+                    logger.debug("could not record agent addresses for %s: %s", host_id, exc)
+
         if ip_source != "user":
-            node = host.get("node")
-            vmid = host.get("proxmox_id")
-            host_type = host.get("host_type")
-            if node and vmid and host_type == "qemu":
-                new_ip = await self._try_qemu_agent_ip(node, int(vmid))
+            if agent_result is not None:
+                new_ip = self._first_agent_ipv4(agent_result)
                 if new_ip:
                     ip_source_val = "pve"
             if not new_ip:

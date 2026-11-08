@@ -11,7 +11,8 @@ and a chat bot by hand. A channel is one row plus one vault entry:
   than storing the URL in the clear.
 
 Channels receive the two alert transitions (``alert_firing``,
-``alert_resolved``) and the "Send test" message. Delivery runs in the
+``alert_resolved``), ``update_available`` (a newer HomePilot release, once per
+version) and the "Send test" message. Delivery runs in the
 background so a slow ntfy server cannot hold up the evaluator, and every
 attempt is recorded on the channel (last ok / last error) and on the alert
 event (``delivered_to``), so "was anyone told?" has an answer in the product.
@@ -34,9 +35,11 @@ logger = logging.getLogger(__name__)
 
 KIND_NTFY = "ntfy"
 CHANNEL_KINDS = (KIND_NTFY,)
-# The events a channel is sent. Alerts only: artifact events keep the webhook
-# path (they carry approval codes, which do not belong on a phone lock screen).
-CHANNEL_EVENTS = ("alert_firing", "alert_resolved")
+# The events a channel is sent. Alerts and the release notice: artifact events
+# keep the webhook path (they carry approval codes, which do not belong on a
+# phone lock screen).
+EVENT_UPDATE_AVAILABLE = "update_available"
+CHANNEL_EVENTS = ("alert_firing", "alert_resolved", EVENT_UPDATE_AVAILABLE)
 TEST_EVENT = "notification_test"
 
 MAX_NAME_LENGTH = 80
@@ -168,8 +171,33 @@ def _describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}"[:300]
 
 
+def _compose(
+    event_type: str, payload: dict[str, Any]
+) -> tuple[str, str, int, list[str], str | None]:
+    """``(title, message, priority, tags, click URL)`` for one channel event."""
+    if event_type == EVENT_UPDATE_AVAILABLE:
+        version = payload.get("version", "?")
+        title = f"HomePilot {version} is available"
+        message = str(payload.get("message") or title)
+        url = str(payload.get("url") or "")
+        return (
+            title,
+            message,
+            ntfy.PRIORITY_UPDATE,
+            ["homepilot", "update"],
+            url if url.startswith("https://") else None,
+        )
+    firing = event_type == "alert_firing"
+    host = payload.get("hostname", "?")
+    rule = payload.get("rule_name", "?")
+    title = f"{'Alert' if firing else 'Resolved'}: {rule} on {host}"
+    message = str(payload.get("message") or title)
+    priority = ntfy.PRIORITY_FIRING if firing else ntfy.PRIORITY_RESOLVED
+    return title, message, priority, ["homepilot", "firing" if firing else "resolved"], None
+
+
 class Notifier:
-    """Delivers alert transitions to every enabled channel.
+    """Delivers alert transitions and release notices to every enabled channel.
 
     ``transport`` is an ``httpx`` transport, injectable so a test can stand in
     for the ntfy server at the HTTP layer and assert the real request."""
@@ -268,7 +296,14 @@ class Notifier:
         return secret if isinstance(secret, dict) and secret.get("url") else None
 
     async def _send_once(
-        self, row: dict[str, Any], *, title: str, message: str, priority: int, tags: list[str]
+        self,
+        row: dict[str, Any],
+        *,
+        title: str,
+        message: str,
+        priority: int,
+        tags: list[str],
+        click: str | None = None,
     ) -> tuple[bool, str | None]:
         secret = await self._secret(row)
         if secret is None:
@@ -278,7 +313,7 @@ class Notifier:
         except ValueError as exc:
             return False, f"stored URL is not usable: {exc}"
         body = ntfy.build_message(
-            topic=topic, title=title, message=message, priority=priority, tags=tags
+            topic=topic, title=title, message=message, priority=priority, tags=tags, click=click
         )
         try:
             async with httpx.AsyncClient(
@@ -304,17 +339,18 @@ class Notifier:
         priority: int,
         tags: list[str],
         retry: bool,
+        click: str | None = None,
     ) -> tuple[bool, str | None]:
         delays = self._retry_delays if retry else ()
         ok, error = await self._send_once(
-            row, title=title, message=message, priority=priority, tags=tags
+            row, title=title, message=message, priority=priority, tags=tags, click=click
         )
         for delay in delays:
             if ok:
                 break
             await asyncio.sleep(delay)
             ok, error = await self._send_once(
-                row, title=title, message=message, priority=priority, tags=tags
+                row, title=title, message=message, priority=priority, tags=tags, click=click
             )
         await self.store.record_attempt(int(row["id"]), ok, error)
         if not ok:
@@ -355,7 +391,8 @@ class Notifier:
     async def dispatch(
         self, event_type: str, payload: dict[str, Any], *, event_id: int | None = None
     ) -> None:
-        """Queue one alert transition for every enabled channel and return.
+        """Queue one alert transition (or release notice) for every enabled
+        channel and return.
 
         The sends run in the background; ``drain()`` waits for them."""
         if event_type not in CHANNEL_EVENTS:
@@ -376,17 +413,17 @@ class Notifier:
         payload: dict[str, Any],
         event_id: int | None,
     ) -> None:
-        firing = event_type == "alert_firing"
-        host = payload.get("hostname", "?")
-        rule = payload.get("rule_name", "?")
-        title = f"{'Alert' if firing else 'Resolved'}: {rule} on {host}"
-        message = str(payload.get("message") or title)
-        priority = ntfy.PRIORITY_FIRING if firing else ntfy.PRIORITY_RESOLVED
-        tags = ["homepilot", "firing" if firing else "resolved"]
+        title, message, priority, tags, click = _compose(event_type, payload)
         results = await asyncio.gather(
             *(
                 self._deliver(
-                    row, title=title, message=message, priority=priority, tags=tags, retry=True
+                    row,
+                    title=title,
+                    message=message,
+                    priority=priority,
+                    tags=tags,
+                    retry=True,
+                    click=click,
                 )
                 for row in channels
             ),

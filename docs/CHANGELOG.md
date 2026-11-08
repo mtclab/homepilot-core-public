@@ -1,5 +1,174 @@
 # Changelog
 
+## 3.8.0 - 2026-11-08
+
+Three lanes of the 2026-11 review in one release: HomePilot says when a newer
+release is out (A+), and Phase B "knows the fleet" begins - the fleet model
+(B1) and every address with its clashes (B2).
+
+**Upgrade:** two schema migrations run in one start, with the usual
+pre-migration backup (`backups/pre-migration-v36.db`) taken first. Migration
+37 adds `is_template`, `pool`, `pve_tags`, `maxcpu`, `maxmem_mb`,
+`maxdisk_gb`, `env`, `env_source` and `is_self` to `hosts` (plus a partial
+unique index allowing one `is_self` row); migration 38 adds `host_addresses`.
+Both are additive and every 3.7.0 row carries over; the first inventory sync
+after the upgrade fills the new facts and addresses in, so the inventory
+journal records each guest as "changed" once. The release check needs no
+migration. Re-import the n8n flow if you use it (`update_available` has its
+own formatter). An install with no internet access should set
+`HP_UPDATE_CHECK_ENABLED=0`.
+
+### Updates available: HomePilot says when a newer release is out (review A+)
+
+Nothing told an operator that a release existed. A new reconciler checks the
+public mirror's latest GitHub release shortly after boot and then daily
+(`HP_UPDATE_CHECK_INTERVAL_SECONDS`, default 86400, at least 3600):
+unauthenticated, ETag-revalidated, 10 s timeout, and when GitHub says the rate
+limit is spent it waits for the reset rather than asking again. Pre-releases
+(by flag or by a suffixed tag) are never offered; versions compare numerically,
+and a pre-release build is behind its own final release.
+
+- When the release is newer than the running version, the Overview shows ONE
+  notice line - "HomePilot X.Y.Z is available - you run A.B.C" - linking to the
+  release notes (new tab), with the operator actions found in the notes listed
+  under it. The comparison is made against the version running at read time,
+  so the line is gone right after the upgrade.
+- ONE `update_available` event per new version, through the existing event
+  path: SSE, the events webhook and webhook configs (the n8n flow has its own
+  formatter for it, and the every-event gate holds it), and the ntfy channels
+  (tapping the push opens the notes). The announced version is stored, so a
+  daily check or a restart never repeats it; a later release is announced once
+  more.
+- Notify only: nothing anywhere upgrades HomePilot.
+- `GET /dashboard/updates`, the summary's `updates` block and the MCP read tool
+  `get_update_status` return the same verdict from one function.
+- `HP_UPDATE_CHECK_ENABLED=0` (or Settings -> Subsystems -> Release check)
+  switches it off for an offline install. The self-check line `update_check`
+  says when it is off, and when it is failing - an install with no internet
+  gets that one line and one log warning, retries hourly, and never raises;
+  the loop itself stays healthy so the reconcilers line does not repeat it.
+
+### `make gate` works in the public mirror
+
+`gate-mirror` (part of `make gate`) runs `scripts/mirror_tree_check.py`, which
+the scrub removes from the export, so `make gate` failed in the mirror. In a
+mirror tree (PROVENANCE present, script absent) the target now says it has
+nothing to do and passes; in the private tree it runs the script as before.
+`tests/test_makefile_gate_mirror.py` drives the real Makefile through `make`
+in both shapes, and runs the real target when the suite runs in the mirror's
+tree (which `gate-mirror` builds).
+
+### The fleet knows what Proxmox knows (Phase B lane B1, review 02 steps 1-3)
+
+- **Templates leave the fleet numbers.** The sync reads `/cluster/resources`
+  once per sweep. A Proxmox template is flagged `is_template` and counted in no
+  Overview number (total, coverage, pending adoption, by status/role/type); the
+  summary reports how many were left out (`inventory.templates`). Hosts hides
+  them by default with a "Show templates (N hidden)" toggle and lists them in
+  their own group with a `template` chip; adopting one is refused (409, and a
+  failed entry in a bulk adopt). `GET /inventory` gains
+  `templates=include|exclude|only` (default `include`, unchanged for API/MCP
+  clients) and returns `templates_hidden`.
+- **Pool, PVE tags and allocation are read.** Each guest row carries its pool,
+  PVE tags and allocated cores/RAM/disk; the host page shows them. A failed
+  `/cluster/resources` read costs these facts for one cycle and nothing else:
+  the sweep's completeness and the absent sweep are untouched, and a stored
+  pool is not wiped by a read that failed.
+- **VMID and "Open in Proxmox".** Hosts has a VMID column and an "Open in
+  Proxmox" row-menu link (also on the host page), built from the address
+  HomePilot talks to Proxmox on; a gone host has none.
+- **Env: which VMs are prod / dev / infra / friend / lab.** A new `env` field,
+  shown as a column, a filter and a "Hosts by env" line (with an `unset`
+  count). It is imported from a PVE tag `hp-env-<value>` (Proxmox tags cannot
+  contain `:`, so the `hp-env:<value>` spelling is impossible; `-`, `.`, `_` are
+  read), a template is `template`, and an operator can set it on the host page
+  or with `PATCH /inventory/{id}` / MCP `update_host` (`env`). An operator value
+  is pinned against later syncs; "Use Proxmox's" (`env: ""`) withdraws it.
+  `env_source` says which of the three decided. The owner decision on the
+  source of truth (PVE tag vs HomePilot field vs pool) is still open; this
+  implements the reviewer's recommendation (tag import + operator override).
+- **HomePilot knows its own host.** `GET /inventory/self-guest` proposes the
+  guest holding an address the control plane is reached at - read from the
+  address table below (its config claims, its guest agent's report, or an
+  operator-typed address; a bare `ip_address` guess is not evidence). On a
+  default install - HomePilot in a container, no advertise address set - the
+  only address the process knows for itself is its bridge address, which no
+  guest holds; there the guest whose agent dials the hub from the container's
+  default gateway (the docker host) is proposed. Evidence ranks: advertise
+  address, then that agent, then the hub bind address, then the address the
+  browser asked for (Host / X-Forwarded-Host), then the process hostname; the
+  `evidence` text says which one matched. An admin confirms it on Hosts
+  (or marks/unmarks any guest on its host page); nothing is marked on a match
+  alone. The row carries `is_self` and a "HomePilot" marker, the Overview says
+  when that host has no agent or is gone from Proxmox, and confirming/clearing
+  is audited. Later power actions will use it as their guard.
+
+### Addresses and clashes (lane B2 of the 2026-11 review)
+
+Starting a stopped VM whose cloud-init `ipconfig0` named an address a running
+VM already used silently took that address over on the LAN; another VM shared
+an address with a LAN device for days. HomePilot had both configs and said
+nothing, because a host had one `ip_address`, guessed, with no age and no
+source.
+
+- **Every address, with where it came from.** The inventory sync records each
+  guest's static addresses from its config (VM cloud-init `ipconfigN`,
+  container `netN ip=`), with the NIC's MAC, bridge and VLAN; each node's own
+  bridge addresses; and an operator-typed address (a manual device, or a
+  pinned IP). The enrich pass records what each running VM's guest agent
+  reports, with when. Interfaces internal to a machine (docker, veth, bridges
+  inside the guest) are not LAN addresses and are not recorded. A template's
+  config holds no address.
+- **Hosts list** shows every address a host holds, a clashing one marked
+  `(!)`. **Host page -> Network** (new, read-only) lists each address with
+  interface, MAC, source and age, and every clash the host is in with a link to
+  the other machine. `GET /inventory/{id}/network`; `get_host` (REST and MCP)
+  carries `addresses`.
+- **Clashes are a critical Overview line.** Two machines whose configs claim one
+  address on the same bridge/VLAN - running or not, since whichever starts
+  second takes it over - raise one critical "address clash" line naming both
+  (VMID and state) with the remedy. So does an address configured on one
+  machine that a running guest's agent reports holding. The same address on two
+  different bridges or VLANs is two networks and is not a clash; a guest
+  Proxmox no longer reports holds nothing. Each clash is journaled once when it
+  appears (`address_conflict`, per machine) and once when it clears.
+  `GET /dashboard/summary` carries `addresses.conflicts`.
+- **Provisioning refuses an address somebody holds.** A static `ipconfig0`
+  written by the operator (or the provisioning default) was never checked: the
+  allocator only scans when it is choosing. It is now compared, live and before
+  the clone, against every guest config on the same wire (running or stopped),
+  the nodes, manual devices, running guests' agent reports and other
+  provisions in flight. A scan that cannot complete refuses.
+- **Start precondition for the power controls (#781).**
+  `InventoryService.address_conflicts_for_start(host)` returns the running
+  machines holding an address the guest would claim on boot - its config plus
+  pending changes, so a Reboot applying a new `ipconfig` is covered - reading the
+  cluster live and raising rather than guessing when it cannot. Not yet called
+  by anything: the power controls land in their own lane.
+- **Not yet: the active ARP probe.** Detecting a device that answers ARP for a
+  guest's address with a different MAC needs a probe on the LAN; the control
+  plane's container cannot see it without new privileges. The seam
+  (`NeighbourProbe`), the storage of its answers and the comparison are in and
+  tested with a fake; the probe itself (through the agent on HomePilot's own
+  VM) waits for the self-guest to be known.
+
+### The lanes together
+
+- **One address source.** The self-guest proposal (B1) reads B2's
+  `host_addresses` table instead of assembling addresses live from the guest
+  config and `hosts.ip_address`, so the proposal and the clash line can never
+  disagree about who holds an address. A guest the sync flags as a template
+  records no address claims even when its config does not say so itself.
+- **The Overview lines share one shape.** The release line (A+) is the only
+  one that opens a new tab and lists actions; the address-clash (B2) and
+  own-host (B1) lines are doors inside the console.
+- **Migrations cannot collide silently.** Both Phase B lanes wrote "version
+  37"; the release numbers them 37 and 38. A gate now reads the migration
+  table's source and fails when a version is written twice (Python keeps only
+  the last value of a repeated dict key, which would drop one lane's schema
+  without an error), and a 3.7.0 database with real hosts rows is driven
+  through both migrations and both lanes' code in one start.
+
 ## 3.7.0 - 2026-11-07
 
 Phase A of the 2026-11 review, "honest and heard": the Overview says what is

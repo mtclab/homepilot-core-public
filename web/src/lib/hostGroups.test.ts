@@ -147,3 +147,19 @@ describe('collapse defaults', () => {
 		}
 	});
 });
+
+describe('templates (lane B1)', () => {
+	it('puts a Proxmox template in its own group, never in the queue or the faults', () => {
+		const tmpl = {
+			id: 't',
+			hostname: 'ubuntu-cloudinit',
+			status: 'offline',
+			import_state: 'pending',
+			is_template: 1,
+		} as Host;
+		expect(attentionReason(tmpl)).toBe('');
+		expect(groupOf(tmpl)).toBe('templates');
+		const groups = groupHosts([tmpl, { ...tmpl, id: 'g', hostname: 'guest', is_template: 0 }]);
+		expect(groups.map((g) => g.id)).toEqual(['discovered', 'templates']);
+	});
+});

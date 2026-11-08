@@ -44,11 +44,20 @@ gate: gate-py gate-web gate-go gate-go-race gate-security gate-mirror
 # The suite in the public mirror's file tree (the scrub's deletions + PROVENANCE).
 # The mirror's CI runs the same tests; a test that reads a file the scrub removes
 # used to fail only there, after merge (3.6.25, 3.7.0).
+#
+# In the mirror itself (PROVENANCE present) the scrub has removed the script, and
+# the tree already IS the mirror tree - gate-py just ran the suite in it. So the
+# target says so and passes there, and `make gate` keeps working in the mirror
+# (tests/test_makefile_gate_mirror.py holds both branches).
 gate-mirror: export HP_GATE := 1
 gate-mirror: export HP_GO_BIN := $(HP_GO_BIN)
 gate-mirror: export GOCACHE := $(GOCACHE)
 gate-mirror:
-	$(VENV)/python scripts/mirror_tree_check.py
+	@if [ -f PROVENANCE ] && [ ! -f scripts/mirror_tree_check.py ]; then \
+		echo "gate-mirror: skipped - this is the public mirror's tree (PROVENANCE present, scripts/mirror_tree_check.py removed by the scrub); gate-py already ran the suite in it"; \
+	else \
+		$(VENV)/python scripts/mirror_tree_check.py; \
+	fi
 	@echo "gate: all sub-gates passed"
 
 gate-security:

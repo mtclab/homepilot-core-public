@@ -106,6 +106,31 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_update_status",
+        "description": (
+            "Is a newer HomePilot released? The daily release check's last verdict: "
+            "whether the check is enabled, its state (off / not_checked / ok / "
+            "failing, with last_error and consecutive_failures), the running "
+            "version, the latest final release on the public mirror (version, "
+            "release-notes url, published_at, operator_actions found in the notes) "
+            "and `update_available`, plus which version was already announced "
+            "(notified_version). Reads the stored verdict; never asks GitHub. Notify "
+            "only - nothing upgrades HomePilot. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "state": {"type": "string"},
+                "running_version": {"type": "string"},
+                "update_available": {"type": "boolean"},
+                "latest": {"type": ["object", "null"]},
+            },
+            "required": ["enabled", "state", "running_version", "update_available"],
+        },
+    },
+    {
         "name": "get_audit_log",
         "description": (
             "The control plane's audit trail: what was done, to which artifact and "
@@ -304,6 +329,17 @@ async def handle_get_dashboard_summary(
     if repo is None:
         raise RuntimeError("Repository not configured")
     return await build_summary(repo)
+
+
+async def handle_get_update_status(
+    arguments: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    from homepilot.updates.checker import update_status
+
+    repo = ctx.get("repo")
+    if repo is None:
+        raise RuntimeError("Repository not configured")
+    return await update_status(repo)
 
 
 async def handle_get_audit_log(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:

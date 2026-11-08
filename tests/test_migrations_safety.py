@@ -321,3 +321,37 @@ class TestV15TasksRebuildAndHostsOwner:
         # Re-running migrations must not fail on the already-present column.
         await run_migrations(db)
         assert await _schema_version(db) == TARGET_VERSION
+
+
+class TestEveryMigrationVersionIsWrittenOnce:
+    """Two lanes that each add "the next" version must not silently become one.
+
+    ``MIGRATIONS`` is a dict literal, and Python keeps only the LAST value of a
+    repeated key: merging two parallel lanes that both wrote ``37: [...]``
+    imports cleanly, numbers without a gap, and drops the first lane's DDL
+    without a word (it nearly lost a migration in 3.7.0, and 3.8.0's lanes did
+    it again). So this reads the SOURCE, where both keys still exist.
+    """
+
+    def test_no_version_key_is_repeated_in_the_source(self):
+        import ast
+
+        import homepilot.db.migrations as migrations_mod
+
+        tree = ast.parse(Path(migrations_mod.__file__).read_text(encoding="utf-8"))
+        literals = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign | ast.Assign)
+            and isinstance(node.value, ast.Dict)
+            and any(
+                isinstance(t, ast.Name) and t.id == "MIGRATIONS"
+                for t in ([node.target] if isinstance(node, ast.AnnAssign) else node.targets)
+            )
+        ]
+        assert len(literals) == 1, "MIGRATIONS is no longer one dict literal: update this gate"
+        keys = [k.value for k in literals[0].keys if isinstance(k, ast.Constant)]
+        assert len(keys) == len(literals[0].keys), "a MIGRATIONS key is not a literal number"
+        repeated = sorted({k for k in keys if keys.count(k) > 1})
+        assert repeated == [], f"migration version(s) written twice, the first is lost: {repeated}"
+        assert sorted(keys) == list(range(1, len(keys) + 1)) == sorted(MIGRATIONS)

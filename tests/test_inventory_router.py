@@ -14,6 +14,9 @@ def _make_inventory_app() -> FastAPI:
     app = FastAPI()
     app.include_router(inventory_router, prefix="/inventory")
     app.state.repo = MagicMock()
+    # The address reads the list and PATCH routes make (lane B2).
+    app.state.repo.list_address_rows = AsyncMock(return_value=[])
+    app.state.repo.sync_operator_address = AsyncMock()
     app.state.inventory_service = MagicMock()
     return app
 
@@ -53,6 +56,8 @@ class TestInventoryRouter:
             import_state="pending",
             pve_status="running",
             status=None,
+            env=None,
+            is_template=None,
             limit=100,
             offset=0,
         )

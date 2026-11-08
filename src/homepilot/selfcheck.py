@@ -680,6 +680,80 @@ def _agent_versions_subsystem(state: Any, settings: Any) -> Subsystem:
     )
 
 
+def _update_check_subsystem(state: Any, settings: Any) -> Subsystem:
+    """Would this install hear about a newer HomePilot? (review A+)
+
+    Read from the checker's own state row, never by asking GitHub: the report is
+    per request and bounded, and the check has its own schedule. Off is a choice
+    (an offline install); a failing check is `unknown`, not `unreachable` - not
+    knowing about a release is worth one warning line, not a critical one."""
+    from .updates.checker import RETRY_AFTER_FAILURE_SECONDS, load_state, running_version
+
+    # A settings object that does not carry the switch (a hand-built one, never
+    # the real Settings - whose default is on) has not configured the check.
+    try:
+        enabled = bool(int(getattr(settings, "update_check_enabled", 0) or 0))
+    except (TypeError, ValueError):
+        enabled = True
+    current = running_version()
+
+    async def probe() -> bool | ProbeVerdict:
+        from .updates import releases
+
+        repo = getattr(state, "repo", None)
+        if repo is None:
+            return ProbeVerdict(
+                STATE_UNKNOWN, "No database is wired in, so the release check cannot be read."
+            )
+        data = await load_state(repo)
+        if not data.get("checked_at"):
+            return ProbeVerdict(
+                STATE_OK,
+                "No release check has run yet; the first one runs about two minutes "
+                "after boot. Until then nothing is known about newer releases.",
+            )
+        error = data.get("last_error")
+        if error:
+            last_ok = data.get("last_ok_at")
+            since = f"the last successful check was {last_ok}" if last_ok else "no check has worked"
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                f"The check for a newer HomePilot failed {int(data.get('failures') or 1)} "
+                f"time(s) in a row ({error}); {since}, so a new release would go "
+                f"unnoticed. It retries within {_humanise(RETRY_AFTER_FAILURE_SECONDS)}. "
+                "If this install has no internet access on purpose, switch the check "
+                "off (Settings, or HP_UPDATE_CHECK_ENABLED=0).",
+            )
+        latest = data.get("latest") if isinstance(data.get("latest"), dict) else None
+        age = _age_seconds(str(data.get("last_ok_at") or ""))
+        when = f"{_humanise(age)} ago" if age is not None else "recently"
+        if latest and releases.is_newer(latest.get("version"), current):
+            return ProbeVerdict(
+                STATE_OK,
+                f"Checked {when}: HomePilot {latest['version']} is available (this install "
+                f"runs {current}) - see the Overview for the release notes.",
+            )
+        return ProbeVerdict(
+            STATE_OK,
+            f"Checked {when}: {current} is the newest released HomePilot.",
+        )
+
+    return Subsystem(
+        name="update_check",
+        label="the release check",
+        configured=enabled,
+        target="",
+        off=(
+            "The check for newer HomePilot releases is off, so this install is never "
+            "told one exists - watch the releases page yourself, or switch it back on "
+            "(Settings, or HP_UPDATE_CHECK_ENABLED=1)."
+        ),
+        ok="The release check runs on schedule and its last attempt worked.",
+        broken="The release check failed, so a newer release would go unnoticed.",
+        probe=probe if enabled else None,
+    )
+
+
 # What STOPS HAPPENING when one loop stops. "A reconciler is failing" tells an
 # operator nothing about what they have lost, and the whole point of this report
 # is the consequence in plain words. Keyed by the name each loop puts on its own
@@ -704,6 +778,7 @@ _RECONCILER_CONSEQUENCE: dict[str, str] = {
     "alert_evaluator": (
         "no alert rule is evaluated, so nothing raises an alert however bad it gets"
     ),
+    "update_check": "nobody is told when a newer HomePilot is released",
 }
 
 # A loop may legitimately be one cycle late. Three is not lateness - the same
@@ -832,6 +907,7 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _artifacts_remote_subsystem(state, settings),
         _reconcilers_subsystem(state),
         _agent_versions_subsystem(state, settings),
+        _update_check_subsystem(state, settings),
     ]
 
 

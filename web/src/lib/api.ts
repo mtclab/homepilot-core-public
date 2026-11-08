@@ -272,7 +272,43 @@ export interface OnboardingStep {
 /** The buckets `drift.unknown_by_reason` sorts unestablished verdicts into. */
 export type UnknownDriftReason = 'no_agent' | 'check_failed' | 'no_proxmox' | 'by_design' | 'other';
 
+/** A release the update check found (review A+). */
+export interface ReleaseInfo {
+	version: string;
+	tag: string;
+	name: string;
+	/** The release notes. */
+	url: string;
+	published_at: string | null;
+	/** Upgrade instructions found in the notes; empty when there are none. */
+	operator_actions: string[];
+}
+
+/**
+ * The release check's verdict (review A+): GET /dashboard/updates, MCP
+ * get_update_status, and `updates` on the summary - one server function.
+ */
+export interface UpdateStatus {
+	enabled: boolean;
+	state: 'off' | 'not_checked' | 'ok' | 'failing';
+	running_version: string;
+	/** Against the version running NOW: false again right after an upgrade. */
+	update_available: boolean;
+	latest: ReleaseInfo | null;
+	checked_at: string | null;
+	last_ok_at: string | null;
+	last_error: string | null;
+	consecutive_failures: number;
+	rate_limited_until: string | null;
+	notified_version: string | null;
+	notified_at: string | null;
+	interval_seconds: number;
+	releases_url: string;
+}
+
 export interface DashboardSummary {
+	/** Is a newer HomePilot released? Absent on an older backend. */
+	updates?: UpdateStatus;
 	/**
 	 * The first-run path (#445 A7). Every step's `done` is derived from the
 	 * estate itself, never from a stored "you did the setup" flag - a checklist
@@ -287,6 +323,18 @@ export interface DashboardSummary {
 		by_status: Record<string, number>;
 		by_role: Record<string, number>;
 		by_type: Record<string, number>;
+		/** Fleet hosts per env; `unset` for none. Templates are in no number here. */
+		by_env?: Record<string, number>;
+		/** Templates left out of every number above. */
+		templates?: number;
+		/** The confirmed self-guest, or null when none is confirmed. */
+		self_guest?: {
+			host_id: string;
+			hostname: string;
+			proxmox_id: number | null;
+			has_agent: boolean;
+			absent: boolean;
+		} | null;
 	};
 	drift: {
 		total: number;
@@ -304,6 +352,8 @@ export interface DashboardSummary {
 	};
 	artifacts: Record<string, number>;
 	tasks: Record<string, number>;
+	/** Address clashes (lane B2). Absent on an older backend. */
+	addresses?: { conflicts: AddressConflict[] };
 	agents: {
 		known: number;
 		connected: number;
@@ -632,6 +682,116 @@ export interface Host {
 	 * `null` means it could not be told - which is never the same as fine.
 	 */
 	agent_behind?: boolean | null;
+	// ── The fleet model (lane B1) ──
+	/** A Proxmox template: a provisioning input, never a fleet member. */
+	is_template?: number;
+	/** The Proxmox pool the guest is in, as the last sync read it. */
+	pool?: string | null;
+	/** The guest's PVE tags, `;`-separated, as Proxmox stores them. */
+	pve_tags?: string | null;
+	/** What Proxmox allocated: cores, memory (MiB), disk (GiB). */
+	maxcpu?: number | null;
+	maxmem_mb?: number | null;
+	maxdisk_gb?: number | null;
+	/** Which part of the estate: prod / dev / infra / friend / lab / template. */
+	env?: string | null;
+	/** Who decided `env`: a PVE `hp-env-*` tag, the template flag, or an operator. */
+	env_source?: 'pve_tag' | 'pve_template' | 'user' | null;
+	/** 1 on the ONE row an operator confirmed as the machine HomePilot runs on. */
+	is_self?: number;
+	/** This host's page in the Proxmox web UI; null when there is none (gone, manual). */
+	proxmox_url?: string | null;
+	/** Every address it holds (lane B2), configured provenance first. List view only. */
+	addresses?: HostAddressBrief[];
+}
+
+/**
+ * Where an address came from (lane B2). The first four are CONFIGURED claims -
+ * what the machine will use when it boots; the last two are OBSERVED and age.
+ */
+export type AddressSource =
+	| 'qemu-ipconfig'
+	| 'lxc-net'
+	| 'pve-node'
+	| 'manual'
+	| 'guest-agent'
+	| 'arp';
+
+/** One address in the host list: which sources say so, and whether it clashes. */
+export interface HostAddressBrief {
+	address: string;
+	sources: AddressSource[];
+	conflict: boolean;
+}
+
+/** One address row on the host's Network tab. */
+export interface HostAddress {
+	address: string;
+	prefixlen: number | null;
+	iface: string;
+	mac: string | null;
+	bridge: string | null;
+	vlan: number | null;
+	source: AddressSource;
+	observed_at: string;
+}
+
+/** A machine holding a clashing address, named as Proxmox would show it. */
+export interface AddressHolder {
+	address: string;
+	hostname: string;
+	/** `web-01 (VM 101, running)` */
+	label: string;
+	source: AddressSource;
+	host_id: string | null;
+	proxmox_id: number | null;
+	iface: string;
+	mac: string | null;
+	observed_at: string | null;
+}
+
+/** One address more than one machine holds or will hold. Always critical. */
+export interface AddressConflict {
+	address: string;
+	kind: 'configured' | 'observed';
+	severity: 'critical';
+	/** One sentence naming every holder - decided server-side, shown verbatim. */
+	summary: string;
+	/** What to do about it - also server-side. */
+	remedy: string;
+	host_ids: string[];
+	holders: AddressHolder[];
+}
+
+export interface HostNetwork {
+	host_id: string;
+	addresses: HostAddress[];
+	conflicts: AddressConflict[];
+}
+
+/** HomePilot's own host: the confirmed row, else what HomePilot proposes (lane B1). */
+export interface SelfGuestCandidate {
+	host_id: string;
+	hostname: string;
+	proxmox_id: number | null;
+	node: string | null;
+	/** The matched control-plane address; null when the evidence is the agent on the docker host. */
+	address: string | null;
+	/** Why, in words: which address matched, or which agent dials in from the docker host. */
+	evidence: string;
+	/** Strength of the evidence, lowest strongest (advertise 0, agent on the docker host 1, bind 2, page 3, hostname 4). */
+	rank: number;
+}
+
+export interface SelfGuestStatus {
+	confirmed: Host | null;
+	/** Exactly one best match, not yet confirmed and not dismissed. */
+	proposal: SelfGuestCandidate | null;
+	candidates: SelfGuestCandidate[];
+	control_plane_addresses: Array<{ address: string; why: string; rank: number }>;
+	/** Connected agents that dial the hub from this container's default gateway, i.e. the docker host. */
+	colocated_agents: Array<{ agent_id: string; hostname: string; peer: string; why: string }>;
+	dismissed_host_id: string | null;
 }
 
 /** The host page's Agent section (#514 S2): the channel, and why it last broke. */
@@ -933,8 +1093,27 @@ export const api = {
 	},
 
 	// --- Inventory ---
-	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string; q?: string; limit?: number; offset?: number } = {}) {
-		return req<{ items: Host[]; total: number }>('/inventory' + qs(params));
+	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string; env?: string; templates?: 'include' | 'exclude' | 'only'; q?: string; limit?: number; offset?: number } = {}) {
+		return req<{ items: Host[]; total: number; templates_hidden?: number }>('/inventory' + qs(params));
+	},
+	/** Which host HomePilot runs on: confirmed, or proposed for confirmation. */
+	getSelfGuest() {
+		return req<SelfGuestStatus>('/inventory/self-guest');
+	},
+	confirmSelfGuest(hostId: string) {
+		return req<SelfGuestStatus>('/inventory/self-guest', {
+			method: 'PUT',
+			body: JSON.stringify({ host_id: hostId }),
+		});
+	},
+	clearSelfGuest() {
+		return req<SelfGuestStatus>('/inventory/self-guest', { method: 'DELETE' });
+	},
+	dismissSelfGuest(hostId: string) {
+		return req<SelfGuestStatus>('/inventory/self-guest/dismiss', {
+			method: 'POST',
+			body: JSON.stringify({ host_id: hostId }),
+		});
 	},
 	/**
 	 * Add a host Proxmox has never heard of (#445 A5) - the NAS, the router, the
@@ -993,7 +1172,11 @@ export const api = {
 	getHostDoc(id: string) {
 		return req<HostDoc>(`/inventory/${id}/doc`);
 	},
-	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean; import_state?: string; status?: string }) {
+	getHostNetwork(id: string) {
+		return req<HostNetwork>(`/inventory/${id}/network`);
+	},
+	/** `env: ''` withdraws the operator's env, so the Proxmox tag applies again. */
+	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean; import_state?: string; status?: string; env?: string }) {
 		return req<Host>(`/inventory/${id}`, {
 			method: 'PATCH',
 			body: JSON.stringify(data),

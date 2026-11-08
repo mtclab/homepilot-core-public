@@ -12,6 +12,7 @@ from typing import Any
 from ..adapters.proxmox import ProxmoxClient, ProxmoxError
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
+from ..inventory.addresses import AddressGuard, parse_guest_config
 from ..tasks.repository import TaskRepository
 from .defaults import ProvisioningDefaults, provisioning_defaults
 from .fence_verify import (
@@ -671,6 +672,16 @@ class ProvisionService:
                 if allocation is not None:
                     self.reservations.reserve_address(allocation.address)
                     reserved_address = allocation.address
+                else:
+                    # An operator-written static address was never checked
+                    # against anything (lane B2): the allocator only scans the
+                    # guest vnet, and only when it allocates. Refused here,
+                    # before the clone, when another guest already claims it.
+                    step = "check_static_ip"
+                    static = await self._refuse_claimed_static(proxmox, request, defaults)
+                    if static is not None:
+                        self.reservations.reserve_address(static)
+                        reserved_address = static
 
                 step = "next_vmid"
                 vmid = await self._next_vmid(request.node, defaults)
@@ -1130,6 +1141,48 @@ class ProvisionService:
         return await allocate_address(
             self.proxmox, fence, defaults.nameserver, reserved=self.reservations.addresses
         )
+
+    async def _refuse_claimed_static(
+        self, proxmox: ProxmoxClient, request: ProvisionRequest, defaults: ProvisioningDefaults
+    ) -> str | None:
+        """Refuse a static ``ipconfig0`` another machine already claims (lane B2).
+
+        Returns the address to reserve while this provision is in flight, or
+        None when the request claims no static address (``ip=dhcp``).
+
+        "Claims" is any guest whose config names the address on the same wire
+        - running OR stopped, because the new guest starts at the end of this
+        provision and a stopped holder would take it back the moment it is
+        started - plus a Proxmox node, a manual device, a running guest whose
+        agent reports holding it, and another provision in flight. Read live,
+        and a scan that cannot complete refuses (``AddressCheckError``): the
+        same stance the allocator takes, for the same reason.
+        """
+        # ip=dhcp claims nothing, and costs no read of the cluster at all.
+        if not parse_guest_config({"ipconfig0": request.ipconfig0}, "qemu"):
+            return None
+        net0 = defaults.net0
+        if net0 is None:
+            # The clone keeps the template's NIC, so the template says which
+            # wire the address will be on.
+            template = await proxmox.get_vm_config(request.node, request.template_vmid)
+            net0 = str(template.get("net0") or "")
+        claims = parse_guest_config({"ipconfig0": request.ipconfig0, "net0": net0}, "qemu")
+        in_flight = [c.address for c in claims if c.address in self.reservations.addresses]
+        if in_flight:
+            raise RuntimeError(
+                f"{in_flight[0]} is being given to another guest that is provisioning right "
+                "now; choose another address"
+            )
+        holders = await AddressGuard(self.repo, proxmox).holders(claims, include_stopped=True)
+        if holders:
+            names = ", ".join(sorted({h.label for h in holders}))
+            raise RuntimeError(
+                f"{holders[0].address} is already claimed by {names}. A second guest on "
+                "the same address takes it over on the LAN whenever both run; choose "
+                "another address (nothing was built)"
+            )
+        return claims[0].address
 
     async def _resolve_fence(self, defaults: ProvisioningDefaults) -> DesiredGuestNetwork | None:
         """The guest network this provision must fence against, or None.

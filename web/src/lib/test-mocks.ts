@@ -83,6 +83,7 @@ vi.mock('$lib/api', async () => {
 			replayArtifact: vi.fn(),
 			revokeArtifact: vi.fn(),
 			getHostDoc: vi.fn(),
+			getHostNetwork: vi.fn().mockResolvedValue({ host_id: '', addresses: [], conflicts: [] }),
 			searchKB: vi.fn().mockResolvedValue({ results: [], total: 0 }),
 			listKB: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			// The Agents page: enough of the fleet surface that the route can be
@@ -91,6 +92,17 @@ vi.mock('$lib/api', async () => {
 			// could not be mounted.
 			getDashboard: vi.fn().mockResolvedValue(null),
 			listInventory: vi.fn().mockResolvedValue({ items: [], total: 0 }),
+			// The self-guest (lane B1): nothing confirmed, nothing proposed.
+			getSelfGuest: vi.fn().mockResolvedValue({
+				confirmed: null,
+				proposal: null,
+				candidates: [],
+				control_plane_addresses: [],
+				dismissed_host_id: null,
+			}),
+			confirmSelfGuest: vi.fn(),
+			dismissSelfGuest: vi.fn(),
+			clearSelfGuest: vi.fn(),
 			addHost: vi.fn(),
 			forgetHost: vi.fn().mockResolvedValue({ forgotten: true }),
 			refreshInventory: vi.fn(),

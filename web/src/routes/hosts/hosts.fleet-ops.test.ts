@@ -96,9 +96,9 @@ describe('Hosts fleet operations (#514 S3/S4)', () => {
 		render(Hosts);
 		await waitFor(() => expect(screen.getByText('alive-box')).toBeTruthy());
 
-		// Select all three rows through the header checkbox.
-		const checkboxes = screen.getAllByRole('checkbox');
-		await fireEvent.click(checkboxes[0]);
+		// Select all three rows through the header checkbox (by its name: the
+		// filter row has a checkbox of its own, "Show templates").
+		await fireEvent.click(screen.getByRole('checkbox', { name: 'Select all hosts' }));
 
 		expect(await screen.findByRole('button', { name: /Forget 2 agents/ })).toBeTruthy();
 		expect(screen.getByRole('button', { name: /Revoke 1 agent/ })).toBeTruthy();

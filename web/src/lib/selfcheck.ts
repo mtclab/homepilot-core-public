@@ -25,6 +25,7 @@ const SUBSYSTEM_LABELS: Record<string, string> = {
 	artifacts_remote: 'Artifact backup',
 	reconcilers: 'Scheduled reconcilers',
 	agent_versions: 'Agent versions',
+	update_check: 'Release check',
 };
 
 export function subsystemLabel(sub: Pick<SelfcheckSubsystem, 'name' | 'label'>): string {

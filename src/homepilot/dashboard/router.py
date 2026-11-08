@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Request
 from ..app_settings import resolver_from_state
 from ..auth.deps import require_scope
 from ..config import get_settings
+from ..updates.checker import update_status
 from .service import build_summary
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -40,3 +41,11 @@ async def ui_config(request: Request) -> dict[str, Any]:
 @router.get("/summary", dependencies=[Depends(require_scope("read"))])
 async def summary(request: Request) -> dict[str, Any]:
     return await build_summary(request.app.state.repo)
+
+
+@router.get("/updates", dependencies=[Depends(require_scope("read"))])
+async def updates(request: Request) -> dict[str, Any]:
+    """Is a newer HomePilot released (review A+)? The release check's last
+    verdict - read from its state row, never a live request to GitHub. Notify
+    only: nothing here or anywhere upgrades the control plane."""
+    return await update_status(request.app.state.repo)

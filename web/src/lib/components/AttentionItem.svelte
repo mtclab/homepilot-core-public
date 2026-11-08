@@ -22,6 +22,17 @@
 	export let href = '';
 	/** Optional trailing context: a timestamp, a count. Never the fix itself. */
 	export let meta = '';
+	/**
+	 * Where the fix is OUTSIDE this console (a release's notes): opened in a new
+	 * tab, so the operator does not lose the page they were reading.
+	 */
+	export let external = false;
+	/**
+	 * What the ONE subject of this line asks of the operator, said under it -
+	 * a release's operator actions. Not a way to enumerate several subjects:
+	 * those are several lines.
+	 */
+	export let details: string[] = [];
 
 	const chip: Record<string, string> = {
 		critical: 'badge-critical',
@@ -33,11 +44,18 @@
 <svelte:element
 	this={href ? 'a' : 'div'}
 	href={href || undefined}
-	class="flex items-baseline gap-s-2 py-s-1 px-s-2 rounded {href
-		? 'hover:bg-raised transition-colors'
-		: ''}"
+	target={href && external ? '_blank' : undefined}
+	rel={href && external ? 'noopener noreferrer' : undefined}
+	class="block py-s-1 px-s-2 rounded {href ? 'hover:bg-raised transition-colors' : ''}"
 >
-	<span class="badge {chip[severity]} shrink-0">{label}</span>
-	<span class="prose-body text-sm min-w-0 flex-1 truncate" title={text}>{text}</span>
-	{#if meta}<span class="text-xs text-muted shrink-0 num-inline">{meta}</span>{/if}
+	<span class="flex items-baseline gap-s-2">
+		<span class="badge {chip[severity]} shrink-0">{label}</span>
+		<span class="prose-body text-sm min-w-0 flex-1 truncate" title={text}>{text}</span>
+		{#if meta}<span class="text-xs text-muted shrink-0 num-inline">{meta}</span>{/if}
+	</span>
+	{#if details.length}
+		<ul class="mt-s-1 pl-s-4 list-disc text-xs text-muted prose-body">
+			{#each details as detail}<li>{detail}</li>{/each}
+		</ul>
+	{/if}
 </svelte:element>

@@ -377,6 +377,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     app.state.alert_evaluator = alert_evaluator
 
+    # Updates available (review A+): a daily look at the public mirror's latest
+    # release, first a couple of minutes after boot. Registered always - the
+    # switch (HP_UPDATE_CHECK_ENABLED / Settings) is read every cycle, so an
+    # offline install turns it off without a restart. Notify only.
+    from .updates.checker import STARTUP_DELAY_SECONDS, UpdateChecker
+
+    update_checker = UpdateChecker(state.repo, resolver=settings_resolver, notifier=state.notifier)
+    reconciler_scheduler.register(
+        update_checker,
+        interval=update_checker.interval,
+        startup_delay=STARTUP_DELAY_SECONDS,
+    )
+    app.state.update_checker = update_checker
+
     # The artifact archive push (#442 follow-up): "configured" means "actually
     # synced". Registered whenever there is a store to push, not only when a
     # remote is set at boot: the remote is an operator setting now (#553 C2), and

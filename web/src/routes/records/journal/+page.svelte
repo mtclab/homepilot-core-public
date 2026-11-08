@@ -33,6 +33,10 @@
 		// trail as first-class actions rather than as unfilterable strays.
 		'host_added',
 		'host_forgotten',
+		// Two machines on one address, journaled when it appears and when it
+		// clears (lane B2) - one entry per machine involved.
+		'address_conflict',
+		'address_conflict_resolved',
 		// The credential lifecycle (#686): who minted, revoked or used a token,
 		// and when the instance was claimed.
 		'token_minted',
@@ -52,6 +56,8 @@
 		drift_check: 'bg-info-tint text-info',
 		host_added: 'badge-approved',
 		host_forgotten: 'badge-revoked',
+		address_conflict: 'badge-critical',
+		address_conflict_resolved: 'badge-approved',
 		token_minted: 'badge-approved',
 		token_revoked: 'badge-revoked',
 		instance_claimed: 'badge-applied',

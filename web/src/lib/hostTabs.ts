@@ -12,6 +12,8 @@ import type { QueryTabDef } from './tabs';
 
 export const HOST_TABS: QueryTabDef[] = [
 	{ id: 'overview', label: 'Overview' },
+	// Every address the machine holds and who else holds one (lane B2).
+	{ id: 'network', label: 'Network' },
 	{ id: 'metrics', label: 'Metrics' },
 	{ id: 'changes', label: 'Changes' },
 	{ id: 'activity', label: 'Activity' },
@@ -34,6 +36,7 @@ const LEGACY_ANCHORS: Record<string, string> = {
 	services: 'overview',
 	notes: 'overview',
 	metrics: 'metrics',
+	network: 'network',
 	changes: 'changes',
 	artifacts: 'changes',
 	activity: 'activity',

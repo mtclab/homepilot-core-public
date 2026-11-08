@@ -25,12 +25,14 @@
 		type Service,
 		type Task,
 	} from '$lib/api';
-	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
+	import { ENVS, allocation, envClass, envSourceLabel, pveTags } from '$lib/fleet';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import Sparkline from '$lib/components/Sparkline.svelte';
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
 	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
+	import HostNetwork from '$lib/components/HostNetwork.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
 	import { formatMetricValue, metricLabel } from '$lib/sparkline';
 	import { queryTabs, activeQueryTab } from '$lib/tabs';
@@ -63,6 +65,7 @@
 
 	$: id = $page.params.id ?? '';
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+	$: canAdmin = capIsAdmin($sessionStore?.capabilities);
 	$: agent = host?.agent ?? null;
 
 	// ── Sectors (#549 F3). The tab is `?tab=` state on this one route, because
@@ -222,6 +225,43 @@
 	let editField: 'role' | 'ip' | null = null;
 	let editValue = '';
 
+	// ── Env (lane B1): set here it is pinned against later syncs; "Use
+	// Proxmox's" withdraws it, and the hp-env-* tag (or `template`) applies.
+	let envEditing = false;
+	let envValue = '';
+
+	function startEnvEdit() {
+		envValue = host?.env ?? '';
+		envEditing = true;
+	}
+
+	async function saveEnv(value: string) {
+		if (!host) return;
+		try {
+			await api.updateHost(host.id, { env: value });
+			notify(value ? `Env set to ${value}` : 'Env handed back to Proxmox');
+			envEditing = false;
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		}
+	}
+
+	// ── Self-guest (lane B1): an admin marks or unmarks the machine HomePilot
+	// runs on. The Hosts page proposes it; this is the door for every other case
+	// (no match, several matches, a proposal that was wrong).
+	async function setSelf(mark: boolean) {
+		if (!host) return;
+		try {
+			if (mark) await api.confirmSelfGuest(host.id);
+			else await api.clearSelfGuest();
+			notify(mark ? `${host.hostname} is marked as HomePilot's host` : 'Mark removed');
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		}
+	}
+
 	async function loadEligibility() {
 		if (!host) return;
 		// Admin-only answer: a read-only session simply gets no install button.
@@ -334,7 +374,7 @@
 				href: '',
 			});
 		}
-		if (host.status === 'offline') {
+		if (host.status === 'offline' && !host.is_template) {
 			out.push({ severity: 'critical', label: 'offline', text: 'The host is offline', href: '' });
 		}
 		if (agent && !agent.connected) {
@@ -455,6 +495,13 @@
 					{#if host.absent_since}
 						<span class="badge badge-failed" title="Proxmox stopped reporting this host on {fmtDate(host.absent_since)}">gone</span>
 					{/if}
+					{#if host.is_self}
+						<span class="badge bg-accent-tint text-accent-strong"
+							title="An operator confirmed HomePilot runs on this host">HomePilot runs here</span>
+					{/if}
+					{#if host.is_template}
+						<span class="badge bg-raised text-muted" title="A Proxmox template: a provisioning input, never adopted">template</span>
+					{/if}
 				</div>
 				<p class="text-muted text-sm mt-1">
 					{host.role ?? 'guest'}{host.description ? ` — ${host.description}` : ''}
@@ -462,7 +509,7 @@
 			</div>
 			<div class="flex gap-2 flex-wrap">
 				{#if canWrite}
-					{#if host.source === 'discovered' && host.import_state !== 'ignored'}
+					{#if host.source === 'discovered' && host.import_state !== 'ignored' && !host.is_template}
 						<button class="btn btn-ghost text-xs" on:click={adopt}
 							title="Adopting says HomePilot may act on this host">Adopt</button>
 						<button class="btn btn-ghost text-xs" on:click={() => setImportState('ignored')}>Ignore</button>
@@ -480,6 +527,19 @@
 						<button class="btn btn-ghost text-xs" on:click={reenrich}
 							title="Re-read this guest's details from Proxmox">Re-enrich</button>
 					{/if}
+				{/if}
+				{#if canAdmin && (host.host_type === 'qemu' || host.host_type === 'lxc') && !host.is_template}
+					{#if host.is_self}
+						<button class="btn btn-ghost text-xs" on:click={() => setSelf(false)}
+							title="HomePilot no longer claims to know which host it runs on">Not HomePilot's host</button>
+					{:else if !host.absent_since}
+						<button class="btn btn-ghost text-xs" on:click={() => setSelf(true)}
+							title="Mark this as the machine HomePilot runs on; later power actions treat it with care">This is HomePilot's host</button>
+					{/if}
+				{/if}
+				{#if host.proxmox_url}
+					<a class="btn btn-ghost text-xs" href={host.proxmox_url} target="_blank" rel="noopener noreferrer"
+						title="This host's page in the Proxmox web UI">Open in Proxmox ↗</a>
 				{/if}
 				<a class="btn btn-ghost text-xs" href="{base}/hosts">← All hosts</a>
 			</div>
@@ -561,6 +621,48 @@
 						</dd>
 						<dt class="text-muted">Type</dt>
 						<dd class="text-ink m-0">{host.host_type ?? '—'}{host.node ? ` on ${host.node}` : ''}</dd>
+						{#if host.proxmox_id != null}
+							<dt class="text-muted">VMID</dt>
+							<dd class="text-ink m-0 num-inline">{host.proxmox_id}</dd>
+						{/if}
+						<dt class="text-muted">Env</dt>
+						<dd class="text-ink m-0">
+							{#if envEditing}
+								<select class="input text-xs" bind:value={envValue} aria-label="Env">
+									{#each ENVS as env}<option value={env}>{env}</option>{/each}
+								</select>
+								<button class="text-accent text-xs" disabled={!envValue} on:click={() => saveEnv(envValue)}>Save</button>
+								<button class="text-muted text-xs" on:click={() => (envEditing = false)}>Cancel</button>
+							{:else}
+								{#if host.env}
+									<span class="badge {envClass(host.env)}">{host.env}</span>
+									<span class="text-muted text-xs">{envSourceLabel(host.env_source)}</span>
+								{:else}
+									— <span class="text-muted text-xs">(tag the guest <span class="font-mono">hp-env-dev</span> in Proxmox, or set it here)</span>
+								{/if}
+								{#if canWrite}
+									<button class="text-muted text-xs ml-1" on:click={startEnvEdit}>Edit</button>
+									{#if host.env_source === 'user'}
+										<button class="text-muted text-xs ml-1" on:click={() => saveEnv('')}
+											title="Withdraw this value; the Proxmox tag applies again">Use Proxmox's</button>
+									{/if}
+								{/if}
+							{/if}
+						</dd>
+						{#if host.pool}
+							<dt class="text-muted">Pool</dt>
+							<dd class="text-ink m-0">{host.pool}</dd>
+						{/if}
+						{#if pveTags(host.pve_tags).length}
+							<dt class="text-muted">Proxmox tags</dt>
+							<dd class="text-ink m-0 flex flex-wrap gap-1">
+								{#each pveTags(host.pve_tags) as tag (tag)}<span class="badge bg-raised text-muted font-mono">{tag}</span>{/each}
+							</dd>
+						{/if}
+						{#if allocation(host)}
+							<dt class="text-muted">Allocated</dt>
+							<dd class="text-ink m-0 num-inline" title="What Proxmox gives this guest">{allocation(host)}</dd>
+						{/if}
 						<dt class="text-muted">Source</dt>
 						<dd class="text-ink m-0">{host.source ?? '—'}</dd>
 					</dl>
@@ -621,6 +723,9 @@
 						</div>
 					</div>
 				{/if}
+			{:else if activeTab === 'network'}
+				<!-- ── Network: every address, its source and age, and its clashes ── -->
+				<HostNetwork hostId={id} />
 			{:else if activeTab === 'metrics'}
 				<!-- ── Metrics ─────────────────────────────────────────────────────── -->
 				<div class="card p-4 space-y-3">

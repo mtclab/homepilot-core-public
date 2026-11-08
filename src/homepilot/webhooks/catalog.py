@@ -27,6 +27,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "artifact_drifted",
         "alert_firing",
         "alert_resolved",
+        "update_available",
     }
 )
 # Subscribes to everything, including events added later.
