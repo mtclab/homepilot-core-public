@@ -10,15 +10,23 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 
 from ..adapters.agent import AgentAdapter
 from ..agent_hub.version_skew import control_plane_version as _control_plane_version
 from ..agent_hub.version_skew import is_behind as _is_behind
 from ..auth.deps import require_scope, require_token
-from ..auth.principal import audit_actor
+from ..auth.principal import ACTOR_ADMIN_SECRET, audit_actor, principal_from_token
 from .addresses import find_conflicts
-from .fleet_model import ENV_SOURCE_USER, ENVS, imported_env, parse_pve_tags, proxmox_ui_url
+from .fleet_model import (
+    ENV_SOURCE_USER,
+    ENVS,
+    imported_env,
+    parse_pve_tags,
+    proxmox_console_url,
+    proxmox_ui_url,
+)
 from .self_guest import (
     DISMISSED_KEY,
     colocated_agents,
@@ -119,6 +127,10 @@ class HostPatchRequest(BaseModel):
     # an EMPTY string withdraws the operator's value and hands the field back
     # to what Proxmox says (its `hp-env-*` tag, or `template`).
     env: str | None = None
+    # Shutting down, rebooting or stopping a protected guest from HomePilot
+    # takes its name typed back (lane B3, #781). Operator-only: see
+    # update_host_record.
+    protected: bool | None = None
 
     @field_validator("env")
     @classmethod
@@ -260,6 +272,8 @@ async def list_inventory(
     proxmox = getattr(getattr(request.app.state, "inventory_service", None), "proxmox", None)
     for h in hosts:
         h["proxmox_url"] = proxmox_ui_url(proxmox, h)
+        # The row menu's Console door (UI slice 5).
+        h["console_url"] = proxmox_console_url(proxmox, h)
     # The agent is a property of the host (#514 S1): a fleet list that cannot
     # say "this machine has a live channel" forces a second tab to answer it.
     agent_ids = [h["agent_id"] for h in hosts if h.get("agent_id")]
@@ -585,16 +599,28 @@ async def get_host_doc(request: Request, host_id: str) -> dict[str, Any]:
     return doc
 
 
-async def update_host_record(repo: Any, host_id: str, body: HostPatchRequest) -> dict[str, Any]:
+async def update_host_record(
+    repo: Any, host_id: str, body: HostPatchRequest, *, operator: bool = False
+) -> dict[str, Any]:
     """Apply an operator's edits to one host and PIN the fields they set.
 
     Shared by the HTTP route and the MCP ``update_host`` tool. Raises
     ``InventoryError(404)`` when unknown and ``InventoryError(400)`` when the
     patch carries no recognised field.
+
+    ``operator``: the caller holds an admin credential (a person). Only an
+    operator may change ``protected`` - it is the guard on powering a guest
+    off, and an assistant that could lift it could then propose the shutdown
+    the guard exists to stop (#781).
     """
     host = await repo.get_host(host_id)
     if host is None:
         raise InventoryError(404, f"Host not found: {host_id}")
+    if body.protected is not None and not operator:
+        raise InventoryError(
+            403,
+            "only an operator (an admin credential) may change whether a guest is protected",
+        )
     updates: dict[str, Any] = {}
     if body.managed is not None:
         updates["managed"] = int(body.managed)
@@ -612,6 +638,8 @@ async def update_host_record(repo: Any, host_id: str, body: HostPatchRequest) ->
         updates["import_state"] = body.import_state
     if body.status is not None:
         updates["status"] = body.status
+    if body.protected is not None:
+        updates["protected"] = int(body.protected)
     clear_env = body.env == ""
     if body.env:
         updates["env"] = body.env
@@ -683,12 +711,86 @@ async def ignore_host_record(repo: Any, host_id: str) -> dict[str, Any]:
     return dict(updated)
 
 
+def _is_operator(token: dict[str, Any]) -> bool:
+    """An admin credential - a person (auth/principal.py) - or the admin secret."""
+    return token.get("auth") == ACTOR_ADMIN_SECRET or principal_from_token(token).is_operator
+
+
 @router.patch("/{host_id}", dependencies=[Depends(require_scope("write"))])
-async def update_host(request: Request, host_id: str, body: HostPatchRequest) -> dict[str, Any]:
+async def update_host(
+    request: Request, host_id: str, body: HostPatchRequest, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
     try:
-        return await update_host_record(request.app.state.repo, host_id, body)
+        return await update_host_record(
+            request.app.state.repo, host_id, body, operator=_is_operator(token)
+        )
     except InventoryError as e:
         raise HTTPException(status_code=e.status, detail=e.detail) from e
+
+
+class PowerRequest(BaseModel):
+    """One operator power action (lane B3, #781)."""
+
+    action: Literal["start", "shutdown", "reboot", "stop"]
+    # The guest's name typed back: required to shut down, reboot or stop the
+    # machine HomePilot runs on or a protected guest.
+    confirm_name: str | None = Field(default=None, max_length=253)
+    # How long a shutdown (or the shutdown half of a reboot) may take before the
+    # result says "timed out". Nothing is ever forced when it runs out.
+    timeout_s: int | None = None
+
+
+def _power_service(request: Request) -> Any:
+    from .power import PowerService
+
+    svc = _get_service(request)
+    return PowerService(svc.repo, svc.proxmox)
+
+
+@router.get("/{host_id}/power", dependencies=[Depends(require_scope("read"))])
+async def get_power_state(request: Request, host_id: str) -> dict[str, Any]:
+    """A guest's live power state, its pending config changes, and what each action needs.
+
+    A read: nothing is sent to the guest. The pending changes are what a Reboot
+    would apply (cloud-init ``ipconfigN`` among them).
+    """
+    from .power import PowerRefusedError
+
+    try:
+        result: dict[str, Any] = await _power_service(request).describe(host_id)
+    except PowerRefusedError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail()) from e
+    return result
+
+
+@router.post("/{host_id}/power", dependencies=[Depends(require_scope("admin"))])
+async def power_host(
+    request: Request, host_id: str, body: PowerRequest, token: dict[str, Any] = _principal
+) -> Any:
+    """Start, shut down, reboot or stop a guest - DIRECTLY, as the operator.
+
+    Admin scope: an admin credential is a person (auth/principal.py), and a
+    person acts without a propose/approve round trip. An assistant never
+    reaches this; its ``power_guest`` tool proposes a ``guest-power`` artifact.
+
+    The answer is 200 once the action was SENT, whatever its outcome
+    (``ok`` / ``failed`` / ``timed_out`` / ``unknown``); a guard that refused
+    answers 4xx with a ``code`` and the reason, and nothing was sent.
+    """
+    from .power import PowerRefusedError
+
+    try:
+        result = await _power_service(request).execute(
+            host_id,
+            body.action,
+            actor=audit_actor(token),
+            source="api",
+            confirm_name=body.confirm_name,
+            timeout_s=body.timeout_s,
+        )
+    except PowerRefusedError as e:
+        return JSONResponse(status_code=e.status, content={"detail": e.detail()})
+    return result.as_dict()
 
 
 @router.post("/enrich", dependencies=[Depends(require_scope("write"))])

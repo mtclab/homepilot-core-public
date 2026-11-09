@@ -245,8 +245,8 @@ describe('the Guest network card', () => {
 		const text = card().textContent ?? '';
 		expect(text).toMatch(/guest-network/);
 		expect(text).toMatch(/approve it with the\s+code/i);
-		const link = card().querySelector('a[href="/ui/changes/review"]');
-		expect(link, 'the card must point at the review queue').toBeTruthy();
+		const link = card().querySelector('a[href="/ui/changes/inbox"]');
+		expect(link, 'the card must point at the Changes inbox').toBeTruthy();
 
 		// No button on this card changes the estate. Re-check and the per-setting
 		// Save/Test/Reset are the whole button budget.

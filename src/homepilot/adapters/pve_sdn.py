@@ -45,6 +45,17 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
+# The PVE library is loaded with this module, not inside the functions that use
+# it: those run on the event loop (the claim's and Settings' write-token probe,
+# the guest-network gateway), and importing it there - proxmoxer, requests,
+# charset detection - held the loop 265 ms on a fresh venv (3.10.0 gate,
+# test_first_run_claim). homepilot.main imports this module before uvicorn
+# starts the loop; tests/test_no_blocking_on_loop.py holds both.
+from proxmox_mcp import firewall, sdn
+from proxmox_mcp.config import EndpointConfig, MultiConfig
+from proxmox_mcp.exceptions import ProxmoxNotFoundError
+from proxmox_mcp.multi_client import MultiClient
+
 from .pve_firewall_guard import (
     LOCKOUT_POLICIES,
     OptionsScope,
@@ -218,9 +229,6 @@ def multi_client_from(credentials: PveCredentials) -> Any:
     HomePilot has no separate write token the read one answers for both, which
     is the same fallback ``ProxmoxClient`` already makes.
     """
-    from proxmox_mcp.config import EndpointConfig, MultiConfig
-    from proxmox_mcp.multi_client import MultiClient
-
     monitor_id, monitor_secret = _split_token(credentials.token)
     admin_id, admin_secret = _split_token(_usable_write_token(credentials))
     endpoint = EndpointConfig(
@@ -419,8 +427,6 @@ class PveSdnGateway:
         forever (#713). A guest destroyed between the listing and this read is
         not an error - there is nothing left to fence.
         """
-        from proxmox_mcp.exceptions import ProxmoxNotFoundError
-
         try:
             payload = await self._client.safe_api_call(
                 self._api().nodes(node).qemu(vmid).firewall.rules.get
@@ -436,8 +442,6 @@ class PveSdnGateway:
     # of this running at all.
 
     async def create_zone(self, **params: Any) -> str:
-        from proxmox_mcp import sdn
-
         zone = str(params.pop("zone", ""))
         zone_type = str(params.pop("type", "simple"))
         return str(
@@ -447,14 +451,10 @@ class PveSdnGateway:
         )
 
     async def update_zone(self, **params: Any) -> str:
-        from proxmox_mcp import sdn
-
         zone = str(params.pop("zone", ""))
         return str(await sdn.update_sdn_zone(self._client, zone=zone, confirm=True, **params))
 
     async def create_vnet(self, **params: Any) -> str:
-        from proxmox_mcp import sdn
-
         vnet = str(params.pop("vnet", ""))
         zone = str(params.pop("zone", ""))
         return str(
@@ -462,8 +462,6 @@ class PveSdnGateway:
         )
 
     async def create_subnet(self, **params: Any) -> str:
-        from proxmox_mcp import sdn
-
         vnet = str(params.pop("vnet", ""))
         subnet = str(params.pop("subnet", ""))
         return str(
@@ -526,8 +524,6 @@ class PveSdnGateway:
         return f"vnet {vnet!r} firewall rule {pos} deleted"
 
     async def apply_sdn(self, **_params: Any) -> str:
-        from proxmox_mcp import sdn
-
         return str(await sdn.apply_sdn(self._client, confirm=True))
 
     async def ensure_datacenter_firewall_enabled(self, **_params: Any) -> str:
@@ -583,8 +579,6 @@ class PveSdnGateway:
     # ── The per-VM fence ─────────────────────────────────────────────────────
 
     async def set_vm_firewall_options(self, node: str, vmid: int, **options: Any) -> str:
-        from proxmox_mcp import firewall
-
         return str(
             await firewall.set_vm_firewall_options(
                 self._client, node=node, vmid=vmid, confirm=True, **options
@@ -594,8 +588,6 @@ class PveSdnGateway:
     async def delete_vm_firewall_rule(
         self, node: str, vmid: int, pos: int, expect: Mapping[str, Any] | None = None
     ) -> str:
-        from proxmox_mcp import firewall
-
         api = self._api().nodes(node).qemu(vmid).firewall.rules(pos)
         await self._expected_rule(api, f"guest {vmid}", pos, expect)
         return str(
@@ -626,8 +618,6 @@ class PveSdnGateway:
         return rule
 
     async def create_vm_firewall_rule(self, node: str, vmid: int, **rule: Any) -> str:
-        from proxmox_mcp import firewall
-
         # The library spells the rule's direction `dptype` (PVE's `type`), so the
         # translation happens HERE, once, rather than in every caller.
         rule = dict(rule)

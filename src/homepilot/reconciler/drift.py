@@ -12,6 +12,7 @@ from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
 from homepilot.events import emit_event
 from homepilot.executor.orchestrator import ArtifactExecutor
+from homepilot.runtime.blocking import run_blocking
 
 from .base import Reconciler, ReconcilerResult
 from .verify import VerifyResult, verify_artifact
@@ -34,7 +35,7 @@ class DriftReconciler(Reconciler):
 
     async def run(self) -> ReconcilerResult:
         try:
-            applied = self.store.list(status=ArtifactStatus.APPLIED.value)
+            applied = await run_blocking("io", self.store.list, status=ArtifactStatus.APPLIED.value)
             checkable = [a for a in applied if a.get("kind") != ArtifactKind.KB_NOTE.value]
 
             if not checkable:
@@ -226,7 +227,7 @@ class DriftReconciler(Reconciler):
             if result.details:
                 payload["details"] = result.details
             try:
-                fm, _ = self.store.read(artifact_id)
+                fm, _ = await run_blocking("io", self.store.read, artifact_id)
                 payload["kind"] = fm.get("kind", "")
                 payload["intent"] = fm.get("intent", "")
                 target = fm.get("target")

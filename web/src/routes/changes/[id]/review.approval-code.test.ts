@@ -69,7 +69,8 @@ describe('Review screen approval code', () => {
 			approval_code: null,
 		});
 		render(Detail);
-		await screen.findByText('the plan'); // body renders once loaded
+		// The page has loaded (the raw spec is behind a disclosure since 3.10).
+		await screen.findByRole('heading', { name: 'Install nginx' });
 		expect(screen.queryByTestId('approval-code')).toBeNull();
 	});
 });

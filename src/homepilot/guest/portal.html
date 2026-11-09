@@ -130,6 +130,7 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   let pending = null; // {id, hostname, action}
+  let busy = false; // a power action is being followed: keep its banner up
 
   const fmt = {
     mem: (mb) => mb == null ? "—" : (mb / 1024).toFixed(mb % 1024 ? 1 : 0) + " GB",
@@ -235,7 +236,7 @@
   async function refresh() {
     try {
       const [vms, quota] = await Promise.all([api("/guest/vms"), api("/guest/quota")]);
-      banner("");
+      if (!busy) banner("");
       $("who").textContent = quota.cn ? `Signed in as ${quota.cn}` : "";
 
       const list = $("vms");
@@ -273,15 +274,26 @@
     pending = null;
     $("confirm").close();
     if (!p) return;
+    // The answer comes once the machine has settled (the same checks and the
+    // same follow-through as the operator's own button), so say what is
+    // happening while it does.
+    const verb = p.action === "start" ? "Starting" : p.action === "stop" ? "Stopping" : "Restarting";
+    banner(`${verb} ${p.hostname}... waiting for it to finish`);
+    busy = true;
     try {
-      await api(`/guest/vms/${encodeURIComponent(p.id)}/power`, {
+      const res = await api(`/guest/vms/${encodeURIComponent(p.id)}/power`, {
         method: "POST",
         body: JSON.stringify({ action: p.action }),
       });
-      toast(`${p.action === "start" ? "Starting" : p.action === "stop" ? "Stopping" : "Rebooting"} ${p.hostname}…`);
-      setTimeout(refresh, 2500);
+      busy = false;
+      banner("");
+      toast(`${p.hostname}: ${res.message || "done"}`);
+      refresh();
     } catch (e) {
-      banner(e.message);
+      busy = false;
+      // After the reload, which clears the banner when the list loads.
+      await refresh();
+      banner(`${p.hostname}: ${e.message}`);
     }
   });
 

@@ -10,6 +10,7 @@ from ..artifacts.models import ArtifactBusyError, ArtifactStatus
 from ..artifacts.store import ArtifactStore
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..executor.orchestrator import ArtifactExecutor
+from ..runtime.blocking import run_blocking
 from .repository import TERMINAL_TASK_STATUSES, TaskRepository
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ class TaskRunner:
         # (executor.apply raises, the APPLIED→FAILED transition also raises, and
         # the task never leaves 'running'), blocking all future apply/revoke.
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
@@ -114,7 +115,7 @@ class TaskRunner:
         self, artifact_id: str, user: str = "system", reason: str | None = None
     ) -> dict[str, Any]:
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
@@ -135,6 +136,51 @@ class TaskRunner:
             "status": "pending",
         }
 
+    async def withdraw(
+        self, artifact_id: str, user: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Withdraw an approved change that has not run (#797), in the run slot.
+
+        `reject` refuses an approved artifact and `revoke` is for undoing an
+        applied one (it may run a rollback), so an approved-but-broken change
+        could only sit in the queue or be run. This takes it back, running
+        nothing. It claims the artifact's ONE run slot first - the same claim
+        apply/replay/revoke make - so it cannot land while an apply is starting
+        or running, and no apply can start while it lands. The slot is a task
+        row (action `withdraw`) finished here, which also puts the withdrawal
+        on the Tasks record.
+
+        Raises ConflictError when the artifact is not approved (or a run left
+        its outcome unsettled), ArtifactBusyError when a run holds the slot,
+        ValueError when there is no such artifact.
+        """
+        try:
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
+        except FileNotFoundError:
+            raise ValueError(f"Artifact not found: {artifact_id}") from None
+        status = ArtifactStatus(fm["status"])
+        if status != ArtifactStatus.APPROVED:
+            raise ConflictError(
+                f"only an approved change that has not run can be withdrawn; "
+                f"{artifact_id} is {status.value}"
+            )
+
+        task_id = await self._claim(artifact_id, "withdraw")
+        await self.repo.update_task_status(task_id, "running")
+        try:
+            await self.lifecycle.withdraw(artifact_id, user, reason)
+        except BaseException as exc:
+            # Never strand the slot: a running row blocks every later run.
+            await self.repo.update_task_status(task_id, "failed", error=str(exc))
+            raise
+        payload = json.dumps({"withdrawn": True, "reason": reason})
+        await self.repo.update_task_status(task_id, "succeeded", result_json=payload)
+        return {
+            "id": artifact_id,
+            "status": ArtifactStatus.WITHDRAWN.value,
+            "task_id": task_id,
+        }
+
     async def start_replay(self, artifact_id: str) -> dict[str, Any]:
         """Re-apply an already-applied artifact, through the ONE engine (#423).
 
@@ -145,7 +191,7 @@ class TaskRunner:
         to have exactly one way in.
         """
         try:
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
         except FileNotFoundError:
             raise ValueError(f"Artifact not found: {artifact_id}") from None
 
@@ -241,7 +287,17 @@ class TaskRunner:
             log = (
                 f"[earlier output truncated, showing the last {self._MAX_STORED_LOG} chars]\n{kept}"
             )
-        payload = json.dumps({"execution_log": log}) if log else None
+        record: dict[str, Any] = {"execution_log": log} if log else {}
+        # What a failed run did change (#796) and what PVE warned about on a
+        # successful one ride on the task, where the Changes page reads the
+        # outcome from - never a bare "failed" or "WARNINGS: 1".
+        partial = getattr(result, "partial_apply", None)
+        if isinstance(partial, dict) and partial:
+            record["partial_apply"] = partial
+        warnings = getattr(result, "warnings", None)
+        if isinstance(warnings, list) and warnings:
+            record["warnings"] = warnings
+        payload = json.dumps(record) if record else None
 
         unsettled = getattr(result, "unsettled_task", None)
         if isinstance(unsettled, dict) and unsettled:

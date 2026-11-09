@@ -90,6 +90,22 @@ describe('RowMenu', () => {
 		expect(screen.getByRole('menu')).toBeInTheDocument();
 	});
 
+	it('an item that re-renders on click (Start -> Confirm start) keeps the menu open', async () => {
+		// Found on the built UI (slice 5): the clicked item was detached before
+		// the window's outside-click check ran, so the click read as "outside"
+		// and the menu shut before its confirm could be pressed. Teeth: check
+		// `root.contains(event.target)` alone and this fails.
+		const user = userEvent.setup();
+		render(RowMenuFixture);
+
+		await user.click(screen.getByRole('button', { name: 'Actions for web-01' }));
+		await user.click(screen.getByRole('menuitem', { name: 'Arm' }));
+
+		expect(screen.getByRole('menu')).toBeInTheDocument();
+		await user.click(screen.getByRole('menuitem', { name: 'Confirm arm' }));
+		expect(screen.queryByRole('menu')).toBeNull();
+	});
+
 	it('an item that asks to close closes the menu', async () => {
 		const user = userEvent.setup();
 		render(RowMenuFixture);

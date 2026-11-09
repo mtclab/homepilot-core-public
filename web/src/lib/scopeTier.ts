@@ -9,8 +9,8 @@
 // normalize to read+write+admin.
 
 export interface ScopeTier {
+	/** Said as words under the signed-in name, e.g. "Full access". */
 	label: string;
-	cls: string;
 }
 
 const SUPERUSER = new Set(['*', 'all', 'full']);
@@ -20,10 +20,10 @@ export function scopeTier(
 	scope: string | null | undefined,
 ): ScopeTier | null {
 	const raw = (scope ?? '').trim();
-	if (SUPERUSER.has(raw)) return { label: 'all', cls: 'text-ok' };
+	if (SUPERUSER.has(raw)) return { label: 'Full access' };
 	const caps = capabilities ?? [];
-	if (caps.includes('admin')) return { label: 'admin', cls: 'text-warn' };
-	if (caps.includes('write')) return { label: 'read, write', cls: 'text-accent' };
-	if (caps.includes('read')) return { label: 'read only', cls: 'text-muted' };
+	if (caps.includes('admin')) return { label: 'Admin access' };
+	if (caps.includes('write')) return { label: 'Can read and change' };
+	if (caps.includes('read')) return { label: 'Read only' };
 	return null;
 }

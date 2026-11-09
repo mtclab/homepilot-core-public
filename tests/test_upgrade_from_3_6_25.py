@@ -43,9 +43,12 @@ SCHEMA_3_7_0 = 36
 # * 37 - the fleet model (lane B1): template flag, pool, PVE tags, allocation,
 #   env and the self-guest mark on ``hosts``
 # * 38 - addresses and clashes (lane B2): ``host_addresses``
+# Unreleased:
+# * 39 - operator power controls (lane B3): ``hosts.protected``
+# * 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept
 # tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
 # through both.
-SCHEMA_LATEST = 38
+SCHEMA_LATEST = 40
 
 
 async def _version(db: Database) -> int:
@@ -87,6 +90,12 @@ async def db_3_6_25(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "INSERT INTO bootstrap_tokens (token_hash, expires_at) VALUES (?, ?)",
         ("ab" * 32, time.time() + 600),
     )
+    await database.execute(
+        "INSERT INTO tasks (id, artifact_id, action, status, result_json, created_at, "
+        "finished_at, error) VALUES ('t-old', '2026-01-01-old-aaaaaa', 'apply', 'succeeded', "
+        '\'{"execution_log": "ok"}\', ?, ?, NULL)',
+        (now, now),
+    )
     await database.conn.commit()
     yield database
     await database.close()
@@ -111,6 +120,7 @@ class TestADatabaseFrom3625UpgradesInOneStart:
             "env",
             "env_source",
             "is_self",
+            "protected",
         } <= await _columns(db_3_6_25, "hosts")
         assert "host_addresses" in await _tables(db_3_6_25)
 
@@ -118,6 +128,17 @@ class TestADatabaseFrom3625UpgradesInOneStart:
         assert {"alert_events", "notification_channels", "enrolment_attempts"} <= tables
         assert "kind" in await _columns(db_3_6_25, "alert_rules")
         assert {"created_at", "minted_by"} <= await _columns(db_3_6_25, "bootstrap_tokens")
+
+        # 40 rebuilt `tasks` for the `withdraw` action (#797): the old run is
+        # kept as it was, and the one-run-per-artifact index came back with it.
+        (old,) = await db_3_6_25.fetchall("SELECT * FROM tasks")
+        assert (old["id"], old["action"], old["status"]) == ("t-old", "apply", "succeeded")
+        assert old["result_json"] == '{"execution_log": "ok"}'
+        indexes = {
+            r["name"]
+            for r in await db_3_6_25.fetchall("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        assert "idx_tasks_one_active_per_artifact" in indexes
 
         # The pre-migration snapshot is of the 3.6.25 database, so the one
         # restore an operator is told about takes them back to what they had.

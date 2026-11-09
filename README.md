@@ -401,6 +401,7 @@ hp artifacts approve <id>     # approve a proposed artifact
 hp artifacts reject <id>      # reject a proposed artifact
 hp artifacts reset-approval <id>  # clear a brute-force approval-code lock
 hp artifacts apply <id>       # apply an approved artifact (via the backend's executor)
+hp artifacts withdraw <id>    # take back an approved artifact that has not run (runs nothing)
 hp artifacts edit <id>        # open artifact in editor
 hp artifacts revoke <id>      # revoke an applied artifact
 hp artifacts replay <id>      # re-apply an already-applied artifact

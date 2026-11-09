@@ -119,6 +119,8 @@ ROUTE_TO_TOOL: dict[str, str] = {
     # The Network tab's read (lane B2); get_host carries the same addresses and
     # clashes as `addresses` / `address_conflicts`, from one service method.
     "/inventory/{host_id}/network": "get_host",
+    # Guest power state + pending changes (lane B3, #781); read-only.
+    "/inventory/{host_id}/power": "get_guest_power",
     # KB
     "/kb": "list_kb",
     "/kb/search": "search_kb",
@@ -326,6 +328,8 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     # DELETE /artifacts/{id} is API require_scope('write') -> full tier (it rolls
     # an applied artifact back through the runner; it cannot grant approval).
     ("DELETE", "/artifacts/{artifact_id}"): "revoke_artifact",
+    # Withdraw an approved, never-run change (#797): API `write` -> full tier.
+    ("POST", "/artifacts/{artifact_id}/withdraw"): "withdraw_artifact",
     # Guest management (#442). These routes are API `admin`; wave 3 moved the tools
     # to the admin tier so tool and route now match (no exemption).
     ("POST", "/admin/guests/quota"): "set_guest_quota",
@@ -341,6 +345,17 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
+    # ── Operator power controls (lane B3, #781). ──
+    ("POST", "/inventory/{host_id}/power"): (
+        "powers a guest DIRECTLY - the operator's own act, admin scope. An assistant "
+        "never powers anything: its power_guest tool proposes a guest-power artifact "
+        "the owner approves"
+    ),
+    ("POST", "/artifacts/{artifact_id}/approve-and-apply"): (
+        "the owner's one-tap approve AND run of a proposed change, admin scope. "
+        "An assistant approves only with a human-relayed code (approve_artifact) and "
+        "applies as a separate act (apply_artifact)"
+    ),
     # ── The self-guest mark (lane B1). ──
     ("PUT", "/inventory/self-guest"): (
         "marks the machine HomePilot runs on - the guard later power actions check. "
@@ -663,6 +678,11 @@ def _tier_mismatches(tier_fn: Any, exemptions: set[str]) -> list[str]:
 # hand-placed at and why no route governs it. A new tool that is neither fails
 # TestEveryToolIsTierGoverned rather than quietly escaping the gate.
 ROUTELESS_TOOLS: dict[str, str] = {
+    "power_guest": (
+        "full - PROPOSES a guest-power artifact (the same authority as propose_artifact, "
+        "POST /artifacts, API write) and sends nothing to Proxmox. The direct power "
+        "route POST /inventory/{host_id}/power is admin and deliberately has no MCP twin."
+    ),
     "create_guest_template": (
         "admin - MCP-only for now. Builds the cloud-init template provision_guest "
         "clones; there is no API route, so it is placed next to the admin-tier "

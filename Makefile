@@ -12,6 +12,10 @@
 # few minutes, so it is NOT part of the default `gate` — run it before releasing.
 # The local suite runs against the venv and cannot catch a build-resolution drift
 # (see #399); only building the real image can.
+#
+# `make gate-e2e` IS part of `gate`: tests/test_e2e.py against the real built UI
+# and a real server from this tree, driven by headless chromium - the steps of
+# the public mirror's `e2e` workflow, run here (scripts/gate-e2e.sh).
 
 VENV ?= .venv/bin
 
@@ -37,9 +41,9 @@ HP_GO_BIN := $(shell command -v $(GO_BIN) 2>/dev/null)
 GOCACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/homepilot-gate/go-build
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-py gate-web gate-go gate-go-race gate-image gate-security gate-mirror
+.PHONY: gate gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-image gate-security gate-mirror schema-lock
 
-gate: gate-py gate-web gate-go gate-go-race gate-security gate-mirror
+gate: gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-security gate-mirror
 
 # The suite in the public mirror's file tree (the scrub's deletions + PROVENANCE).
 # The mirror's CI runs the same tests; a test that reads a file the scrub removes
@@ -59,6 +63,15 @@ gate-mirror:
 		$(VENV)/python scripts/mirror_tree_check.py; \
 	fi
 	@echo "gate: all sub-gates passed"
+
+# The venv must BE uv.lock before anything is tested in it (3.10.0). The 3.9.0
+# gate passed in a venv that had drifted to newer fastapi/pydantic/starlette;
+# on the locked versions - the ones the image installs - the first request
+# after every start blocked the event loop ~300 ms, and no gate step could see
+# it. Offline (`uv sync --locked --check --offline`); fails on any dependency
+# that differs from the lock. scripts/check_venv_lock.py says why and how to fix.
+gate-lock:
+	$(VENV)/python scripts/check_venv_lock.py "$(VENV)"
 
 gate-security:
 	# Mirror CI's integration job runs these exact audits; a local gate that
@@ -135,5 +148,25 @@ gate-go:
 gate-go-race:
 	cd agent/go && $(GO_ENV) $(GO_BIN) test -race ./...
 
+# tests/test_e2e.py skips itself without a live server and a token, so gate-py
+# never ran it: 3.9.0 went out with two e2e failures that only the mirror's CI
+# saw, after the release (a redirect expectation the UI slice had moved, and a
+# loop-block false positive in an e2e fixture). This runs the mirror workflow's
+# steps locally - `npm ci` + build, the server from this tree in an isolated
+# HOME/data dir on free localhost ports, a token minted over HTTP, Playwright
+# chromium - and fails if any e2e test is skipped. Needs node/npm and, the first
+# time, network for `playwright install chromium` (user cache, no system deps).
+gate-e2e:
+	bash scripts/gate-e2e.sh "$(VENV)"
+
 gate-image:
 	bash scripts/smoke-image.sh
+
+# Regenerate src/homepilot/db/schema.lock after an INTENDED schema change (a new
+# migration). tests/test_schema_fingerprint.py fails on any schema the lock does
+# not record. Refuses to change a recorded version's hash: a released migration
+# is applied history (pass --rewrite-history by hand only for a version that was
+# never released).
+schema-lock: export PYTHONPATH := $(CURDIR)/src
+schema-lock:
+	$(VENV)/python -m homepilot.db.schema_fingerprint --write

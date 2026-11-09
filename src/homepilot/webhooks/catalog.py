@@ -24,6 +24,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "artifact_failed",
         "artifact_superseded",
         "artifact_revoked",
+        "artifact_withdrawn",
         "artifact_drifted",
         "alert_firing",
         "alert_resolved",

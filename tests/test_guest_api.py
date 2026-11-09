@@ -17,12 +17,14 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
+from homepilot.adapters.proxmox import ProxmoxError
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
 from homepilot.db.repository import Repository
 from homepilot.guest.router import router as guest_router
 
 from .portal_support import cert_headers, client_for, portal_settings
+from .test_power_controls import FakeCluster, qemu_net
 
 pytestmark = pytest.mark.asyncio
 
@@ -30,46 +32,41 @@ ALICE = "alice"
 BOB = "bob"
 
 
-class PowerPVE:
-    """Records power calls; fails on demand."""
+class PowerPVE(FakeCluster):
+    """The cluster fake every power test uses (tests/test_power_controls.py).
+
+    The portal's power route runs the operator's ``PowerService`` (#781), so its
+    tests answer the same Proxmox calls: who is at (node, VMID) now, its
+    pending config, the power task and its outcome. ``calls`` lists the power
+    actions that REACHED the hypervisor; ``fail`` makes Proxmox refuse them
+    with text a guest must never see.
+    """
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, int]] = []
+        super().__init__()
         self.fail = False
-        # Which machine each (node, vmid) holds NOW. The power route asks
-        # before it acts (#706), so the fake answers the way PVE does.
-        self.guests: dict[tuple[str, int], str] = {
-            ("pve1", 105): "alice-web",
-            ("pve1", 106): "bob-box",
-        }
+        self.add(105, "alice-web", "running", qemu_net("192.0.2.15", "BC:24:11:00:01:05"))
+        self.add(106, "bob-box", "running", qemu_net("192.0.2.16", "BC:24:11:00:01:06"))
 
-    async def get_vm_config(self, node: str, vmid: int) -> dict[str, Any]:
-        from homepilot.adapters.proxmox import ProxmoxError
+    @property
+    def calls(self) -> list[tuple[str, str, int]]:
+        # /nodes/<node>/<type>/<vmid>/status/<action>
+        out: list[tuple[str, str, int]] = []
+        for path in self.power_posts:
+            parts = path.strip("/").split("/")
+            out.append((parts[5], parts[1], int(parts[3])))
+        return out
 
-        name = self.guests.get((node, vmid))
-        if name is None:
-            raise ProxmoxError(
-                "GET",
-                f"nodes/{node}/qemu/{vmid}/config",
-                500,
-                f"Configuration file 'nodes/{node}/qemu-server/{vmid}.conf' does not exist",
-            )
-        return {"name": name}
-
-    async def start_vm(self, node: str, vmid: int) -> str:
-        return self._record("start", node, vmid)
-
-    async def stop_vm(self, node: str, vmid: int) -> str:
-        return self._record("stop", node, vmid)
-
-    async def reboot_vm(self, node: str, vmid: int) -> str:
-        return self._record("reboot", node, vmid)
-
-    def _record(self, action: str, node: str, vmid: int) -> str:
-        if self.fail:
-            raise RuntimeError("pve exploded: node pve9, storage local-lvm full")
-        self.calls.append((action, node, vmid))
-        return f"UPID:{node}:{action}:{vmid}:"
+    async def call(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if method != "GET" and self.fail:
+            raise ProxmoxError(method, path, 500, "pve exploded: node pve9, storage local-lvm full")
+        return await super().call(method, path, body, query)
 
 
 @pytest.fixture
@@ -82,7 +79,7 @@ async def stack(tmp_path: Path):
     async def add(hostname: str, owner: str | None, vmid: int | None = None) -> str:
         host_id = await repo.create_host(
             hostname=hostname,
-            host_type="vm",
+            host_type="qemu",
             source="hp_created",
             owner=owner,
             proxmox_id=vmid,
@@ -211,6 +208,7 @@ class TestPowerIsScopedAndHonest:
     async def test_a_pve_failure_never_leaks_its_text_to_the_guest(self, stack):
         app, pve, ids = stack
         pve.fail = True
+        pve.guests[105]["status"] = "stopped"
         async with client_for(app) as client:
             res = await client.post(
                 f"/guest/vms/{ids['alice']}/power",

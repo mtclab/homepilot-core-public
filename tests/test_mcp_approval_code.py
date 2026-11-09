@@ -322,6 +322,9 @@ class TestSurfacing:
             async def get_active_task(self, _id: str) -> None:
                 return None
 
+            async def list_tasks(self, **_kw: Any) -> list[dict[str, Any]]:
+                return []
+
         class _State:
             def __init__(self) -> None:
                 self.artifact_store = store

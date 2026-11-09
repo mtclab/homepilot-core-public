@@ -85,6 +85,7 @@ async def migrate_fleet_to_tls(
     not given - refusing with the list is more useful than a partial success an
     operator has to reconstruct.
     """
+    from ..runtime.blocking import run_blocking
     from .selfconfig import certificate_fingerprint, ensure_hub_certificate
 
     if hub is None or registry is None:
@@ -107,11 +108,14 @@ async def migrate_fleet_to_tls(
     # Generate (do NOT serve) the certificate: the agents need its fingerprint
     # while they are still talking plaintext. ensure_hub_certificate reuses an
     # existing pair, so a retried migration hands out the same pin.
-    cert_path, _key_path = ensure_hub_certificate(
+    # Key generation and file IO: off the event loop.
+    cert_path, _key_path = await run_blocking(
+        "io",
+        ensure_hub_certificate,
         Path(data_dir),
         extra_hosts=(settings.agent_hub_advertise_host, settings.agent_hub_host),
     )
-    fingerprint = certificate_fingerprint(cert_path)
+    fingerprint = await run_blocking("io", certificate_fingerprint, cert_path)
 
     adopted: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []

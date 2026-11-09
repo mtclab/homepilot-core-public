@@ -402,3 +402,15 @@ def _no_leftover_db_worker_threads():
         f"{[t.name for t in stuck]}. They are non-daemon, so the process cannot exit - "
         "a Database was closed in a way that never ended its worker, or never closed."
     )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Fail any test that blocks an event loop (tests/loop_block_detector.py).
+
+    Installed for every run, not just `make gate`: a blocking call on the loop
+    freezes the API, the hub and every reconciler at once (#795), and a fast
+    box finishes it inside any human-noticeable time - only a gate notices."""
+    from . import loop_block_detector
+
+    loop_block_detector.install()
+    config.pluginmanager.register(loop_block_detector, "hp-loop-block-detector")

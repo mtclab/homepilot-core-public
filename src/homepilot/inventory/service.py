@@ -13,6 +13,7 @@ import httpx
 from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
+from homepilot.runtime.blocking import run_blocking
 
 from .addresses import (
     GUEST_CONFIG_SOURCES,
@@ -26,7 +27,7 @@ from .addresses import (
     parse_agent_interfaces,
     parse_guest_config,
 )
-from .fleet_model import env_update, guest_facts, proxmox_ui_url
+from .fleet_model import env_update, guest_facts, proxmox_console_url, proxmox_ui_url
 from .introspect import introspect_host
 
 logger = logging.getLogger(__name__)
@@ -157,9 +158,7 @@ def node_pve_status(raw_status: str | None) -> str:
 async def _guess_ip(hostname: str) -> str | None:
     """Resolve hostname to IP via DNS. Returns None on failure."""
     try:
-        loop = asyncio.get_event_loop()
-        ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
-        return ip
+        return await run_blocking("net", socket.gethostbyname, hostname)
     except socket.gaierror as exc:
         logger.debug("DNS resolution failed for %s: %s", hostname, exc)
         return None
@@ -307,6 +306,7 @@ class InventoryService:
         host_dict["services"] = [dict(s) for s in services]
         # Here, not in the route, so the MCP `get_host` tool carries it too.
         host_dict["proxmox_url"] = proxmox_ui_url(self.proxmox, host_dict)
+        host_dict["console_url"] = proxmox_console_url(self.proxmox, host_dict)
         # Every address it holds, with provenance and age, and every clash it
         # is in (lane B2) - the same answer as its Network tab.
         network = await self.host_network(host_id)

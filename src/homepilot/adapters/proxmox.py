@@ -7,7 +7,7 @@ import re
 import signal as _signal
 import time
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlparse
 
 import httpx
 
@@ -20,6 +20,9 @@ GUEST_TYPES = ("qemu", "lxc")
 # Artifact target kinds that name a guest, mapped onto the PVE collection. PVE
 # spellings map to themselves so a caller may pass either vocabulary.
 TARGET_KIND_GUEST_TYPES = {"vm": "qemu", "qemu": "qemu", "lxc": "lxc"}
+
+# The power actions PVE offers both collections under `status/<action>` (#781).
+GUEST_POWER_ACTIONS = ("start", "shutdown", "reboot", "stop")
 
 
 # PVE's own verdict for a task that SUCCEEDED but logged warnings: pve-common's
@@ -42,6 +45,50 @@ def task_warnings(exitstatus: Any) -> int | None:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def _query_value(value: Any) -> Any:
+    """A parameter as PVE reads it from a query string: booleans are 1/0.
+
+    A JSON body may carry ``true``; a URL carries text, and httpx would spell a
+    Python bool ``true``, which PVE's boolean schema does not take."""
+    if isinstance(value, bool):
+        return int(value)
+    return value
+
+
+def wire_parameters(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    query: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+    """Where each parameter of a PVE call must travel: ``(path, body, query)``.
+
+    Two rules of the wire, both of which lost parameters before:
+
+    * PVE reads a DELETE's parameters from the URL query only. A DELETE sent
+      with a JSON body is refused, ``501 Unexpected content for method
+      'DELETE'`` (#797) - an approved destroy step with ``body: {purge: 1}``
+      failed at apply, after the steps before it had already run. So a DELETE's
+      body is sent as query parameters, which keeps every artifact written with
+      ``body:`` on a DELETE step working rather than refusing it.
+    * httpx REPLACES a URL's own query string when ``params`` is given. A path
+      carrying ``?purge=1`` plus a ``query`` dict silently dropped ``purge``.
+      The path's own parameters are folded into the dict instead (the dict wins
+      on a clash, being the explicit one).
+    """
+    if method.upper() == "DELETE" and body:
+        query = {**body, **(query or {})}
+        body = None
+    if query is None:
+        return path, body, None
+    merged: dict[str, Any] = {}
+    if "?" in path:
+        path, own = path.split("?", 1)
+        merged.update(parse_qsl(own, keep_blank_values=True))
+    merged.update(query)
+    return path, body, {k: _query_value(v) for k, v in merged.items()}
 
 
 def _signal_name(signum: int) -> str:
@@ -162,6 +209,7 @@ class ProxmoxClient:
     ) -> dict[str, Any]:
         path = path.lstrip("/")
         method_upper = method.upper()
+        path, body, query = wire_parameters(method_upper, path, body, query)
         is_mutation = method_upper in ("POST", "PUT", "PATCH", "DELETE")
         client = self._write_client if is_mutation else self._client
         if is_mutation:
@@ -435,6 +483,30 @@ class ProxmoxClient:
             logger.warning("PVE task %s succeeded with %d warning(s)", upid, warnings)
         return {**data, "warnings": warnings}
 
+    async def task_warning_lines(self, node: str, upid: str, limit: int = 2000) -> list[str]:
+        """The warning lines a finished PVE task wrote to its log.
+
+        A task that ends ``WARNINGS: n`` succeeded (#711), and the count alone
+        says nothing an operator can judge - is it the harmless UEFI note or a
+        disk that did not make it into the backup? PVE writes each warning as a
+        ``WARN: ...`` line in the task log; those are what this returns, in
+        order, without the prefix. Read errors propagate (ProxmoxError): the
+        caller decides what a log it could not read means.
+        """
+        path = f"/nodes/{node}/tasks/{quote(upid, safe='')}/log"
+        result = await self.read(path, query={"start": 0, "limit": limit})
+        rows = result.get("data", result)
+        lines: list[str] = []
+        if isinstance(rows, list):
+            for row in rows:
+                text = str(row.get("t", "")) if isinstance(row, dict) else str(row)
+                stripped = text.strip()
+                if stripped.upper().startswith("WARN:"):
+                    lines.append(stripped[5:].strip())
+                elif stripped.upper().startswith("WARNING:"):
+                    lines.append(stripped[8:].strip())
+        return lines
+
     async def wait_until_stopped(
         self,
         node: str,
@@ -503,16 +575,23 @@ class ProxmoxClient:
             body["sshkeys"] = quote(str(body["sshkeys"]), safe="")
         return await self.call("POST", f"/nodes/{node}/qemu/{vmid}/config", body=body)
 
-    async def get_vm_config(self, node: str, vmid: int, guest_type: str = "qemu") -> dict[str, Any]:
+    async def get_vm_config(
+        self, node: str, vmid: int, guest_type: str = "qemu", *, current: bool = False
+    ) -> dict[str, Any]:
         """One guest's configuration as PVE stores it (#630).
 
         `guest_type` because an LXC container's config lives in a different
         collection and states its address on the NIC line rather than on a
         cloud-init one - and a container on the guest wire holds an address
         just as firmly as a VM does.
+
+        `current`: PVE answers a plain GET with the PENDING changes already
+        applied - the config the guest will boot with next, not the one it is
+        running. ``current=True`` asks for what is really attached now (#781).
         """
         collection = "lxc" if guest_type == "lxc" else "qemu"
-        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/config")
+        query = {"current": 1} if current else None
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/config", query)
         data = result.get("data", result)
         return data if isinstance(data, dict) else {}
 
@@ -540,6 +619,55 @@ class ProxmoxClient:
 
     async def get_vm_current(self, node: str, vmid: int) -> dict[str, Any]:
         return await self.read(f"/nodes/{node}/qemu/{vmid}/status/current")
+
+    async def power_guest(
+        self,
+        node: str,
+        vmid: int,
+        action: str,
+        *,
+        guest_type: str = "qemu",
+        timeout_s: int | None = None,
+    ) -> str | None:
+        """Send one power action to a VM or a container; the task's UPID, or None.
+
+        The operator power controls (#781), for both collections. ``shutdown``
+        is sent with ``forceStop: 0`` ALWAYS: a guest that does not shut down
+        within ``timeout_s`` stays running and its task fails, so the caller
+        can say "timed out" - never a silent escalation to a hard stop.
+        ``reboot`` is PVE's own (shutdown, then start the guest again), which
+        is what applies pending config such as a cloud-init ``ipconfigN``.
+        """
+        if action not in GUEST_POWER_ACTIONS:
+            raise ValueError(f"unknown power action {action!r}")
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        body: dict[str, Any] = {}
+        if action in ("shutdown", "reboot") and timeout_s is not None:
+            body["timeout"] = int(timeout_s)
+        if action == "shutdown":
+            body["forceStop"] = 0
+        result = await self.call(
+            "POST", f"/nodes/{node}/{collection}/{vmid}/status/{action}", body=body or None
+        )
+        return self.upid_of(result)
+
+    async def get_guest_status(
+        self, node: str, vmid: int, guest_type: str = "qemu"
+    ) -> dict[str, Any]:
+        """A VM's or container's live status (``status``, ``name``, ``lock``...)."""
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/status/current")
+        data = result.get("data", result)
+        return data if isinstance(data, dict) else {}
+
+    async def get_guest_pending(
+        self, node: str, vmid: int, guest_type: str = "qemu"
+    ) -> list[dict[str, Any]]:
+        """PVE's ``/pending`` rows: ``{key, value[, pending][, delete]}`` per config key."""
+        collection = "lxc" if guest_type == "lxc" else "qemu"
+        result = await self.read(f"/nodes/{node}/{collection}/{vmid}/pending")
+        data = result.get("data", result)
+        return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
 
     async def get_vm_agent_network(self, node: str, vmid: int) -> dict[str, Any] | None:
         """Guest-agent interface list, or None when the agent cannot answer.

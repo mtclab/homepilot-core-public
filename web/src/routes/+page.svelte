@@ -4,6 +4,7 @@
 	import {
 		api,
 		sessionStore,
+		type AlertHistory,
 		type AuditEntry,
 		type FiringAlert,
 		type Host,
@@ -17,20 +18,27 @@
 	import { taskStatusClass, shortTaskId } from '$lib/taskStatus';
 	import { attentionReason } from '$lib/hostGroups';
 	import { subsystemLabel } from '$lib/selfcheck';
-	import { canWrite as capCanWrite } from '$lib/capabilities';
+	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
-	import Donut from '$lib/components/Donut.svelte';
-	import StatCard from '$lib/components/StatCard.svelte';
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
-	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
+	import AlertStrip from '$lib/components/AlertStrip.svelte';
+	import Readout from '$lib/components/Readout.svelte';
+	import Lamp from '$lib/components/Lamp.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 
-	// Overview is the operator's morning glance (#549 F2). Three zones, in
-	// priority order, no tabs:
+	// Overview is the operator's morning glance (#549 F2; relaid out in UI
+	// slice 4 / review 01 step 13). Four zones, in priority order, no tabs:
 	//
 	//   1. Needs attention — what wants an operator NOW, each line a door to the
-	//      surface where it is fixed. Absent entirely when nothing is wrong.
-	//   2. Fleet at a glance — the host chips, coverage, the honest counts.
-	//   3. Recent movement — tasks and journal as ONE short feed.
+	//      surface where it is fixed and, where one exists, the action that
+	//      fixes it without leaving the page. One serif line when calm.
+	//   2. Alerts — two lines: how many fire, where an alert goes (the list is
+	//      Monitoring > Alerts; the Overview never repeats it).
+	//   3. Estate — one readout row (hosts, watched, agents, in spec, changes)
+	//      and the host chips. The capacity ledger joins this row when its
+	//      backend reports (review 02/8, 03/7); until then it is absent, not
+	//      zero - a number nobody measured is not shown.
+	//   4. Recent movement — tasks and journal as ONE short feed.
 	//
 	// Everything below is composed from the summary plus the same reads the
 	// pages it links to make (inventory, firing alerts, tasks, journal, the
@@ -40,43 +48,26 @@
 	// artifact's frozen verdict once made this zone say 2 where the page said 1.
 
 	let d: DashboardSummary | null = null;
+	// What waits in the Changes Inbox: proposals AND approved changes not yet
+	// run (#805). Counting proposals alone made an approved change vanish from
+	// the Estate readout, the "lost change" the owner hit (3.10.0).
+	$: waitingProposed = d?.changes?.proposed ?? d?.artifacts?.proposed ?? 0;
+	$: waitingReady = d?.changes?.ready ?? 0;
 	let error = '';
 	let loading = true;
-
-	// One status color language across the whole UI — the status tokens, never a
-	// loose hex.
-	const STATUS_COLORS: Record<string, string> = {
-		online: 'var(--color-ok)',
-		offline: 'var(--color-danger)',
-		unknown: 'var(--color-muted)',
-		running: 'var(--color-ok)',
-		stopped: 'var(--color-danger)'
-	};
-	// Categorical (non-status) series use the neutral chart ramp so a green slice
-	// never reads as "healthy".
-	const ROLE_COLORS = [
-		'var(--chart-1)',
-		'var(--chart-2)',
-		'var(--chart-3)',
-		'var(--chart-4)',
-		'var(--chart-5)',
-		'var(--chart-6)'
-	];
-
-	function toSegments(m: Record<string, number>, colors?: Record<string, string>) {
-		return Object.entries(m || {})
-			.filter(([, v]) => v > 0)
-			.map(([label, value], i) => ({
-				label,
-				value,
-				color: (colors && colors[label]) || ROLE_COLORS[i % ROLE_COLORS.length]
-			}));
-	}
 
 	// The fleet-health strip (#514 P3/S5): one chip per host - state, agent,
 	// firing alerts - so glancing is Overview and digging is the host page.
 	let fleet: Host[] = [];
 	let firing: FiringAlert[] = [];
+	// The alert strip's two reads, `null` when they did not come back - the
+	// strip then says "could not read", never "0 firing".
+	let firingRead: FiringAlert[] | null = null;
+	let alertHistory: AlertHistory | null = null;
+	// When the page last finished reading, for "last read 12 s ago" and the
+	// calm line's "checked N sources".
+	let readAt = 0;
+	let now = Date.now();
 	// Zone 1 + zone 3 both read these; one fetch each, not one per zone.
 	let tasks: Task[] = [];
 	let journal: AuditEntry[] = [];
@@ -113,6 +104,10 @@
 	const INVENTORY_PAGE = 100;
 	const TASK_PAGE = 50;
 	let unread: Unread[] = [];
+	/** The attention sources that answered on the last read. */
+	let checked: string[] = [];
+	/** Every source the attention list is built from (summary first). */
+	const ATTENTION_SOURCES = 6;
 	// Where every subsystem line (and the self-check's own unread line) goes.
 	const SUBSYSTEMS_HREF = `${base}/settings?tab=subsystems`;
 
@@ -121,7 +116,7 @@
 		try {
 			d = await api.getDashboard();
 			const selfcheckFresh = !force && selfcheck && Date.now() - selfcheckAt < SELFCHECK_TTL_MS;
-			const [inv, alerts, taskRes, auditRes, checkRes, joinRes] = await Promise.allSettled([
+			const [inv, alerts, taskRes, auditRes, checkRes, joinRes, historyRes] = await Promise.allSettled([
 				// Templates are provisioning inputs, not machines of the fleet (B1).
 				api.listInventory({ limit: INVENTORY_PAGE, templates: 'exclude' }),
 				api.listFiringAlerts(),
@@ -129,7 +124,10 @@
 				api.listAudit({ limit: 20 }),
 				selfcheckFresh ? Promise.resolve(selfcheck as SelfcheckReport) : api.getSelfcheck(),
 				api.getEnrolmentRequests(),
+				api.listAlertEvents(24),
 			]);
+			alertHistory = historyRes.status === 'fulfilled' ? historyRes.value : null;
+			firingRead = alerts.status === 'fulfilled' ? alerts.value.items : null;
 			joining = joinRes.status === 'fulfilled' ? joinRes.value : null;
 			if (checkRes.status === 'fulfilled') {
 				if (!selfcheckFresh) selfcheckAt = Date.now();
@@ -156,7 +154,7 @@
 				unread.push({
 					key: 'unread:alerts',
 					text: 'Could not read firing alerts, so this page cannot say whether anything is alerting',
-					href: `${base}/hosts`,
+					href: `${base}/monitoring/alerts`,
 				});
 			if (taskRes.status === 'rejected')
 				unread.push({
@@ -174,7 +172,7 @@
 				unread.push({
 					key: 'unread:joining',
 					text: 'Could not read enrolment requests, so a host waiting to join cannot be reported here',
-					href: `${base}/hosts`,
+					href: `${base}/hosts/agents`,
 				});
 			if (auditRes.status === 'rejected')
 				unread.push({
@@ -189,6 +187,19 @@
 					text: `Agent state is checked here for ${fleet.length} of ${inv.value.total} hosts; the rest are on the hosts page`,
 					href: `${base}/hosts`,
 				});
+			// Which sources the attention list was built from, by name - the calm
+			// line says how many it looked at (review 01, 3.5), and an unread one
+			// is already its own line above.
+			checked = [
+				'the dashboard summary',
+				...(inv.status === 'fulfilled' ? ['the host inventory'] : []),
+				...(alerts.status === 'fulfilled' ? ['firing alerts'] : []),
+				...(taskRes.status === 'fulfilled' ? ['recent tasks'] : []),
+				...(checkRes.status === 'fulfilled' ? ['the self-check'] : []),
+				...(joinRes.status === 'fulfilled' ? ['enrolment requests'] : []),
+			];
+			readAt = Date.now();
+			now = readAt;
 			if (taskRes.status === 'fulfilled' && (taskRes.value.total ?? 0) > tasks.length)
 				unread.push({
 					key: 'partial:tasks',
@@ -203,12 +214,6 @@
 		}
 	}
 
-	// The Alerts list links a hostname to its page when inventory knows it.
-	function alertHostHref(hostname: string): string {
-		const h = fleet.find((x) => x.hostname === hostname);
-		return h ? `${base}/hosts/${h.id}` : '';
-	}
-
 	function alertCount(hostname: string): number {
 		return firing.filter((f) => f.hostname === hostname).length;
 	}
@@ -218,7 +223,11 @@
 		} catch {
 			onboardingHidden = false;
 		}
-		return load(true);
+		// "last read 12 s ago" ages on screen; the reads themselves stay
+		// event-driven (no polling here).
+		const ticker = setInterval(() => (now = Date.now()), 5000);
+		void load(true);
+		return () => clearInterval(ticker);
 	});
 	// The dashboard summary rolls up artifact + drift counts, so refresh it live
 	// on any lifecycle/drift event — coalesced, so a burst is one summary call.
@@ -258,13 +267,27 @@
 		text: string;
 		href: string;
 		meta: string;
-		/** A gone host the operator may remove from inventory from this line. */
-		forget?: Host;
+		/** When the condition began (ISO), where the source says; never guessed. */
+		since?: string | null;
+		/** The one-click fix this line offers, where one exists today. */
+		action?: AttentionAction;
 		/** The fix is outside the console (release notes): open it in a new tab. */
 		external?: boolean;
 		/** What this line's one subject asks of the operator (operator actions). */
 		details?: string[];
 	}
+
+	/**
+	 * The actions an attention line can complete without leaving the page
+	 * (UI slice 4): the ones the API offers today. Forget and Cancel are
+	 * mutating and ask first in place; opening the enrolment window is the
+	 * same 15 minutes Hosts > Agents opens; Re-check only re-reads.
+	 */
+	type AttentionAction =
+		| { kind: 'forget'; host: Host }
+		| { kind: 'open-window' }
+		| { kind: 'recheck-drift' }
+		| { kind: 'cancel-task'; task: Task };
 
 	// A running task that has outlived this is stuck, not busy. Deliberately
 	// generous: an apply over a slow link is not an incident.
@@ -297,6 +320,14 @@
 		const hours = Math.floor(mins / 60);
 		if (hours < 48) return `for ${hours}h`;
 		return `for ${Math.floor(hours / 24)}d`;
+	}
+
+	/** "12 s ago" / "3 min ago" for the page's own last read. */
+	function secondsAgo(at: number, nowMs: number): string {
+		const s = Math.max(0, Math.round((nowMs - at) / 1000));
+		if (s < 5) return 'just now';
+		if (s < 90) return `${s} s ago`;
+		return `${Math.round(s / 60)} min ago`;
 	}
 
 	function ago(iso: string | null | undefined): string {
@@ -442,6 +473,7 @@
 						: ''),
 				href: `${base}/hosts`,
 				meta: summary.agents.offline_since ? lasting(summary.agents.offline_since) : 'never connected',
+				since: summary.agents.offline_since,
 			});
 		}
 
@@ -472,17 +504,20 @@
 		// enrolment window is open (lane A3). Counted by hostname - the panel
 		// keeps one row per hostname + address - and only while the window is
 		// shut: with it open they get in on their next retry, nothing to do.
-		const waiting = join?.window.open
-			? 0
-			: new Set((join?.attempts ?? []).filter((a) => a.wants_to_join).map((a) => a.hostname)).size;
+		const knocking = join?.window.open ? [] : (join?.attempts ?? []).filter((a) => a.wants_to_join);
+		const waiting = new Set(knocking.map((a) => a.hostname)).size;
 		if (waiting > 0) {
+			// Waiting since the first knock of any of them.
+			const firstKnock = knocking.map((a) => a.first_seen).sort()[0] ?? null;
 			out.push({
 				key: 'agents:waiting',
 				severity: 'warning',
 				label: 'wants to join',
-				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts to let ${waiting === 1 ? 'it' : 'them'} in`,
-				href: `${base}/hosts`,
-				meta: '',
+				text: `${plural(waiting, 'host is', 'hosts are')} waiting to join - open an enrolment window on Hosts > Agents to let ${waiting === 1 ? 'it' : 'them'} in`,
+				href: `${base}/hosts/agents`,
+				meta: lasting(firstKnock),
+				since: firstKnock,
+				action: { kind: 'open-window' },
 			});
 		}
 
@@ -519,6 +554,7 @@
 				text: `${plural(summary.drift.drifted, 'artifact disagrees', 'artifacts disagree')} with the host`,
 				href: `${base}/changes/drift`,
 				meta: '',
+				action: { kind: 'recheck-drift' },
 			});
 		}
 
@@ -546,6 +582,8 @@
 						(parts.length ? `: ${parts.join(', ')}` : ''),
 					href: `${base}/changes/drift`,
 					meta: '',
+					// A failed check or a missing Proxmox link may have cleared.
+					action: n('check_failed') || n('no_proxmox') || n('other') ? { kind: 'recheck-drift' } : undefined,
 				});
 			}
 		}
@@ -590,6 +628,7 @@
 					text: `${t.action} ${taskTarget(t)} failed${t.error ? `: ${t.error}` : ''}`,
 					href: taskHref(t),
 					meta: ago(t.finished_at ?? t.created_at),
+					since: t.finished_at ?? t.created_at,
 				})),
 				'failed tasks',
 				`${base}/records/tasks`,
@@ -605,7 +644,7 @@
 				severity: 'warning',
 				label: 'not watched',
 				text: 'No alert rule is enabled, so nothing raises an alert however bad it gets',
-				href: `${base}/settings#monitoring`,
+				href: `${base}/monitoring/rules`,
 				meta: '',
 			});
 		} else if (summary.metrics.rules_watching_nothing > 0 && !fleetDark) {
@@ -621,7 +660,7 @@
 					severity: 'warning',
 					label: 'not watched',
 					text: `${plural(thresholdInert, 'alert rule matches', 'alert rules match')} no host - check the metric name and the host filter`,
-					href: `${base}/settings#monitoring`,
+					href: `${base}/monitoring/rules`,
 					meta: '',
 				});
 			if (darkInert > 0)
@@ -645,6 +684,7 @@
 					text: `${a.hostname}: ${a.name}`,
 					href: hostHref(a.hostname),
 					meta: ago(a.firing_since),
+					since: a.firing_since,
 				})),
 				'firing alerts',
 				`${base}/hosts`,
@@ -668,6 +708,7 @@
 					text: `${h.hostname}: agent enrolled but not connected`,
 					href: `${base}/hosts/${h.id}`,
 					meta: lasting(h.agent_offline_since),
+					since: h.agent_offline_since,
 				})),
 				'hosts with an absent agent',
 				`${base}/hosts`,
@@ -687,7 +728,8 @@
 					text: `${h.hostname}: Proxmox no longer reports this host`,
 					href: `${base}/hosts/${h.id}`,
 					meta: lasting(h.absent_since),
-					forget: h,
+					since: h.absent_since,
+					action: { kind: 'forget' as const, host: h },
 				})),
 				'hosts Proxmox no longer reports',
 				`${base}/hosts`,
@@ -711,6 +753,8 @@
 					text: `${t.action} ${taskTarget(t)} is still ${t.status}`,
 					href: taskHref(t),
 					meta: ago(t.created_at),
+					since: t.created_at,
+					action: { kind: 'cancel-task' as const, task: t },
 				})),
 				'long-running tasks',
 				`${base}/records/tasks`,
@@ -718,14 +762,28 @@
 		);
 
 		// Waiting on a human: not a fault, but nothing moves until it is done.
-		const proposed = summary.artifacts?.proposed ?? 0;
+		const proposed = summary.changes?.proposed ?? summary.artifacts?.proposed ?? 0;
 		if (proposed > 0) {
 			out.push({
 				key: 'review',
 				severity: 'notice',
 				label: 'review',
 				text: `${plural(proposed, 'change', 'changes')} awaiting review`,
-				href: `${base}/changes/review`,
+				href: `${base}/changes/inbox`,
+				meta: '',
+			});
+		}
+		// Approved and not yet run (owner feedback 2026-11-08): it is still the
+		// owner's move, so it is said here too - an approved change that left
+		// every list read as a lost one.
+		const ready = summary.changes?.ready ?? 0;
+		if (ready > 0) {
+			out.push({
+				key: 'ready',
+				severity: 'notice',
+				label: 'ready',
+				text: `${plural(ready, 'approved change', 'approved changes')} ready to run`,
+				href: `${base}/changes/inbox`,
 				meta: '',
 			});
 		}
@@ -744,6 +802,7 @@
 				href: upd.latest.url,
 				external: true,
 				meta: ago(upd.latest.published_at),
+				since: upd.latest.published_at,
 				details: upd.latest.operator_actions ?? [],
 			});
 		}
@@ -754,20 +813,81 @@
 	// DELETE the Hosts page offers (services and the observation note go with
 	// the row), so the same two-step confirm. The server refuses a host
 	// Proxmox still reports, so a stale line cannot delete a live machine.
-	let forgetConfirm: string | null = null;
-	let forgetting: string | null = null;
+	//
+	// Every line action follows one shape (plan 5.3): the mutating ones turn
+	// their button into [Confirm verb] [Cancel] in place, the working one says
+	// what it is doing, and the page re-reads afterwards so the line goes (or
+	// stays) by what the server now says - never by what the click hoped.
+	let confirming: string | null = null;
+	let working: string | null = null;
 
-	async function forgetGone(h: Host) {
-		forgetting = h.id;
+	async function runAction(key: string, act: AttentionAction) {
+		working = key;
 		try {
-			await api.forgetHost(h.id);
-			notify(`Removed ${h.hostname} from inventory`);
-			forgetConfirm = null;
-			await load();
+			if (act.kind === 'forget') {
+				await api.forgetHost(act.host.id);
+				notify(`Removed ${act.host.hostname} from inventory`);
+			} else if (act.kind === 'open-window') {
+				await api.openEnrolmentWindow(15);
+				notify('Enrolment window open for 15 min - waiting hosts join on their next retry', 'ok');
+			} else if (act.kind === 'recheck-drift') {
+				const res = await api.getDriftStatus({ refresh: true });
+				const drifted = (res.items ?? []).filter((c) => (c.state ? c.state === 'drifted' : c.drifted)).length;
+				notify(`Drift re-checked: ${plural(drifted, 'artifact disagrees', 'artifacts disagree')} with the host`, 'ok');
+			} else if (act.kind === 'cancel-task') {
+				await api.cancelTask(act.task.id);
+				notify(`Cancelled ${act.task.action} ${taskTarget(act.task)}`, 'ok');
+			}
+			confirming = null;
+			await load(true);
 		} catch (e) {
 			notify(e instanceof Error ? e.message : String(e), 'err');
 		} finally {
-			forgetting = null;
+			working = null;
+		}
+	}
+
+	/** The verb on the button, the confirm wording, and who may press it. */
+	function actionSpec(act: AttentionAction): {
+		verb: string;
+		busy: string;
+		confirm: string | null;
+		title: string;
+		allowed: boolean;
+	} {
+		switch (act.kind) {
+			case 'forget':
+				return {
+					verb: 'Forget',
+					busy: 'Removing...',
+					confirm: 'Confirm forget',
+					title: `Remove ${act.host.hostname} from inventory, with its services and notes`,
+					allowed: canWrite,
+				};
+			case 'open-window':
+				return {
+					verb: 'Open window',
+					busy: 'Opening...',
+					confirm: 'Open for 15 min',
+					title: 'Let hosts holding the shared token join for the next 15 minutes',
+					allowed: admin,
+				};
+			case 'recheck-drift':
+				return {
+					verb: 'Re-check',
+					busy: 'Checking...',
+					confirm: null,
+					title: 'Check every applied artifact against its host now',
+					allowed: true,
+				};
+			case 'cancel-task':
+				return {
+					verb: 'Cancel task',
+					busy: 'Cancelling...',
+					confirm: 'Confirm cancel',
+					title: `Cancel ${act.task.action} ${taskTarget(act.task)}`,
+					allowed: canWrite,
+				};
 		}
 	}
 
@@ -794,6 +914,7 @@
 		apply: 'badge-applied',
 		revoke: 'badge-revoked',
 		reject: 'badge-rejected',
+		withdraw: 'badge-revoked',
 		replay: 'badge-superseded',
 		drift_check: 'badge-notice',
 		host_added: 'badge-approved',
@@ -840,20 +961,27 @@
 
 	$: doneCount = d ? d.onboarding.steps.filter((s) => s.done).length : 0;
 	$: nextStep = d ? d.onboarding.steps.find((s) => !s.done) : undefined;
-	$: statusSegments = d ? toSegments(d.inventory.by_status, STATUS_COLORS) : [];
-	$: artifactSegments = d ? toSegments(d.artifacts) : [];
 	$: attention = buildAttention(d, fleet, firing, tasks, unread, selfcheck, joining);
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
+	$: admin = capIsAdmin($sessionStore?.capabilities);
+	$: readAgo = readAt ? secondsAgo(readAt, now) : '';
+	// The estate's watched share: hosts read whose agent is connected now.
+	$: watched = fleet.filter((h) => h.agent_connected === true).length;
 	// Zone 3 is fed by the two reads that can go unanswered, so its empty state
 	// has the same two meanings and must not collapse them into "nothing yet".
 	$: movementUnread = unread.some((u) => u.key === 'unread:tasks' || u.key === 'unread:journal');
 	$: movement = buildMovement(tasks, journal);
 </script>
 
-<div class="page-stack">
-	<div class="flex items-center justify-between">
+<div class="page-stack overview">
+	<div class="flex items-baseline justify-between gap-s-3 flex-wrap">
 		<h1 class="page-title">Overview</h1>
-		<button class="btn btn-ghost text-xs" on:click={() => load(true)} disabled={loading}>↻ Refresh</button>
+		<div class="flex items-center gap-s-3">
+			{#if readAgo}
+				<span class="text-xs text-muted num-inline" data-last-read>last read {readAgo}</span>
+			{/if}
+			<button class="btn btn-ghost text-xs" on:click={() => load(true)} disabled={loading}><Icon name="refresh" />Refresh</button>
+		</div>
 	</div>
 
 	{#if loading && !d}
@@ -882,7 +1010,7 @@
 						<li class="flex items-start gap-3">
 							<span
 								class="mt-0.5 shrink-0 {step.done ? 'text-ok' : 'text-muted'}"
-								aria-hidden="true">{step.done ? '✓' : `${i + 1}.`}</span
+								aria-hidden="true">{#if step.done}<Icon name="check" />{:else}{i + 1}.{/if}</span
 							>
 							<span class="space-y-0.5">
 								<span class="block text-sm {step.done ? 'text-muted line-through' : 'text-ink'}">
@@ -893,7 +1021,7 @@
 									<span class="block prose-note text-xs">{step.detail}</span>
 									{#if step.key === nextStep?.key}
 										<a class="btn btn-primary text-xs mt-1 inline-block" href="{base}{step.href}"
-											>Do this next →</a
+											>Do this next <Icon name="arrow-right" /></a
 										>
 									{/if}
 								{/if}
@@ -904,184 +1032,204 @@
 			</section>
 		{/if}
 
-		<!-- Zone 1. A calm estate gets ONE line, not an empty card with a heading
-		     and a zero in it: the absence of a section is itself the signal. -->
-		{#if attention.length}
-			<section class="card section-stack" aria-labelledby="needs-attention">
-				<div class="flex items-center justify-between">
-					<h2 class="section-title" id="needs-attention">Needs attention</h2>
-					<span class="text-xs text-muted num-inline">{attention.length}</span>
-				</div>
-				<div class="flex flex-col">
-					{#each attention as item (item.key)}
-						{#if item.forget && canWrite}
-							{@const h = item.forget}
-							<div class="flex items-baseline gap-s-2" data-testid="attention-gone">
-								<div class="min-w-0 flex-1">
-									<AttentionItem
-										severity={item.severity}
-										label={item.label}
-										text={item.text}
-										href={item.href}
-										meta={item.meta}
-									/>
-								</div>
-								{#if forgetConfirm === h.id}
-									<button
-										class="btn btn-danger btn-sm text-xs shrink-0"
-										disabled={forgetting === h.id}
-										on:click={() => forgetGone(h)}
-										>{forgetting === h.id ? 'Removing…' : 'Confirm forget'}</button
-									>
-									<button
-										class="btn btn-ghost btn-sm text-xs shrink-0"
-										on:click={() => (forgetConfirm = null)}>Cancel</button
-									>
-								{:else}
-									<button
-										class="btn btn-ghost btn-sm text-xs shrink-0"
-										title="Remove {h.hostname} from inventory, with its services and notes"
-										on:click={() => (forgetConfirm = h.id)}>Forget</button
-									>
-								{/if}
-							</div>
-						{:else}
+		<div class="overview-top">
+			<!-- Zone 1. A calm estate gets ONE serif line, not an empty card with a
+			     heading and a zero in it - but the line says what it looked at, so
+			     a calm screen is a checked one, not a quiet one. -->
+			{#if attention.length}
+				<section class="panel overview-attention" aria-labelledby="needs-attention">
+					<div class="panel-head">
+						<h2 class="panel-title flex items-center gap-s-2" id="needs-attention">
+							<Lamp
+								state={attention.some((a) => a.severity === 'critical')
+									? 'crit'
+									: attention.some((a) => a.severity === 'warning')
+										? 'warn'
+										: 'off'}
+							/>Needs attention
+						</h2>
+						<span class="panel-meta" data-attention-meta
+							>{attention.length} open · checked {checked.length} of {ATTENTION_SOURCES} sources</span
+						>
+					</div>
+					<div class="flex flex-col py-s-1">
+						{#each attention as item (item.key)}
 							<AttentionItem
+								id={item.key}
 								severity={item.severity}
 								label={item.label}
 								text={item.text}
 								href={item.href}
 								meta={item.meta}
+								since={item.since ?? ''}
 								external={item.external ?? false}
 								details={item.details ?? []}
-							/>
-						{/if}
-					{/each}
-				</div>
-			</section>
-		{:else}
-			<p class="prose-note prose-measure text-sm">Nothing needs you.</p>
-		{/if}
+							>
+								<svelte:fragment slot="actions">
+									{#if item.action}
+										{@const spec = actionSpec(item.action)}
+										{@const act = item.action}
+										{#if spec.allowed}
+											{#if confirming === item.key && spec.confirm}
+												<button
+													class="btn {act.kind === 'forget' ? 'btn-danger' : 'btn-primary'} btn-sm text-xs"
+													disabled={working === item.key}
+													on:click={() => runAction(item.key, act)}
+													>{working === item.key ? spec.busy : spec.confirm}</button
+												>
+												<button class="btn btn-ghost btn-sm text-xs" on:click={() => (confirming = null)}
+													>Cancel</button
+												>
+											{:else}
+												<button
+													class="btn btn-ghost btn-sm text-xs"
+													title={spec.title}
+													disabled={working === item.key}
+													on:click={() =>
+														spec.confirm ? (confirming = item.key) : runAction(item.key, act)}
+													>{working === item.key ? spec.busy : spec.verb}</button
+												>
+											{/if}
+										{/if}
+									{/if}
+								</svelte:fragment>
+							</AttentionItem>
+						{/each}
+					</div>
+				</section>
+			{:else}
+				<p class="overview-calm prose-body" data-calm>
+					<Lamp state="ok" />
+					<span
+						>Nothing needs you - checked <span title={checked.join(', ')}
+							>{checked.length} sources</span
+						>{readAgo ? ` ${readAgo}` : ''}.</span
+					>
+				</p>
+			{/if}
 
-		<!-- Alerts (#660): firing now, resolved recently, and where they are sent. -->
-		<AlertsPanel hostHref={alertHostHref} />
+			<!-- Zone 2: would I know? Two lines and the door to Monitoring. -->
+			<AlertStrip firing={firingRead} history={alertHistory} rulesEnabled={d.metrics.rules_enabled} />
+		</div>
 
-		<!-- Zone 2: fleet at a glance. -->
-		<section class="section-stack" aria-labelledby="fleet-at-a-glance">
-			<h2 class="section-title" id="fleet-at-a-glance">Fleet at a glance</h2>
-
-			<div class="grid grid-cols-1 md:grid-cols-3 gap-s-3">
-				<StatCard
-					label="Coverage"
-					value="{d.inventory.coverage_pct}%"
-					sub="{d.inventory.managed}/{d.inventory.total} hosts managed{d.inventory.uncovered
+		<!-- Zone 3: the estate. One readout row where the donuts were (review 01
+		     P3-1: they carried little decision value and one was wrong), then the
+		     host chips. -->
+		<section class="panel" aria-labelledby="estate">
+			<div class="panel-head">
+				<h2 class="panel-title" id="estate">Estate</h2>
+				<a class="text-accent text-xs" href="{base}/hosts">All hosts <Icon name="arrow-right" /></a>
+			</div>
+			<div class="readouts" style="--readouts: 5">
+				<Readout
+					label="Hosts"
+					value={d.inventory.total}
+					unit={d.inventory.templates ? `+${d.inventory.templates} tpl` : ''}
+					sub="{d.inventory.managed} managed{d.inventory.uncovered
 						? ` · ${d.inventory.uncovered} pending adoption`
 						: ''}"
-					accent={d.inventory.coverage_pct >= 80 ? 'ok' : 'warn'}
+					tone={d.inventory.uncovered ? 'warn' : 'neutral'}
 					href="{base}/hosts"
+				/>
+				{#if unread.some((u) => u.key === 'unread:hosts')}
+					<Readout label="Watched by agent" value="?" sub="could not read the host inventory" tone="warn" href="{base}/monitoring/alerts" />
+				{:else}
+					<!-- A stopped or friend's guest without an agent is a fact, not news:
+					     only "nothing watched at all" is painted (the attention list
+					     carries the absent agents that ARE news). -->
+					<Readout
+						label="Watched by agent"
+						value={watched}
+						unit="/{fleet.length}"
+						sub={unread.some((u) => u.key === 'partial:hosts')
+							? `of the first ${fleet.length} hosts read`
+							: 'hosts whose metrics can alert'}
+						tone={fleet.length > 0 && watched === 0 ? 'crit' : 'neutral'}
+						href="{base}/monitoring/alerts"
+					/>
+				{/if}
+				<Readout
+					label="Agents"
+					value={d.agents.connected}
+					unit="/{d.agents.known}"
+					sub="connected / known"
+					tone={d.agents.known > 0 && d.agents.connected === d.agents.known
+						? 'ok'
+						: d.agents.connected === 0 && d.agents.known > 0
+							? 'crit'
+							: d.agents.known === 0
+								? 'neutral'
+								: 'warn'}
+					href="{base}/hosts/agents"
 				/>
 				<!-- P6: nothing checked is NOT 100%. The dash is the honest answer
 				     until a check has actually run. -->
-				<StatCard
+				<Readout
 					label="In spec"
-					value={d.drift.checked > 0 ? `${d.drift.in_spec_pct}%` : '—'}
+					value={d.drift.checked > 0 ? d.drift.in_spec : '—'}
+					unit={d.drift.checked > 0 ? `/${d.drift.checked}` : ''}
 					sub={d.drift.checked === 0
 						? 'nothing checked yet'
 						: d.drift.unknown
-							? `${d.drift.drifted} drifting / ${d.drift.checked} checked · ${d.drift.unknown} not established${d.drift.unknown_by_reason?.by_design ? ` (${d.drift.unknown_by_reason.by_design} describe-only)` : ''}`
-							: `${d.drift.drifted} drifting / ${d.drift.checked} checked`}
-					accent={d.drift.checked === 0
+							? `${d.drift.drifted} drifting · ${d.drift.unknown} not established${d.drift.unknown_by_reason?.by_design ? ` (${d.drift.unknown_by_reason.by_design} describe-only)` : ''}`
+							: `${d.drift.drifted} drifting`}
+					tone={d.drift.checked === 0
 						? 'neutral'
 						: d.drift.drifted > 0
-							? 'danger'
+							? 'crit'
 							: d.drift.unknown > 0
 								? 'warn'
 								: 'ok'}
 					href="{base}/changes/drift"
 				/>
-				<StatCard
-					label="Agents"
-					value="{d.agents.connected}/{d.agents.known}"
-					sub="connected / known"
-					accent={d.agents.known > 0 && d.agents.connected === d.agents.known
-						? 'ok'
-						: d.agents.connected === 0
-							? 'danger'
-							: 'warn'}
-					href="{base}/agents"
+				<Readout
+					label="Changes"
+					value={waitingProposed + waitingReady}
+					unit="waiting"
+					sub="{waitingProposed} proposed · {waitingReady} ready to run"
+					href="{base}/changes/inbox"
 				/>
 			</div>
 
 			{#if fleet.length}
-				<div class="card section-stack">
-					<div class="flex items-center justify-between">
-						<div class="section-title">Hosts</div>
-						<a class="text-accent text-xs" href="{base}/hosts">All hosts →</a>
-					</div>
-					<div class="flex flex-wrap gap-1.5">
-						{#each fleet as h (h.id)}
-							<a
-								href="{base}/hosts/{h.id}"
-								class="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-line text-xs hover:border-accent"
-								title="{h.hostname}: {h.status ?? 'unknown'}{h.agent_id ? (h.agent_connected ? ', agent connected' : ', agent not connected') : ''}"
-							>
-								<span
-									class="w-1.5 h-1.5 rounded-full {h.status === 'online'
-										? 'bg-ok'
-										: h.status === 'offline'
-											? 'bg-danger'
-											: 'bg-border-strong'}"
-								></span>
-								<span class="text-ink font-mono">{h.hostname}</span>
-								{#if h.agent_id && !h.agent_connected}
-									<span class="text-muted" title="Agent enrolled but not connected">∅</span>
-								{/if}
-								{#if alertCount(h.hostname)}
-									<span class="badge badge-failed">{alertCount(h.hostname)}</span>
-								{/if}
-							</a>
-						{/each}
-					</div>
+				<!-- The host chips: the door to each machine. One line that scrolls
+				     sideways on a phone, so the estate never pushes the feed off the
+				     first screen. -->
+				<div class="overview-chips" data-host-chips>
+					{#each fleet as h (h.id)}
+						<a
+							href="{base}/hosts/{h.id}"
+							class="overview-chip"
+							title="{h.hostname}: {h.status ?? 'unknown'}{h.agent_id ? (h.agent_connected ? ', agent connected' : ', agent not connected') : ', no agent'}"
+						>
+							<Lamp
+								state={h.status === 'online' || h.status === 'running'
+									? 'ok'
+									: h.status === 'offline' || h.status === 'stopped'
+										? 'crit'
+										: 'off'}
+							/>
+							<span class="font-mono">{h.hostname}</span>
+							{#if h.agent_id && !h.agent_connected}
+								<span class="text-muted">no agent</span>
+							{/if}
+							{#if alertCount(h.hostname)}
+								<span class="badge badge-critical">{alertCount(h.hostname)}</span>
+							{/if}
+						</a>
+					{/each}
 				</div>
 			{/if}
-
-			<div class="grid grid-cols-1 md:grid-cols-2 gap-s-3">
-				<div class="card">
-					<h3 class="section-title mb-3">Hosts by status</h3>
-					{#if statusSegments.length}
-						<Donut segments={statusSegments} centerLabel={String(d.inventory.total)} centerSub="hosts" />
-					{:else}
-						<p class="prose-note text-xs">No hosts yet.</p>
-					{/if}
-				</div>
-				<div class="card">
-					<h3 class="section-title mb-3">Artifacts</h3>
-					{#if artifactSegments.length}
-						<Donut
-							segments={artifactSegments}
-							centerLabel={String(artifactSegments.reduce((s, x) => s + x.value, 0))}
-							centerSub="total"
-						/>
-					{:else}
-						<p class="prose-note text-xs">No artifacts yet.</p>
-					{/if}
-				</div>
-			</div>
-
-			<p class="prose-note text-xs">
-				Each host's page carries its charts. Metrics kept for {d.metrics.retention_days} days.
-				{d.metrics.rules_enabled}
-				{d.metrics.rules_enabled === 1 ? 'alert rule' : 'alert rules'} enabled.
-			</p>
 		</section>
 
 		<!-- Zone 3: recent movement. One feed, capped, with a door to the full
 		     record rather than an unbounded scroll here. -->
-		<section class="card section-stack" aria-labelledby="recent-movement">
-			<div class="flex items-center justify-between">
-				<h2 class="section-title" id="recent-movement">Recent movement</h2>
-				<a class="text-accent text-xs" href="{base}/records">Records →</a>
+		<section class="panel" aria-labelledby="recent-movement">
+			<div class="panel-head">
+				<h2 class="panel-title" id="recent-movement">Recent movement</h2>
+				<a class="text-accent text-xs" href="{base}/records">Records <Icon name="arrow-right" /></a>
 			</div>
+			<div class="py-s-1">
 			{#if movement.length}
 				<ul class="flex flex-col">
 					{#each movement as m (m.key)}
@@ -1103,8 +1251,63 @@
 					happened.
 				</p>
 			{:else}
-				<p class="prose-note text-xs">Nothing has happened yet.</p>
+				<p class="prose-note text-xs px-s-3">Nothing has happened yet.</p>
 			{/if}
+			</div>
 		</section>
 	{/if}
 </div>
+
+<style>
+	/* Attention and the alert strip side by side on a desk (attention takes
+	   two thirds), stacked in that order below lg. */
+	.overview-top {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--space-section);
+		align-items: start;
+	}
+	@media (min-width: 1024px) {
+		.overview-top {
+			grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+		}
+	}
+	/* The calm state is a sentence, set in the reading serif (owner decision
+	   6: attention sentences and calm states in Source Serif 4). */
+	.overview-calm {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
+		font-size: 0.9375rem;
+		padding: var(--space-2) 0;
+	}
+	.overview-chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.375rem;
+		padding: var(--space-2) 0.625rem;
+		border-top: 1px solid var(--color-divider);
+	}
+	@media (max-width: 767px) {
+		.overview-chips {
+			flex-wrap: nowrap;
+			overflow-x: auto;
+		}
+	}
+	.overview-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		flex-shrink: 0;
+		padding: 0.1875rem 0.5rem;
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		background: var(--color-surface-raised);
+		color: var(--color-text-strong);
+		font-size: 0.75rem;
+		transition: border-color 120ms ease;
+	}
+	.overview-chip:hover {
+		border-color: var(--color-accent);
+	}
+</style>

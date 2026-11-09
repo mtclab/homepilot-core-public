@@ -193,72 +193,120 @@ async def power(request: Request, host_id: str, body: PowerRequest) -> Any:
     if host is None:
         raise HTTPException(status_code=404, detail="No such machine")
 
-    if host.get("absent_since"):
-        # The machine is GONE, and its VMID may already be somebody else's:
-        # PVE reuses numbers. A power action here reached whoever holds the
-        # number now (#706).
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "this machine no longer exists, so it cannot be powered"},
-        )
+    # The SAME guards as the operator's button and an approved guest-power
+    # change (#781): one PowerService, so a friend can never start their
+    # machine into an address a running guest holds, onto a passthrough disk a
+    # running guest has open, past a lock, at a reused VMID (#706) or while it
+    # is gone. The portal used to carry its own shorter copy of these checks,
+    # which had neither the address nor the disk guard.
+    from ..inventory.power import OUTCOME_FAILED, PowerRefusedError, PowerService
 
     proxmox = getattr(request.app.state, "proxmox", None)
-    node = host.get("node")
-    vmid = host.get("proxmox_id")
-    if proxmox is None or not node or vmid is None:
-        # Honest and guest-safe: no topology, no Proxmox error text.
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "power control is not available right now"},
-        )
-
-    # The row can be stale by up to a refresh interval, so the machine at
-    # (node, vmid) is asked who it is BEFORE anything is sent to it (#706): a
-    # different name there is a different machine, and a read that fails is not
-    # a licence to act.
     try:
-        config = await proxmox.get_vm_config(node, int(vmid))
-    except Exception:
-        logger.warning("guest power %s: could not verify vmid %s on %s", body.action, vmid, node)
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "this machine could not be found where it was, so nothing was sent"},
+        result = await PowerService(repo, proxmox).execute(
+            host_id, body.action, actor=f"guest:{cn}", source="guest-portal"
         )
-    from ..inventory.service import same_guest
-
-    if not same_guest(host, (config or {}).get("name")):
-        logger.warning(
-            "guest power %s refused: vmid %s on %s is %r, not %r",
+    except PowerRefusedError as refused:
+        # The full reason (holder names, VMIDs, nodes) is the operator's; the
+        # guest gets a sentence that names nothing outside their own machine.
+        logger.info(
+            "guest power %s refused for host %s (cn=%s): %s",
             body.action,
-            vmid,
-            node,
-            (config or {}).get("name"),
-            host.get("hostname"),
+            host_id,
+            cn,
+            refused.message,
         )
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "this machine no longer exists, so it cannot be powered"},
-        )
+        status, detail = _guest_refusal(refused.code, body.action)
+        return JSONResponse(status_code=status, content={"detail": detail, "code": refused.code})
 
-    try:
-        if body.action == "start":
-            await proxmox.start_vm(node, int(vmid))
-        elif body.action == "stop":
-            await proxmox.stop_vm(node, int(vmid))
-        else:
-            await proxmox.reboot_vm(node, int(vmid))
-    except Exception:
+    if result.outcome == OUTCOME_FAILED:
         # The real error goes to the operator's log, never to the guest page.
-        logger.exception("guest power %s failed for host %s (cn=%s)", body.action, host_id, cn)
+        logger.warning(
+            "guest power %s failed for host %s (cn=%s): %s",
+            body.action,
+            host_id,
+            cn,
+            result.message,
+        )
         return JSONResponse(
             status_code=502,
-            content={"detail": f"the {body.action} could not be completed"},
+            content={"detail": f"the {body.action} could not be completed", "outcome": "failed"},
         )
+    return {
+        "id": host_id,
+        "action": body.action,
+        "accepted": True,
+        "outcome": result.outcome,
+        "status": result.status_after,
+        "message": _guest_outcome(result.outcome, body.action),
+    }
 
-    await repo.log_audit(
-        user_id=f"guest:{cn}",
-        source="guest-portal",
-        action=f"vm_{body.action}",
-        target_host=str(host.get("hostname") or ""),
-    )
-    return {"id": host_id, "action": body.action, "accepted": True}
+
+# What a friend reads when a guard refuses. Never a holder's name, a VMID, a
+# node or Proxmox's own text: the other machine may be an operator's host or
+# another friend's, and this surface must not even confirm it exists.
+_GUEST_REFUSALS: dict[str, tuple[int, str]] = {
+    "gone": (409, "this machine no longer exists, so it cannot be powered"),
+    "name_mismatch": (409, "this machine no longer exists, so it cannot be powered"),
+    "unreadable": (409, "this machine could not be found where it was, so nothing was sent"),
+    "not_found": (404, "No such machine"),
+    "template": (409, "this machine is a template and cannot run"),
+    "not_a_guest": (503, "power control is not available right now"),
+    "no_proxmox": (503, "power control is not available right now"),
+    "locked": (
+        409,
+        "your machine is busy (a backup or snapshot is running); try again when it "
+        "finishes. Nothing was sent.",
+    ),
+    "address_clash": (
+        409,
+        "another running machine is using this machine's network address, so starting "
+        "it would knock that machine off the network. Nothing was sent; ask the "
+        "operator to sort the address out.",
+    ),
+    "disk_shared": (
+        409,
+        "a disk this machine uses is attached to another running machine, and two "
+        "machines writing one disk corrupts it. Nothing was sent; ask the operator.",
+    ),
+    "address_unknown": (
+        409,
+        "whether it is safe to start this machine could not be checked right now; "
+        "nothing was sent. Try again in a minute.",
+    ),
+    "disk_unknown": (
+        409,
+        "whether it is safe to start this machine could not be checked right now; "
+        "nothing was sent. Try again in a minute.",
+    ),
+    "confirmation_required": (
+        409,
+        "the operator has protected this machine, so it can only be switched off or "
+        "restarted by them. Nothing was sent.",
+    ),
+}
+
+
+def _guest_outcome(outcome: str, action: str) -> str:
+    """The settled result in the guest's words (Proxmox was followed to the end)."""
+    if outcome == "ok":
+        return {
+            "start": "your machine is running",
+            "stop": "your machine is off",
+            "reboot": "your machine restarted and is running",
+        }.get(action, f"the {action} is done")
+    if outcome == "timed_out":
+        return (
+            "your machine did not shut down in time, so it was not restarted; it is still running"
+        )
+    return f"the {action} was sent but has not finished yet; check again in a minute"
+
+
+def _guest_refusal(code: str, action: str) -> tuple[int, str]:
+    if code == "state":
+        return 409, (
+            "your machine is already running"
+            if action == "start"
+            else "your machine is not running"
+        )
+    return _GUEST_REFUSALS.get(code, (409, f"the {action} was refused; nothing was sent"))

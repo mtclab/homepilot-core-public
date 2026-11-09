@@ -17,6 +17,7 @@
 	import { buildDriftRollup } from '$lib/drift';
 	import { timeAgo } from '$lib/relativeTime';
 	import DriftItemCard from '$lib/components/DriftItemCard.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let artifacts: Artifact[] = [];
 	let hosts: Host[] = [];
@@ -91,7 +92,7 @@
 <div class="section-stack">
 	<div class="flex items-center justify-between">
 		<h1 class="page-title">Drift</h1>
-		<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => load(true)}><Icon name="refresh" />Refresh</button>
 	</div>
 
 	{#if loading}
@@ -100,7 +101,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load drift data.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={() => load(true)}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if rollup.total === 0}
 		<p class="prose-note text-sm">
@@ -124,7 +125,7 @@
 		{#if rollup.drifted.length > 0}
 			<section class="section-stack" data-testid="drift-attention">
 				<h2 class="section-title text-danger">
-					⚠ {rollup.drifted.length} artifact{rollup.drifted.length === 1 ? '' : 's'} disagree{rollup
+					<Icon name="warning" /> {rollup.drifted.length} artifact{rollup.drifted.length === 1 ? '' : 's'} disagree{rollup
 						.drifted.length === 1
 						? 's'
 						: ''} with reality
@@ -165,7 +166,7 @@
 		<div class="card space-y-1">
 			{#if rollup.inSpec.count > 0}
 				<p class="text-sm text-ok" data-testid="drift-in-spec-summary">
-					✓ {rollup.inSpec.count} in spec, last checked {timeAgo(rollup.inSpec.lastCheckedAt)}
+					<Icon name="check" /> {rollup.inSpec.count} in spec, last checked {timeAgo(rollup.inSpec.lastCheckedAt)}
 				</p>
 			{/if}
 			{#if rollup.uncheckedCount > 0}
@@ -191,7 +192,7 @@
 					aria-expanded={showUncovered}
 					on:click={() => (showUncovered = !showUncovered)}
 				>
-					{showUncovered ? '▾' : '▸'} ○ {rollup.uncoveredHosts.length} hosts covered by no artifact
+					<Icon name={showUncovered ? 'chevron-down' : 'chevron-right'} /> <Icon name="circle" /> {rollup.uncoveredHosts.length} hosts covered by no artifact
 				</button>
 				{#if showUncovered}
 					<p class="prose-note text-xs">

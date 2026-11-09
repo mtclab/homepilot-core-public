@@ -48,8 +48,6 @@ describe('Settings tab addressing', () => {
 
 	for (const [tab, heading] of [
 		['proxmox', 'Proxmox Connection'],
-		['guests', 'Guests'],
-		['monitoring', 'Monitoring'],
 		['about', 'About'],
 	] as Array<[string, string]>) {
 		it(`?tab=${tab} opens ${heading}`, async () => {
@@ -60,11 +58,12 @@ describe('Settings tab addressing', () => {
 		});
 	}
 
-	it('?tab=tokens opens the token panel', async () => {
-		setPage('/ui/settings?tab=tokens');
+	// UI slice 1: these left Settings. Moved, not duplicated - the page that
+	// renders a sector must not ALSO render its panels here.
+	it('no longer renders the Monitoring, Guests or Tokens panels', () => {
 		render(SettingsPage);
-		expect(currentTab()).toBe('Tokens');
-		await waitFor(() => expect(screen.getByRole('heading', { name: /API Tokens/i })).toBeTruthy());
+		const labels = screen.getAllByRole('tab').map((t) => t.textContent);
+		for (const gone of ['Monitoring', 'Guests', 'Tokens']) expect(labels).not.toContain(gone);
 	});
 
 	it('gives the panel the tab roles a screen reader needs', () => {
@@ -87,12 +86,12 @@ describe('Legacy Settings deep links keep working', () => {
 		vi.clearAllMocks();
 	});
 
-	it('#tokens is rewritten to the canonical ?tab=tokens', async () => {
-		setPage('/ui/settings#tokens');
+	it('#proxmox is rewritten to the canonical ?tab=proxmox', async () => {
+		setPage('/ui/settings#proxmox');
 		render(SettingsPage);
 		await waitFor(() => expect(goto).toHaveBeenCalled());
 		const [target, opts] = (goto as ReturnType<typeof vi.fn>).mock.calls[0];
-		expect(target).toBe('/ui/settings?tab=tokens');
+		expect(target).toBe('/ui/settings?tab=proxmox');
 		expect(opts).toMatchObject({ replaceState: true });
 	});
 

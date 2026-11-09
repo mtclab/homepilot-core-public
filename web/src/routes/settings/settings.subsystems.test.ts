@@ -150,8 +150,8 @@ describe('Subsystems tab: one truthful status card per subsystem', () => {
 		await waitFor(() => card('Events webhook'));
 		const panel = document.getElementById('settings-panel') as HTMLElement;
 		expect(within(panel).getAllByRole('button').map((b) => b.textContent?.trim())).toEqual([
-			'↻ Re-check',
-			'↻ Re-survey the cluster',
+			'Re-check',
+			'Re-survey the cluster',
 		]);
 		expect(within(panel).queryAllByRole('textbox')).toHaveLength(0);
 	});

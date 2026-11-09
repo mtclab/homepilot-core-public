@@ -1,5 +1,5 @@
 <script lang="ts">
-	// A time series, hand-rolled in inline SVG (same approach as Donut.svelte —
+	// A time series, hand-rolled in inline SVG (the house rule for charts —
 	// no chart library ships with this UI). Colour comes from the categorical
 	// chart ramp by default: a metric has no status meaning, and painting one
 	// green would say "healthy" when it only says "memory".

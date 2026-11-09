@@ -80,8 +80,14 @@ const LABELS: Record<HostGroupId, string> = {
  * The groups, in priority order, with EMPTY ONES DROPPED - an empty "Needs
  * attention" heading is a false alarm rendered every single page load.
  * Membership order inside a group is the server's order, untouched.
+ *
+ * `pinned` holds rows in the group they were in when the operator acted on
+ * them, until the next reload (plan 4.7: a live update never moves a row).
  */
-export function groupHosts(hosts: Host[]): HostGroup[] {
+export function groupHosts(
+	hosts: Host[],
+	pinned: Partial<Record<string, HostGroupId>> = {},
+): HostGroup[] {
 	const order: HostGroupId[] = ['attention', 'managed', 'discovered', 'templates'];
 	const buckets: Record<HostGroupId, Host[]> = {
 		attention: [],
@@ -89,7 +95,7 @@ export function groupHosts(hosts: Host[]): HostGroup[] {
 		discovered: [],
 		templates: [],
 	};
-	for (const h of hosts) buckets[groupOf(h)].push(h);
+	for (const h of hosts) buckets[pinned[h.id] ?? groupOf(h)].push(h);
 	return order
 		.filter((id) => buckets[id].length > 0)
 		.map((id) => ({ id, label: LABELS[id], hosts: buckets[id] }));

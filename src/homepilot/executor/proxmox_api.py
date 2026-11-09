@@ -15,6 +15,7 @@ from homepilot.executor.jinja_utils import (
     _interpolate_obj,
     interpolation_context,
 )
+from homepilot.executor.pve_warnings import explain_warning
 from homepilot.executor.skip_if import SkipIfUndecided, make_pve_response_proxy
 
 logger = logging.getLogger(__name__)
@@ -123,24 +124,163 @@ async def _await_pve_task(
     resp: Any,
     timeout_s: float,
     poll_interval: float,
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
     """Block until the task this step spawned finishes; raise if it failed.
 
-    Returns the text to append to the step log, or "" when the call was
-    synchronous and there was nothing to wait for. A task still running when
-    `timeout_s` runs out raises ProxmoxTaskStillRunningError, which `execute` reports
-    as an unknown outcome - never as a failure (#774).
+    Returns the text to append to the step log ("" when the call was
+    synchronous and there was nothing to wait for) and the task's warnings,
+    explained where recognised. A task still running when `timeout_s` runs out
+    raises ProxmoxTaskStillRunningError, which `execute` reports as an unknown
+    outcome - never as a failure (#774).
     """
     upid = ProxmoxClient.upid_of(resp)
     if not upid:
-        return ""
+        return "", []
     node = _node_for_task(context, upid)
     if not node:
         # Nothing to poll against. Say so rather than implying the task
         # finished - a silent skip here is the very bug this code fixes.
-        return " (task not waited on: no node in the UPID or the target)"
-    await proxmox.wait_for_task(node, upid, timeout_s=timeout_s, poll_interval=poll_interval)
-    return " (task finished OK)"
+        return " (task not waited on: no node in the UPID or the target)", []
+    status = await proxmox.wait_for_task(
+        node, upid, timeout_s=timeout_s, poll_interval=poll_interval
+    )
+    count = int(status.get("warnings") or 0) if isinstance(status, dict) else 0
+    if not count:
+        return " (task finished OK)", []
+    # "WARNINGS: 1" alone told the owner nothing about a backup that was fine
+    # (2026-11-08). The task log names each warning; read it, best-effort - a
+    # log that cannot be read is said so, never dropped.
+    try:
+        lines = await proxmox.task_warning_lines(node, upid)
+    except ProxmoxError as exc:
+        lines = []
+        logger.warning("Could not read the warnings of PVE task %s: %s", upid, exc)
+    warnings = [explain_warning(line) for line in lines]
+    if not warnings:
+        warnings = [
+            {
+                "text": f"PVE reported {count} warning(s) but its task log could not be read",
+                "explanation": None,
+                "harmless": None,
+            }
+        ]
+    suffix = f" (task finished OK with {count} warning{'s' if count != 1 else ''})"
+    for w in warnings:
+        suffix += f"\n    WARN: {w['text']}"
+    return suffix, warnings
+
+
+# Parameters of a PVE config write that are not config keys.
+_CONFIG_META_PARAMS = frozenset({"delete", "digest", "revert", "skiplock", "background_delay"})
+
+
+def _is_config_write(method: str, path: str) -> bool:
+    return method in ("PUT", "POST") and path.split("?", 1)[0].rstrip("/").endswith("/config")
+
+
+async def _reread_config_write(
+    proxmox: ProxmoxClient, path: str, body: Any
+) -> tuple[list[str], list[str]] | None:
+    """Which keys of a FAILED config write PVE took anyway (#796).
+
+    PVE applies a config write key by key: ``delete=scsi2,hostpci0`` removed
+    scsi2 and then refused hostpci0 with a 500, and the run said "failed" as if
+    nothing had changed. Reading the config back after the failure is the only
+    way to know. ``GET .../config`` answers with pending changes applied, which
+    is exactly "what the write was accepted as". Returns (applied, not_applied),
+    or None when the config cannot be read (the caller then says so).
+    """
+    if not isinstance(body, dict):
+        return None
+    try:
+        resp = await proxmox.call("GET", path.split("?", 1)[0])
+    except ProxmoxError:
+        logger.warning("Could not re-read %s after a failed write", path, exc_info=True)
+        return None
+    config = resp.get("data", resp) if isinstance(resp, dict) else None
+    if not isinstance(config, dict):
+        return None
+    applied: list[str] = []
+    not_applied: list[str] = []
+    raw_delete = body.get("delete") or []
+    deletes = (
+        [k.strip() for k in raw_delete.split(",")]
+        if isinstance(raw_delete, str)
+        else [str(k).strip() for k in raw_delete]
+    )
+    for key in (k for k in deletes if k):
+        (applied if key not in config else not_applied).append(key)
+    for key, value in body.items():
+        if key in _CONFIG_META_PARAMS:
+            continue
+        (applied if key in config and str(config[key]) == str(value) else not_applied).append(key)
+    return applied, not_applied
+
+
+def describe_partial(partial: dict[str, Any]) -> str:
+    """The sentence a partly applied run is reported with (#796).
+
+    ``partly applied: steps a, b done; step c failed: <why>; not run: d`` - and
+    when the failed step was a config write that PVE took in part, which keys
+    went through and which did not.
+    """
+    parts: list[str] = []
+    done = partial.get("steps_done") or []
+    if done:
+        parts.append(f"step{'s' if len(done) != 1 else ''} {', '.join(done)} done")
+    for failed in partial.get("steps_failed") or []:
+        applied = partial.get("keys_applied") or []
+        if applied and partial.get("step_reread") == failed:
+            not_applied = partial.get("keys_not_applied") or []
+            text = f"step {failed} changed {', '.join(applied)} before it failed"
+            if not_applied:
+                text += f" (not applied: {', '.join(not_applied)})"
+        else:
+            text = f"step {failed} failed"
+        parts.append(text)
+    sentence = "partly applied: " + "; ".join(parts)
+    if partial.get("error"):
+        sentence += f": {partial['error']}"
+    not_run = partial.get("steps_not_run") or []
+    if not_run:
+        sentence += f"; not run: {', '.join(not_run)}"
+    return sentence
+
+
+def _with_partial(
+    result: dict[str, Any],
+    *,
+    done: list[str],
+    failed: list[str],
+    error: str | None,
+    not_run: list[str],
+    warnings: list[dict[str, Any]],
+    reread: tuple[str, list[str], list[str]] | None = None,
+) -> dict[str, Any]:
+    """Finish a failed run's result with what it DID change (#796).
+
+    A run that changed nothing keeps its plain failure. One that completed
+    steps before the failure - or whose failed config write PVE took in part
+    (`reread` = step, applied keys, not-applied keys) - carries `partial_apply`
+    and says "partly applied: ..." instead of a bare "failed".
+    """
+    keys_applied = reread[1] if reread else []
+    if done or keys_applied:
+        partial: dict[str, Any] = {
+            "steps_done": list(done),
+            "steps_failed": list(failed),
+            "steps_not_run": list(not_run),
+            "error": error,
+        }
+        if reread:
+            partial["step_reread"] = reread[0]
+            partial["keys_applied"] = list(reread[1])
+            partial["keys_not_applied"] = list(reread[2])
+        result["partial_apply"] = partial
+        result["failure_reason"] = describe_partial(partial)
+    if warnings:
+        result["warnings"] = list(warnings)
+    return result
 
 
 def _extract_steps(body: str, tag: str) -> list[dict[str, Any]] | None:
@@ -211,6 +351,14 @@ async def execute(
     # over a step that failed or that was refused by an undecided precheck is the
     # lie this review exists to remove (#642 B5).
     unfinished: list[str] = []
+    # Steps that ran and did what they were asked (#796): the record of what a
+    # failed run had already changed. A step its precheck skipped is not here -
+    # it changed nothing.
+    done: list[str] = []
+    warnings_all: list[dict[str, Any]] = []
+
+    def _later(index: int) -> list[str]:
+        return [str(later.get("id", "unknown")) for later in steps[index + 1 :]]
 
     for index, step in enumerate(steps):
         step_id = step.get("id", "unknown")
@@ -228,11 +376,18 @@ async def execute(
             log_lines.append(step_log)
             elapsed = time.monotonic() - start
             log_lines.append(f"duration={elapsed:.1f}s")
-            return {
-                "success": False,
-                "execution_log": "\n".join(log_lines),
-                "failure_reason": f"step {step_id} could not be interpolated: {exc}",
-            }
+            return _with_partial(
+                {
+                    "success": False,
+                    "execution_log": "\n".join(log_lines),
+                    "failure_reason": f"step {step_id} could not be interpolated: {exc}",
+                },
+                done=done,
+                failed=[str(step_id)],
+                error=f"could not be interpolated: {exc}",
+                not_run=_later(index),
+                warnings=warnings_all,
+            )
 
         precheck = step.get("precheck")
         if precheck and not rollback:
@@ -244,11 +399,20 @@ async def execute(
                 log_lines.append(step_log)
                 elapsed = time.monotonic() - start
                 log_lines.append(f"duration={elapsed:.1f}s")
-                return {
-                    "success": False,
-                    "execution_log": "\n".join(log_lines),
-                    "failure_reason": f"precheck for {step_id} could not be interpolated: {exc}",
-                }
+                return _with_partial(
+                    {
+                        "success": False,
+                        "execution_log": "\n".join(log_lines),
+                        "failure_reason": (
+                            f"precheck for {step_id} could not be interpolated: {exc}"
+                        ),
+                    },
+                    done=done,
+                    failed=[str(step_id)],
+                    error=f"its precheck could not be interpolated: {exc}",
+                    not_run=_later(index),
+                    warnings=warnings_all,
+                )
             skip_if_expr = precheck.get("skip_if")
 
             step_log += f" precheck {pre_method} {pre_path}"
@@ -285,14 +449,21 @@ async def execute(
                 if on_error == "halt":
                     elapsed = time.monotonic() - start
                     log_lines.append(f"duration={elapsed:.1f}s")
-                    return {
-                        "success": False,
-                        "execution_log": "\n".join(log_lines),
-                        "failure_reason": (
-                            f"step {step_id} was not run: its precheck could not be "
-                            f"decided ({undecided})"
-                        ),
-                    }
+                    return _with_partial(
+                        {
+                            "success": False,
+                            "execution_log": "\n".join(log_lines),
+                            "failure_reason": (
+                                f"step {step_id} was not run: its precheck could not be "
+                                f"decided ({undecided})"
+                            ),
+                        },
+                        done=done,
+                        failed=[str(step_id)],
+                        error=f"its precheck could not be decided ({undecided})",
+                        not_run=_later(index),
+                        warnings=warnings_all,
+                    )
                 continue
 
         try:
@@ -310,9 +481,13 @@ async def execute(
             # also hid outright failure: a task that dies asynchronously was
             # still logged as OK. Wait for the task and report what it did.
             wait_s = task_timeout_for(step, method, path, do_body, task_timeout_s)
-            waited = await _await_pve_task(proxmox, context, resp, wait_s, poll_interval)
+            waited, step_warnings = await _await_pve_task(
+                proxmox, context, resp, wait_s, poll_interval
+            )
             if waited:
                 step_log += waited
+            warnings_all.extend(step_warnings)
+            done.append(str(step_id))
         except ProxmoxTaskStillRunningError as e:
             # The cluster ACCEPTED the work and is still doing it. That is not a
             # failure (#774: a vzdump reported failed at 600 s finished OK with
@@ -349,15 +524,35 @@ async def execute(
             }
         except ProxmoxError as e:
             step_log += f" {method} {path} -> ERROR {e.status_code}: {e.body[:200]}"
+            reread: tuple[str, list[str], list[str]] | None = None
+            if _is_config_write(method, path):
+                # PVE may have taken part of this write before refusing the
+                # rest (#796); only reading it back can say which part.
+                keys = await _reread_config_write(proxmox, path, do_body)
+                if keys is None:
+                    step_log += " (could not re-read the config to see what was applied)"
+                else:
+                    reread = (str(step_id), keys[0], keys[1])
+                    if keys[0]:
+                        step_log += f" (re-read: applied {', '.join(keys[0])}"
+                        step_log += f"; not applied {', '.join(keys[1])})" if keys[1] else ")"
             if on_error == "halt":
                 elapsed = time.monotonic() - start
                 log_lines.append(step_log)
                 log_lines.append(f"duration={elapsed:.1f}s")
-                return {
-                    "success": False,
-                    "execution_log": "\n".join(log_lines),
-                    "failure_reason": f"step {step_id} failed: {e}",
-                }
+                return _with_partial(
+                    {
+                        "success": False,
+                        "execution_log": "\n".join(log_lines),
+                        "failure_reason": f"step {step_id} failed: {e}",
+                    },
+                    done=done,
+                    failed=[str(step_id)],
+                    error=str(e),
+                    not_run=_later(index),
+                    warnings=warnings_all,
+                    reread=reread,
+                )
             unfinished.append(step_id)
 
         log_lines.append(step_log)
@@ -365,15 +560,25 @@ async def execute(
     elapsed = time.monotonic() - start
     log_lines.append(f"duration={elapsed:.1f}s")
     if unfinished:
-        return {
-            "success": False,
-            "execution_log": "\n".join(log_lines),
-            "failure_reason": (
-                "these steps did not complete (on_error: continue kept the "
-                "sequence going, it did not make them succeed): " + ", ".join(unfinished)
-            ),
-        }
-    return {"success": True, "execution_log": "\n".join(log_lines)}
+        return _with_partial(
+            {
+                "success": False,
+                "execution_log": "\n".join(log_lines),
+                "failure_reason": (
+                    "these steps did not complete (on_error: continue kept the "
+                    "sequence going, it did not make them succeed): " + ", ".join(unfinished)
+                ),
+            },
+            done=done,
+            failed=[str(u) for u in unfinished],
+            error=None,
+            not_run=[],
+            warnings=warnings_all,
+        )
+    result: dict[str, Any] = {"success": True, "execution_log": "\n".join(log_lines)}
+    if warnings_all:
+        result["warnings"] = warnings_all
+    return result
 
 
 async def _pick_cluster_node(proxmox: ProxmoxClient) -> str | None:

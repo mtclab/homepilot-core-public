@@ -9,6 +9,11 @@
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import { isTerminalStatus } from '$lib/taskStatus';
+	import Icon from '$lib/components/Icon.svelte';
+	import ChangeOutcome from '$lib/components/ChangeOutcome.svelte';
+	import ChangeSummary from '$lib/components/ChangeSummary.svelte';
+	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+	import { runningLine } from '$lib/changes';
 
 	let detail: ArtifactDetail | null = null;
 	let loading = true;
@@ -23,8 +28,16 @@
 	let pollFailures = 0;
 	let pollLost = false;
 	const POLL_MAX_FAILURES = 3;
-	let confirmAction: { fn: () => Promise<void>; label: string } | null = null;
-	let confirmEl: HTMLDivElement | null = null;
+	type Action = {
+		label: string;
+		cls: string;
+		fn: () => Promise<void>;
+		/** Asks first (UI_PLAN 5.3); `typed` asks for the target's name back. */
+		destructive?: boolean;
+		typed?: boolean;
+		consequence?: string;
+	};
+	let confirmAction: Action | null = null;
 
 	$: id = $page.params.id ?? '';
 	// Approve/Reject/Apply/Revoke all 403 without write scope — don't offer them.
@@ -43,6 +56,7 @@
 		revoked: 'badge-revoked',
 		failed: 'badge-failed',
 		superseded: 'badge-superseded',
+		withdrawn: 'badge-revoked',
 	};
 	function statusClass(s: string): string { return STATUS_CLASSES[s] ?? 'badge-proposed'; }
 
@@ -55,23 +69,65 @@
 		return t.host ?? t.service ?? t.node ?? '—';
 	}
 
-	function getActions(): { label: string; cls: string; fn: () => Promise<void>; destructive?: boolean }[] {
+	// A destroy or a forced stop asks for the target's name typed back before
+	// it runs (UI_PLAN 3.10); the words come from the server's summary.
+	function runGuard(): Pick<Action, 'destructive' | 'typed' | 'consequence'> {
+		const danger = detail?.summary?.danger;
+		if (!danger) return {};
+		return {
+			destructive: true,
+			typed: true,
+			consequence:
+				(detail?.summary?.steps.join('. ') ?? '') +
+				(danger === 'destroy'
+					? '. This cannot be undone: the guest and its disks are deleted.'
+					: '. Anything unsaved in the guest is lost.'),
+		};
+	}
+
+	function getActions(): Action[] {
 		if (!canWrite || hasActiveTask || working) return [];
+		const summary = detail?.summary;
 		switch (status) {
 			case 'proposed':
 				return [
-					...(canApprove ? [{ label: 'Approve', cls: 'btn-success', fn: doApprove }] : []),
+					// One action from proposal to applied (owner decision 5); a
+					// composite or replay_safe:false change keeps two steps. An
+					// older backend sends no summary: plain Approve, as before.
+					...(canApprove && summary && !summary.two_step
+						? [
+								{
+									label: 'Approve and apply',
+									cls: 'btn-primary',
+									fn: doApproveAndApply,
+									...runGuard(),
+								},
+								{ label: 'Approve only', cls: 'btn-ghost', fn: doApprove },
+							]
+						: canApprove
+							? [{ label: 'Approve', cls: 'btn-success', fn: doApprove }]
+							: []),
 					{ label: 'Reject', cls: 'btn-danger', fn: doReject, destructive: true },
 				];
 			case 'approved':
-				return [{ label: 'Apply', cls: 'btn-success', fn: doApply }];
+				// Ready to run: Apply, or take the approval back (#797).
+				return [
+					{ label: 'Apply', cls: 'btn-primary', fn: doApply, ...runGuard() },
+					{
+						label: 'Withdraw',
+						cls: 'btn-ghost',
+						fn: doWithdraw,
+						destructive: true,
+						consequence: 'It will never run. Nothing on any host is touched.',
+					},
+				];
 			case 'failed':
 				return [
 					...(canApprove ? [{ label: 'Re-approve', cls: 'btn-success', fn: doApprove }] : []),
 					{ label: 'Revoke', cls: 'btn-danger', fn: doRevoke, destructive: true },
 				];
 			case 'applied':
-				const actions: { label: string; cls: string; fn: () => Promise<void>; destructive?: boolean }[] = [
+				const actions: Action[] = [
 					{ label: 'Revoke', cls: 'btn-danger', fn: doRevoke, destructive: true },
 				];
 				if (detail?.frontmatter?.replay_safe !== false) {
@@ -136,6 +192,36 @@
 			await load();
 		} catch (e) {
 			notify(String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
+	async function doWithdraw() {
+		working = true;
+		try {
+			await api.withdrawArtifact(id);
+			notify('Withdrawn - it will not run');
+			await load();
+		} catch (e) {
+			notify(String(e), 'err');
+		} finally {
+			working = false;
+		}
+	}
+
+	async function doApproveAndApply() {
+		working = true;
+		try {
+			const res = await api.approveAndApplyArtifact(id);
+			notify('Approved and started');
+			startPolling(res.task_id);
+			await load();
+		} catch (e) {
+			// Approved but not started is still Ready to run: re-read so the page
+			// says so instead of the old proposed state.
+			notify(String(e), 'err');
+			await load(false);
 		} finally {
 			working = false;
 		}
@@ -232,9 +318,9 @@
 		}
 	}
 
-	function handleAction(action: { fn: () => Promise<void>; label: string; destructive?: boolean }) {
+	function handleAction(action: Action) {
 		if (action.destructive) {
-			confirmAction = { fn: action.fn, label: action.label };
+			confirmAction = action;
 		} else {
 			action.fn();
 		}
@@ -245,37 +331,6 @@
 			const fn = confirmAction.fn;
 			confirmAction = null;
 			fn();
-		}
-	}
-
-	// The dialog guards a destructive path (Reject / Revoke), so it must behave
-	// like a dialog: Escape cancels, and Tab cannot wander onto the page behind
-	// it (where a stray Enter would hit an action button).
-	function focusFirst(node: HTMLDivElement) {
-		const first = node.querySelector<HTMLElement>('button');
-		first?.focus();
-		return {};
-	}
-
-	function modalKeydown(e: KeyboardEvent) {
-		if (!confirmAction || !confirmEl) return;
-		if (e.key === 'Escape') {
-			e.preventDefault();
-			confirmAction = null;
-			return;
-		}
-		if (e.key !== 'Tab') return;
-		const focusable = Array.from(confirmEl.querySelectorAll<HTMLElement>('button'));
-		if (focusable.length === 0) return;
-		const first = focusable[0];
-		const last = focusable[focusable.length - 1];
-		const active = document.activeElement as HTMLElement | null;
-		if (e.shiftKey && (active === first || !confirmEl.contains(active))) {
-			e.preventDefault();
-			last.focus();
-		} else if (!e.shiftKey && (active === last || !confirmEl.contains(active))) {
-			e.preventDefault();
-			first.focus();
 		}
 	}
 
@@ -297,7 +352,7 @@
 
 <div class="space-y-5">
 	<div class="flex items-center gap-3">
-		<a href="{base}/changes" class="text-muted hover:text-ink text-xs">← Artifacts</a>
+		<a href="{base}/changes" class="text-muted hover:text-ink text-xs"><Icon name="arrow-left" />Changes</a>
 		<h1 class="page-title">
 			{detail?.frontmatter.intent ?? id}
 		</h1>
@@ -308,6 +363,18 @@
 	{:else if !detail}
 		<p class="text-danger text-sm">Not found.</p>
 	{:else}
+		<!-- The change in plain words, first (owner feedback 2026-11-08): what
+		     it does, to what, where it stands and how its last run ended. The raw
+		     spec is further down, behind a disclosure. -->
+		<div class="card space-y-3" data-testid="change-top">
+			<ChangeOutcome
+				fm={detail.frontmatter}
+				activeTask={detail.active_task}
+				lastTask={detail.last_task}
+			/>
+			<ChangeSummary summary={detail.summary} />
+		</div>
+
 		<div class="card space-y-3">
 			<div class="flex items-center gap-2 text-xs flex-wrap">
 				<span class="badge {statusClass(status)}">{status}</span>
@@ -356,7 +423,13 @@
 					<circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
 					<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
 				</svg>
-				<span>Task {detail?.active_task?.action ?? activeTask?.action ?? ''} in progress ({detail?.active_task?.status ?? activeTask?.status ?? ''})…</span>
+				<span data-testid="running-banner"
+					>{runningLine(
+						detail.frontmatter.intent,
+						detail.active_task?.created_at ?? activeTask?.created_at,
+					)} · {detail.active_task?.action ?? activeTask?.action ?? ''}
+					{detail.active_task?.status ?? activeTask?.status ?? ''}</span
+				>
 			</div>
 		{/if}
 
@@ -388,32 +461,21 @@
 
 		{#if detail.body}
 			<div class="card space-y-2">
-				<h2 class="section-title">Body</h2>
-				<pre class="code-block text-xs overflow-x-auto whitespace-pre-wrap">{detail.body}</pre>
+				<h2 class="section-title">Spec and execution log</h2>
+				<ChangeSummary summary={undefined} body={detail.body} />
 			</div>
 		{/if}
 	{/if}
 </div>
 
-<!-- Top level by necessity (a <svelte:window> may not sit inside a block); the
-     handler no-ops while no dialog is open. -->
-<svelte:window on:keydown={modalKeydown} />
-
 {#if confirmAction}
-	<div class="fixed inset-0 bg-black/60 z-20 flex items-center justify-center" on:click|self={() => (confirmAction = null)} role="presentation">
-		<div
-			class="bg-surface border border-border rounded-lg p-5 max-w-sm space-y-4"
-			bind:this={confirmEl}
-			use:focusFirst
-			role="dialog"
-			aria-modal="true"
-			aria-labelledby="confirm-title"
-		>
-			<p id="confirm-title" class="text-sm text-ink">Confirm {confirmAction.label.toLowerCase()}?</p>
-			<div class="flex gap-2 justify-end">
-				<button class="btn btn-ghost text-xs" on:click={() => (confirmAction = null)}>Cancel</button>
-				<button class="btn btn-danger text-xs" on:click={confirmDestructive}>{confirmAction.label}</button>
-			</div>
-		</div>
-	</div>
+	{@const action = confirmAction}
+	<ConfirmDialog
+		title="{action.label} {detail?.summary?.target ?? targetStr()}"
+		consequence={action.consequence ?? ''}
+		confirmName={action.typed ? (detail?.summary?.confirm_name ?? null) : null}
+		confirmLabel={action.label}
+		on:confirm={confirmDestructive}
+		on:cancel={() => (confirmAction = null)}
+	/>
 {/if}

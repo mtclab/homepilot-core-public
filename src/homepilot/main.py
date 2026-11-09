@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import ipaddress
 import logging
+import logging.handlers
 import os
-import signal
+import queue
 import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
@@ -13,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
 
+import fastapi.routing as fastapi_routing
 import httpx
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.dependencies.models import Dependant
@@ -26,6 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from prometheus_client import Counter, Histogram, generate_latest
 
 from . import __version__
+
+# Loaded here, before uvicorn starts the loop, like the MCP server below: the PVE
+# library (proxmox_mcp -> proxmoxer -> requests) was first imported inside a
+# request - the claim's write-token probe, a guest-network read - ON the loop
+# (3.10.0: 265 ms on a fresh venv). tests/test_no_blocking_on_loop.py holds it.
+from .adapters import pve_sdn as _pve_sdn  # noqa: F401
 from .app_state import create_app_state, get_agent_registry
 from .auth.deps import _SAFE_METHODS, SCOPE_ENFORCER_ATTR, require_token
 from .auth.tokens import validate_token as _validate_token
@@ -34,6 +43,18 @@ from .common import APIError
 from .config import get_settings
 from .db.repository import Repository
 from .instance_lock import InstanceLock
+
+# Loaded with this module - before uvicorn starts the event loop - and not
+# first inside the lifespan: importing the MCP server (and the SDK under it)
+# takes ~0.4 s of CPU, which inside the lifespan ran ON the loop at every
+# start, with the agent hub and the loop watchdog already up (3.9.0: #801's
+# detector caught it on #800's shutdown journey). The lifespan's own
+# `from .mcp.server import ...` is then a lookup, and a test that patches that
+# module still reaches it. tests/test_no_blocking_on_loop.py holds every
+# lifespan import to this.
+from .mcp import server as _mcp_server  # noqa: F401
+from .runtime.blocking import shutdown_pools
+from .runtime.loop_watchdog import LoopStallWatchdog
 from .selfcheck import (
     agent_hub_listening,
     mcp_transport_running,
@@ -140,19 +161,57 @@ def configure_logging(level: str) -> None:
         logging.getLogger(__name__).warning(
             "HP_LOG_LEVEL=%r is not a level name; using INFO", level
         )
+    # Through a queue: a log line written on the event loop must not wait on
+    # stderr. A slow or full log pipe (a stalled `docker logs` reader, a busy
+    # disk under a file redirect) otherwise blocks the loop inside
+    # `stream.write` - measured at 359 ms by the suite's loop-block detector.
+    # The handler only enqueues; one listener thread does the writing.
+    global _log_listener
+    stream = logging.StreamHandler()
+    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log_queue: queue.SimpleQueue[logging.LogRecord] = queue.SimpleQueue()
+    listener = logging.handlers.QueueListener(log_queue, stream, respect_handler_level=False)
     logging.basicConfig(
         level=resolved,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.handlers.QueueHandler(log_queue)],
         force=True,
     )
+    listener.start()
+    if _log_listener is not None:
+        _log_listener.stop()  # flushes what the previous configuration queued
+    else:
+        atexit.register(_stop_log_listener)
+    _log_listener = listener
     logging.getLogger("homepilot").setLevel(resolved)
+
+
+_log_listener: logging.handlers.QueueListener | None = None
+
+
+def _stop_log_listener() -> None:
+    """Flush the queued log lines at interpreter exit (the listener's thread is a daemon)."""
+    if _log_listener is not None:
+        _log_listener.stop()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
     configure_logging(settings.log_level)
-    state = await create_app_state(settings)
+    # First, so it also watches startup. Off-loop blocking is the rule
+    # (runtime/blocking.py); this is how a breach names itself in the log.
+    loop_watchdog = (
+        LoopStallWatchdog(settings.loop_stall_ms) if settings.loop_stall_ms > 0 else None
+    )
+    if loop_watchdog is not None:
+        loop_watchdog.start()
+    app.state.loop_watchdog = loop_watchdog
+    try:
+        state = await create_app_state(settings)
+    except BaseException:
+        if loop_watchdog is not None:
+            await loop_watchdog.stop()
+        raise
 
     for cidr in (settings.trusted_proxies or _HP_TRUSTED_PROXIES_ENV).split(","):
         cidr = cidr.strip()
@@ -637,18 +696,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.mount("/mcp", mcp_app)
     logger.info("MCP server mounted at /mcp")
 
-    # Register SIGTERM handler for graceful shutdown in Docker
-    _shutdown_event = asyncio.Event()
-
-    def _sigterm_handler() -> None:
-        logger.info("Received SIGTERM — initiating graceful shutdown")
-        _shutdown_event.set()
-
-    loop = asyncio.get_running_loop()
-    try:
-        loop.add_signal_handler(signal.SIGTERM, _sigterm_handler)
-    except (OSError, ValueError):
-        logger.debug("Could not register SIGTERM handler (ok in non-Docker env)")
+    # SIGTERM belongs to uvicorn, which turns it into the graceful shutdown that
+    # runs the `finally` below. The lifespan must not install a handler of its
+    # own: one used to sit here, and `loop.add_signal_handler` REPLACES uvicorn's
+    # (which uvicorn sets with signal.signal) - while it only set an Event that
+    # nothing awaited. `docker stop` was ignored until Docker's SIGKILL, so the
+    # reconcilers were never stopped and the database never checkpointed and
+    # closed (#800). tests/test_sigterm_stops_the_server.py holds the outcome.
 
     # Starlette does NOT run a mounted sub-app's lifespan, so the mounted MCP app's
     # StreamableHTTPSessionManager (started inside create_http_app's own lifespan
@@ -738,6 +792,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             except Exception as exc:
                 logger.warning("%s drain error: %s", label, exc)
 
+        # Then the work those services handed to the blocking pools (git, io,
+        # net): a commit nobody awaits any more, or the integrity check's sqlite
+        # read - a read transaction still open would leave the checkpoint below
+        # busy. Bounded; queued work is finished, never cancelled.
+        try:
+            await shutdown_pools(timeout=10.0)
+        except Exception as exc:
+            logger.warning("Blocking pool shutdown error: %s", exc)
+
+        # Fold the WAL into the database file now that nothing writes any more,
+        # so the close below has no checkpoint left to do (closing the last
+        # connection otherwise runs one implicitly: unbounded disk I/O, #795).
+        # Off the loop and bounded by Database.checkpoint itself; one that cannot
+        # finish leaves the WAL for the close or the next start, which is safe.
+        try:
+            await state.database.checkpoint()
+        except Exception as exc:
+            logger.warning("WAL checkpoint before close failed: %s", exc)
+
         try:
             await asyncio.wait_for(state.database.close(), timeout=10.0)
         except TimeoutError:
@@ -755,6 +828,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Released LAST: while it is held, nothing else may start against this
         # data directory and run the orphan sweep over our tasks.
         instance_lock.release()
+        if loop_watchdog is not None:
+            await loop_watchdog.stop()
         logger.info("HomePilot v2 shut down")
 
 
@@ -1510,3 +1585,36 @@ if _UI_DIR is not None:
 # Enforce scope coverage once the full route table (routers + app-level routes +
 # optional UI routes) is assembled. Raises at import/construction on any gap.
 assert_all_routes_scoped(app)
+
+
+def build_route_table(target_app: FastAPI) -> int:
+    """Build every included route's effective context now; return how many.
+
+    FastAPI 0.137+ keeps `include_router` as a wrapper and builds each route's
+    effective context - its dependant combined with the include-time
+    dependencies and prefix - lazily, the first time a request is matched
+    against that router, and caches it. For this app that is ~140 routes and
+    ~300 ms of CPU, and it ran ON the event loop inside the first request after
+    every start (usually the container's own /health probe), blocking every
+    other request and the agent hub for that long. The 3.9.0 gate missed it
+    only because its venv had drifted to a FastAPI that is cheaper here; on the
+    locked 0.141.1 the loop-block detector caught it (3.10.0).
+
+    `fastapi.routing.iter_route_contexts` is the walk FastAPI's own OpenAPI
+    generation uses, and it fills the same per-router cache the request path
+    reads. The cache is keyed by each included router's own route version, so
+    the lifespan's later `app.mount("/mcp", ...)` on the root does not discard
+    it. On a FastAPI without the lazy build (< 0.137 flattens includes at
+    include time) there is nothing to build and this returns 0.
+    tests/test_first_request_does_not_block.py holds the first request to it.
+    """
+    iter_route_contexts = getattr(fastapi_routing, "iter_route_contexts", None)
+    if iter_route_contexts is None:
+        return 0
+    return sum(1 for _ in iter_route_contexts(list(target_app.routes)))
+
+
+# Once the table is complete and checked, and before uvicorn starts the loop:
+# the one-time route construction happens at import, off the loop, the way the
+# MCP server's import was moved out of the lifespan in 3.9.0.
+ROUTE_CONTEXTS_BUILT = build_route_table(app)

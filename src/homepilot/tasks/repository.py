@@ -34,6 +34,9 @@ VALID_ACTIONS = {
     # Retrying a guest tailnet join with a fresh key (#628). Its own action, not
     # a second "provision": nothing is cloned, configured or recorded as a host.
     "tailnet_join",
+    # Withdrawing an approved, never-run change (#797). Instant - no executor -
+    # but it holds the artifact's run slot so no apply can start underneath it.
+    "withdraw",
 }
 
 # Actions that create infrastructure rather than apply an artifact. They carry a
@@ -172,7 +175,8 @@ class TaskRepository:
 
     async def get_active_task(self, artifact_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone(
-            """SELECT id, status, action FROM tasks
+            # created_at rides along so a page can say "started 18:28".
+            """SELECT id, status, action, created_at FROM tasks
                WHERE artifact_id = ? AND status IN ('pending', 'running')
                ORDER BY created_at DESC LIMIT 1""",
             (artifact_id,),

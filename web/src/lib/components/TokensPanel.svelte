@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { api, ApiError, sessionStore, type TokenInfo } from '$lib/api';
 	import { notify } from '$lib/stores';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let tokens: TokenInfo[] = [];
 	let total = 0;
@@ -203,7 +204,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load tokens.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if !isAdmin}
 		<div class="card p-6 text-center">

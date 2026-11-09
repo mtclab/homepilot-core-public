@@ -1221,7 +1221,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.8.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.10.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1275,6 +1275,7 @@ forward.
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
 | `HP_DB_INTEGRITY_INTERVAL_SECONDS` | `21600` | How often `PRAGMA quick_check` runs against the database file, on its own read-only connection. `0` turns it off. `/health` reports the verdict as `database: corrupt`; `hp db check` runs it on demand |
+| `HP_LOOP_STALL_MS` | `500` | Loop-stall watchdog: when one callback holds the event loop longer than this, the loop thread's Python stack is logged while it is still blocked, and the stall shows in `/admin/selfcheck` as `loop_watchdog` (a stall in the last 15 minutes reads as a fault). Every request, the agent hub and every reconciler share that loop. `0` turns it off |
 | `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` | `3600` | How often the artifact store is pushed to `HP_ARTIFACTS_REMOTE` (only when a remote is set) |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |

@@ -18,6 +18,7 @@ Three slow-burn defects, each invisible until the day it matters:
 from __future__ import annotations
 
 import logging
+import logging.handlers
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -133,6 +134,21 @@ class TestTheLogLevelSwitchIsWired:
             assert logging.getLogger("homepilot").level == logging.DEBUG
         finally:
             configure_logging("info")
+
+    def test_log_lines_reach_stderr_through_a_queue_not_on_the_caller(self, capfd):
+        """A log call on the event loop only enqueues; a listener thread writes.
+        A slow log pipe used to block the loop inside `stream.write`."""
+        from homepilot import main as main_mod
+
+        try:
+            configure_logging("info")
+            handlers = logging.getLogger().handlers
+            assert [type(h) for h in handlers] == [logging.handlers.QueueHandler]
+            logging.getLogger("homepilot.test").warning("through-the-queue marker")
+        finally:
+            configure_logging("info")  # stops (and so flushes) that listener
+        assert main_mod._log_listener is not None
+        assert "through-the-queue marker" in capfd.readouterr().err
 
     async def test_an_unknown_level_falls_back_rather_than_crashing_the_boot(self):
         try:

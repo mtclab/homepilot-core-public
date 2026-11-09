@@ -83,7 +83,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "The operator overview, computed from the estate itself: inventory counts "
             "and coverage, drift over ACTIVE artifacts (in-spec, drifted, how many were "
             "never established and why: no agent / check failed / no Proxmox / by "
-            "design / other), artifacts and tasks by status, agents known vs connected "
+            "design / other), artifacts and tasks by status, the changes waiting on "
+            "the owner (`changes`: proposed, ready to run = approved and not running, "
+            "running), agents known vs connected "
             "(and, when none is connected, since when and whether that has outlasted "
             "the grace period - `offline_alarm`), firing alert "
             "count and metrics retention, plus the first-run onboarding checklist and "
@@ -98,6 +100,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "inventory": {"type": "object"},
                 "drift": {"type": "object"},
                 "artifacts": {"type": "object"},
+                "changes": {"type": "object"},
                 "tasks": {"type": "object"},
                 "agents": {"type": "object"},
                 "metrics": {"type": "object"},

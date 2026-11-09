@@ -165,6 +165,24 @@ async def build_summary(repo: Any) -> dict[str, Any]:
     # ── Pipeline ───────────────────────────────────────────────────────────────
     artifacts_by_status = await grouped("SELECT status, COUNT(*) FROM artifacts GROUP BY status")
     tasks_by_status = await grouped("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+    # What is waiting on the owner in Changes > Inbox (owner feedback 2026-11-08).
+    # An approved change used to leave the queue's count the moment it was
+    # approved, so a queue that still held work to run read as empty and the
+    # change as lost. `ready` is approved with no run in flight - it needs the
+    # Apply press; `running` is approved with a run in flight.
+    approved_split = await db.fetchone(
+        "SELECT "
+        "SUM(CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.artifact_id = a.id "
+        "AND t.status IN ('pending', 'running')) THEN 0 ELSE 1 END) AS ready, "
+        "SUM(CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.artifact_id = a.id "
+        "AND t.status IN ('pending', 'running')) THEN 1 ELSE 0 END) AS running "
+        "FROM artifacts a WHERE a.status = 'approved'"
+    )
+    changes_waiting = {
+        "proposed": artifacts_by_status.get("proposed", 0),
+        "ready": int((approved_split["ready"] if approved_split else 0) or 0),
+        "running": int((approved_split["running"] if approved_split else 0) or 0),
+    }
 
     # ── Agent fleet (persisted + live) ─────────────────────────────────────────
     # "Connected" comes from the LIVE registry, never from agents.connected. That
@@ -312,6 +330,7 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             "unknown_by_reason": unknown_by_reason,
         },
         "artifacts": artifacts_by_status,
+        "changes": changes_waiting,
         "tasks": tasks_by_status,
         "addresses": {"conflicts": address_conflicts},
         "agents": {

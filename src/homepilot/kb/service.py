@@ -21,6 +21,7 @@ from homepilot.common import redact_endpoint
 from homepilot.config import get_settings
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
+from homepilot.runtime.blocking import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +293,7 @@ class KBService:
 
             files: list[tuple[str, str]] = []
             try:
-                files = await asyncio.to_thread(self._walk_dir, path)
+                files = await run_blocking("io", self._walk_dir, path)
             except FileNotFoundError:
                 errors += 1
                 errors_detail.append(f"directory not found: {path}")
@@ -564,11 +565,13 @@ class KBService:
                     except sqlite3.OperationalError as exc:
                         logger.warning("Could not drop embeddings: %s", exc)
 
-                for artifact_meta in self.store.list(kind="kb-note", status="applied"):
+                for artifact_meta in await run_blocking(
+                    "io", self.store.list, kind="kb-note", status="applied"
+                ):
                     artifact_id = artifact_meta.get("id", "")
                     source = f"artifact:{artifact_id}"
                     try:
-                        fm, body = self.store.read(artifact_id)
+                        fm, body = await run_blocking("io", self.store.read, artifact_id)
                         result = await kb_note_executor.execute(
                             fm, body, self.repo, no_embeddings=no_embeddings
                         )
@@ -684,7 +687,7 @@ class KBService:
             artifact_id = source[len("artifact:") :]
             if self.store.exists(artifact_id):
                 try:
-                    fm, _body = self.store.read(artifact_id)
+                    fm, _body = await run_blocking("io", self.store.read, artifact_id)
                 except (OSError, ValueError, sqlite3.OperationalError) as exc:
                     logger.warning(
                         "Keeping KB document for %s: its artifact could not be read (%s)",
@@ -1016,7 +1019,7 @@ class KBService:
         }
 
     async def reindex_if_needed(self, reason: str = "lifecycle") -> None:
-        applied_notes = self.store.list(kind="kb-note", status="applied")
+        applied_notes = await run_blocking("io", self.store.list, kind="kb-note", status="applied")
         row = await self.repo.db.fetchone(
             "SELECT COUNT(*) AS c FROM doc_metadata WHERE source LIKE 'artifact:%'"
         )
@@ -1106,7 +1109,7 @@ class KBService:
             await self.index_note(result_id)
             return result_id
         except (FileExistsError, ValueError, OSError, LifecycleError):
-            fm, _body = self.store.read(artifact_id)
+            fm, _body = await run_blocking("io", self.store.read, artifact_id)
             from homepilot.artifacts.models import compute_body_hash
 
             if fm.get("hash") == compute_body_hash(content):
@@ -1137,7 +1140,7 @@ class KBService:
         from homepilot.executor import kb_note as kb_note_executor
 
         try:
-            fm, body = self.store.read(artifact_id)
+            fm, body = await run_blocking("io", self.store.read, artifact_id)
         except (FileNotFoundError, OSError, ValueError) as exc:
             logger.warning("Could not read %s to index it: %s", artifact_id, exc)
             return {"indexed": False, "reason": f"artifact unreadable: {exc}"}

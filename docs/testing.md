@@ -33,6 +33,8 @@ What's covered:
 | `test_kb_*.py` | KB indexing, vector search |
 | `test_inventory_*.py` | Inventory service, host discovery |
 | `test_migrations.py` | Schema migrations idempotency |
+| `test_migrations_contiguous.py` | The migration chain is versions 1..N, each once: a repeat, gap or reorder fails at import |
+| `test_schema_fingerprint.py` | Fresh install and an upgrade from every older version produce the schema in `src/homepilot/db/schema.lock`; released migrations are unchanged. After an intended schema change: `make schema-lock` |
 | `test_mcp_*.py` | MCP tool wiring |
 
 ---

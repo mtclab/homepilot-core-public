@@ -21,6 +21,7 @@
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
 	import { groupByDay, partition } from '$lib/grouping';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let tasks: Task[] = [];
 	let total = 0;
@@ -197,7 +198,7 @@
 				{#if activeCount}<span class="text-warn">{activeCount} in flight.</span>{/if}
 			</p>
 		</div>
-		<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Refresh</button>
+		<button class="btn btn-ghost text-xs" on:click={() => load(true)}><Icon name="refresh" />Refresh</button>
 	</div>
 
 	{#if loading}
@@ -206,7 +207,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load tasks.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={() => load(true)}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={() => load(true)}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if tasks.length === 0}
 		<div class="card p-6 text-center space-y-1">

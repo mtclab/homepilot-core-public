@@ -629,6 +629,7 @@ def status() -> None:
         "superseded",
         "revoked",
         "rejected",
+        "withdrawn",
     ]:
         table.add_row(f"  Artifacts/{status_val}", str(counts.get(status_val, 0)))
 
@@ -863,6 +864,26 @@ def artifacts_reject(
     console.print(f"[yellow]Rejected: {id}[/yellow]")
 
 
+@artifacts_app.command("withdraw")
+def artifacts_withdraw(
+    id: str = typer.Argument(..., help="Artifact ID"),
+    reason: list[str] | None = typer.Option(None, "--reason", help="Why it is withdrawn"),  # noqa: B008
+) -> None:
+    """Withdraw an approved change that has not run, so it is never applied (#797).
+
+    Runs nothing on any host. Through the running backend, which holds the run
+    slot that keeps a withdraw and an apply of one change apart."""
+    body: dict[str, Any] = {"reason": " ".join(reason)} if reason else {}
+    try:
+        asyncio.run(_backend_api("POST", f"/artifacts/{id}/withdraw", body, scope="write"))
+    except typer.Exit:
+        raise
+    except Exception as e:
+        err_console.print(f"[red]Withdraw failed for {id}: {e}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"[yellow]Withdrawn: {id}[/yellow]")
+
+
 @artifacts_app.command("edit")
 def artifacts_edit(
     id: str = typer.Argument(..., help="Artifact ID"),
@@ -895,6 +916,7 @@ def artifacts_edit(
         ArtifactStatus.SUPERSEDED.value,
         ArtifactStatus.REVOKED.value,
         ArtifactStatus.REJECTED.value,
+        ArtifactStatus.WITHDRAWN.value,
     }
     if fm.get("status") in terminal:
         err_console.print(

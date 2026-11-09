@@ -1,5 +1,7 @@
 <script lang="ts">
 	// Settings (#549 F6): seven stacked cards became seven `?tab=` sectors.
+	// UI slice 1 made it plumbing only: Monitoring, Guests and Tokens left for
+	// pages of their own, and their old addresses redirect there.
 	//
 	// Nothing in them was redesigned except the self-check, which was a bullet
 	// list summarising an admin diagnostic and is now the Subsystems tab: one
@@ -10,20 +12,16 @@
 	// are now edited on its card, each one showing where its value comes from,
 	// because the server's env > db > default precedence is only honest if the
 	// operator can see which of the three is in force.
-	import AlertRules from '$lib/components/AlertRules.svelte';
-	import WebhooksPanel from '$lib/components/WebhooksPanel.svelte';
-	import NotificationChannels from '$lib/components/NotificationChannels.svelte';
 	import SettingFields from '$lib/components/SettingFields.svelte';
 	import GuestNetworkCard from '$lib/components/GuestNetworkCard.svelte';
-	import GuestsPanel from '$lib/components/GuestsPanel.svelte';
-	import TokensPanel from '$lib/components/TokensPanel.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { base } from '$app/paths';
 	import { queryTabs, activeQueryTab } from '$lib/tabs';
-	import { SETTINGS_TABS, settingsTabFromHash } from '$lib/settingsTabs';
+	import { SETTINGS_TABS, settingsTabFromHash, movedSettingsTarget } from '$lib/settingsTabs';
 	import {
 		subsystemLabel,
 		subsystemStateClass,
@@ -46,6 +44,7 @@
 	// the session is still loading.
 	$: isAdminUser = capIsAdmin($sessionStore?.capabilities);
 	let health: string | null = null;
+	let healthOk = false;
 	let checking = false;
 	let cookieSession = false;
 	let currentScope = '';
@@ -241,6 +240,13 @@
 	 */
 	onMount(() => {
 		const url = $page.url;
+		// A sector that left Settings (Monitoring, Guests, Tokens) lands on
+		// the page that has it now, query and fragment carried.
+		const moved = movedSettingsTarget(url);
+		if (moved) {
+			void goto(base + moved, { replaceState: true });
+			return;
+		}
 		if (url.searchParams.get('tab')) return;
 		const fromHash = settingsTabFromHash(url.hash);
 		// Connection is what an address-less URL already resolves to; redirecting
@@ -362,9 +368,11 @@
 			const target = resolveApiBase(apiBase, envApiBase());
 			const res = await fetch(`${target}/health`, { credentials: 'include' });
 			const data = await res.json();
-			health = res.ok ? `✓ ${data.status} — v${data.version}` : `✗ ${res.status}`;
+			health = res.ok ? `${data.status} — v${data.version}` : `failed: HTTP ${res.status}`;
+			healthOk = res.ok;
 		} catch (e) {
-			health = `✗ ${String(e)}`;
+			health = `failed: ${String(e)}`;
+			healthOk = false;
 		} finally {
 			checking = false;
 		}
@@ -436,7 +444,7 @@
 							{/if}
 						</p>
 						{#if cookieSession && sessionIsAdmin}
-							<a href="{base}/settings?tab=tokens" class="text-xs text-accent hover:underline">Manage API tokens →</a>
+							<a href="{base}/assistants" class="text-xs text-accent hover:underline">Manage API tokens on Assistants</a>
 						{/if}
 					</div>
 
@@ -449,7 +457,7 @@
 							{checking ? 'Checking…' : 'Test connection'}
 						</button>
 						{#if health}
-							<span class="text-xs {health.startsWith('✓') ? 'text-ok' : 'text-danger'}">{health}</span>
+							<span class="text-xs inline-flex items-center gap-1 {healthOk ? 'text-ok' : 'text-danger'}"><Icon name={healthOk ? 'check' : 'close'} />{health}</span>
 						{/if}
 					</div>
 				</div>
@@ -515,7 +523,7 @@
 								The fields below are not showing the current configuration — saving now would
 								overwrite it.
 							</p>
-							<button class="btn btn-ghost text-xs" on:click={loadProxmoxSettings}>↻ Retry</button>
+							<button class="btn btn-ghost text-xs" on:click={loadProxmoxSettings}><Icon name="refresh" />Retry</button>
 						</div>
 					{:else}
 						<div class="space-y-1">
@@ -535,7 +543,7 @@
 								{#if pveTokenConfigured}
 									Token stored in vault (source: <span class="text-muted">{pveTokenSource}</span>). Leave blank to keep existing.
 								{:else}
-									Enter a PVE API token with read access. Create one in the PVE UI under <em>Datacenter → Permissions → API Tokens</em>.
+									Enter a PVE API token with read access. Create one in the PVE UI under <em>Datacenter &gt; Permissions &gt; API Tokens</em>.
 								{/if}
 							</p>
 						</div>
@@ -605,7 +613,7 @@
 								{selfcheckAt ? `Checked ${selfcheckAt.toLocaleTimeString()}` : 'Not checked yet'}
 							</span>
 							<button class="btn btn-ghost btn-sm" disabled={selfcheckLoading} on:click={loadSelfcheck}>
-								{selfcheckLoading ? 'Checking…' : '↻ Re-check'}
+								{#if selfcheckLoading}Checking…{:else}<Icon name="refresh" />Re-check{/if}
 							</button>
 						</div>
 					</div>
@@ -649,6 +657,15 @@
 						<!-- The guest network: settings, survey and plan on ONE card,
 						     because a subnet setting means nothing without what the
 						     cluster currently has. -->
+						<!-- Guests left Settings for a page of their own; the guest
+						     network and provisioning defaults below stay here because
+						     they are configuration. The door is here so the first
+						     invite is reachable before Guests shows in the nav. -->
+						<p class="prose-note prose-measure text-xs" data-testid="guests-door">
+							Friends' machines, invites and budgets are on the
+							<a class="text-accent hover:underline" href="{base}/guests">Guests page</a>;
+							it appears in the navigation once a guest or an invite exists.
+						</p>
 						<GuestNetworkCard
 							overrides={overrides}
 							canWrite={isAdminUser}
@@ -690,42 +707,6 @@
 					admin-only. Sign in with an admin token to see it.
 				</p>
 			{/if}
-		{:else if activeTab === 'guests'}
-			<div class="card space-y-3 max-w-3xl">
-				<h2 class="section-title">Guests</h2>
-				<GuestsPanel />
-			</div>
-		{:else if activeTab === 'monitoring'}
-			<div class="card space-y-3 max-w-3xl">
-				<h2 class="section-title">Monitoring</h2>
-				<AlertRules />
-			</div>
-			<div class="card space-y-3 max-w-3xl mt-4">
-				<h2 class="section-title">Notification channels</h2>
-				{#if sessionIsAdmin}
-					<NotificationChannels />
-				{:else}
-					<p class="prose-note text-xs">
-						Channels decide who is woken up for an alert, and their URLs are
-						credentials, so they need an admin session.
-					</p>
-				{/if}
-			</div>
-			<div class="card space-y-3 max-w-3xl mt-4">
-				<h2 class="section-title">Webhooks</h2>
-				{#if sessionIsAdmin}
-					<WebhooksPanel />
-				{:else}
-					<p class="prose-note text-xs">
-						Webhooks decide where events - approval codes included - are sent, so
-						they need an admin session.
-					</p>
-				{/if}
-			</div>
-		{:else if activeTab === 'tokens'}
-			<div class="card space-y-3">
-				<TokensPanel />
-			</div>
 		{:else if activeTab === 'about'}
 			<div class="card space-y-2 max-w-lg">
 				<h2 class="section-title">About</h2>
