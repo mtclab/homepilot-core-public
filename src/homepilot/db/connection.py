@@ -144,6 +144,7 @@ class Database:
         """
         if self._connection is None or self._is_memory():
             return False
+        await self._roll_back_orphaned_transaction()
         path = self.db_path
         outcome: dict[str, Any] = {}
 
@@ -175,6 +176,46 @@ class Database:
             return False
         logger.info("WAL checkpointed and truncated before close")
         return True
+
+    async def _roll_back_orphaned_transaction(self) -> None:
+        """Roll back a write transaction nobody will ever finish. Shutdown only.
+
+        Every repository shares this connection, and SQLite opens a transaction
+        implicitly at the first write. A coroutine cut off between that write
+        and its commit - a reconciler cancelled at shutdown, a method whose
+        commit failed - leaves the transaction OPEN, and
+        `wal_checkpoint(TRUNCATE)` waits on an open writer for its whole budget
+        and then gives up: the "WAL checkpoint still running after 3s" the e2e
+        fleet server logged as it shut down. `checkpoint()` runs once nothing
+        writes any more, so an open transaction then has no owner left to
+        commit it, and closing the connection would roll it back anyway; doing
+        that first lets the checkpoint run.
+
+        Through aiosqlite's worker, on the daemon closer loop, bounded and never
+        cancelled - the pattern `close()` uses, for the same reason (#496).
+        """
+        conn = self._connection
+        if conn is None or not conn.in_transaction:
+            return
+        bridge = asyncio.wrap_future(asyncio.run_coroutine_threadsafe(conn.rollback(), _closer()))
+        _done, pending = await asyncio.wait({bridge}, timeout=self._CHECKPOINT_SECONDS)
+        if pending:
+            logger.warning(
+                "A write transaction was still open at shutdown and rolling it back did "
+                "not finish in %.0fs; the close rolls it back.",
+                self._CHECKPOINT_SECONDS,
+            )
+            return
+        exc = bridge.exception()
+        if exc is not None:
+            logger.warning(
+                "A write transaction was still open at shutdown; rolling it back failed: %s", exc
+            )
+            return
+        logger.warning(
+            "A write transaction was still open at shutdown (a writer was interrupted "
+            "before its commit); rolled it back so the WAL checkpoint can run."
+        )
 
     def _is_memory(self) -> bool:
         return self.db_path == ":memory:" or "mode=memory" in self.db_path
@@ -372,6 +413,18 @@ class Database:
         return dict(row) if row else None
 
     async def fetchall(self, query: str, params: Any = None) -> list[dict[str, Any]]:
-        cursor = await self.conn.execute(query, params or ())
-        rows = await cursor.fetchall()
+        """Execute and read every row in ONE operation on aiosqlite's worker thread.
+
+        Every repository shares this one connection, so any `await` between a
+        statement's execute and its last row is a point where another coroutine's
+        `commit()` reaches the worker. For a write that returns rows
+        (`UPDATE ... RETURNING`) the statement is still IN PROGRESS until its
+        last row is read, and SQLite refuses that commit: "cannot commit
+        transaction - SQL statements in progress". That is how two inventory
+        sweeps at once failed the e2e fleet server's startup. Executed and read
+        in a single worker operation, there is no gap for anything to land in,
+        so a RETURNING statement goes only through here
+        (tests/test_db_commit_race.py holds the source to that).
+        """
+        rows = await self.conn.execute_fetchall(query, params or ())
         return [dict(row) for row in rows]

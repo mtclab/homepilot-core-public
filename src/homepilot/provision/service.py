@@ -2145,19 +2145,15 @@ class ProvisionService:
         # keeps refresh_inventory from stamping import_state='pending' on a guest
         # HomePilot itself created, so a provisioned VM never shows up in the
         # "unimported, please adopt" queue. managed_by records the provenance.
-        return await self.repo.create_host(
+        # An upsert, because an inventory sweep may have recorded the new guest
+        # as "discovered" while it was still being built, and the database
+        # holds one live row per VMID (migration 41).
+        return await self.repo.record_provisioned_guest(
             hostname=request.name,
             host_type=HOST_TYPE,
             proxmox_id=vmid,
             node=request.node,
             ip_address=ip,
-            ip_source="pve" if ip else None,
-            managed_by="provisioned",
-            managed=True,
-            source="hp_created",
-            role_source="inferred",
-            pve_status="running",
-            status="online" if ip else "unknown",
             cpu_cores=request.cores,
             memory_mb=request.memory_mb,
             disk_gb=request.disk_gb,

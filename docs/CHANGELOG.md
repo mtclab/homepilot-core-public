@@ -18,10 +18,16 @@ the first request after a start no longer holds every other request for about
 a third of a second while the app builds its route table; it is built before
 the server starts listening.
 
+Two inventory syncs at once - the one that runs at every start and a Sync, an
+MCP refresh or a CLI sweep - could record a guest twice or stop with "cannot
+commit transaction - SQL statements in progress". Syncs now take turns, the
+database keeps one live row per machine, and migration 41 retires any duplicate
+an install already has.
+
 ### Operator actions
 
-- Migration 40 runs at the first start, after the usual backup (`backups/pre-migration-v39.db`); it rebuilds `tasks`, keeping every row. To go back, restore that backup with `hp db restore`.
-- Copy `proxy_read_timeout 360s;` from the reference vhosts into your deployed nginx vhosts (`location /` and the portal's guest/invite block), then reload nginx.
+- Migrations 40 and 41 run at the first start, after the usual backup (`backups/pre-migration-v39.db`): 40 rebuilds `tasks`, keeping every row; 41 marks any duplicate host row gone (kept, and listed in the audit log). To go back, restore that backup with `hp db restore`.
+- Copy `proxy_read_timeout 360s;` from the reference vhosts into your nginx vhosts (`location /` and the portal's guest/invite block), then reload nginx.
 - MCP clients with a tool allow-list: add `withdraw_artifact`.
 
 ### `docker stop` shuts HomePilot down cleanly

@@ -46,9 +46,10 @@ SCHEMA_3_7_0 = 36
 # Unreleased:
 # * 39 - operator power controls (lane B3): ``hosts.protected``
 # * 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept
+# * 41 - one live ``hosts`` row per VMID and per node (duplicates retired)
 # tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
 # through both.
-SCHEMA_LATEST = 40
+SCHEMA_LATEST = 41
 
 
 async def _version(db: Database) -> int:
@@ -139,6 +140,8 @@ class TestADatabaseFrom3625UpgradesInOneStart:
             for r in await db_3_6_25.fetchall("SELECT name FROM sqlite_master WHERE type = 'index'")
         }
         assert "idx_tasks_one_active_per_artifact" in indexes
+        # 41: one live row per machine.
+        assert {"idx_hosts_one_live_per_vmid", "idx_hosts_one_live_node"} <= indexes
 
         # The pre-migration snapshot is of the 3.6.25 database, so the one
         # restore an operator is told about takes them back to what they had.

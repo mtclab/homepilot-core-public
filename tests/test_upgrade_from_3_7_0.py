@@ -41,7 +41,8 @@ SCHEMA_3_7_0 = 36
 SCHEMA_3_8_0 = 38
 # 39 - operator power controls (lane B3): ``hosts.protected``.
 # Unreleased: 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept.
-SCHEMA_LATEST = 40
+# Unreleased: 41 - one live ``hosts`` row per VMID and per node (duplicates retired).
+SCHEMA_LATEST = 41
 
 _NOW = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -160,6 +161,9 @@ class TestADatabaseFrom370UpgradesInOneStart:
             "idx_host_addresses_host",
             # 40 rebuilt `tasks` (#797); the run-slot index must survive it.
             "idx_tasks_one_active_per_artifact",
+            # 41: one live row per machine.
+            "idx_hosts_one_live_per_vmid",
+            "idx_hosts_one_live_node",
         } <= indexes
 
         after = [dict(r) for r in await db_3_7_0.fetchall("SELECT * FROM hosts ORDER BY id")]

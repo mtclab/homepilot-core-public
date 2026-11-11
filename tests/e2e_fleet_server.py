@@ -94,8 +94,19 @@ async def _seeded(app: Any) -> Any:
     async with _lifespan(app) as state:
         app.state.proxmox = pve
         repo = app.state.repo
+        # The inventory reconciler's first cycle starts with the lifespan too, so
+        # this sweep and that one run at the same time - the race 3.10.0's
+        # mirror e2e caught (two rows for one guest, a refused commit). Strict
+        # on purpose: the fleet is complete and every machine is ONE row.
         result = await app.state.inventory_service.refresh_inventory()
-        assert result["complete"], result
+        if not result["complete"]:
+            raise RuntimeError(f"the fleet's seed sweep did not complete: {result}")
+        live = await repo.db.fetchall(
+            "SELECT hostname, COUNT(*) AS n FROM hosts WHERE absent_since IS NULL "
+            "GROUP BY hostname HAVING n > 1"
+        )
+        if live:
+            raise RuntimeError(f"the fleet has duplicate host rows: {live}")
         for name, env in ENVS.items():
             row = await repo.get_host_by_hostname(name)
             assert row is not None, name

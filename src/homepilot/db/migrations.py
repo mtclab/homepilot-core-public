@@ -1444,6 +1444,70 @@ MIGRATION_CHAIN: tuple[Migration, ...] = (
             ),
         ],
     ),
+    Migration(
+        41,
+        [
+            # One LIVE row per machine (3.10.0). Two inventory sweeps at once -
+            # the reconciler's first cycle and a Sync, an MCP refresh, a CLI
+            # sweep from another process - each looked a new guest up, found
+            # nothing and inserted it; provisioning recording its guest after a
+            # sweep had already discovered it did the same. Rows of EARLIER
+            # occupants of a VMID stay (#706): they carry absent_since, so the
+            # rule is over live rows only.
+            #
+            # An install that already has duplicates keeps ONE row per machine
+            # - the one the operator worked with (an owner, adopted, managed, an
+            # agent, an operator-set env), else the oldest - and the rest are
+            # RETIRED exactly as the sweep retires a vanished guest: stamped
+            # absent, never deleted, each one journaled. Their history stays.
+            # The duplicates: every live row past the first per VMID, and per
+            # node name, ranked so the operator's row comes first. Written out
+            # in full in both statements (no SQL assembled from strings).
+            (
+                "WITH dup AS ("
+                "SELECT id, hostname FROM (SELECT id, hostname, ROW_NUMBER() OVER ("
+                "PARTITION BY proxmox_id ORDER BY (owner IS NOT NULL) DESC, "
+                "(import_state = 'adopted') DESC, managed DESC, (agent_id IS NOT NULL) DESC, "
+                "(env_source = 'user') DESC, rowid) AS rank FROM hosts "
+                "WHERE proxmox_id IS NOT NULL AND absent_since IS NULL) WHERE rank > 1 "
+                "UNION ALL "
+                "SELECT id, hostname FROM (SELECT id, hostname, ROW_NUMBER() OVER ("
+                "PARTITION BY hostname ORDER BY (owner IS NOT NULL) DESC, "
+                "(import_state = 'adopted') DESC, managed DESC, (agent_id IS NOT NULL) DESC, "
+                "(env_source = 'user') DESC, rowid) AS rank FROM hosts "
+                "WHERE host_type = 'node' AND absent_since IS NULL) WHERE rank > 1) "
+                "INSERT INTO audit_log (user_id, source, action, target_host, details_json) "
+                "SELECT 'system', 'migration:41', 'duplicate_host_retired', hostname, "
+                "json_object('host_id', id) FROM dup"
+            ),
+            (
+                "WITH dup AS ("
+                "SELECT id, hostname FROM (SELECT id, hostname, ROW_NUMBER() OVER ("
+                "PARTITION BY proxmox_id ORDER BY (owner IS NOT NULL) DESC, "
+                "(import_state = 'adopted') DESC, managed DESC, (agent_id IS NOT NULL) DESC, "
+                "(env_source = 'user') DESC, rowid) AS rank FROM hosts "
+                "WHERE proxmox_id IS NOT NULL AND absent_since IS NULL) WHERE rank > 1 "
+                "UNION ALL "
+                "SELECT id, hostname FROM (SELECT id, hostname, ROW_NUMBER() OVER ("
+                "PARTITION BY hostname ORDER BY (owner IS NOT NULL) DESC, "
+                "(import_state = 'adopted') DESC, managed DESC, (agent_id IS NOT NULL) DESC, "
+                "(env_source = 'user') DESC, rowid) AS rank FROM hosts "
+                "WHERE host_type = 'node' AND absent_since IS NULL) WHERE rank > 1) "
+                "UPDATE hosts SET absent_since = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), "
+                "status = 'unknown', pve_status = 'unknown' "
+                "WHERE id IN (SELECT id FROM dup)"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts_one_live_per_vmid "
+                "ON hosts(proxmox_id) WHERE proxmox_id IS NOT NULL AND absent_since IS NULL"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts_one_live_node "
+                "ON hosts(hostname) WHERE host_type = 'node' AND absent_since IS NULL"
+            ),
+        ],
+    ),
 )
 
 

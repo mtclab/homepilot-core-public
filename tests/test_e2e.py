@@ -853,11 +853,35 @@ def fleet():
         with open(log_path, encoding="utf-8", errors="replace") as f:
             return f.read()[-3000:]
 
+    def failure_log() -> str:
+        """The server log for a failure message: from the first trouble to the end.
+
+        A fixed 3000-character tail cut the traceback off whenever the shutdown
+        that follows a failed start logged enough after it, so the message said
+        the server exited without saying why. This keeps everything from the
+        first WARNING/ERROR/Traceback on (the startup banner before it is noise),
+        and fails with pytrace off so pytest does not truncate it either.
+        """
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        marks = [
+            i
+            for i in (text.find(" WARNING "), text.find("ERROR"), text.find("Traceback"))
+            if i >= 0
+        ]
+        start = text.rfind("\n", 0, min(marks)) + 1 if marks else max(0, len(text) - 3000)
+        return text[start:][-30000:]
+
     try:
         deadline = time.monotonic() + 90
         while "E2E_FLEET_READY" not in server_log():
-            assert proc.poll() is None, "the fleet server exited:\n" + server_log()
-            assert time.monotonic() < deadline, "the fleet server never got ready:\n" + server_log()
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"the fleet server exited (code {proc.returncode}):\n{failure_log()}",
+                    pytrace=False,
+                )
+            if time.monotonic() >= deadline:
+                pytest.fail(f"the fleet server never got ready:\n{failure_log()}", pytrace=False)
             time.sleep(0.2)
         req = urllib.request.Request(
             f"{base}/auth/tokens",
@@ -1114,6 +1138,11 @@ class TestFleetJourneys:
         try:
             page.goto(f"{fleet['base']}/ui/")
             expect(page.locator("h1").first).to_be_visible()
+            # The shell mounts the palette (and its Ctrl+K listener) only once
+            # the session check answers, which on a loaded runner is after the
+            # first heading paints: a press before that reaches no listener.
+            # "Signed in as" is rendered by that same answer.
+            expect(page.get_by_text("Signed in as", exact=False)).to_be_visible()
             page.keyboard.press("Control+k")
             box = page.get_by_role("combobox")
             expect(box).to_be_focused()
