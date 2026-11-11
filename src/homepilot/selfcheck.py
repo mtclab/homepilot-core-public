@@ -907,10 +907,19 @@ def _loop_watchdog_subsystem(state: Any) -> Subsystem:
                 "The loop watchdog is configured but not running, so a frozen event "
                 "loop would go unreported.",
             )
+        # Late wake-ups with no callback running are the machine being busy,
+        # not a blocking call: said, never reported as a fault.
+        late = (
+            f" {snap['late_wakes']} late wake-up(s) with no callback running (a busy "
+            f"machine, not a blocking call), the worst {snap['late_worst_ms']:.0f} ms."
+            if snap.get("late_wakes")
+            else ""
+        )
         if not snap["stalls"]:
             return ProbeVerdict(
                 STATE_OK,
-                f"No callback has held the event loop longer than {threshold} ms since start.",
+                f"No callback has held the event loop longer than {threshold} ms since start."
+                + late,
             )
         age = time.time() - float(snap["last_at"] or 0)
         detail = (
@@ -925,7 +934,7 @@ def _loop_watchdog_subsystem(state: Any) -> Subsystem:
                 + detail
                 + " The log holds the loop thread's stack from while it was blocked.",
             )
-        return ProbeVerdict(STATE_OK, "The event loop is responsive. Earlier: " + detail)
+        return ProbeVerdict(STATE_OK, "The event loop is responsive. Earlier: " + detail + late)
 
     return Subsystem(
         name="loop_watchdog",

@@ -354,6 +354,102 @@ def test_watchdog_logs_the_blocking_stack_while_blocked() -> None:
     assert "SNAP 0 1 True" in out
 
 
+_PAUSED_SCRIPT = textwrap.dedent(
+    """
+    import asyncio, logging, sys
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    from homepilot.runtime.loop_watchdog import LoopStallWatchdog
+
+    async def main():
+        dog = LoopStallWatchdog(150)
+        dog.start()
+        await asyncio.sleep(0.3)
+        print("READY", flush=True)
+        await asyncio.sleep(1.5)  # idle the whole time: the parent pauses us here
+        snap = dog.snapshot()
+        print("SNAP", snap["stalls"], snap["late_wakes"] >= 1, snap["late_worst_ms"] >= 400)
+        await dog.stop()
+
+    asyncio.run(main())
+    """
+)
+
+
+def test_a_paused_process_is_a_late_wake_not_a_blocking_call() -> None:
+    """The 3.10.0 dev walk: the Overview said "frozen by a blocking call" for a
+    554 ms late wake with NO callback running (a busy two-core box). A process
+    the machine did not schedule is reproduced exactly: SIGSTOP an idle loop."""
+    import signal
+
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", _PAUSED_SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "READY"
+    os.kill(proc.pid, signal.SIGSTOP)
+    time.sleep(0.7)
+    os.kill(proc.pid, signal.SIGCONT)
+    out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    # Not a stall, no "blocked" warning with a stack: a late wake-up, counted.
+    assert "SNAP 0 True True" in out, out
+    assert "Event loop blocked for" not in out, out
+    assert "woke" in out and "not a blocking call" in out, out
+
+
+def test_an_idle_loop_thread_is_not_inside_a_callback() -> None:
+    """What the monitor's sample means: a loop waiting for work is in the loop's
+    own machinery; a callback that blocks is not."""
+    from homepilot.runtime.loop_watchdog import callback_running
+
+    started = threading.Event()
+    release = threading.Event()
+    idents: dict[str, int] = {}
+
+    def idle_loop() -> None:
+        idents["idle"] = threading.get_ident()
+        loop = asyncio.new_event_loop()
+        loop.call_later(0.05, started.set)
+        loop.run_until_complete(until_released())
+        loop.close()
+
+    async def until_released() -> None:
+        while not release.is_set():
+            await asyncio.sleep(0.5)
+
+    blocked = threading.Event()
+
+    def blocking_loop() -> None:
+        idents["blocking"] = threading.get_ident()
+        loop = asyncio.new_event_loop()
+
+        def hold() -> None:
+            blocked.set()
+            release.wait(10)
+
+        loop.call_soon(hold)
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.close()
+
+    threads = [threading.Thread(target=idle_loop), threading.Thread(target=blocking_loop)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert started.wait(5) and blocked.wait(5)
+        time.sleep(0.1)  # the idle loop is back in its select by now
+        frames = sys._current_frames()
+        assert callback_running(frames[idents["idle"]]) is False
+        assert callback_running(frames[idents["blocking"]]) is True
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(5)
+
+
 _CHILD_CONFTEST = textwrap.dedent(
     """
     import sys
@@ -589,3 +685,49 @@ def test_the_pve_library_is_loaded_before_the_loop() -> None:
         f"{sorted(set(library) - set(result['loaded']))}"
     )
     assert result["ms"] <= _LIFESPAN_IMPORT_BUDGET_MS, result
+
+
+class _DogStub:
+    def __init__(self, **snap: Any) -> None:
+        self._snap = {
+            "running": True,
+            "threshold_ms": 500,
+            "stalls": 0,
+            "worst_ms": 0.0,
+            "last_ms": 0.0,
+            "last_at": None,
+            "late_wakes": 0,
+            "late_worst_ms": 0.0,
+            **snap,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return dict(self._snap)
+
+
+async def _watchdog_verdict(**snap: Any) -> tuple[str, str]:
+    from types import SimpleNamespace
+
+    from homepilot.selfcheck import _loop_watchdog_subsystem
+
+    subsystem = _loop_watchdog_subsystem(SimpleNamespace(loop_watchdog=_DogStub(**snap)))
+    assert subsystem.probe is not None
+    verdict = await subsystem.probe()
+    return verdict.state, verdict.consequence
+
+
+async def test_selfcheck_does_not_call_a_busy_machine_a_frozen_loop() -> None:
+    """What the operator reads on the Overview. A late wake-up with no callback
+    running is said in plain words and is NOT a fault; a real stall still is."""
+    from homepilot.selfcheck import STATE_OK, STATE_UNREACHABLE
+
+    state, text = await _watchdog_verdict(late_wakes=1, late_worst_ms=554.0)
+    assert state == STATE_OK, text
+    assert "1 late wake-up(s) with no callback running" in text
+    assert "not a blocking call" in text and "frozen" not in text
+
+    state, text = await _watchdog_verdict(
+        stalls=1, worst_ms=900.0, last_ms=900.0, last_at=time.time(), late_wakes=2
+    )
+    assert state == STATE_UNREACHABLE, text
+    assert "recently frozen by a blocking call" in text

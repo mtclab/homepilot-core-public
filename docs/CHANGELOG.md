@@ -128,6 +128,15 @@ every task row is kept. Webhooks: a new event, `artifact_withdrawn`; re-import
 
 ### Fixes
 
+- **A busy machine is no longer called a frozen event loop.** The loop
+  watchdog counted every late heartbeat as "frozen by a blocking call", and the
+  Overview showed it as a fault. On a busy or paused machine the process is
+  simply not scheduled and the loop wakes late with no callback running (found
+  walking 3.10.0 on a two-core dev box: 554 ms, stack inside the loop's own run
+  call). A stall is now counted only when two samples caught a callback
+  running; anything else is a late wake-up, which the self-check mentions and
+  never reports as a fault.
+
 - **#797:** a DELETE step's options (`body: {purge: 1}`) went to PVE as a JSON
   body and PVE answered `501 Unexpected content for method 'DELETE'`. A DELETE's
   parameters are now always sent as URL query parameters, so existing

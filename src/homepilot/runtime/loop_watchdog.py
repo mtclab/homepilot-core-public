@@ -12,6 +12,18 @@ to be reasoned out afterwards. This watchdog makes the next one name itself:
 * when the loop comes back, the heartbeat measures how late it was and records
   the stall (count, worst, last) for the self-check.
 
+A late heartbeat alone is not a blocking call. On a busy or paused machine the
+process is simply not scheduled, and the loop wakes late with NO callback
+running: the 3.10.0 dev walk showed "the event loop was recently frozen by a
+blocking call" on the Overview for a 554 ms late wake whose stack ended in the
+loop's own run call. So the monitor samples the loop thread on every tick the
+heartbeat is overdue, and a late wake counts as a STALL only when TWO samples
+of that stall caught a callback running: a blocking call holds its callback
+across ticks, while a machine that was not scheduling the process gives the
+monitor no samples during the pause and at most one in the backlog after it.
+Anything else is recorded as a late wake-up (the machine was busy), which the
+self-check mentions and never reports as a fault.
+
 Idle cost is one short sleep-and-stamp on the loop and one timed wait on the
 thread per tick (4 per second at the default 500 ms threshold).
 """
@@ -30,6 +42,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# The innermost Python frame of a loop thread that is running NO callback: the
+# loop's own machinery, waiting in select (asyncio) or inside the C loop under
+# `run_until_complete` (uvloop, where no deeper Python frame exists).
+_LOOP_MACHINERY_FILES = (
+    "asyncio/runners.py",
+    "asyncio/base_events.py",
+    "asyncio/selector_events.py",
+    "asyncio/unix_events.py",
+    "selectors.py",
+)
+
+
+def callback_running(frame: Any) -> bool:
+    """Whether a loop thread sampled at ``frame`` was inside a callback."""
+    if frame is None:
+        return False
+    filename = str(frame.f_code.co_filename).replace("\\", "/")
+    return not filename.endswith(_LOOP_MACHINERY_FILES)
+
 
 @dataclass
 class _StallStats:
@@ -37,6 +68,9 @@ class _StallStats:
     worst_ms: float = 0.0
     last_ms: float = 0.0
     last_at: float = 0.0  # wall clock, for the self-check
+    # Late wake-ups with no callback running: the machine, not a blocking call.
+    late_wakes: int = 0
+    late_worst_ms: float = 0.0
 
 
 class LoopStallWatchdog:
@@ -54,6 +88,9 @@ class LoopStallWatchdog:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._reported_beat: float | None = None
+        # The monitor's evidence on the stall in progress: (beat it belongs to,
+        # how many of its samples caught a callback running).
+        self._sampled: tuple[float, int] | None = None
         self._stats = _StallStats()
         self._lock = threading.Lock()
 
@@ -92,10 +129,23 @@ class LoopStallWatchdog:
             await asyncio.sleep(self._tick)
             late = time.monotonic() - before - self._tick
             if late > self._threshold:
-                self._record(late)
+                self._record(late, before)
 
-    def _record(self, late: float) -> None:
+    def _record(self, late: float, beat: float) -> None:
         ms = round(late * 1000.0, 1)
+        with self._lock:
+            sampled = self._sampled
+            in_callback = sampled is not None and sampled[0] == beat and sampled[1] >= 2
+            if not in_callback:
+                self._stats.late_wakes += 1
+                self._stats.late_worst_ms = max(self._stats.late_worst_ms, ms)
+        if not in_callback:
+            logger.info(
+                "Event loop woke %.0f ms late with no callback running: the process was "
+                "not scheduled (a busy or paused machine), not a blocking call",
+                ms,
+            )
+            return
         with self._lock:
             self._stats.stalls += 1
             self._stats.worst_ms = max(self._stats.worst_ms, ms)
@@ -112,11 +162,24 @@ class LoopStallWatchdog:
         while not self._stop.wait(self._tick):
             beat = self._beat
             stuck_for = time.monotonic() - beat - self._tick
-            if stuck_for <= self._threshold or self._reported_beat == beat:
+            if stuck_for <= 0:
+                continue
+            # Sampled on every tick the heartbeat is overdue, so a stall that
+            # only just crosses the threshold has been looked at twice while it
+            # was happening (the tick is half the threshold).
+            frame = sys._current_frames().get(self._loop_thread_id or -1)
+            with self._lock:
+                seen = (
+                    self._sampled[1]
+                    if self._sampled is not None and self._sampled[0] == beat
+                    else 0
+                )
+                seen += 1 if callback_running(frame) else 0
+                self._sampled = (beat, seen)
+            if stuck_for <= self._threshold or self._reported_beat == beat or seen < 2:
                 continue
             self._reported_beat = beat
-            frame = sys._current_frames().get(self._loop_thread_id or -1)
-            stack = "".join(traceback.format_stack(frame)) if frame is not None else "?"
+            stack = "".join(traceback.format_stack(frame))
             logger.warning(
                 "Event loop blocked for %.0f ms and counting; loop thread stack:\n%s",
                 stuck_for * 1000.0,
@@ -133,4 +196,6 @@ class LoopStallWatchdog:
             "worst_ms": stats.worst_ms,
             "last_ms": stats.last_ms,
             "last_at": stats.last_at or None,
+            "late_wakes": stats.late_wakes,
+            "late_worst_ms": stats.late_worst_ms,
         }
