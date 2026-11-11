@@ -55,12 +55,15 @@ handler restored, the server is still running when the test's 30 s wait ends.
   "passed" on `/ui/hosts`).
 - **A false alarm from the loop-block detector.** Playwright's sync API runs its
   own event loop, and the test's code runs inside one of that loop's callbacks.
-  The detector timed a fixture's wait as a 62 s loop block. Playwright's loop
-  belongs to the test driver, not to HomePilot, so the detector now marks it
-  when Playwright creates it and does not time it. Every other loop is still
-  timed. `tests/test_loop_block_detector_driver.py` proves both: a block inside
-  Playwright's loop is not reported, and a real block on an ordinary loop in the
-  same session still fails its test.
+  The detector timed a fixture's wait as a 62 s loop block. The browser tests
+  drive HomePilot in another process, so no loop in the test process is
+  HomePilot's: the detector now times nothing while a test of
+  `tests/test_e2e.py` runs, and every other test is timed as before. The rule
+  is the module, not Playwright's internals - a first version recognised
+  Playwright's loop by how Playwright builds it and stopped working on a newer
+  Playwright. `tests/test_loop_block_detector_e2e_module.py` proves both
+  halves without Playwright: a loop held in the e2e module is not reported, and
+  the same block in any other module of the same session still fails its test.
 
 The fixture was waiting because the suite exceeded its own rate limit. Token
 creation allows 5 attempts per IP per minute, refused attempts included. The

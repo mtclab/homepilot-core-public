@@ -26,9 +26,9 @@ block whose stack could not be sampled held the GIL throughout (a long C call
 or a starved box, never I/O or Python code) and fails past
 ``HP_LOOP_BLOCK_UNSAMPLED_MS`` (default 500). Loops that exist to CONTAIN
 blocking code on a worker thread (``_CONTAINMENT_THREAD_PREFIXES``) are not the
-shared loop and are not timed against it. Nor is the loop Playwright's SYNC API
-pumps (``_DRIVER_LOOPS``): it belongs to the e2e test driver, and the test's
-own synchronous code runs inside one of its callbacks.
+shared loop and are not timed against it. Nor is anything timed while a test
+of ``tests/test_e2e.py`` runs (``_OUT_OF_PROCESS_MODULES``): HomePilot runs in
+another process there, so no loop in this one is HomePilot's.
 
 A recorded block turns that phase's report (setup, call or teardown) into a
 failure naming the callback, its duration and its loop thread. Blocks recorded
@@ -48,7 +48,6 @@ import sys
 import threading
 import time
 import traceback
-import weakref
 from collections.abc import Callable, Generator
 from types import FrameType
 from typing import Any
@@ -79,21 +78,17 @@ UNSAMPLED_BUDGET_S = float(os.environ.get("HP_LOOP_BLOCK_UNSAMPLED_MS", "500")) 
 # blocking never reaches the shared loop. Blocking that loop is the design.
 _CONTAINMENT_THREAD_PREFIXES = ("pve-library",)
 
-# Loops that belong to the TEST DRIVER, not to HomePilot. Playwright's sync API
-# (pytest-playwright's `page`, `browser`, ... and tests/test_e2e.py) owns a
-# private asyncio loop on the calling thread and runs it in a dispatcher
-# greenlet. A sync call switches to that greenlet until its reply arrives; the
-# reply wakes the test's greenlet from INSIDE a loop callback
-# (`wait_for_future.<locals>.resume`), and the test's own code then runs until
-# its next Playwright call - so every line of a sync e2e test, a fixture's
-# `time.sleep` included, is timed as one "callback" of that loop. The loop
-# serves nothing but the driver (HomePilot runs in its own process there), so
-# nothing on it is a HomePilot loop block. Tagged by the loop itself, at the
-# moment Playwright builds its sync connection (_tag_playwright_sync_loops) -
-# not by test id, thread or callback name - so a block on ANY other loop in
-# the same session, the same thread included, is still timed.
-_DRIVER_LOOPS: weakref.WeakSet[asyncio.AbstractEventLoop] = weakref.WeakSet()
-_original_connection_init: Callable[..., None] | None = None
+# Test modules that drive HomePilot in ANOTHER process. tests/test_e2e.py talks
+# to a server over HTTP and a browser through Playwright's sync API, which pumps
+# a private asyncio loop on the test's thread and runs the test's own code
+# inside that loop's callbacks. Nothing on a loop in that process is HomePilot,
+# so nothing there is a HomePilot loop block - and timing it failed two
+# releases: 3.9.0 (a fixture's sleep, "blocked 62027 ms") and 3.10.0 (a newer
+# Playwright that an exemption keyed on its internals no longer recognised).
+# The rule is the module, not the driver: no dependency on Playwright at all.
+# The server those tests drive has its own watchdog (HP_LOOP_STALL_MS).
+_OUT_OF_PROCESS_MODULES = ("test_e2e.py",)
+_in_out_of_process_item = False
 
 _violations: list[str] = []
 _violations_lock = threading.Lock()
@@ -191,7 +186,7 @@ def _timed_run(self: asyncio.Handle) -> None:
             elapsed > (BUDGET_S if sample else UNSAMPLED_BUDGET_S)
             and not (sample and _test_owned(sample[1]))
             and not threading.current_thread().name.startswith(_CONTAINMENT_THREAD_PREFIXES)
-            and getattr(self, "_loop", None) not in _DRIVER_LOOPS
+            and not _in_out_of_process_item
         ):
             _record(
                 f"event loop blocked {elapsed * 1000:.0f} ms (budget {BUDGET_S * 1000:.0f} ms) "
@@ -234,58 +229,11 @@ def _on_loop(what: str, stack: traceback.StackSummary) -> None:
     _record(f"blocking call on the event loop: {what}\n" + "".join(stack.format()))
 
 
-def _tag_playwright_sync_loops() -> None:
-    """Record the loop of every SYNC-mode Playwright connection in _DRIVER_LOOPS.
-
-    ``playwright._impl._connection.Connection`` is the one place both APIs build
-    a driver connection, and its ``dispatcher_fiber`` is what tells them apart:
-    the sync API passes the greenlet that pumps its private loop, the async API
-    passes None and runs on the caller's loop - a loop the detector must keep
-    timing. The parameters are read by NAME from the real signature, so a
-    Playwright that renames them fails here, loudly, instead of silently
-    exempting nothing (tests/test_loop_block_detector_driver.py also proves the
-    tagging against the installed Playwright).
-    """
-    global _original_connection_init
-    try:
-        from playwright._impl import _connection
-    except ImportError:  # no Playwright installed: no driver loop to exempt
-        return
-    original = _connection.Connection.__init__
-    signature = inspect.signature(original)
-    missing = {"dispatcher_fiber", "loop"} - set(signature.parameters)
-    if missing:
-        raise RuntimeError(
-            f"playwright Connection.__init__ has no {sorted(missing)} parameter; "
-            "tests/loop_block_detector.py cannot tell Playwright's sync driver loop apart"
-        )
-
-    def tagging_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        original(self, *args, **kwargs)
-        bound = signature.bind(self, *args, **kwargs).arguments
-        if bound["dispatcher_fiber"] is not None:
-            _DRIVER_LOOPS.add(bound["loop"])
-
-    _original_connection_init = original
-    _connection.Connection.__init__ = tagging_init  # type: ignore[method-assign]
-
-
-def _untag_playwright_sync_loops() -> None:
-    global _original_connection_init
-    if _original_connection_init is None:
-        return
-    from playwright._impl import _connection
-
-    _connection.Connection.__init__ = _original_connection_init  # type: ignore[method-assign]
-    _original_connection_init = None
-
-
 def install() -> None:
     global _original_run
     if _original_run is not None:
         return
     global _sampler
-    _tag_playwright_sync_loops()
     _original_run = asyncio.events.Handle._run
     asyncio.events.Handle._run = _timed_run  # type: ignore[method-assign]
     gc.callbacks.append(_gc_callback)
@@ -301,10 +249,20 @@ def uninstall() -> None:
         return
     asyncio.events.Handle._run = _original_run  # type: ignore[method-assign]
     _original_run = None
-    _untag_playwright_sync_loops()
     if _gc_callback in gc.callbacks:
         gc.callbacks.remove(_gc_callback)
     blocking.set_on_loop_reporter(None)
+
+
+def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    global _in_out_of_process_item
+    module = os.path.basename(nodeid.split("::", 1)[0])
+    _in_out_of_process_item = module in _OUT_OF_PROCESS_MODULES
+
+
+def pytest_runtest_logfinish(nodeid: str, location: tuple[str, int | None, str]) -> None:
+    global _in_out_of_process_item
+    _in_out_of_process_item = False
 
 
 @pytest.hookimpl(hookwrapper=True)
