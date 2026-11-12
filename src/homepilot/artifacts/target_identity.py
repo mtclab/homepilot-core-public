@@ -208,13 +208,78 @@ def _ctime(config: dict[str, Any]) -> int | None:
     return None
 
 
-async def read_live(proxmox: Any, vmids: list[int]) -> dict[int, dict[str, Any] | None]:
-    """Who is at each VMID now, cluster-wide; None for a free number.
+_GUEST_TYPES = ("qemu", "lxc")
 
-    One ``/cluster/resources`` read names every guest on every node (a VMID is
-    cluster-unique, and the machine may have moved node), then each VM's config
-    with ``current=1`` for its creation stamp. Raises ``TargetUnreadableError``
-    when Proxmox does not answer: a failed read is never "nobody is there".
+
+def _config_absent(exc: Exception) -> bool:
+    """Did PVE say there is no such guest config, rather than fail to answer?"""
+    from homepilot.adapters.proxmox import ProxmoxError
+
+    return (
+        isinstance(exc, ProxmoxError)
+        and exc.status_code in (400, 404, 500)
+        and "does not exist" in str(exc.body).lower()
+    )
+
+
+async def _config_at(proxmox: Any, node: str, guest_type: str, vmid: int) -> dict[str, Any] | None:
+    """The guest's config as it is NOW at (node, type), or None when PVE says
+    there is none there. Any other failure is unreadable, never "absent"."""
+    try:
+        return dict(await proxmox.get_vm_config(node, vmid, guest_type, current=True))
+    except Exception as exc:  # a read that failed says nothing about who is there
+        if _config_absent(exc):
+            return None
+        raise TargetUnreadableError(
+            f"could not read the config of VMID {vmid} on {node} ({exc})"
+        ) from exc
+
+
+async def _vmid_is_free(proxmox: Any, vmid: int) -> bool:
+    """PVE's own answer, from its live VMID list: ``/cluster/nextid?vmid=N``
+    answers N when N is free and refuses ("already exists") when it is taken."""
+    try:
+        await proxmox.read("/cluster/nextid", query={"vmid": vmid})
+        return True
+    except Exception as exc:  # only "already exists" means taken
+        if "already exists" in str(getattr(exc, "body", exc)).lower():
+            return False
+        raise TargetUnreadableError(f"could not ask whether VMID {vmid} is free ({exc})") from exc
+
+
+async def _node_names(proxmox: Any) -> list[str]:
+    try:
+        resp = await proxmox.read("/nodes")
+    except Exception as exc:  # cannot search the cluster: who is there is not known
+        raise TargetUnreadableError(f"could not list the cluster's nodes ({exc})") from exc
+    rows = resp.get("data", resp) if isinstance(resp, dict) else resp
+    return [str(r.get("node")) for r in rows or [] if isinstance(r, dict) and r.get("node")]
+
+
+async def read_live(
+    proxmox: Any,
+    vmids: list[int],
+    hints: dict[int, tuple[str | None, str | None]] | None = None,
+) -> dict[int, dict[str, Any] | None]:
+    """Who is at each VMID now, cluster-wide; None for a free number (#813).
+
+    Identity comes from the guest's CONFIG, read with ``current=1`` - never
+    from ``/cluster/resources``, whose names, types and members are refreshed
+    by pvestatd every few seconds: right after a rename, or a destroy and
+    re-create at the same number, it still describes the previous machine
+    (seen on dev 3.11.0: an approval written for a renamed container ran). The
+    list only LOCATES a guest (node, type) and supplies the running state the
+    confirm dialog shows. Every disagreement resolves towards refusing:
+
+    * listed, but no config there -> asked again: free (PVE's live VMID list
+      says so) is "gone"; taken is searched for on every node and type;
+    * not listed -> free only when PVE's VMID list says free (a guest created
+      a moment ago may not be listed yet); taken is searched for as above;
+    * a VMID taken but whose config cannot be found, or any read that fails,
+      raises ``TargetUnreadableError`` - a failed read is never "nobody is there".
+
+    One config read per guest in the usual case. ``hints`` maps a VMID to the
+    (node, type) it was recorded at, tried before a cluster-wide search.
     """
     if not vmids:
         return {}
@@ -229,33 +294,60 @@ async def read_live(proxmox: Any, vmids: list[int]) -> dict[int, dict[str, Any] 
     for row in rows:
         if isinstance(row, dict) and _vmid(row.get("vmid")) is not None:
             by_vmid[int(row["vmid"])] = row
+    nodes: list[str] | None = None
     out: dict[int, dict[str, Any] | None] = {}
     for vmid in vmids:
         row = by_vmid.get(vmid)
-        if row is None:
-            out[vmid] = None
-            continue
-        guest_type = str(row.get("type") or "")
+        tried: set[tuple[str, str]] = set()
+        found: tuple[str, str, dict[str, Any]] | None = None
+        first = [(str(row.get("node")), str(row.get("type")))] if row else []
+        hint = (hints or {}).get(vmid)
+        if hint and hint[0] and hint[1]:
+            first.append((str(hint[0]), str(hint[1])))
+        for node, guest_type in first:
+            if (node, guest_type) in tried or guest_type not in _GUEST_TYPES:
+                continue
+            tried.add((node, guest_type))
+            config = await _config_at(proxmox, node, guest_type, vmid)
+            if config is not None:
+                found = (node, guest_type, config)
+                break
+        if found is None:
+            if await _vmid_is_free(proxmox, vmid):
+                out[vmid] = None
+                continue
+            if nodes is None:
+                nodes = await _node_names(proxmox)
+            for node in nodes:
+                for guest_type in _GUEST_TYPES:
+                    if (node, guest_type) in tried:
+                        continue
+                    config = await _config_at(proxmox, node, guest_type, vmid)
+                    if config is not None:
+                        found = (node, guest_type, config)
+                        break
+                if found:
+                    break
+            if found is None:
+                raise TargetUnreadableError(
+                    f"VMID {vmid} is taken, but its config was found on no node"
+                )
+        node, guest_type, config = found
+        listed = row if row and str(row.get("node")) == node else {}
         live: dict[str, Any] = {
             "vmid": vmid,
-            "node": row.get("node"),
+            "node": node,
             "type": guest_type,
-            "name": row.get("name"),
-            "status": row.get("status"),
-            "template": bool(row.get("template")),
-            "cpus": row.get("maxcpu"),
-            "maxmem": row.get("maxmem"),
-            "maxdisk": row.get("maxdisk"),
+            "name": config.get("hostname" if guest_type == "lxc" else "name"),
+            # The running state is not identity: the list's view of it serves
+            # the confirm dialog, and is absent while the list lags.
+            "status": listed.get("status"),
+            "template": bool(config.get("template")),
+            "cpus": listed.get("maxcpu"),
+            "maxmem": listed.get("maxmem"),
+            "maxdisk": listed.get("maxdisk"),
         }
         if guest_type == "qemu":
-            try:
-                config = await proxmox.get_vm_config(
-                    str(row.get("node")), vmid, "qemu", current=True
-                )
-            except Exception as exc:  # the stamp is part of the identity
-                raise TargetUnreadableError(
-                    f"could not read the config of VMID {vmid} on {row.get('node')} ({exc})"
-                ) from exc
             live["ctime"] = _ctime(config)
         out[vmid] = live
     return out
@@ -280,7 +372,9 @@ def _recorded_entry(ref: GuestRef, live: dict[str, Any] | None) -> dict[str, Any
 
 async def read_identity(proxmox: Any, refs: list[GuestRef]) -> dict[str, Any]:
     """What to record on an artifact: who each guest it acts on is, right now."""
-    live = await read_live(proxmox, [r.vmid for r in refs])
+    live = await read_live(
+        proxmox, [r.vmid for r in refs], {r.vmid: (r.node, r.guest_type) for r in refs}
+    )
     return {
         "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "guests": {str(r.vmid): _recorded_entry(r, live.get(r.vmid)) for r in refs},
@@ -371,7 +465,14 @@ async def check(proxmox: Any, fm: dict[str, Any], body: str) -> Verdict:
             + ", ".join(f"VMID {r.vmid}" for r in refs),
         )
     try:
-        live = await read_live(proxmox, [r.vmid for r in refs])
+        hints: dict[int, tuple[str | None, str | None]] = {}
+        for r in refs:
+            rec = recorded_all.get(str(r.vmid))
+            if isinstance(rec, dict) and rec.get("node") and rec.get("type"):
+                hints[r.vmid] = (str(rec["node"]), str(rec["type"]))
+            else:
+                hints[r.vmid] = (r.node, r.guest_type)
+        live = await read_live(proxmox, [r.vmid for r in refs], hints)
     except TargetUnreadableError as exc:
         return Verdict(ok=False, code=CODE_UNREADABLE, message=f"{exc}")
     guests: list[dict[str, Any]] = []

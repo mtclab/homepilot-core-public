@@ -98,6 +98,9 @@ class FakePve(ProxmoxClient):
             if self.clock.now < self.tasks[upid]:
                 return {"data": {"status": "running", "upid": upid}}
             return {"data": {"status": "stopped", "exitstatus": self.exitstatus, "upid": upid}}
+        if method == "GET" and path.endswith("/config"):
+            # The guest's own config names it (#813: identity is read from here).
+            return {"data": {"name": f"guest-{path.split('/')[4]}"}}
         if method == "GET" and path == "/cluster/resources":
             # Who is at each VMID (#813): the three guests being backed up.
             return {

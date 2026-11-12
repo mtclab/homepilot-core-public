@@ -101,7 +101,10 @@ class Cluster(FakeCluster):
             return {"data": self._task(parts[1], "OK")}
         if method == "PUT" and len(parts) == 5 and parts[4] == "config":
             self.posts.append((p, body))
-            self.guests[int(parts[3])]["config"].update(dict(body or {}))
+            g = self.guests[int(parts[3])]
+            g["config"].update(dict(body or {}))
+            # A rename is a config write: the config, and the guest, carry it now.
+            g["name"] = g["config"].get("hostname" if g["type"] == "lxc" else "name", g["name"])
             return {"data": None}
         return await super().call(method, path, body, query)
 
@@ -931,3 +934,109 @@ class TestAnAgentOnlyChangeWithNoProxmox:
         fm = _spec("Destroy the probe", DESTROY)
         verdict = await check(None, fm, fm["body"])
         assert verdict.ok is False and verdict.code == "unreadable"
+
+
+# ── /cluster/resources lags; the identity is read from the config (#813) ─────
+
+
+def _ct_spec(intent: str, body: dict[str, Any]) -> dict[str, Any]:
+    keys = "".join(f"      {k}: {v}\n" for k, v in body.items())
+    steps = (
+        "  - id: config\n    method: PUT\n"
+        "    path: /nodes/{{ target.node }}/lxc/{{ target.vmid }}/config\n"
+        f"    body:\n{keys}"
+    )
+    spec = _spec(intent, steps, vmid=202, host="ct-db")
+    spec["target"]["kind"] = "lxc"
+    return spec
+
+
+class TestALaggingGuestListIsNotBelieved:
+    """PVE's ``/cluster/resources`` is refreshed every few seconds; right after
+    a rename or a re-create it still describes the previous machine. Seen on
+    the dev walk of 3.11.0: an approval written for a container renamed a
+    moment earlier ran, and re-recorded the OLD name."""
+
+    async def _ct(self, world) -> None:
+        world["pve"].add(202, "ct-db", "running", {}, guest_type="lxc")
+
+    async def test_a_rename_then_an_older_approval_is_refused_naming_the_new_name(self, world):
+        pve = world["pve"]
+        await self._ct(world)
+        older = await _approved(world, _ct_spec("Describe ct-db", {"description": "db"}))
+        rename = await _approved(world, _ct_spec("Rename ct-db", {"hostname": "ct-db2"}))
+        pve.freeze_resources()  # the list still says ct-db for a while
+
+        resp = await world["client"].post(f"/artifacts/{rename}/apply", json={})
+        task = await _settled_task(world, rename, resp.json().get("task_id"))
+        assert task["status"] == "succeeded", task
+        assert pve.guests[202]["config"]["hostname"] == "ct-db2"
+        sent = list(pve.writes)
+
+        resp = await world["client"].post(f"/artifacts/{older}/apply", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert "'ct-db2'" in resp.json()["detail"], resp.json()["detail"]
+        assert pve.writes == sent, "the older approval ran against the renamed machine"
+
+    async def test_the_run_records_the_name_it_left_not_the_listed_one(self, world):
+        pve = world["pve"]
+        await self._ct(world)
+        rename = await _approved(world, _ct_spec("Rename ct-db", {"hostname": "ct-db2"}))
+        pve.freeze_resources()
+
+        resp = await world["client"].post(f"/artifacts/{rename}/apply", json={})
+        assert (await _settled_task(world, rename, resp.json().get("task_id")))[
+            "status"
+        ] == "succeeded"
+
+        assert _fm(world, rename)["target_identity"]["guests"]["202"]["name"] == "ct-db2"
+
+    async def test_a_container_destroyed_and_recreated_at_the_vmid_is_refused(self, world):
+        pve = world["pve"]
+        await self._ct(world)
+        aid = await _approved(world, _ct_spec("Describe ct-db", {"description": "db"}))
+        pve.freeze_resources()
+        pve.guests.pop(202)
+        pve.add(202, "alice-ct", "running", {}, guest_type="lxc")
+
+        resp = await world["client"].post(f"/artifacts/{aid}/apply", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert "'alice-ct'" in resp.json()["detail"]
+        assert pve.writes == []
+
+    async def test_a_vmid_just_taken_but_not_listed_yet_is_not_free(self, world):
+        pve = world["pve"]
+        aid = await _approved(world, _spec("Make a guest", CREATE_300, vmid=300, host=None))
+        pve.freeze_resources()  # 300 is free in the list...
+        pve.add(300, "alice-db", "running", _meta(FRIEND_CTIME))  # ...and taken in fact
+
+        resp = await world["client"].post(f"/artifacts/{aid}/apply", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert "taken by 'alice-db'" in resp.json()["detail"]
+        assert pve.writes == []
+        assert pve.guests[300]["name"] == "alice-db"
+
+    async def test_one_config_read_per_guest_in_the_usual_case(self, world):
+        from homepilot.artifacts.target_identity import read_live
+
+        pve = world["pve"]
+        await self._ct(world)
+        reads: list[str] = []
+        real = pve.call
+
+        async def counted(method, path, body=None, query=None):
+            if method == "GET":
+                reads.append(path)
+            return await real(method, path, body, query)
+
+        pve.call = counted  # type: ignore[method-assign]
+        live = await read_live(pve, [150, 202])
+        assert live[150]["name"] == "probe-1" and live[202]["name"] == "ct-db"
+        assert sorted(reads) == [
+            "/cluster/resources",
+            f"/nodes/{NODE}/lxc/202/config",
+            f"/nodes/{NODE}/qemu/150/config",
+        ]

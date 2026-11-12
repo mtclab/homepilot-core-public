@@ -109,6 +109,10 @@ class FakeCluster(ProxmoxClient):
         self.tasks: dict[str, dict[str, Any]] = {}
         self.fail_status = False
         self._n = 0
+        # When set, /cluster/resources serves this instead of the live guests:
+        # PVE's list is refreshed by pvestatd every few seconds, so right after
+        # a rename or a re-create it still describes the previous machine (#813).
+        self.resources_snapshot: list[dict[str, Any]] | None = None
 
     def add(
         self,
@@ -137,6 +141,23 @@ class FakeCluster(ProxmoxClient):
             "comeback_reads": 0,
             **behaviour,
         }
+
+    def _resources(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "vmid": vmid,
+                "node": g["node"],
+                "type": g["type"],
+                "name": g["name"],
+                "status": g["status"],
+                "template": 0,
+            }
+            for vmid, g in sorted(self.guests.items())
+        ]
+
+    def freeze_resources(self) -> None:
+        """From now on /cluster/resources lags: it shows the cluster as it is NOW."""
+        self.resources_snapshot = self._resources()
 
     @property
     def power_posts(self) -> list[str]:
@@ -217,17 +238,15 @@ class FakeCluster(ProxmoxClient):
                 {"iface": LAN, "type": "bridge", "address": "192.0.2.2", "cidr": "192.0.2.2/24"}
             ]
         if path == "/cluster/resources":
-            return [
-                {
-                    "vmid": vmid,
-                    "node": g["node"],
-                    "type": g["type"],
-                    "name": g["name"],
-                    "status": g["status"],
-                    "template": 0,
-                }
-                for vmid, g in sorted(self.guests.items())
-            ]
+            if self.resources_snapshot is not None:
+                return [dict(r) for r in self.resources_snapshot]
+            return self._resources()
+        if path == "/cluster/nextid":
+            # PVE answers from its live VMID list, never the lagging one.
+            wanted = int(query.get("vmid", 0))
+            if wanted in self.guests:
+                raise ProxmoxError("GET", path, 500, f"VM {wanted} already exists")
+            return wanted
         parts = path.strip("/").split("/")
         if len(parts) == 5 and parts[2] == "tasks" and parts[4] == "status":
             return dict(self.tasks[unquote(parts[3])])
@@ -238,7 +257,17 @@ class FakeCluster(ProxmoxClient):
                 if g["type"] == parts[2] and g["node"] == parts[1]
             ]
         if len(parts) >= 5 and parts[2] in ("qemu", "lxc"):
-            g = self.guests[int(parts[3])]
+            g = self.guests.get(int(parts[3]))
+            if g is None or g["node"] != parts[1] or g["type"] != parts[2]:
+                # What PVE answers for a guest that is not at (node, type).
+                folder = "lxc" if parts[2] == "lxc" else "qemu-server"
+                raise ProxmoxError(
+                    "GET",
+                    path,
+                    500,
+                    f"Configuration file 'nodes/{parts[1]}/{folder}/{parts[3]}.conf' "
+                    "does not exist",
+                )
             tail = "/".join(parts[4:])
             if tail == "config":
                 # PVE's trap: without current=1 the answer has pending applied.
