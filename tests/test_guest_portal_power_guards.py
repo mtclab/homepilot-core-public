@@ -28,6 +28,7 @@ fails - the clash, disk and protected cases with the action SENT.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -89,9 +90,24 @@ async def portal(tmp_path: Path):
         await db.close()
 
 
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def _leaks_nothing(text: str) -> None:
+    # The guest's own host id is a random UUID, and three hex digits of one can
+    # spell the holder's VMID by chance (it did on the 3.11.0 mirror run:
+    # "...bfc6f101e8f2"). Ids of the guest's own machine are not a leak; what is
+    # left must name nothing of the other machine.
+    told = _UUID.sub("<id>", text)
     for secret in (HOLDER, HOLDER_VMID, NODE, DISK):
-        assert secret not in text, f"the portal told a guest {secret!r}: {text}"
+        assert secret not in told, f"the portal told a guest {secret!r}: {text}"
+
+
+def test_the_leak_check_ignores_the_guests_own_id_and_still_bites() -> None:
+    own_id = f"eac72951-538c-4b27-b9df-bfc6f{HOLDER_VMID}e8f2"
+    _leaks_nothing(f'{{"id":"{own_id}","message":"your machine is running"}}')
+    with pytest.raises(AssertionError):
+        _leaks_nothing(f'{{"id":"{own_id}","message":"held by VMID {HOLDER_VMID}"}}')
 
 
 async def _refusals(repo: Repository) -> list[dict[str, Any]]:
