@@ -501,6 +501,9 @@ VALID_TRANSITIONS: dict[ArtifactStatus, set[ArtifactStatus]] = {
         ArtifactStatus.PROPOSED,
     },
     ArtifactStatus.APPROVED: {
+        # Back to review, running nothing: an edit, or an approval that is too
+        # old or whose machine changed (#813).
+        ArtifactStatus.PROPOSED,
         ArtifactStatus.APPLIED,
         ArtifactStatus.FAILED,
         ArtifactStatus.REVOKED,

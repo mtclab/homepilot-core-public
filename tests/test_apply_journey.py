@@ -32,6 +32,10 @@ from homepilot.reconciler.apply import ApplyReconciler
 from homepilot.tasks.repository import TaskRepository
 from homepilot.tasks.runner import TaskRunner
 
+# Proxmox is an AsyncMock here: it cannot say who is at a VMID, so the run
+# guard (#813) is off for this module; tests/test_target_identity.py proves it.
+pytestmark = pytest.mark.usefixtures("no_target_guard")
+
 
 def _spec(artifact_id: str = "2026-08-20-journey-apply-a1b2c3") -> dict:
     return {

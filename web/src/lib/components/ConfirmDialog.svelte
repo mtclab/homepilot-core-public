@@ -26,6 +26,12 @@
 	export let danger = true;
 	/** The action is running: both buttons wait. */
 	export let busy = false;
+	/**
+	 * Why the action is not offered at all (#813: the machine at the VMID is not
+	 * the one the change was written for). Said instead of the typed field, and
+	 * there is no confirm button - only Close.
+	 */
+	export let blocked: string | null = null;
 
 	const dispatch = createEventDispatcher<{ confirm: { typed: string }; cancel: void }>();
 
@@ -67,7 +73,7 @@
 	}
 
 	function submit() {
-		if (!nameOk || busy) return;
+		if (!nameOk || busy || blocked) return;
 		dispatch('confirm', { typed: typed.trim() });
 	}
 </script>
@@ -89,7 +95,9 @@
 				<slot />
 			</div>
 		{/if}
-		{#if typedTier}
+		{#if blocked}
+			<p class="text-sm text-danger" role="alert" data-confirm-blocked>{blocked}</p>
+		{:else if typedTier}
 			<label class="field-label block">
 				Type <span class="font-mono text-ink">{confirmName}</span> to continue:
 				<input
@@ -104,14 +112,16 @@
 		{/if}
 		<div class="flex justify-end gap-2">
 			<button type="button" class="btn btn-ghost text-xs" disabled={busy} on:click={cancel}
-				>Cancel</button
+				>{blocked ? 'Close' : 'Cancel'}</button
 			>
-			<button
-				type="submit"
-				bind:this={confirmButton}
-				class="btn {danger ? 'btn-danger' : 'btn-primary'} text-xs"
-				disabled={!nameOk || busy}>{busy ? 'Working...' : confirmLabel}</button
-			>
+			{#if !blocked}
+				<button
+					type="submit"
+					bind:this={confirmButton}
+					class="btn {danger ? 'btn-danger' : 'btn-primary'} text-xs"
+					disabled={!nameOk || busy}>{busy ? 'Working...' : confirmLabel}</button
+				>
+			{/if}
 		</div>
 	</form>
 </dialog>

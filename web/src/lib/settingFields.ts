@@ -30,6 +30,12 @@ export const EXTRA_GROUPS: Array<{ id: string; title: string; note: string; keys
 		keys: ['retention_days', 'metrics_retention_days'],
 	},
 	{
+		id: 'changes',
+		title: 'Changes',
+		note: 'How long an approved change may wait before it runs. An older approval goes back to review with the reason, because the cluster it was reviewed against may have changed - a VMID may even belong to a different machine by now.',
+		keys: ['approval_max_age_days'],
+	},
+	{
 		id: 'provisioning',
 		title: 'Provisioning defaults',
 		note: 'What guest provisioning uses when a request does not say it itself, so an invite carries a person and a size rather than the cluster\u2019s topology. Each value is checked against the live cluster before it is saved; Test asks without saving. A bridge is per-node, so set the node first - and setting a bridge is what makes provisioning write net0 at all. Address mode \u201cstatic\u201d has HomePilot allocate the guest\u2019s address from the guest subnet itself, which is what an install whose node runs no DHCP server needs.',
@@ -56,6 +62,7 @@ const FIELD_LABELS: Record<string, string> = {
 	events_webhook_url: 'Webhook URL',
 	retention_days: 'Operational history (days)',
 	metrics_retention_days: 'Metric samples (days)',
+	approval_max_age_days: 'Approvals expire after (days, 0 = never)',
 	update_check_enabled: 'Check for new releases (1 = on)',
 	update_check_interval_seconds: 'Check interval (seconds, at least 3600)',
 	provision_default_node: 'Node',

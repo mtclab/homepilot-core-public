@@ -78,18 +78,18 @@ def target_label(target: dict[str, Any] | None) -> str:
     return kind or "no target"
 
 
-def confirm_name(target: dict[str, Any] | None) -> str:
-    """What the operator types back to confirm a destructive change (UI_PLAN 3.10).
+def confirm_name(target: dict[str, Any] | None) -> str | None:
+    """The name the artifact gives its target, or None (UI_PLAN 3.10, #813).
 
-    The guest's name when the artifact names one, else its VMID: the dialog says
-    which it asks for."""
+    Never the VMID: a VMID is exactly what a different machine at the same
+    number shares, so typing it back confirms nothing. The confirm dialog asks
+    for the guest's name AS READ LIVE (``GET /artifacts/{id}/target``); this
+    is only the name the change was written with."""
     t = target or {}
     for key in ("host", "name"):
         if t.get(key):
             return str(t[key])
-    if t.get("vmid") not in (None, ""):
-        return str(t["vmid"])
-    return str(t.get("node") or "")
+    return None
 
 
 def _proxmox_steps(body: str) -> list[dict[str, Any]]:
@@ -197,6 +197,8 @@ def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
     label = target_label(target)
     steps: list[str] = []
     danger: str | None = None
+    # The guest the danger falls on: whose live name the confirm asks for.
+    danger_vmid: Any = target.get("vmid")
 
     if kind == ArtifactKind.PROXMOX_API_SEQUENCE.value:
         context = interpolation_context(target, fm)
@@ -205,6 +207,9 @@ def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
             steps.append(sentence)
             if step_danger == "destroy" or (step_danger and danger is None):
                 danger = step_danger
+                g = _GUEST_PATH.match(_render(step.get("path", ""), context).split("?", 1)[0])
+                if g:
+                    danger_vmid = g["vmid"]
     elif kind == ArtifactKind.GUEST_POWER.value:
         try:
             action = parse_guest_power_spec(body).action
@@ -237,6 +242,7 @@ def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
         "steps": steps,
         "danger": danger,
         "confirm_name": confirm_name(target) if danger else None,
+        "danger_vmid": int(danger_vmid) if danger and str(danger_vmid or "").isdigit() else None,
         "two_step": two_step_reason is not None,
         "two_step_reason": two_step_reason,
     }

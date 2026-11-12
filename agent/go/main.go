@@ -44,6 +44,12 @@ type Agent struct {
 	// rejects must not be retried forever.
 	usingFileToken bool
 
+	// enrolFallbackUsed records that this process has already made its ONE
+	// switch away from a credential the hub refused with an enrolment refusal
+	// (#815). It is never reset, so two credentials that are both refused that
+	// way cannot be alternated for ever.
+	enrolFallbackUsed bool
+
 	// Replay-protection state (#362 slice 3). hasPerAgent is durable across the
 	// process (set once a per-agent token is held/adopted); the rest are
 	// per-connection and reset in register(). When replayOn is set, every frame
@@ -235,8 +241,11 @@ func (a *Agent) register() error {
 		return err
 	}
 	if e := str(resp, "error"); e != "" {
-		if isAuthError(e) {
+		switch {
+		case isAuthError(e):
 			a.rotateTokenSource()
+		case isEnrolmentRefusal(e):
+			a.fallBackAfterEnrolmentRefusal()
 		}
 		return fmt.Errorf("registration failed: %s", e)
 	}
@@ -272,6 +281,7 @@ func (a *Agent) register() error {
 		log.Printf("replay protection enabled for this connection")
 	}
 	log.Printf("registered as agent %s", a.agentID)
+	a.restoreAcceptedCredential()
 	a.scrubEnrolmentToken()
 	return nil
 }
@@ -374,14 +384,105 @@ func (a *Agent) rotateTokenSource() {
 		log.Printf("hub rejected the stored per-agent credential; retrying with the configured enrollment token")
 		return
 	}
-	stored := resolveToken(a.cfg.AuthTokenFile, "")
-	if stored == "" || stored == a.cfg.AuthToken {
+	if !a.useStoredCredential() {
 		return // nothing else to try
+	}
+	log.Printf("hub rejected the enrollment token; retrying with the stored per-agent credential")
+}
+
+// storedCredential is the credential this host kept from an earlier enrolment:
+// the token file, or - when an installer moved it aside to enrol with a fresh
+// token (#815) - the one previous copy, agent.token.prev.
+func (a *Agent) storedCredential() string {
+	if t := resolveToken(a.cfg.AuthTokenFile, ""); t != "" {
+		return t
+	}
+	if a.cfg.AuthTokenFile == "" {
+		return ""
+	}
+	return resolveToken(prevTokenFilePath(a.cfg.AuthTokenFile), "")
+}
+
+// useStoredCredential switches the live credential to the stored one, and
+// reports false when there is none or it is the one just refused.
+func (a *Agent) useStoredCredential() bool {
+	stored := a.storedCredential()
+	if stored == "" || stored == a.cfg.AuthToken {
+		return false
 	}
 	a.cfg.AuthToken = stored
 	a.usingFileToken = true
 	a.hasPerAgent = true
-	log.Printf("hub rejected the enrollment token; retrying with the stored per-agent credential")
+	return true
+}
+
+// isEnrolmentRefusal reports whether a hub error reply is an ENROLMENT refusal:
+// the hub recognised the credential as the shared fleet token and still turned
+// it away (no enrolment window is open, or the hostname holds its own
+// credential). The hub keeps the word "auth" out of these on purpose, so they
+// are matched by the prefix the hub gives them (ENROLMENT_WINDOW_CLOSED_ERROR
+// and HOST_HOLDS_CREDENTIAL_ERROR in agent_hub/server.py).
+func isEnrolmentRefusal(e string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(e)), "enrolment refused")
+}
+
+// fallBackAfterEnrolmentRefusal handles the one refusal the auth-error rotation
+// never saw (#815): a host re-installed with a fresh bootstrap token whose
+// persisted credential is an OLD install's shared token. The hub refuses that
+// token for want of an enrolment window, the refusal carries no "auth", and the
+// agent used to present it for ever while the bootstrap token it was given sat
+// unused.
+//
+// The switch is made ONCE per process, in whichever direction applies:
+//   - refused on the stored credential, and the environment carries a
+//     different token: present the environment token next;
+//   - refused on the environment token (say, a shared token re-run over a host
+//     that holds its own credential), and a stored credential exists: present
+//     that next, so a reinstall never locks a healthy host out (#789).
+//
+// After that one switch the agent stays on whatever it then holds; an
+// enrolment refusal never sends it back, so it cannot bounce between two
+// refused credentials. No token is ever logged.
+func (a *Agent) fallBackAfterEnrolmentRefusal() {
+	if a.enrolFallbackUsed {
+		return
+	}
+	if a.usingFileToken {
+		env := a.cfg.EnvAuthToken
+		if env == "" || env == a.cfg.AuthToken {
+			return
+		}
+		a.enrolFallbackUsed = true
+		a.cfg.AuthToken = env
+		a.usingFileToken = false
+		a.hasPerAgent = false
+		log.Printf("hub refused the stored credential for enrolment; " +
+			"retrying once with the configured enrollment token")
+		return
+	}
+	if !a.useStoredCredential() {
+		return
+	}
+	a.enrolFallbackUsed = true
+	log.Printf("hub refused the configured enrollment token for enrolment; " +
+		"retrying once with the credential kept from the previous install")
+}
+
+// restoreAcceptedCredential puts a stored credential the hub just ACCEPTED back
+// into the token file when the file no longer holds it - the case where an
+// installer moved it aside to agent.token.prev and the fresh token it brought
+// was refused (#815). Without this the next restart would present the refused
+// token again. Atomic and 0600, like every credential write.
+func (a *Agent) restoreAcceptedCredential() {
+	path := a.cfg.AuthTokenFile
+	if !a.usingFileToken || path == "" || resolveToken(path, "") == a.cfg.AuthToken {
+		return
+	}
+	if err := writeAgentTokenFile(path, a.cfg.AuthToken); err != nil {
+		log.Printf("warning: could not restore the accepted credential to %s: %v", path, err)
+		return
+	}
+	log.Printf("restored the accepted credential from the previous install to %s", path)
 }
 
 // featuresContain reports whether a register_ack advertises the named feature.

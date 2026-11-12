@@ -89,6 +89,8 @@ vi.mock('$lib/api', async () => {
 			powerGuest: vi.fn(),
 			approveAndApplyArtifact: vi.fn(),
 			withdrawArtifact: vi.fn(),
+			getArtifactTarget: vi.fn(),
+			recheckArtifact: vi.fn(),
 			searchKB: vi.fn().mockResolvedValue({ results: [], total: 0 }),
 			listKB: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			// The Agents page: enough of the fleet surface that the route can be
@@ -162,6 +164,7 @@ vi.mock('$lib/api', async () => {
 			getHost: vi.fn(),
 			agentInstallEligibility: vi.fn().mockResolvedValue({ eligible: false, message: 'not in test' }),
 			installAgent: vi.fn(),
+			getAgentUpgrades: vi.fn().mockResolvedValue([]),
 			getTask: vi.fn(),
 			adoptHost: vi.fn(),
 			ignoreHost: vi.fn(),

@@ -38,7 +38,7 @@ func agentStateDir(t *testing.T) string {
 
 func TestWritesToTheAgentsOwnStateAreRefused(t *testing.T) {
 	conf := agentStateDir(t)
-	for _, name := range []string{"agent.transport", "agent.token", "agent.id", "agent.env"} {
+	for _, name := range []string{"agent.transport", "agent.token", "agent.token.prev", "agent.id", "agent.env"} {
 		path := filepath.Join(conf, name)
 		if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
 			t.Fatal(err)

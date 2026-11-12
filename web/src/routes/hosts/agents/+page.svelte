@@ -6,10 +6,12 @@
 	import { canWrite as capCanWrite } from '$lib/capabilities';
 	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
 	import JoinRequests from '$lib/components/JoinRequests.svelte';
+	import AgentUpgrades from '$lib/components/AgentUpgrades.svelte';
 	import Icon from '$lib/components/Icon.svelte';
 
 	let enrollShow: 'bootstrap' | 'hub' | null = null;
 	let joinRequests: JoinRequests | null = null;
+	let agentUpgrades: AgentUpgrades | null = null;
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
 </script>
 
@@ -17,7 +19,7 @@
 	<div class="flex flex-wrap items-center justify-between gap-s-2">
 		<h1 class="page-title">Agents</h1>
 		<div class="flex gap-2">
-			<button class="btn btn-ghost" on:click={() => joinRequests?.load()}>
+			<button class="btn btn-ghost" on:click={() => { joinRequests?.load(); agentUpgrades?.load(); }}>
 				<Icon name="refresh" />Reload
 			</button>
 			{#if canWrite}
@@ -43,6 +45,8 @@
 		{canWrite}
 		on:enrolWithBootstrap={() => (enrollShow = 'bootstrap')}
 	/>
+
+	<AgentUpgrades bind:this={agentUpgrades} {canWrite} />
 
 	<EnrollAgent show={enrollShow} />
 </div>

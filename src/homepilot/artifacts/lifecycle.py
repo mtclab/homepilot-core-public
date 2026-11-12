@@ -89,12 +89,38 @@ class ArtifactLifecycle:
     def _validate_transition(self, current: ArtifactStatus, target: ArtifactStatus) -> None:
         validate_transition(current, target)
 
+    async def _read_identity(self, fm: dict[str, Any], body: str) -> dict[str, Any] | None:
+        """Who the guests this change acts on are, read live now (#813).
+
+        None when the change acts on no guest, or there is no Proxmox to ask.
+        Raises ``TargetUnreadableError`` when Proxmox does not answer.
+        """
+        from .target_identity import guest_refs, read_identity
+
+        refs = guest_refs(fm, body)
+        if not refs or self._proxmox is None:
+            return None
+        return await read_identity(self._proxmox, refs)
+
     async def propose(self, spec: dict[str, Any]) -> str:
+        # Who the change is for, read BEFORE it is written (#813): PVE reuses
+        # VMIDs, so the number alone does not say which machine was meant. A
+        # read that fails does not refuse the proposal - the change simply has
+        # nothing recorded, cannot be run as it stands, and its approval reads
+        # the machine instead (see approve).
+        identity: dict[str, Any] | None = None
+        try:
+            identity = await self._read_identity(spec, str(spec.get("body", "")))
+        except Exception as exc:  # TargetUnreadableError, or a spec too broken to parse
+            logger.warning("Could not record the target identity of %s: %s", spec.get("id"), exc)
+
         def _validate_and_write() -> dict[str, Any]:
             # One serialised step, as it was on the loop: the "id is free" check
             # inside the validation and the write that takes the id cannot be
             # split by another propose of the same id.
             fm, event = validate_propose_spec(spec, self.store)
+            if identity is not None and fm.get("status") == ArtifactStatus.PROPOSED.value:
+                fm["target_identity"] = identity
             body: str = spec.get("body", "")
             fm_yml: str = self._file_store.serialize_frontmatter(fm)
             self._file_store.write(spec["id"], fm_yml, body, event)
@@ -281,7 +307,10 @@ class ArtifactLifecycle:
                 f"not {type(principal).__name__}"
             )
         authority = await self._approval_authority(id, principal, approval_code)
-        await self._ensure_transitions().approve(id, principal.name, reason, authority=authority)
+        identity = await self._confirm_identity_for_approval(id)
+        await self._ensure_transitions().approve(
+            id, principal.name, reason, authority=authority, identity=identity
+        )
         # The artifact has left PROPOSED, so its approval code is spent: clear it
         # so a replay of the same code cannot re-approve anything (#385 gate 2).
         if self.repo is not None:
@@ -308,6 +337,100 @@ class ArtifactLifecycle:
                 id,
                 exc_info=True,
             )
+
+    async def _confirm_identity_for_approval(self, id: str) -> dict[str, Any] | None:
+        """Refuse to approve a change for a machine that is no longer there (#813),
+        and record the machine for one that has nothing recorded.
+
+        * Recorded and readable: the live machine must still be the recorded one,
+          or the approval is refused with what is there now (approving it would
+          only send it back again at apply).
+        * Nothing recorded for a guest it acts on (proposed before 3.11, or the
+          read at propose failed): THIS approval is the confirmation against the
+          live machine, so the machine is read and recorded with it - unless the
+          artifact names a host and a different name is at the VMID now. A read
+          that fails refuses the approval: nothing would say which machine was
+          approved.
+
+        Returns the identity to record, or None to leave the artifact's as it is.
+        """
+        from .target_identity import (
+            CODE_UNREADABLE,
+            TargetUnreadableError,
+            check,
+            guest_refs,
+            read_identity,
+        )
+
+        if self._proxmox is None:
+            return None
+        fm, body = await run_blocking("io", self.store.read, id)
+        refs = guest_refs(fm, body)
+        if not refs:
+            return None
+        recorded = (fm.get("target_identity") or {}).get("guests") or {}
+        complete = all(str(r.vmid) in recorded for r in refs)
+        verdict = await check(self._proxmox, fm, body)
+        if verdict.ok:
+            return None
+        if verdict.code == CODE_UNREADABLE:
+            if complete:
+                return None  # all recorded: the apply asks Proxmox before it sends anything
+            raise LifecycleError(
+                f"cannot approve {id}: {verdict.message}, so which machine this approval "
+                "is for cannot be recorded. Nothing was approved; try again when Proxmox answers."
+            )
+        problems = [g for g in verdict.guests if g.get("problem")]
+        changed = [g for g in problems if g.get("recorded") is not None]
+        if changed:
+            raise LifecycleError(
+                f"cannot approve {id}: {changed[0]['problem']}. Nothing was approved; reject it "
+                "and propose the change again for the machine that is there now."
+            )
+        named = str((fm.get("target") or {}).get("host") or "").strip()
+        target_vmid = (fm.get("target") or {}).get("vmid")
+        if named and target_vmid is not None:
+            from homepilot.inventory.service import same_guest
+
+            for g in problems:
+                live = g.get("live")
+                if str(g.get("vmid")) != str(target_vmid) or g.get("creates"):
+                    continue
+                if live is None or not same_guest({"hostname": named}, live.get("name")):
+                    now = repr(live.get("name")) if live else "free"
+                    raise LifecycleError(
+                        f"cannot approve {id}: it names {named!r}, but VMID {target_vmid} "
+                        f"is now {now}. Nothing was approved; reject it."
+                    )
+        try:
+            fresh = await read_identity(self._proxmox, refs)
+        except TargetUnreadableError as exc:
+            raise LifecycleError(f"cannot approve {id}: {exc}. Nothing was approved.") from exc
+        # Keep what was recorded; fill only what was missing.
+        merged = dict((fm.get("target_identity") or {}).get("guests") or {})
+        for key, entry in fresh["guests"].items():
+            merged.setdefault(key, entry)
+        return {**fresh, "guests": merged}
+
+    async def return_for_review(self, id: str, code: str, reason: str) -> bool:
+        """approved -> proposed with the reason, and a fresh approval code (#813).
+
+        False when the artifact was not approved any more (nothing changed)."""
+        fm = await self._ensure_transitions().return_for_review(id, code, reason)
+        if fm is None:
+            return False
+        if self.repo is not None:
+            # Back in review: a coded approval needs a live code again.
+            try:
+                from .approval_code import generate_code
+
+                await self.repo.rotate_approval_code(id, generate_code())
+            except (sqlite3.OperationalError, sqlite3.IntegrityError):
+                logger.exception("Minting an approval code failed for %s", id)
+        return True
+
+    async def record_target_identity(self, id: str, identity: dict[str, Any]) -> None:
+        await self._ensure_transitions().record_target_identity(id, identity)
 
     async def reject(self, id: str, user: str, reason: str | None = None) -> None:
         await self._ensure_transitions().reject(id, user, reason)

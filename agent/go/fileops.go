@@ -45,6 +45,8 @@ var procEnvironRe = regexp.MustCompile(`^/proc/[^/]+/environ$`)
 var agentSecretBases = map[string]bool{
 	"agent.env":   true,
 	"agent.token": true,
+	// The one previous copy an installer keeps when it re-enrols (#815).
+	"agent.token.prev": true,
 }
 
 // agentConfigDir is where the installer keeps the agent's identity and
@@ -226,7 +228,7 @@ func resolveWritePath(path string) (resolved, resolvedDir string, err error) {
 // agentStateNames are the files the agent keeps in its configuration directory:
 // its identity, its credential, the hub-pushed transport and the installer's
 // environment file.
-var agentStateNames = []string{"agent.id", "agent.token", "agent.transport", "agent.env"}
+var agentStateNames = []string{"agent.id", "agent.token", "agent.token.prev", "agent.transport", "agent.env"}
 
 // agentStateFiles lists where THIS agent keeps its state: the default names in
 // its config directory and beside its token file, plus wherever the env moved

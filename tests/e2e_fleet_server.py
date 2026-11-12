@@ -121,8 +121,41 @@ async def _seeded(app: Any) -> Any:
         # The friend's machine, as provisioning hands it over.
         alice = await repo.get_host_by_hostname("alice-web")
         await repo.update_host(str(alice["id"]), owner="alice")
+        await _seed_reused_vmid(app)
         print("E2E_FLEET_READY", flush=True)
         yield state
+
+
+async def _seed_reused_vmid(app: Any) -> None:
+    """The #813 scene: a destroy approved for a throw-away probe at VMID 150,
+    after which PVE gave 150 to another machine. Written and approved through
+    the real lifecycle while the probe exists (so its identity is recorded),
+    then the number is reused - outside the inventory, as a fresh guest is."""
+    from datetime import UTC, datetime
+
+    from homepilot.auth.principal import Principal
+
+    pve.add(150, "probe-1", "stopped", {"meta": "creation-qemu=9.0.2,ctime=1700000000"})
+    lifecycle = app.state.artifact_lifecycle
+    aid = await lifecycle.propose(
+        {
+            "id": f"{datetime.now(UTC):%Y-%m-%d}-destroy-probe-1-e2e813",
+            "kind": "proxmox-api-sequence",
+            "intent": "Destroy probe-1",
+            "body": (
+                "Destroy the probe.\n\n```yaml proxmox-api-spec\nsteps:\n  - id: destroy\n"
+                "    method: DELETE\n"
+                "    path: /nodes/{{ target.node }}/qemu/{{ target.vmid }}\n```\n"
+            ),
+            "target": {"kind": "vm", "vmid": 150, "node": "pve1", "host": "probe-1"},
+            "idempotence": "declared-natural",
+            "requires_snapshot": False,
+            "produced_by": {"session": "e2e", "agent": "e2e", "user": "e2e"},
+        }
+    )
+    await lifecycle.approve(aid, Principal.operator("owner"))
+    pve.guests.pop(150)
+    pve.add(150, "alice-db", "running", {"meta": "creation-qemu=9.0.2,ctime=1705000000"})
 
 
 main.app.router.lifespan_context = _seeded

@@ -32,7 +32,9 @@ from homepilot.auth.principal import Principal
 from homepilot.executor.orchestrator import ArtifactExecutor
 from homepilot.executor.rollback import derive_rollback, has_rollback_section
 
-pytestmark = pytest.mark.asyncio
+# Proxmox is an AsyncMock here: it cannot say who is at a VMID, so the run
+# guard (#813) is off for this module; tests/test_target_identity.py proves it.
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("no_target_guard")]
 
 SHELL_WITH_ROLLBACK = """\
 ## Plan

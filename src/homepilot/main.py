@@ -318,6 +318,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.agent_registry = None
         app.state.agent_hub_task = None
 
+    # Propose records, and approve confirms, which machine a change's guests are
+    # (#813): the lifecycle reads them from the same client the executor uses.
+    state.artifact_lifecycle._proxmox = state.proxmox
+
     try:
         from .adapters.agent import AgentAdapter
         from .executor import ArtifactExecutor

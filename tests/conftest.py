@@ -414,3 +414,23 @@ def pytest_configure(config: pytest.Config) -> None:
 
     loop_block_detector.install()
     config.pluginmanager.register(loop_block_detector, "hp-loop-block-detector")
+
+
+@pytest.fixture
+def no_target_guard(monkeypatch):
+    """Switch off the run guard (#813) for a module whose Proxmox is an AsyncMock.
+
+    An AsyncMock cannot say who is at a VMID, so the guard rightly refuses every
+    run there - and those modules are about something else (snapshots, the task
+    record, approval authority...). Opt in per module with
+    ``pytestmark = pytest.mark.usefixtures("no_target_guard")``, never autouse.
+    The guard itself is proven in tests/test_target_identity.py, including that
+    EVERY execution path asks it; modules with a fake cluster that answers
+    (FakeCluster, FakePve) keep it on.
+    """
+    from homepilot.executor.orchestrator import ArtifactExecutor
+
+    async def _may_run(self, fm, body, action):
+        return None
+
+    monkeypatch.setattr(ArtifactExecutor, "check_run", _may_run)

@@ -776,7 +776,21 @@
 		// Approved and not yet run (owner feedback 2026-11-08): it is still the
 		// owner's move, so it is said here too - an approved change that left
 		// every list read as a lost one.
-		const ready = summary.changes?.ready ?? 0;
+		// An approval older than approval_max_age_days will not run (#813): the
+		// cluster it was reviewed against may be gone - a VMID may hold a
+		// different machine by now. Said apart from the ready ones, as a warning.
+		const expired = summary.changes?.expired ?? 0;
+		const ready = Math.max(0, (summary.changes?.ready ?? 0) - expired);
+		if (expired > 0) {
+			out.push({
+				key: 'ready:expired',
+				severity: 'warning',
+				label: 'expired',
+				text: `${plural(expired, 'approved change has', 'approved changes have')} an approval too old to run on - review ${expired === 1 ? 'it' : 'them'} again in the Inbox`,
+				href: `${base}/changes/inbox`,
+				meta: '',
+			});
+		}
 		if (ready > 0) {
 			out.push({
 				key: 'ready',

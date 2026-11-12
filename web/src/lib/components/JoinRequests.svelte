@@ -18,6 +18,8 @@
 
 	let state: EnrolmentRequests | null = null;
 	let opening = false;
+	// Host ids with an "Install again" in flight from this panel.
+	let installing: Record<string, boolean> = {};
 
 	export async function load() {
 		try {
@@ -37,6 +39,36 @@
 			notify('Failed to open the enrolment window: ' + String(e), 'err');
 		} finally {
 			opening = false;
+		}
+	}
+
+	// A host knocking with a credential the hub refuses - most often one left by an
+	// earlier install (#815) - is re-enrolled by running the zero-touch install
+	// again: it moves the old credential aside and enrols with a fresh one-time
+	// token. No enrolment window, nothing done by hand on the host.
+	async function installAgain(hostId: string, hostname: string) {
+		installing = { ...installing, [hostId]: true };
+		try {
+			const { task_id } = await api.installAgent(hostId);
+			notify(`Installing the agent on ${hostname} again - progress in Tasks`);
+			for (;;) {
+				const task = await api.getTask(task_id);
+				if (task.status !== 'pending' && task.status !== 'running') {
+					notify(
+						task.status === 'succeeded'
+							? `${hostname} re-enrolled`
+							: `Install on ${hostname} failed: ${task.error ?? ''}`,
+						task.status === 'succeeded' ? 'ok' : 'err'
+					);
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 3000));
+			}
+			await load();
+		} catch (e) {
+			notify(e instanceof Error ? e.message : String(e), 'err');
+		} finally {
+			installing = { ...installing, [hostId]: false };
 		}
 	}
 
@@ -84,6 +116,14 @@
 								refused {a.attempts} time{a.attempts === 1 ? '' : 's'} since {timeAgo(a.first_seen)},
 								last {timeAgo(a.last_seen)}
 							</span>
+							{#if canWrite && a.install_host_id}
+								<button class="btn btn-ghost text-xs" data-testid="install-again"
+									title="Run the agent install again through qemu-guest-agent: the old credential is moved aside and the host enrols with a fresh one-time token. No enrolment window is opened."
+									disabled={installing[a.install_host_id]}
+									on:click={() => a.install_host_id && installAgain(a.install_host_id, a.hostname)}>
+									{installing[a.install_host_id] ? 'Installing…' : 'Install again'}
+								</button>
+							{/if}
 						</li>
 					{/each}
 				</ul>
@@ -112,12 +152,21 @@
 									{a.attempts} attempt{a.attempts === 1 ? '' : 's'}, last {timeAgo(a.last_seen)}</span>
 							</p>
 							<p class="prose-note text-xs">{a.reason}</p>
+							{#if canWrite && a.install_host_id}
+								<button class="btn btn-ghost text-xs" data-testid="install-again"
+									title="Run the agent install again through qemu-guest-agent: the old credential is moved aside and the host enrols with a fresh one-time token. No enrolment window is opened."
+									disabled={installing[a.install_host_id]}
+									on:click={() => a.install_host_id && installAgain(a.install_host_id, a.hostname)}>
+									{installing[a.install_host_id] ? 'Installing…' : 'Install again'}
+								</button>
+							{/if}
 						</li>
 					{/each}
 				</ul>
 				<p class="prose-note text-xs">
 					An open window would not let these in - each line says why. A host you do mean to add
-					joins by re-running the install one-liner on it with a fresh bootstrap token.
+					joins by re-running the install with a fresh bootstrap token: Install again where the
+					line offers it, or the install one-liner on the host.
 				</p>
 			</div>
 		{/if}

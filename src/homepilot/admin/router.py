@@ -554,6 +554,9 @@ async def _do_reload(request: Request) -> dict[str, Any]:
                 # failure on a partly-applied change (#388). Guarded like the two
                 # lookups above it.
                 lifecycle = getattr(request.app.state, "artifact_lifecycle", None)
+                if lifecycle is not None:
+                    # Propose and approve read who a change's guests are (#813).
+                    lifecycle._proxmox = new_proxmox
                 executor_ref = getattr(lifecycle, "_executor_ref", None)
                 if executor_ref is not None:
                     executor_ref.proxmox = new_proxmox

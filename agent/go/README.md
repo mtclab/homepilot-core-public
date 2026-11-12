@@ -25,7 +25,7 @@ go vet ./... && go test ./...
 | `HP_AGENT_HUB_HOST` | `localhost` | Hub host |
 | `HP_AGENT_HUB_PORT` | `8443` | Hub port |
 | `HP_AGENT_AUTH_TOKEN` | — | Shared/bootstrap enrollment token. Once the per-agent credential is persisted to `HP_AGENT_TOKEN_FILE`, the agent removes this line from `HP_AGENT_ENV_FILE` (#683): an enrolled host does not keep a fleet-wide enrolment secret. A host that later loses its credential is re-enrolled by an operator (revoke, then reinstall, or a bootstrap token) |
-| `HP_AGENT_TOKEN_FILE` | — | Where the durable per-agent credential handed back at enrollment is persisted |
+| `HP_AGENT_TOKEN_FILE` | — | Where the durable per-agent credential handed back at enrollment is persisted. Presented in preference to `HP_AGENT_AUTH_TOKEN`. The installer, given a token, moves an existing one aside to `<file>.prev` (one copy kept). A credential the hub refuses for enrolment makes the agent try the other one ONCE - the configured token, or that kept copy (put back into this file when accepted) - never back and forth (#815) |
 | `HP_AGENT_ENV_FILE` | `agent.env` beside `HP_AGENT_TOKEN_FILE` | The installer's environment file the enrolment token is removed from. Nothing is removed when no token file is configured |
 | `HP_AGENT_ID` | persisted id | Explicit agent identity; wins over the id file |
 | `HP_AGENT_ID_FILE` | `agent.id` beside `HP_AGENT_TOKEN_FILE`, else `/etc/homepilot/agent.id` | Where a generated agent id is persisted. The identity MUST be stable: the hub's per-agent credential is bound to it, so a new id per start would orphan the stored token |
