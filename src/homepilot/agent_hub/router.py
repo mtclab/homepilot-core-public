@@ -465,25 +465,30 @@ _enrolment_only = Depends(_enrolment_credential)
 @router.get("/dist", dependencies=[_admin_only])
 async def agent_dist_manifest() -> dict[str, Any]:
     """What agent payload this image can hand to a guest, with digests (#464)."""
+    from ..runtime.blocking import run_blocking
     from .dist import manifest
 
-    return {"artifacts": manifest()}
+    # Hashes every payload file (multi-MB binaries): off the loop.
+    return {"artifacts": await run_blocking("io", manifest)}
 
 
-def _dist_response(path: Path, media_type: str) -> FileResponse:
+async def _dist_response(path: Path, media_type: str) -> FileResponse:
     """Serve a payload file with its digest in a header.
 
     The digest travels WITH the bytes so the installer can verify what it just
     received without a second round trip - and so a proxy that rewrites one
     cannot leave the other looking right.
     """
+    from ..runtime.blocking import run_blocking
     from .dist import sha256
 
+    # Hashing the whole binary is disk + CPU per download: off the loop.
+    digest = await run_blocking("io", sha256, path)
     return FileResponse(
         path,
         media_type=media_type,
         filename=path.name,
-        headers={"x-hp-sha256": sha256(path)},
+        headers={"x-hp-sha256": digest},
     )
 
 
@@ -499,7 +504,7 @@ async def agent_installer() -> FileResponse:
     from .dist import DistUnavailableError, installer
 
     try:
-        return _dist_response(installer(), "text/x-shellscript")
+        return await _dist_response(installer(), "text/x-shellscript")
     except DistUnavailableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -510,7 +515,7 @@ async def agent_binary_download(arch: str) -> FileResponse:
     from .dist import DistUnavailableError, agent_binary
 
     try:
-        return _dist_response(agent_binary(arch), "application/octet-stream")
+        return await _dist_response(agent_binary(arch), "application/octet-stream")
     except DistUnavailableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

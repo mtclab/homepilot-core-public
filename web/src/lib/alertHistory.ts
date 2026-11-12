@@ -80,3 +80,40 @@ const STATE_WORDS: Record<ChannelSummary['state'], string> = {
 	untested: 'never tested',
 	disabled: 'disabled',
 };
+
+/** One delivery row: an alert transition and who it reached. */
+export interface DeliveryRow {
+	id: number;
+	at: string;
+	hostname: string;
+	/** "went dark" / "Disk over 90 % fired" / "went dark for 7 min, resolved". */
+	what: string;
+	/** "sent to phone" / "nobody was notified". */
+	outcome: string;
+	reached: boolean;
+}
+
+/**
+ * The deliveries list (UI plan 3.5): every transition in the window whose
+ * delivery is KNOWN, newest first. A transition still being delivered
+ * (`delivered_to: null`) is not listed as failed - it has not failed yet.
+ */
+export function deliveryRows(items: AlertEvent[], limit = 10): DeliveryRow[] {
+	return items
+		.filter((e) => e.delivered_to !== null)
+		.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+		.slice(0, limit)
+		.map((e) => ({
+			id: e.id,
+			at: e.at,
+			hostname: e.hostname,
+			what:
+				e.event === 'resolved'
+					? `${resolvedText(e)}, resolved`
+					: e.rule_kind === 'nodata'
+						? 'went dark'
+						: `${e.rule_name} fired`,
+			outcome: deliveryText(e) ?? '',
+			reached: (e.delivered_to ?? []).length > 0,
+		}));
+}

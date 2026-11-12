@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -65,9 +65,14 @@ class TestPreviewArtifact:
             "/tmp/fake-artifacts/2025/01/2025-01-01-test-artifact-abc123.md"
         )
 
-        with patch("homepilot.artifacts.router.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(stdout="diff output here")
-            resp = api_client.post("/artifacts/2025-01-01-test-artifact-abc123/preview")
+        # The diff is the store's own git call now, run on the git pool.
+        mock_store.diff_previous.return_value = MagicMock(
+            stdout=b"diff output here", stderr=b"", returncode=0
+        )
+        resp = api_client.post("/artifacts/2025-01-01-test-artifact-abc123/preview")
+        mock_store.diff_previous.assert_called_once_with(
+            "2025/01/2025-01-01-test-artifact-abc123.md"
+        )
 
         assert resp.status_code == 200
         data = resp.json()
@@ -87,9 +92,8 @@ class TestPreviewArtifact:
             "/tmp/fake-artifacts/2025/01/2025-01-01-test-artifact-abc123.md"
         )
 
-        with patch("homepilot.artifacts.router.subprocess.run") as mock_run:
-            mock_run.side_effect = Exception("git not available")
-            resp = api_client.post("/artifacts/2025-01-01-test-artifact-abc123/preview")
+        mock_store.diff_previous.side_effect = Exception("git not available")
+        resp = api_client.post("/artifacts/2025-01-01-test-artifact-abc123/preview")
 
         assert resp.status_code == 200
         assert resp.json()["diff"] == ""

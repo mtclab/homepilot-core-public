@@ -108,7 +108,7 @@
 <div class="min-h-screen flex items-center justify-center bg-canvas">
 	<div class="w-full max-w-sm">
 		<div class="text-center mb-8">
-			<span class="wordmark text-2xl">HomePilot</span>
+			<span class="wordmark text-4xl">Home<em>Pilot</em></span>
 			<p class="prose-note text-sm mt-2">
 				{#if mode === 'claim'}
 					This instance has not been claimed yet

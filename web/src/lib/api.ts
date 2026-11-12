@@ -8,14 +8,22 @@ import { getApiBase } from './apiBase';
 export class ApiError extends Error {
 	status: number;
 	detail: string;
+	/**
+	 * The server's structured `detail`, when it sent one (a power refusal's
+	 * `{code, message, holders}`), so a caller can name the holder in place
+	 * instead of parsing the sentence. `null` for a plain-string detail.
+	 */
+	info: Record<string, unknown> | null = null;
 	constructor(status: number, body: string) {
 		let detail = body;
+		let info: Record<string, unknown> | null = null;
 		try {
 			const parsed = JSON.parse(body);
 			if (parsed && parsed.detail !== undefined && parsed.detail !== null) {
 				// `detail` may be a string OR a structured object (e.g. a revoke
 				// conflict sends `{"reason": ...}`). Never let raw JSON reach a toast.
 				detail = ApiError.detailToString(parsed.detail);
+				if (typeof parsed.detail === 'object') info = parsed.detail as Record<string, unknown>;
 			}
 		} catch {
 			// non-JSON body: keep as-is
@@ -23,6 +31,7 @@ export class ApiError extends Error {
 		super(ApiError.humanize(status, detail));
 		this.status = status;
 		this.detail = detail;
+		this.info = info;
 		this.name = 'ApiError';
 	}
 	// Collapse a server `detail` (string or object) to a single human line.
@@ -133,6 +142,45 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 	return s ? `?${s}` : '';
 }
 
+export type PowerAction = 'start' | 'shutdown' | 'reboot' | 'stop';
+
+export interface PendingChange {
+	key: string;
+	current?: unknown;
+	pending?: unknown;
+	delete?: boolean;
+}
+
+export interface GuestPowerState {
+	host_id: string;
+	hostname: string;
+	vmid: number | null;
+	node: string | null;
+	guest_type: string | null;
+	is_self: boolean;
+	protected: boolean;
+	protected_reason: string | null;
+	status: string;
+	/** Who Proxmox says is at (node, VMID) now, and whether that is this row's guest. */
+	pve_name?: string | null;
+	name_matches?: boolean;
+	pending: PendingChange[];
+	actions: Partial<
+		Record<PowerAction, { available: boolean; reason: string | null; needs_typed_confirmation: boolean }>
+	>;
+	error: string | null;
+}
+
+export interface GuestPowerResult {
+	action: PowerAction;
+	outcome: 'ok' | 'failed' | 'timed_out' | 'unknown';
+	message: string;
+	upid: string | null;
+	status_after: string | null;
+	next_actions: PowerAction[];
+	pending_after: PendingChange[] | null;
+}
+
 export interface Artifact {
 	id: string;
 	status: string;
@@ -144,6 +192,65 @@ export interface Artifact {
 	replay_safe?: boolean;
 	tags?: string[];
 	version?: string;
+	applied_at?: string;
+	failed_at?: string;
+	failure_reason?: string;
+	/** What a failed run DID change before it stopped (#796). */
+	partial_apply?: PartialApply;
+	approved_by?: { user?: string; at?: string };
+	withdrawn_by?: { user?: string; at?: string; reason?: string };
+}
+
+/** A change in plain words, from the server (artifacts/summary.py). */
+export interface ArtifactSummary {
+	headline: string;
+	target: string;
+	steps: string[];
+	/** The worst irreversible thing it does; guarded by a typed confirmation. */
+	danger: 'destroy' | 'stop' | null;
+	/** What the operator types back to confirm a dangerous change. */
+	confirm_name: string | null;
+	/** Composite / replay_safe:false: approved, then applied, as two acts. */
+	two_step: boolean;
+	two_step_reason: string | null;
+}
+
+/** One PVE task warning, explained where the server recognises it. */
+export interface PveWarning {
+	text: string;
+	explanation: string | null;
+	/** true harmless, false act on it, null not recognised. */
+	harmless: boolean | null;
+}
+
+/** #796: the parts of a failed run that DID happen. */
+export interface PartialApply {
+	steps_done: string[];
+	steps_failed: string[];
+	steps_not_run: string[];
+	error: string | null;
+	step_reread?: string;
+	keys_applied?: string[];
+	keys_not_applied?: string[];
+}
+
+/** The artifact's latest task, its result parsed (no raw execution log). */
+export interface LastTask {
+	id: string;
+	artifact_id: string | null;
+	action: string;
+	status: TaskStatus;
+	created_at: string;
+	finished_at: string | null;
+	error: string | null;
+	result: {
+		partial_apply?: PartialApply;
+		warnings?: PveWarning[];
+		outcome?: string;
+		rolled_back?: boolean;
+		rollback_detail?: string;
+		withdrawn?: boolean;
+	};
 }
 
 // 'unknown' (#774): the run stopped following a PVE task that was still
@@ -154,7 +261,15 @@ export interface Task {
 	id: string;
 	// null for artifactless tasks (provision creates infrastructure, not intent)
 	artifact_id: string | null;
-	action: 'apply' | 'revoke' | 'replay' | 'provision' | 'install_agent' | 'create_guest_template';
+	action:
+		| 'apply'
+		| 'revoke'
+		| 'replay'
+		| 'withdraw'
+		| 'provision'
+		| 'install_agent'
+		| 'create_guest_template'
+		| 'tailnet_join';
 	status: TaskStatus;
 	result_json: string | null;
 	created_at: string;
@@ -166,6 +281,8 @@ export interface ActiveTask {
 	id: string;
 	status: string;
 	action: string;
+	/** When the run was queued; absent on an older backend. */
+	created_at?: string;
 }
 
 export interface AgentInfo {
@@ -351,6 +468,8 @@ export interface DashboardSummary {
 		unknown_by_reason?: Partial<Record<UnknownDriftReason, number>>;
 	};
 	artifacts: Record<string, number>;
+	/** What waits on the owner in Changes > Inbox. Absent on an older backend. */
+	changes?: { proposed: number; ready: number; running: number };
 	tasks: Record<string, number>;
 	/** Address clashes (lane B2). Absent on an older backend. */
 	addresses?: { conflicts: AddressConflict[] };
@@ -589,6 +708,10 @@ export interface ArtifactDetail {
 	// were relayed; an operator clears it with resetApprovalCode.
 	approval_code?: string | null;
 	approval_locked?: boolean;
+	/** Plain-words summary (owner feedback 2026-11-08). Absent on an older backend. */
+	summary?: ArtifactSummary;
+	/** How the last run ended. Absent on an older backend; null before any run. */
+	last_task?: LastTask | null;
 }
 
 /** What a person fills in to propose an artifact; the server adds the rest. */
@@ -701,6 +824,10 @@ export interface Host {
 	is_self?: number;
 	/** This host's page in the Proxmox web UI; null when there is none (gone, manual). */
 	proxmox_url?: string | null;
+	/** The guest's console in the Proxmox web UI (noVNC / xterm.js); null when it has none. */
+	console_url?: string | null;
+	/** Is it protected: off-actions need its name typed (3.9.0 `hosts.protected`). */
+	protected?: number | null;
 	/** Every address it holds (lane B2), configured provenance first. List view only. */
 	addresses?: HostAddressBrief[];
 }
@@ -1044,6 +1171,26 @@ export const api = {
 			body: JSON.stringify({ reason }),
 		});
 	},
+	/**
+	 * Take back an approved change that has not run (#797). Runs nothing; the
+	 * change ends `withdrawn`.
+	 */
+	withdrawArtifact(id: string, reason?: string) {
+		return req<{ id: string; status: string; task_id: string }>(`/artifacts/${id}/withdraw`, {
+			method: 'POST',
+			body: JSON.stringify({ reason }),
+		});
+	},
+	/**
+	 * The owner's one tap: approve, then apply (#781; every kind since 3.10 except
+	 * composite and replay_safe:false, which keep two steps). Admin session.
+	 */
+	approveAndApplyArtifact(id: string) {
+		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(
+			`/artifacts/${id}/approve-and-apply`,
+			{ method: 'POST', body: JSON.stringify({}) },
+		);
+	},
 	applyArtifact(id: string) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}/apply`, {
 			method: 'POST',
@@ -1174,6 +1321,17 @@ export const api = {
 	},
 	getHostNetwork(id: string) {
 		return req<HostNetwork>(`/inventory/${id}/network`);
+	},
+	/** A guest's live power state, pending changes, and what each action needs (#781). */
+	getGuestPower(id: string) {
+		return req<GuestPowerState>(`/inventory/${id}/power`);
+	},
+	/** Power a guest DIRECTLY (operator session). 200 = sent; read `outcome`. */
+	powerGuest(id: string, data: { action: PowerAction; confirm_name?: string; timeout_s?: number }) {
+		return req<GuestPowerResult>(`/inventory/${id}/power`, {
+			method: 'POST',
+			body: JSON.stringify(data),
+		});
 	},
 	/** `env: ''` withdraws the operator's env, so the Proxmox tag applies again. */
 	updateHost(id: string, data: { role?: string; ip_address?: string; description?: string; tags?: string; managed?: boolean; import_state?: string; status?: string; env?: string }) {

@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from ..runtime.blocking import assert_off_loop
 
 _DEFAULT_GIT_TIMEOUT = int(os.environ.get("HP_GIT_TIMEOUT", "30"))
 
@@ -115,6 +118,18 @@ def _artifact_matches(fm: dict[str, Any], needle: str) -> bool:
 
 
 class ArtifactStore:
+    """The artifacts git repository. Every method is SYNCHRONOUS and blocks.
+
+    Code running on the event loop never calls them directly: it goes through
+    ``homepilot.runtime.blocking.run_blocking`` - pool ``"git"`` for anything
+    that runs git (write, push, pull, remote changes, diff), so repository
+    operations keep their order and never interleave, and pool ``"io"`` for
+    reads and listings, which therefore never queue behind a slow push. Reads
+    are safe beside a concurrent write because ``write`` replaces the file
+    atomically. ``_run_git`` and ``_git_locked`` report any call made on a
+    running loop (``assert_off_loop``).
+    """
+
     def __init__(self, artifacts_dir: Path, remote: str = "", ssh_key: str = ""):
         self.root = Path(artifacts_dir)
         self.remote = remote
@@ -125,6 +140,9 @@ class ArtifactStore:
 
     @contextmanager
     def _git_locked(self, timeout: float = 30.0) -> Generator[None, None, None]:
+        # The spin below sleeps; on the loop it froze everything for up to 30 s.
+        # Async callers reach it through the `a*` methods (pool "git").
+        assert_off_loop("ArtifactStore git lock (flock + time.sleep spin)")
         self._lockfile_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self._lockfile_path), os.O_CREAT | os.O_RDONLY)
         acquired = False
@@ -160,6 +178,7 @@ class ArtifactStore:
     ) -> subprocess.CompletedProcess[bytes]:
         if timeout is None:
             timeout = _DEFAULT_GIT_TIMEOUT
+        assert_off_loop(f"git {operation} subprocess")
         try:
             result = subprocess.run(
                 ["git", *args],
@@ -347,7 +366,7 @@ class ArtifactStore:
         path = self.resolve_path(id)
         path.parent.mkdir(parents=True, exist_ok=True)
         content = self._compose_file(id, frontmatter_yml, body)
-        path.write_text(content, encoding="utf-8")
+        _replace_file(path, content)
 
         fm = yaml.safe_load(frontmatter_yml) or {}
         intent_line = (fm.get("intent") or "").split("\n")[0]
@@ -437,6 +456,29 @@ class ArtifactStore:
             return self.resolve_path(id).exists()
         except ValueError:
             return False
+
+    def diff_previous(self, rel_path: str) -> subprocess.CompletedProcess[bytes]:
+        """`git diff HEAD~1 -- <rel_path>`: the artifact preview's diff.
+
+        Like every git command here it blocks; code on the event loop runs it
+        with ``run_blocking("git", ...)`` so it is serialised with the writes.
+        """
+        return self._run_git(["diff", "HEAD~1", "--", rel_path], "diff", check=False)
+
+
+def _replace_file(path: Path, content: str) -> None:
+    """Write `content` to `path` atomically (temp file in the same directory,
+    then rename). Readers run on another thread than writers since the store
+    moved off the event loop, and must never see a half-written artifact."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 _README_TEMPLATE = """\

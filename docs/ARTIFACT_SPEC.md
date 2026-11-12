@@ -86,9 +86,9 @@ YAML. Keys are stable; do not rename without a version bump.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string | Matches the filename basename |
-| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `kb-note` |
+| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `host-provision`, `guest-network`, `guest-power`, `kb-note` |
 | `intent` | string | One-line human description, ≤ 200 chars |
-| `status` | enum | One of: `proposed`, `approved`, `rejected`, `applied`, `failed`, `superseded`, `revoked` |
+| `status` | enum | One of: `proposed`, `approved`, `rejected`, `applied`, `failed`, `superseded`, `revoked`, `withdrawn` |
 | `mutating` | bool | `true` for all kinds except `kb-note` |
 | `produced_by` | object | `{ session: str, agent: str, user: str, at: ISO8601 }` |
 | `hash` | string | `sha256:<hex>` of the body (see §10) |
@@ -112,6 +112,8 @@ YAML. Keys are stable; do not rename without a version bump.
 | `superseded_by` | string | Set when status moves to `superseded`. |
 | `rejected_by` | object | `{ user: str, at: ISO8601, reason: str? }`. Set on reject transition. |
 | `revoked_by` | object | `{ user: str, at: ISO8601, reason: str? }`. Set on revoke transition. |
+| `withdrawn_by` | object | `{ user: str, at: ISO8601, reason: str? }`. Set on withdraw transition (#797). |
+| `partial_apply` | object | Set with `failed` when the run changed part of what it was asked to (#796): `steps_done`, `steps_failed`, `steps_not_run`, `error`, and for a failed config write that was read back `step_reread`, `keys_applied`, `keys_not_applied`. `failure_reason` then starts `partly applied:`. Cleared when a later run applies. |
 
 ### Optional
 
@@ -222,6 +224,8 @@ For kind=kb-note: skips approval gate.
 | `failed` | `revoked` | `hp artifacts revoke <id>` | Optionally executes rollback if hint present |
 | `applied` | `superseded` | Auto: when another artifact with same `target` + same `intent semantic class` reaches `applied` | `superseded_by` set to the newer artifact ID |
 | `applied` | `revoked` | `hp artifacts revoke <id>` | Optionally executes rollback if hint present |
+| `approved` | `withdrawn` | `hp artifacts withdraw <id>`, `withdraw_artifact`, "Withdraw" in Changes | Terminal. Runs nothing (#797): the change was never applied. Takes the artifact's run slot, so it is refused while a run is in flight, and refused while the last run left `unsettled_task`. `withdrawn_by` recorded. |
+| `approved` | `revoked` | `hp artifacts revoke <id>` | Allowed, but for a change that never ran (no `applied_at`/`failed_at`) the rollback is NOT run - there is nothing to undo. Prefer withdraw. |
 
 ### kb-note shortcut
 
@@ -365,7 +369,8 @@ steps:
 - id: <unique-step-id>           # required
   method: GET | POST | PUT | DELETE
   path: <relative-path>          # Jinja2-interpolated; see D2 for variables
-  body: <object>                 # optional, for POST/PUT; values may be Jinja2-interpolated
+  body: <object>                 # optional; values may be Jinja2-interpolated. On a DELETE these
+                                 # are sent as URL query parameters (PVE reads none from a body, #797)
   precheck:                      # required for mutating steps unless idempotence: declared-natural
     method: GET
     path: <relative-path>
@@ -680,6 +685,58 @@ the per-VM rule set written at provision time. See
 
 ---
 
+### 5.8 `kind: guest-power`
+
+One power action on one VM or container (#781): `start`, `shutdown`
+(graceful), `reboot` (a Proxmox reboot, which applies pending config such as a
+cloud-init `ipconfigN`) or `stop` (forced). It is how an ASSISTANT asks for a
+power action: the `power_guest` MCP tool proposes it and sends nothing to
+Proxmox. An operator powers a guest directly from the Hosts page instead
+(`POST /api/inventory/{host_id}/power`), with no artifact.
+
+**Body structure** (the tool writes it; `render_guest_power_body`):
+
+````markdown
+## Power action: reboot web-01
+
+Proxmox reboot (shutdown, then start): pending config ... is applied.
+
+## Spec
+
+```yaml guest-power-spec
+action: reboot        # start | shutdown | reboot | stop
+timeout_s: 120        # shutdown/reboot only: 10-600, default 120
+```
+````
+
+**Frontmatter rules, refused at propose:** `target.kind` is `vm` or `lxc` and
+`target.host` names the guest; `idempotence: replay-only` (a second run is a
+second power action); `requires_snapshot: false` (a power action changes no
+disk). No rollback.
+
+**Executor:** finds the inventory row by VMID, node AND name, then runs the same
+`PowerService` the operator's route runs, so every guard is checked again at
+apply time: the guest is gone or another machine now holds the VMID, it is not
+in a state the action applies to, it is locked, a RUNNING guest holds one of the
+addresses it would boot with (start, and a reboot applying a pending address),
+or a running guest on the same node has its `/dev/...` passthrough disk
+attached. A shutdown, reboot or stop of the machine HomePilot runs on, or of a
+protected guest, is refused outright on this path: their guard is a name a
+person types on the Hosts page, which an approval is not.
+
+**Outcome:** `ok` applies the artifact; `failed` and `timed_out` (a guest that
+did not shut down within its timeout - nothing is forced) fail it with the
+reason; a PVE task still running when the run stopped following it leaves the
+outcome unknown (`unsettled_task`, #774).
+
+**Approve and apply in one step:** an operator may run `POST
+/api/artifacts/{id}/approve-and-apply` (admin scope; "Approve and apply" in
+Changes) on a `guest-power` proposal, as on most kinds (see §7).
+
+**Drift:** none - a power action is a moment, not a state.
+
+---
+
 ## 6. Composite semantics
 
 Already covered in §5.4. Recapping for findability:
@@ -745,9 +802,9 @@ If status is `failed`, `hp artifacts approve <id>` is allowed *only if* `idempot
 
 ### Combining approve + apply
 
-`hp artifacts apply <id>` accepts `--approve` to do both transitions atomically (still writes both audit log entries, still records `approved_by`). Convenience for trusted, frequent operations.
+`POST /api/artifacts/{id}/approve-and-apply` (admin scope; "Approve and apply" in Changes) approves a `proposed` artifact and starts its apply in one action, through the same guards as approve and then apply: both audit entries are written and `approved_by` is recorded. Every kind may use it except a `composite` and a `replay_safe: false` artifact, which keep approve and apply as two explicit acts (the refusal names the reason; `summary.two_step` says so in advance). If the approval lands but the run cannot start (another run holds the slot), the artifact stays `approved` - ready to run - and the answer says so.
 
-`hp artifacts apply <id>` without `--approve` requires the artifact to already be `approved`.
+`hp artifacts apply <id>` requires the artifact to already be `approved`.
 
 ### Composite approval
 

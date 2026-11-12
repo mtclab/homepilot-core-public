@@ -3,92 +3,247 @@
 @tailwind utilities;
 
 /* ---------------------------------------------------------------------------
-   HomePilot design tokens — the ONE place colour, type and spacing are decided.
+   HomePilot design tokens - the ONE place colour, type and spacing are decided.
    Everything else (tailwind.config.js theme, the component classes below, the
    route markup) references these names, never a raw palette value.
 
-   House: civic / data — deep institutional field, ONE restrained accent, serif
-   reading register. The accent is a muted copper on near-black: deliberately
-   not the stock template blue. Red / amber / green / teal are RESERVED for
-   status meaning and never used as decoration.
+   Direction "Instrument" (owner decision 2026-11-08): the console as an
+   instrument panel. A neutral near-black field with panels one step up, lamps
+   and tags that carry status alongside the word, aligned mono numerals, dense
+   rows. The one non-status colour is a phosphor lilac: an indicator hue that
+   is neither alarm nor health, so it can mark what you can touch and what is
+   selected without lying about state. Red / amber / green are RESERVED for
+   status (crit / warn / ok) and never used as decoration; a hollow grey lamp
+   means "no data".
 
-   Type rule: serif = reading text (titles, prose, KB/journal content).
-   sans = UI chrome and data (nav, buttons, controls, table headers, numbers).
-   mono = genuinely machine-shaped values only (ids, hashes, paths, log output).
+   Two themes: Night (the default, this block) and Day (the block after it).
+   `data-theme` on <html> picks one; the System preference resolves to one of
+   the two in src/lib/theme.ts (and before first paint in static/theme-boot.js).
 
-   Contrast: every text/background pair below is asserted against WCAG AA by
-   src/lib/tokens.test.ts. Change a value there and the gate re-checks it.
+   Type rule:
+     display = Instrument Serif - page titles and the wordmark ONLY (it is a
+               condensed display face; below ~20px it stops being readable).
+     serif   = Source Serif 4 - reading text: attention sentences, calm states,
+               descriptions, empty states, KB and journal content.
+     sans    = Atkinson Hyperlegible - UI chrome: nav, buttons, labels, tables.
+     mono    = JetBrains Mono - every number compared down a column, tags, and
+               machine-shaped values (ids, hashes, paths, logs).
+   All four are self-hosted under /ui/fonts (OFL, licence files beside them):
+   the CSP is default-src 'self', so nothing is fetched from a font service.
+
+   Contrast: every text/background pair below, in BOTH themes, is asserted
+   against WCAG AA by src/lib/tokens.test.ts. Change a value and the gate
+   re-checks it.
 --------------------------------------------------------------------------- */
+
+/* Latin + Latin Extended subsets. Anything outside these ranges (a Cyrillic
+   hostname, say) falls through to the next family in the stack. */
+@font-face {
+	font-family: "Instrument Serif";
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/instrument-serif-latin-400-normal.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Instrument Serif";
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/instrument-serif-latin-ext-400-normal.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "Instrument Serif";
+	font-style: italic;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/instrument-serif-latin-400-italic.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Instrument Serif";
+	font-style: italic;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/instrument-serif-latin-ext-400-italic.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-400-normal.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: normal;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-ext-400-normal.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: italic;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-400-italic.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: italic;
+	font-weight: 400;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-ext-400-italic.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+/* Atkinson has no 500/600: those weights resolve to 700, its only bold. */
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: normal;
+	font-weight: 500 700;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-700-normal.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Atkinson Hyperlegible";
+	font-style: normal;
+	font-weight: 500 700;
+	font-display: swap;
+	src: url("/fonts/atkinson-hyperlegible-latin-ext-700-normal.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "JetBrains Mono";
+	font-style: normal;
+	font-weight: 100 800;
+	font-display: swap;
+	src: url("/fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "JetBrains Mono";
+	font-style: normal;
+	font-weight: 100 800;
+	font-display: swap;
+	src: url("/fonts/jetbrains-mono-latin-ext-wght-normal.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "Source Serif 4";
+	font-style: normal;
+	font-weight: 200 900;
+	font-display: swap;
+	src: url("/fonts/source-serif-4-latin-wght-normal.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Source Serif 4";
+	font-style: normal;
+	font-weight: 200 900;
+	font-display: swap;
+	src: url("/fonts/source-serif-4-latin-ext-wght-normal.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: "Source Serif 4";
+	font-style: italic;
+	font-weight: 200 900;
+	font-display: swap;
+	src: url("/fonts/source-serif-4-latin-wght-italic.woff2") format("woff2");
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: "Source Serif 4";
+	font-style: italic;
+	font-weight: 200 900;
+	font-display: swap;
+	src: url("/fonts/source-serif-4-latin-ext-wght-italic.woff2") format("woff2");
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* --- Night (default) ------------------------------------------------------ */
 :root {
 	color-scheme: dark;
 
-	/* Type voice — no downloads: every fallback ships with the OS. */
+	/* Type voice. Each stack starts with the self-hosted face; the fallbacks
+	   are named families, never the system UI face (the identity system's
+	   "system-ui body text" tell). */
+	--font-display: "Instrument Serif", "Source Serif 4", Charter, Georgia, serif;
 	--font-serif: "Source Serif 4", Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
-	--font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-	--font-mono: ui-monospace, "JetBrains Mono", "Fira Code", SFMono-Regular, Menlo, Consolas, monospace;
+	--font-sans: "Atkinson Hyperlegible", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+	--font-mono: "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 
-	/* Field */
-	--color-bg: #100f0d;
-	--color-surface: #191714;
-	--color-surface-raised: #221f1b;
-	--color-divider: #262320;
-	--color-border: #33302a;
+	/* Field: the deck, panels one step up, raised controls one more. */
+	--color-bg: #0a0b0d;
+	--color-surface: #111317;
+	--color-surface-raised: #181b21;
+	--color-divider: #1c2026;
+	--color-border: #262a31;
 	/* Control boundaries (inputs, checkboxes): >= 3:1 on bg, surface and raised. */
-	--color-border-strong: #736a5c;
+	--color-border-strong: #6a727e;
 
 	/* Ink */
-	--color-text: #ded7cc;
-	--color-text-strong: #f3efe8;
-	--color-muted: #a79d90;
+	--color-text: #d7dbe0;
+	--color-text-strong: #f2f4f7;
+	--color-muted: #8d95a0;
 
-	/* Accent — muted copper. The single non-status colour. */
-	--color-accent: #c8804f;
-	--color-accent-strong: #dc9c6f;
-	--color-accent-tint: #2c1d13;
-	--color-accent-border: #55361f;
+	/* Accent - phosphor lilac. The single non-status colour: what you can
+	   touch, and what is selected. */
+	--color-accent: #b79cff;
+	--color-accent-strong: #cdb9ff;
+	--color-accent-tint: #2a2440;
+	--color-accent-border: #5b4a8f;
 
-	/* Status — meaning only, never decoration. */
-	--color-ok: #74c78a;
-	--color-ok-tint: #14251a;
-	--color-ok-border: #2f5238;
-	--color-warn: #d9a441;
-	--color-warn-tint: #2a1f0d;
-	--color-warn-border: #57411c;
-	--color-danger: #ea8177;
-	--color-danger-tint: #2a1512;
-	--color-danger-border: #5a2a24;
-	--color-info: #63bdb4;
-	--color-info-tint: #10241f;
-	--color-info-border: #24493f;
-	--color-note: #a996d8;
-	--color-note-tint: #1e1a2b;
-	--color-note-border: #3a3350;
+	/* Status - meaning only, never decoration. ok / warn / danger are the
+	   lamp colours (ok / warn / crit); info and note are lifecycle and kind
+	   colours that never stand for health. */
+	--color-ok: #4ade80;
+	--color-ok-tint: #10301c;
+	--color-ok-border: #23683d;
+	--color-warn: #ffb648;
+	--color-warn-tint: #3a2a10;
+	--color-warn-border: #7a5719;
+	--color-danger: #ff5c5c;
+	--color-danger-tint: #3a1618;
+	--color-danger-border: #7d2e30;
+	--color-info: #5ec8d8;
+	--color-info-tint: #0f2a30;
+	--color-info-border: #24606a;
+	--color-note: #e8a0c8;
+	--color-note-tint: #3a1a2e;
+	--color-note-border: #74405f;
+	/* The hollow lamp: no data. Non-text, so 3:1 is its floor. */
+	--color-nodata: #6b7380;
 
-	/* Solid action surfaces (dark ink on colour). */
-	--color-on-accent: #140f0a;
-	/* The primary action carries the full accent, not a dimmed version of it: at
-	   #b8703f the button read as disabled next to its own label. */
-	--color-accent-solid: #c8804f;
-	--color-accent-solid-hover: #dc9c6f;
-	--color-ok-solid: #2f6b41;
-	--color-ok-solid-hover: #37784a;
-	--color-on-ok: #f1f7f0;
-	--color-danger-solid: #8c3229;
-	--color-danger-solid-hover: #a33d33;
-	--color-on-danger: #fdeceb;
+	/* Solid action surfaces: dark ink on the full colour, like a lit key. */
+	--color-on-accent: #0a0b0d;
+	--color-accent-solid: #b79cff;
+	--color-accent-solid-hover: #cdb9ff;
+	--color-ok-solid: #4ade80;
+	--color-ok-solid-hover: #6ee7a0;
+	--color-on-ok: #0a0b0d;
+	--color-danger-solid: #ff5c5c;
+	--color-danger-solid-hover: #ff7a7a;
+	--color-on-danger: #0a0b0d;
 
-	/* Categorical chart ramp — for dimensions that have NO status meaning (host
-	   role, artifact kind). Copper-anchored so charts stay in the family; the
-	   status colours above are deliberately kept out of it so a green arc never
-	   reads as "healthy" when it only means "role: worker". */
-	--chart-1: #c8804f;
-	--chart-2: #63bdb4;
-	--chart-3: #a996d8;
-	--chart-4: #d9a441;
+	/* Categorical chart ramp - for dimensions that have NO status meaning (host
+	   role, artifact kind). The status colours are deliberately kept out of it
+	   so a green arc never reads as "healthy" when it only means "worker". */
+	--chart-1: #b79cff;
+	--chart-2: #5ec8d8;
+	--chart-3: #e8a0c8;
+	--chart-4: #d9c27a;
 	--chart-5: #8fa5c4;
-	--chart-6: #a79d90;
+	--chart-6: #8d95a0;
 
-	/* Space — generous and active; calm, not cramped. */
+	/* Space - the alphabet. */
 	--space-1: 0.25rem;
 	--space-2: 0.5rem;
 	--space-3: 0.75rem;
@@ -96,24 +251,86 @@
 	--space-5: 1.5rem;
 	--space-6: 2.5rem;
 
-	/* Rhythm — the density scale (#549 F1, principle 3: "white-space discipline
-	   is the fingerprint"). The raw --space-N steps above are the alphabet; these
-	   three are the WORDS the layout speaks, so "cards breathe more" is one edit
-	   here rather than a sweep through every route. Anything that stacks uses
-	   them, in this order of magnitude: inside a group < between groups.
+	/* Rhythm - the words the layout speaks (#549 F1). An instrument panel is
+	   dense in rows and calm in structure: white space goes BETWEEN sections,
+	   not inside rows.
 	     --space-stack   gap between siblings inside one section
-	     --space-card    a card's own padding
-	     --space-section gap between the sections of a page */
-	--space-stack: 0.75rem;
-	--space-card: 1.25rem;
-	--space-section: 2rem;
+	     --space-card    a panel's own padding
+	     --space-section gap between the sections of a page
+	     --space-row-y   a table cell's vertical padding (26 px rows at 12.5 px) */
+	--space-stack: 0.5rem;
+	--space-card: 0.75rem;
+	--space-section: 1rem;
+	--space-row-y: 0.3125rem;
 
-	/* Reading measure. Prose past ~75 characters loses the line it is on; the
-	   console's descriptions, empty states and KB bodies are prose. */
+	/* Body text size: 12.5 px. Rows and chrome are set from here. */
+	--text-body: 0.78125rem;
+
+	/* Reading measure. Prose past ~75 characters loses the line it is on. */
 	--measure-prose: 65ch;
 
-	--radius-sm: 3px;
-	--radius-md: 6px;
+	/* Panels, tags and buttons share one small radius: an instrument, not a
+	   card deck. */
+	--radius-sm: 2px;
+	--radius-md: 2px;
+}
+
+/* --- Day ----------------------------------------------------------------- */
+/* Every colour token of the Night block is redeclared here - the token gate
+   fails on one that is missing, because a missing one would silently keep its
+   Night value and paint near-black ink on near-black paper. */
+:root[data-theme="day"] {
+	color-scheme: light;
+
+	--color-bg: #eef0f3;
+	--color-surface: #ffffff;
+	--color-surface-raised: #f6f7f9;
+	--color-divider: #e4e7ec;
+	--color-border: #d3d7de;
+	--color-border-strong: #7c838d;
+
+	--color-text: #1b1f26;
+	--color-text-strong: #0a0b0d;
+	--color-muted: #555d68;
+
+	--color-accent: #5b3fb8;
+	--color-accent-strong: #452c96;
+	--color-accent-tint: #ebe5fa;
+	--color-accent-border: #b9a8ec;
+
+	--color-ok: #1b7a3d;
+	--color-ok-tint: #def3e5;
+	--color-ok-border: #9fd3b0;
+	--color-warn: #915400;
+	--color-warn-tint: #fbeed7;
+	--color-warn-border: #e2c17f;
+	--color-danger: #c21f1f;
+	--color-danger-tint: #fbe3e3;
+	--color-danger-border: #eba3a3;
+	--color-info: #0d6674;
+	--color-info-tint: #ddf0f3;
+	--color-info-border: #9fd0d8;
+	--color-note: #9a2f6e;
+	--color-note-tint: #f7e4ef;
+	--color-note-border: #dca6c6;
+	--color-nodata: #6b7380;
+
+	--color-on-accent: #ffffff;
+	--color-accent-solid: #5b3fb8;
+	--color-accent-solid-hover: #452c96;
+	--color-ok-solid: #1b7a3d;
+	--color-ok-solid-hover: #156331;
+	--color-on-ok: #ffffff;
+	--color-danger-solid: #c21f1f;
+	--color-danger-solid-hover: #a51a1a;
+	--color-on-danger: #ffffff;
+
+	--chart-1: #5b3fb8;
+	--chart-2: #0d6674;
+	--chart-3: #9a2f6e;
+	--chart-4: #8a6a1c;
+	--chart-5: #4d6283;
+	--chart-6: #555d68;
 }
 
 @layer base {
@@ -123,10 +340,23 @@
 
 	body {
 		font-family: var(--font-sans);
+		font-size: var(--text-body);
 		background: var(--color-bg);
 		color: var(--color-text);
-		line-height: 1.5;
+		line-height: 1.45;
 		-webkit-font-smoothing: antialiased;
+	}
+
+	/* Theme switches are instant, but nothing else moves for an operator who
+	   asked the OS for less motion. */
+	@media (prefers-reduced-motion: reduce) {
+		*,
+		*::before,
+		*::after {
+			transition-duration: 0.01ms !important;
+			animation-duration: 0.01ms !important;
+			animation-iteration-count: 1 !important;
+		}
 	}
 
 	::selection {
@@ -144,21 +374,23 @@
 
 @layer components {
 	/* --- Type ------------------------------------------------------------- */
-	/* Reading text is serif. Chrome and data are sans. */
+	/* The page title is the display serif - the one large voice on a page.
+	   Section and panel titles are chrome inside the instrument, so they are
+	   the sans in bold; the display face below ~20px stops being readable. */
 	.page-title {
-		font-family: var(--font-serif);
-		font-size: 1.375rem;
-		font-weight: 600;
-		line-height: 1.3;
-		letter-spacing: -0.01em;
+		font-family: var(--font-display);
+		font-size: 1.75rem;
+		font-weight: 400;
+		line-height: 1.1;
+		letter-spacing: 0;
 		color: var(--color-text-strong);
 	}
 
 	.section-title {
-		font-family: var(--font-serif);
-		font-size: 0.9375rem;
-		font-weight: 600;
-		line-height: 1.4;
+		font-family: var(--font-sans);
+		font-size: 0.75rem;
+		font-weight: 700;
+		line-height: 1.3;
 		color: var(--color-text-strong);
 	}
 
@@ -205,13 +437,19 @@
 	}
 
 	/* The product's name is the one place the estate's type voice should be
-	   unmistakable, so it is set in the serif, mixed case. Letterspaced caps in
-	   a generic sans is the exact template tell the identity system names. */
+	   unmistakable, so it is set in the display serif, mixed case, with the
+	   second half in the accent italic. Letterspaced caps in a generic sans is
+	   the exact template tell the identity system names. */
 	.wordmark {
-		font-family: var(--font-serif);
-		font-size: 1.0625rem;
-		font-weight: 600;
+		font-family: var(--font-display);
+		font-size: 1.375rem;
+		font-weight: 400;
+		line-height: 1;
 		letter-spacing: 0;
+		color: var(--color-text-strong);
+	}
+	.wordmark em {
+		font-style: italic;
 		color: var(--color-accent);
 	}
 
@@ -232,13 +470,16 @@
 	.data-table {
 		width: 100%;
 		font-family: var(--font-sans);
+		font-size: 0.75rem;
 		font-variant-numeric: tabular-nums;
+		border-collapse: collapse;
 	}
 	.data-table thead th {
 		text-align: left;
-		font-weight: 600;
+		font-weight: 700;
 		color: var(--color-muted);
-		border-bottom: 1px solid var(--color-border);
+		border-bottom: 1px solid var(--color-border-strong);
+		white-space: nowrap;
 	}
 	/* Row density lives HERE, not on six hundred individual cells (#445 B3).
 	   Every table repeated `py-2 pr-4` on every `<td>` and `pb-2 pr-4` on every
@@ -258,11 +499,18 @@
 		padding-right: 0;
 	}
 	.data-table thead th {
-		padding-bottom: var(--space-2);
+		padding-top: var(--space-row-y);
+		padding-bottom: var(--space-row-y);
 	}
+	/* 26 px rows: one line of 12 px text plus --space-row-y above and below,
+	   with a hairline between rows so the eye can follow a row across. */
 	.data-table tbody td {
-		padding-top: var(--space-2);
-		padding-bottom: var(--space-2);
+		padding-top: var(--space-row-y);
+		padding-bottom: var(--space-row-y);
+		border-bottom: 1px solid var(--color-divider);
+	}
+	.data-table tbody tr:hover td {
+		background: var(--color-surface-raised);
 	}
 
 	/* Primary vs secondary columns (#549 F1, principle 4). A table row has ONE
@@ -295,21 +543,22 @@
 	   exactly the detail-dump defect #514 S2 removed. Use .num only in table
 	   columns where numbers are compared down the page. */
 	.num-inline {
-		font-family: var(--font-sans);
+		font-family: var(--font-mono);
 		font-variant-numeric: tabular-nums;
 	}
 
-	/* Numbers read right-aligned and tabular wherever they are compared. */
+	/* Numbers read right-aligned, mono and tabular wherever they are compared:
+	   every digit is the same width, so a change in a column is visible. */
 	.num {
-		font-family: var(--font-sans);
+		font-family: var(--font-mono);
 		font-variant-numeric: tabular-nums;
 		text-align: right;
 	}
 
 	.metric {
-		font-family: var(--font-sans);
+		font-family: var(--font-mono);
 		font-variant-numeric: tabular-nums;
-		font-weight: 700;
+		font-weight: 600;
 		letter-spacing: -0.02em;
 	}
 
@@ -325,42 +574,47 @@
 		line-height: 1.55;
 	}
 
-	/* --- Badges (status meaning) ------------------------------------------ */
+	/* --- Badges = tags (status meaning) ----------------------------------- */
+	/* A tag is a small mono word in a box. Colour is never its only carrier:
+	   the word is always there, and the edge is the status colour itself so
+	   the tag still separates from the row in greyscale. Sentence case, never
+	   letterspaced capitals. */
 	.badge {
 		display: inline-flex;
 		align-items: center;
-		font-family: var(--font-sans);
-		font-size: 0.6875rem;
-		font-weight: 500;
-		line-height: 1.4;
-		padding: 0.125rem var(--space-2);
+		font-family: var(--font-mono);
+		font-size: 0.65625rem;
+		font-weight: 600;
+		line-height: 1.3;
+		padding: 0.125rem 0.3125rem;
 		border-radius: var(--radius-sm);
 		border: 1px solid transparent;
+		white-space: nowrap;
 	}
 	.badge-proposed {
 		background: var(--color-accent-tint);
 		color: var(--color-accent);
-		border-color: var(--color-accent-border);
+		border-color: var(--color-accent);
 	}
 	.badge-approved {
 		background: var(--color-info-tint);
 		color: var(--color-info);
-		border-color: var(--color-info-border);
+		border-color: var(--color-info);
 	}
 	.badge-applied {
 		background: var(--color-ok-tint);
 		color: var(--color-ok);
-		border-color: var(--color-ok-border);
+		border-color: var(--color-ok);
 	}
 	.badge-rejected {
 		background: var(--color-danger-tint);
 		color: var(--color-danger);
-		border-color: var(--color-danger-border);
+		border-color: var(--color-danger);
 	}
 	.badge-failed {
 		background: var(--color-warn-tint);
 		color: var(--color-warn);
-		border-color: var(--color-warn-border);
+		border-color: var(--color-warn);
 	}
 	.badge-revoked {
 		background: var(--color-surface-raised);
@@ -374,17 +628,17 @@
 	.badge-critical {
 		background: var(--color-danger-tint);
 		color: var(--color-danger);
-		border-color: var(--color-danger-border);
+		border-color: var(--color-danger);
 	}
 	.badge-warning {
 		background: var(--color-warn-tint);
 		color: var(--color-warn);
-		border-color: var(--color-warn-border);
+		border-color: var(--color-warn);
 	}
 	.badge-notice {
 		background: var(--color-info-tint);
 		color: var(--color-info);
-		border-color: var(--color-info-border);
+		border-color: var(--color-info);
 	}
 
 	/* Superseded differs from revoked by more than a shade — a dashed edge, so
@@ -406,11 +660,15 @@
 
 	/* --- Buttons ---------------------------------------------------------- */
 	.btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.3125rem;
 		font-family: var(--font-sans);
-		font-size: 0.8125rem;
-		font-weight: 500;
+		font-size: 0.71875rem;
+		font-weight: 700;
 		line-height: 1.3;
-		padding: 0.375rem var(--space-3);
+		padding: 0.3125rem 0.625rem;
 		border-radius: var(--radius-sm);
 		border: 1px solid var(--color-border-strong);
 		background: var(--color-surface-raised);
@@ -418,7 +676,7 @@
 		transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
 	}
 	.btn:hover:not(:disabled) {
-		border-color: var(--color-accent);
+		border-color: var(--color-text);
 		color: var(--color-text-strong);
 	}
 	.btn:disabled {
@@ -466,17 +724,17 @@
 		color: var(--color-text);
 	}
 	.btn-sm {
-		font-size: 0.75rem;
-		padding: 0.25rem var(--space-2);
+		font-size: 0.6875rem;
+		padding: 0.1875rem 0.4375rem;
 	}
 	.btn-xs {
 		font-size: 0.6875rem;
-		padding: 0.125rem var(--space-2);
+		padding: 0.125rem 0.375rem;
 	}
 
 	/* --- Surfaces --------------------------------------------------------- */
-	/* Card padding is --space-card, not a raw step: loosening every card in the
-	   console is one token, and no route can quietly disagree with the others. */
+	/* A card is a panel without a head strip: a bordered gauge on the deck.
+	   Its padding is --space-card, so loosening every panel is one token. */
 	.card {
 		background: var(--color-surface);
 		border: 1px solid var(--color-border);
@@ -484,9 +742,123 @@
 		padding: var(--space-card);
 	}
 
+	/* The panel primitive (Panel.svelte): a head strip with the title and a
+	   mono meta line, a hairline, then the body. No shadow, no lift on hover. */
+	.panel {
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		min-width: 0;
+	}
+	.panel-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--space-2);
+		padding: 0.4375rem 0.625rem;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.panel-title {
+		font-family: var(--font-sans);
+		font-size: 0.75rem;
+		font-weight: 700;
+		line-height: 1.3;
+		color: var(--color-text-strong);
+	}
+	.panel-meta {
+		font-family: var(--font-mono);
+		font-size: 0.6875rem;
+		color: var(--color-muted);
+	}
+	.panel-body {
+		padding: var(--space-card);
+	}
+
+	/* --- Lamps (status shape) --------------------------------------------- */
+	/* A lamp is the second carrier of status after the word: filled = a state,
+	   hollow = no data, half = parked. Shape survives colour blindness and
+	   greyscale; the word next to it is still required (Lamp.svelte). */
+	.lamp {
+		position: relative;
+		display: inline-block;
+		flex-shrink: 0;
+		width: 0.5625rem;
+		height: 0.5625rem;
+		border-radius: 999px;
+		border: 1.5px solid var(--color-nodata);
+		background: transparent;
+		vertical-align: -1px;
+		overflow: hidden;
+	}
+	.lamp-ok {
+		background: var(--color-ok);
+		border-color: var(--color-ok);
+	}
+	.lamp-warn {
+		background: var(--color-warn);
+		border-color: var(--color-warn);
+	}
+	.lamp-crit {
+		background: var(--color-danger);
+		border-color: var(--color-danger);
+	}
+	.lamp-accent {
+		background: var(--color-accent);
+		border-color: var(--color-accent);
+	}
+	/* Parked: the left half filled. A pseudo-element, not a gradient. */
+	.lamp-half::after {
+		content: "";
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		width: 50%;
+		background: var(--color-nodata);
+	}
+
+	/* --- Tags (Tag.svelte) ------------------------------------------------- */
+	/* The general tag: same shape as the lifecycle badges above, tone by
+	   meaning. Default is muted - a fact, not a state. */
+	.tag {
+		display: inline-flex;
+		align-items: center;
+		font-family: var(--font-mono);
+		font-size: 0.65625rem;
+		font-weight: 600;
+		line-height: 1.3;
+		padding: 0.125rem 0.3125rem;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--color-border);
+		background: var(--color-bg);
+		color: var(--color-muted);
+		white-space: nowrap;
+	}
+	.tag-crit {
+		background: var(--color-danger-tint);
+		color: var(--color-danger);
+		border-color: var(--color-danger);
+	}
+	.tag-warn {
+		background: var(--color-warn-tint);
+		color: var(--color-warn);
+		border-color: var(--color-warn);
+	}
+	.tag-ok {
+		background: var(--color-ok-tint);
+		color: var(--color-ok);
+		border-color: var(--color-ok);
+	}
+	.tag-accent {
+		background: var(--color-accent-tint);
+		color: var(--color-accent);
+		border-color: var(--color-accent);
+	}
+
 	.input {
 		font-family: var(--font-sans);
-		font-size: 0.8125rem;
+		font-size: var(--text-body);
 		background: var(--color-surface-raised);
 		border: 1px solid var(--color-border-strong);
 		border-radius: var(--radius-sm);
@@ -499,5 +871,174 @@
 	.input:focus {
 		outline: none;
 		border-color: var(--color-accent);
+	}
+
+	/* --- Readout row (Readout.svelte) ------------------------------------- */
+	/* Gauges side by side in ONE panel, split by hairlines: two per line on a
+	   phone, the whole row on a desk. `--readouts` is the desk column count. */
+	.readouts {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+	.readouts > * {
+		border-bottom: 1px solid var(--color-divider);
+	}
+	.readouts > *:nth-child(odd) {
+		border-right: 1px solid var(--color-divider);
+	}
+	/* A lone last gauge on a phone takes the whole line. */
+	.readouts > *:last-child:nth-child(odd) {
+		grid-column: span 2;
+		border-right: 0;
+	}
+	@media (min-width: 768px) {
+		.readouts {
+			grid-template-columns: repeat(var(--readouts, 4), minmax(0, 1fr));
+		}
+		.readouts > * {
+			border-bottom: 0;
+			border-right: 1px solid var(--color-divider);
+		}
+		.readouts > *:last-child,
+		.readouts > *:last-child:nth-child(odd) {
+			grid-column: auto;
+			border-right: 0;
+		}
+	}
+
+	/* --- Command palette (CommandPalette.svelte) ---------------------------- */
+	/* A panel over the page: the field shows through a veil of its own
+	   colour (no shadow, no gradient), so the rows underneath stop competing
+	   with the results, and the strong edge separates the panel. */
+	.palette-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 40;
+		display: flex;
+		justify-content: center;
+		align-items: flex-start;
+		padding: 12vh 1rem 1rem;
+		background: color-mix(in srgb, var(--color-bg) 72%, transparent);
+	}
+	.palette {
+		width: min(40rem, 100%);
+		max-height: 76vh;
+		display: flex;
+		flex-direction: column;
+		background: var(--color-surface);
+		color: var(--color-text);
+		border: 1px solid var(--color-border-strong);
+		border-radius: var(--radius-md);
+	}
+	.palette-head {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding: 0.5rem 0.75rem;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.palette-input {
+		flex: 1;
+		min-width: 0;
+		font-family: var(--font-sans);
+		font-size: 0.9375rem;
+		background: var(--color-surface);
+		color: var(--color-text-strong);
+		border: 0;
+		padding: 0.25rem 0;
+	}
+	.palette-input:focus {
+		outline: none;
+	}
+	.palette-input::placeholder {
+		color: var(--color-muted);
+	}
+	.palette-scopes {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+		padding: 0.375rem 0.75rem;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.palette-scope {
+		cursor: pointer;
+	}
+	.palette-list {
+		overflow-y: auto;
+		padding: 0.25rem 0 0.375rem;
+	}
+	.palette-group {
+		padding: 0.5rem 0.75rem 0.125rem;
+		font-family: var(--font-sans);
+		font-size: 0.6875rem;
+		font-weight: 700;
+		color: var(--color-muted);
+	}
+	/* The selected row is marked the way the sidebar marks the current page:
+	   the raised field and an accent edge - two carriers, neither colour alone. */
+	.palette-option {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
+		padding: 0.3125rem 0.75rem 0.3125rem calc(0.75rem - 3px);
+		border-left: 3px solid transparent;
+		cursor: pointer;
+		min-width: 0;
+	}
+	.palette-option[aria-selected="true"] {
+		background: var(--color-surface-raised);
+		color: var(--color-text-strong);
+		border-left-color: var(--color-accent);
+	}
+	.palette-label {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		color: var(--color-text-strong);
+		font-weight: 700;
+		white-space: nowrap;
+	}
+	.palette-detail {
+		flex: 1 1 0;
+		min-width: 4rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.6875rem;
+		color: var(--color-muted);
+	}
+	.palette-note {
+		padding: 0.3125rem 0.75rem;
+		font-size: 0.75rem;
+	}
+	.palette-empty,
+	.palette-hint {
+		padding: 0.375rem 0.75rem;
+		font-size: 0.8125rem;
+	}
+	.palette-hint {
+		font-family: var(--font-serif);
+		color: var(--color-muted);
+		border-top: 1px solid var(--color-divider);
+	}
+	.palette-foot {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem 0.875rem;
+		padding: 0.375rem 0.75rem;
+		border-top: 1px solid var(--color-border);
+		font-size: 0.6875rem;
+		color: var(--color-muted);
+	}
+	/* Key names; the markup adds `font-mono` (the mono classes are a closed
+	   set, asserted by the type-voice gate). */
+	.palette-foot kbd,
+	.kbd {
+		font-size: 0.625rem;
+		padding: 0 0.25rem;
+		border: 1px solid var(--color-border-strong);
+		border-radius: var(--radius-sm);
+		color: var(--color-text);
 	}
 }

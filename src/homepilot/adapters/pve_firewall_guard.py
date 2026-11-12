@@ -39,7 +39,6 @@ the cluster network, and the #600 lockout happened with it in place.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import ipaddress
 import socket
@@ -47,6 +46,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, unquote
+
+from homepilot.runtime.blocking import run_blocking
 
 # Input policies that drop what no rule accepts. REJECT severs management
 # exactly as DROP does - it only answers faster.
@@ -507,7 +508,7 @@ async def management_source(host: str | None, port: int) -> IpAddress | None:
     """HomePilot's own address towards the PVE API, resolved off the event loop."""
     if not host:
         return None
-    return await asyncio.to_thread(_local_address_towards, host, port)
+    return await run_blocking("net", _local_address_towards, host, port)
 
 
 __all__ = [

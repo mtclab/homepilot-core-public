@@ -9,6 +9,7 @@ from typing import Any
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
 from homepilot.executor.orchestrator import ArtifactExecutor, ExecutorError, TamperError
+from homepilot.runtime.blocking import run_blocking
 
 from .base import Reconciler, ReconcilerResult
 
@@ -26,6 +27,10 @@ class ApplyResult:
     # The PVE task still running when the run stopped following it (#774): the
     # outcome is unknown, which the task runner must not record as failed.
     unsettled_task: dict[str, Any] | None = None
+    # What a failed run DID change before it stopped (#796), and the PVE task
+    # warnings a successful one logged - passed through to the task record.
+    partial_apply: dict[str, Any] | None = None
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ApplyReconciler(Reconciler):
@@ -62,7 +67,7 @@ class ApplyReconciler(Reconciler):
                 details={"skipped": True, "reason": "auto_apply_disabled"},
             )
 
-        approved = self._get_approved_artifacts()
+        approved = await run_blocking("io", self._get_approved_artifacts)
         if not approved:
             return ReconcilerResult(
                 name="apply",
@@ -190,6 +195,8 @@ class ApplyReconciler(Reconciler):
             failure_reason=result.failure_reason,
             details=details,
             unsettled_task=result.unsettled_task,
+            partial_apply=result.partial_apply,
+            warnings=list(result.warnings),
         )
 
     async def _log_audit(

@@ -10,16 +10,16 @@ import { scopeTier } from './scopeTier';
 describe('scopeTier', () => {
 	it('names the superuser scope by any of its spellings', () => {
 		for (const s of ['all', '*', 'full']) {
-			expect(scopeTier(['read', 'write', 'admin'], s)).toEqual({ label: 'all', cls: 'text-ok' });
+			expect(scopeTier(['read', 'write', 'admin'], s)).toEqual({ label: 'Full access' });
 		}
 	});
 
 	it('reads the tier off the normalized capabilities', () => {
-		expect(scopeTier(['read', 'write', 'admin'], 'admin')?.label).toBe('admin');
-		expect(scopeTier(['read', 'write'], 'read,write')?.label).toBe('read, write');
-		expect(scopeTier(['read', 'write'], 'write,read')?.label).toBe('read, write');
-		expect(scopeTier(['read'], 'read')?.label).toBe('read only');
-		expect(scopeTier(['read'], 'read_only')?.label).toBe('read only');
+		expect(scopeTier(['read', 'write', 'admin'], 'admin')?.label).toBe('Admin access');
+		expect(scopeTier(['read', 'write'], 'read,write')?.label).toBe('Can read and change');
+		expect(scopeTier(['read', 'write'], 'write,read')?.label).toBe('Can read and change');
+		expect(scopeTier(['read'], 'read')?.label).toBe('Read only');
+		expect(scopeTier(['read'], 'read_only')?.label).toBe('Read only');
 	});
 
 	it('says nothing rather than guess when the server sent no capabilities', () => {

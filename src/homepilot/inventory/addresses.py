@@ -786,8 +786,15 @@ class AddressGuard:
                 running_vmids.add(vmid)
             if vmid == exclude_vmid or (status != "running" and not include_stopped):
                 continue
+            # A RUNNING holder holds the addresses it booted with: PVE's plain
+            # GET answers with pending changes already applied, so a running
+            # guest with a queued ipconfig change would be judged by an address
+            # it does not hold yet - and the one it does hold would go unseen.
+            # A stopped holder (the provision question) claims what it will
+            # boot with, which is exactly the plain GET (#781).
+            query = {"current": 1} if status == "running" else None
             try:
-                config = await self.proxmox.read(f"/nodes/{node}/{guest_type}/{vmid}/config")
+                config = await self.proxmox.read(f"/nodes/{node}/{guest_type}/{vmid}/config", query)
             except Exception as exc:  # any failure leaves the scan partial: refuse
                 raise AddressCheckError(
                     f"could not read the config of {guest_type} {vmid} on {node} ({exc}), "

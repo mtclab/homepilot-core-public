@@ -6,6 +6,7 @@
 	import { notify } from '$lib/stores';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
+	import Icon from '$lib/components/Icon.svelte';
 
 	// Proposing is a write. Default-deny while the session is still loading, so
 	// the button never appears for someone who will only get a 403.
@@ -100,6 +101,7 @@
 		{ key: 'applied', label: 'Applied', filter: 'applied' },
 		{ key: 'failed', label: 'Failed', filter: 'failed' },
 		{ key: 'revoked', label: 'Revoked', filter: 'revoked' },
+		{ key: 'withdrawn', label: 'Withdrawn', filter: 'withdrawn' },
 		{ key: 'superseded', label: 'Superseded', filter: 'superseded' },
 	];
 
@@ -111,6 +113,7 @@
 		revoked: 'badge-revoked',
 		failed: 'badge-failed',
 		superseded: 'badge-superseded',
+		withdrawn: 'badge-revoked',
 	};
 	function statusClass(s: string): string { return STATUS_CLASSES[s] ?? 'badge-proposed'; }
 
@@ -219,7 +222,7 @@
 					on:click={() => (showNew = !showNew)}
 				>{showNew ? 'Cancel' : '+ New artifact'}</button>
 			{/if}
-			<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}>↻ Refresh</button>
+			<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}><Icon name="refresh" />Refresh</button>
 		</div>
 	</div>
 
@@ -344,7 +347,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load artifacts.</p>
 			<p class="text-xs text-muted">{error}</p>
-			<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={() => loadAll(true)}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if allItems.length === 0 && search.trim()}
 		<!-- `allItems` is now the SEARCH RESULT, so an empty one must not read as

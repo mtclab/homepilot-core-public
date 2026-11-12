@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -22,11 +22,13 @@ from homepilot.artifacts.models import (
 )
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
+from homepilot.runtime.blocking import run_blocking
 from homepilot.vault.manager import VaultManager
 
 from .ansible import execute as ansible_execute
 from .composite import execute as composite_execute
 from .guest_network import execute as guest_network_execute
+from .guest_power import execute as guest_power_execute
 from .host_provision import execute as host_provision_execute
 from .http_sequence import execute as http_sequence_execute
 from .kb_note import execute as kb_note_execute
@@ -86,6 +88,12 @@ def snapshot_run_tag(now: datetime | None = None) -> str:
 # operator who read `requires_snapshot: true` on the review screen (#642 A7).
 SNAPSHOTTABLE_TARGET_KINDS = ("vm", "lxc")
 
+# Kinds that never take a pre-apply snapshot, whatever `requires_snapshot`
+# says: a power action changes no disk, so a rollback point would only lock the
+# guest and delay the action (#781). Propose refuses `requires_snapshot: true`
+# for them as well.
+_NEVER_SNAPSHOT_KINDS = frozenset({ArtifactKind.GUEST_POWER})
+
 # How long the pre-apply snapshot is followed. A snapshot that saves RAM state
 # writes the guest's whole memory out, which outlasts the general 600 s on a big
 # guest; giving up early aborts an apply over a safety net that was in fact
@@ -109,6 +117,14 @@ class ExecutionResult:
     # as failed either. Carries node + upid so the outcome can be settled from
     # PVE once the task ends.
     unsettled_task: dict[str, Any] | None = None
+    # A failed run that changed SOME of what it was asked to (#796): the steps
+    # that completed, the one that failed and why, the steps never run and -
+    # where the failed write was re-read - the keys PVE took anyway. None when
+    # the run changed nothing it knows of.
+    partial_apply: dict[str, Any] | None = None
+    # The warnings PVE logged on tasks that SUCCEEDED ("WARNINGS: n"), each
+    # with a plain-words explanation where one is known (pve_warnings.py).
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -164,7 +180,7 @@ class ArtifactExecutor:
         return self.agent
 
     async def apply(self, artifact_id: str, approved_by: str) -> ExecutionResult:
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
         status = ArtifactStatus(fm["status"])
 
@@ -198,7 +214,11 @@ class ArtifactExecutor:
         target_kind = target_data.get("kind", "")
 
         try:
-            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
+            if (
+                mutating
+                and target_kind in SNAPSHOTTABLE_TARGET_KINDS
+                and kind not in _NEVER_SNAPSHOT_KINDS
+            ):
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -230,7 +250,10 @@ class ArtifactExecutor:
             )
         else:
             await self.lifecycle.mark_failed(
-                artifact_id, result.failure_reason or "unknown", result.execution_log
+                artifact_id,
+                result.failure_reason or "unknown",
+                result.execution_log,
+                partial_apply=result.partial_apply,
             )
             await self.lifecycle._log_audit(
                 "apply_failed", artifact_id, approved_by, {"reason": result.failure_reason}
@@ -240,7 +263,7 @@ class ArtifactExecutor:
         return result
 
     async def replay(self, artifact_id: str) -> ExecutionResult:
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
         status = ArtifactStatus(fm["status"])
 
@@ -275,7 +298,11 @@ class ArtifactExecutor:
         mutating = fm.get("mutating", True)
 
         try:
-            if mutating and target_kind in SNAPSHOTTABLE_TARGET_KINDS:
+            if (
+                mutating
+                and target_kind in SNAPSHOTTABLE_TARGET_KINDS
+                and kind not in _NEVER_SNAPSHOT_KINDS
+            ):
                 snapshot_id = await self._maybe_snapshot(fm, target_data)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
@@ -309,7 +336,10 @@ class ArtifactExecutor:
         else:
             if status == ArtifactStatus.APPROVED:
                 await self.lifecycle.mark_failed(
-                    artifact_id, result.failure_reason or "unknown", result.execution_log
+                    artifact_id,
+                    result.failure_reason or "unknown",
+                    result.execution_log,
+                    partial_apply=result.partial_apply,
                 )
             await self.lifecycle._log_audit(
                 "replay_failed", artifact_id, "replay", {"reason": result.failure_reason}
@@ -361,7 +391,7 @@ class ArtifactExecutor:
         as it stands now: still unknown while PVE says the task runs, else the
         verdict, which is also written onto the artifact.
         """
-        fm, _ = self.store.read(artifact_id)
+        fm, _ = await run_blocking("io", self.store.read, artifact_id)
         if not fm.get("unsettled_task"):
             return None
         return await self._settle(artifact_id, fm)
@@ -450,7 +480,7 @@ class ArtifactExecutor:
         outcome now rides back to the caller and into the audit row, because
         "reversed" and "relabelled" are different facts about a host.
         """
-        fm, body = self.store.read(artifact_id)
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
         if fm.get("unsettled_task"):
             # A PVE task from the last apply/replay was still running when the
             # run stopped following it (#774). Rolling back underneath it would
@@ -462,11 +492,25 @@ class ArtifactExecutor:
                     f"cannot revoke {artifact_id} yet: {settled.failure_reason}. "
                     "Wait for that task to finish, then revoke again."
                 )
-            fm, body = self.store.read(artifact_id)
+            fm, body = await run_blocking("io", self.store.read, artifact_id)
         kind = ArtifactKind(fm["kind"])
 
         outcome = RevokeResult(rolled_back=False, reason="no rollback for this artifact")
-        if kind != ArtifactKind.KB_NOTE:
+        # An approved change that never ran has nothing on any host to undo
+        # (#797). Running its rollback anyway would ACT on a host nobody changed
+        # - the rollback of "shut down" is "start". A failed run may have
+        # changed part of the host, so only "never ran at all" skips it.
+        never_ran = (
+            ArtifactStatus(fm["status"]) is ArtifactStatus.APPROVED
+            and not fm.get("applied_at")
+            and not fm.get("failed_at")
+        )
+        if never_ran:
+            outcome = RevokeResult(
+                rolled_back=False,
+                reason="it was approved but never run, so there was nothing to roll back",
+            )
+        elif kind != ArtifactKind.KB_NOTE:
             if fm.get("rollback"):
                 outcome = await self._run_rollback(kind, fm, body)
             elif kind_can_roll_back(kind):
@@ -528,6 +572,8 @@ class ArtifactExecutor:
             result = await guest_network_execute(
                 fm, body, target, self.proxmox, self.settings_source, self.sdn_gateway
             )
+        elif kind == ArtifactKind.GUEST_POWER:
+            result = await guest_power_execute(fm, body, target, self.repo, self.proxmox)
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:
@@ -538,6 +584,8 @@ class ArtifactExecutor:
             snapshot_id=result.get("snapshot_id"),
             failure_reason=result.get("failure_reason"),
             unsettled_task=result.get("unsettled_task"),
+            partial_apply=result.get("partial_apply"),
+            warnings=list(result.get("warnings") or []),
         )
 
     async def _maybe_snapshot(self, fm: dict[str, Any], target: dict[str, Any]) -> str | None:

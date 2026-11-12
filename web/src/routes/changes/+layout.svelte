@@ -11,15 +11,22 @@
 	import { base } from '$app/paths';
 	import TabBar from '$lib/components/TabBar.svelte';
 	import { routeTabs, activeRouteTab, type RouteTabDef } from '$lib/tabs';
+	import { shellCounts } from '$lib/nav';
+	import { CHANGES_TABS } from '$lib/sections';
 
-	const views: RouteTabDef[] = [
-		{ id: 'artifacts', label: 'Artifacts', href: '/changes', exact: true },
-		{ id: 'review', label: 'Review queue', href: '/changes/review' },
-		{ id: 'drift', label: 'Drift', href: '/changes/drift' },
-	];
+	// Inbox first (UI_PLAN 3.6): proposals AND approved changes still to run,
+	// so the place a change waits in never looks empty while work is pending.
+	// The Inbox label carries the count of what waits in it and drops it when
+	// nothing does ("Inbox empty" is then the page's own sentence).
+	$: waiting = $shellCounts.proposed?.n ?? 0;
+	$: views = CHANGES_TABS.map((t) =>
+		t.id === 'inbox' && waiting > 0 ? { ...t, label: `${t.label} ${waiting}` } : t,
+	) satisfies RouteTabDef[];
 	$: tabs = routeTabs(views, base);
-	// The artifact detail (/changes/{id}) belongs to the Artifacts view.
-	$: activeId = activeRouteTab(views, $page.url.pathname, base, base + '/changes/');
+	// A change's own page (/changes/{id}) belongs to All, whichever tab led there.
+	$: activeId =
+		activeRouteTab(views, $page.url.pathname, base) ||
+		($page.url.pathname.startsWith(base + '/changes/') ? 'artifacts' : '');
 </script>
 
 <div class="space-y-4">

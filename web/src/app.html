@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="night" data-theme-pref="night">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -7,6 +7,10 @@
 		<link rel="icon" href="%sveltekit.assets%/favicon.png" sizes="64x64" type="image/png" />
 		<link rel="apple-touch-icon" href="%sveltekit.assets%/logo.png" />
 		<title>HomePilot</title>
+		<!-- Before anything paints: the operator's theme (Night / Day / System).
+		     A blocking external script on purpose - script-src 'self' refuses an
+		     inline one, and a late theme flashes the wrong field. -->
+		<script src="%sveltekit.assets%/theme-boot.js"></script>
 		%sveltekit.head%
 	</head>
 	<body class="bg-canvas text-ink font-sans min-h-screen">

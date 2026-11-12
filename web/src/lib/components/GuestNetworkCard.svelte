@@ -17,6 +17,7 @@
 	import { api, type GuestNetworkReport, type SettingOverride } from '$lib/api';
 	import { GUEST_NETWORK_KEYS, settingsFor } from '$lib/settingFields';
 	import SettingFields from './SettingFields.svelte';
+	import Icon from '$lib/components/Icon.svelte';
 
 	export let overrides: SettingOverride[] = [];
 	export let canWrite = false;
@@ -52,7 +53,7 @@
 		     self-check report, and two identically-labelled buttons on one screen
 		     is an operator guessing which one they pressed. -->
 		<button class="btn btn-ghost btn-sm" disabled={loading} on:click={load}>
-			{loading ? 'Surveying…' : '↻ Re-survey the cluster'}
+			{#if loading}Surveying…{:else}<Icon name="refresh" />Re-survey the cluster{/if}
 		</button>
 	</div>
 
@@ -113,7 +114,7 @@
 				Changes ship as a change record, not from this card: propose a
 				<span class="font-mono">guest-network</span> artifact, approve it with the
 				code, and applying it runs exactly the plan above.
-				<a class="link" href="/ui/changes/review">Go to the review queue →</a>
+				<a class="link" href="/ui/changes/inbox">Go to the Changes inbox <Icon name="arrow-right" /></a>
 			</p>
 		{/if}
 	{:else if loading}

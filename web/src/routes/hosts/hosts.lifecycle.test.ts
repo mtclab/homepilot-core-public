@@ -93,7 +93,9 @@ describe('Inventory lifecycle', () => {
 		render(Inventory);
 		await waitFor(() => expect(listInventory).toHaveBeenCalled());
 
-		await fireEvent.click(screen.getByRole('button', { name: /add host/i }));
+		// The door is `+ Add` > "Add a LAN device" (UI slice 5, plan 3.2).
+		await fireEvent.click(screen.getByRole('button', { name: 'Add to the fleet' }));
+		await fireEvent.click(screen.getByRole('menuitem', { name: 'Add a LAN device' }));
 		await fireEvent.input(screen.getByPlaceholderText('nas01'), {
 			target: { value: 'nas01' },
 		});

@@ -31,12 +31,13 @@ through the same scrub every other guest output passes through.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+
+from homepilot.runtime.blocking import run_blocking
 
 # The connect() timeout INSIDE the guest, per target. A DROP produces exactly a
 # timeout, so this is the time a verified fence costs; an answer, either kind,
@@ -201,7 +202,7 @@ async def resolve_ipv4(host: str) -> str | None:
     except ValueError:
         pass
     try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None, socket.AF_INET)
+        infos = await run_blocking("net", socket.getaddrinfo, host, None, socket.AF_INET)
     except (OSError, ValueError):
         return None
     for info in infos:

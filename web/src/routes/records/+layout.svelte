@@ -6,13 +6,9 @@
 	import { page } from '$app/stores';
 	import { base } from '$app/paths';
 	import TabBar from '$lib/components/TabBar.svelte';
-	import { routeTabs, activeRouteTab, type RouteTabDef } from '$lib/tabs';
+	import { routeTabs, activeRouteTab } from '$lib/tabs';
+	import { RECORDS_TABS as views } from '$lib/sections';
 
-	const views: RouteTabDef[] = [
-		{ id: 'tasks', label: 'Tasks', href: '/records/tasks' },
-		{ id: 'journal', label: 'Journal', href: '/records/journal' },
-		{ id: 'kb', label: 'Knowledge base', href: '/records/kb' },
-	];
 	$: tabs = routeTabs(views, base);
 	$: activeId = activeRouteTab(views, $page.url.pathname, base);
 </script>

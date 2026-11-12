@@ -26,7 +26,8 @@ describe('Login page (claimed instance)', () => {
 
 		expect(await screen.findByLabelText(/api token/i)).toBeInTheDocument();
 		expect(screen.getByRole('button', { name: /connect/i })).toBeInTheDocument();
-		expect(screen.getByText(/homepilot/i)).toBeInTheDocument();
+		// The wordmark is set as Home<em>Pilot</em>; what the reader sees is one word.
+		expect(document.querySelector('.wordmark')?.textContent).toBe('HomePilot');
 	});
 
 	it('disables connect button when token is empty', async () => {

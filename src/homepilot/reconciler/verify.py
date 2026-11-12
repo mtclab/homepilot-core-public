@@ -18,6 +18,7 @@ from homepilot.artifacts.store import ArtifactStore
 from homepilot.db.repository import Repository
 from homepilot.executor.jinja_utils import InterpolationError, interpolation_context
 from homepilot.executor.skip_if import SkipIfUndecided, make_pve_response_proxy
+from homepilot.runtime.blocking import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ async def verify_artifact(
         )
 
     try:
-        fm, body = store.read(artifact_id)
+        fm, body = await run_blocking("io", store.read, artifact_id)
     except FileNotFoundError:
         raise
 
@@ -166,6 +167,15 @@ async def verify_artifact(
             return await _verify_host_provision(artifact_id, fm, body, executor)
         elif kind == ArtifactKind.GUEST_NETWORK:
             return await _verify_guest_network(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.GUEST_POWER:
+            # A power action is a moment, not a state: the guest being stopped
+            # tomorrow is not drift from yesterday's start (#781).
+            return VerifyResult(
+                artifact_id=artifact_id,
+                drifted=False,
+                verification_log="guest-power: a one-time action, nothing to drift from",
+                details={"reason": "guest_power_one_time"},
+            )
         else:
             return VerifyResult(
                 artifact_id=artifact_id,

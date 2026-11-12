@@ -48,6 +48,7 @@ _HOST_COLUMN_TYPES: dict[str, type] = {
     "env": str,
     "env_source": str,
     "is_self": int,
+    "protected": int,
 }
 
 _SERVICE_COLUMN_TYPES: dict[str, type] = {
@@ -107,6 +108,7 @@ _HOST_COLUMNS: frozenset[str] = frozenset(
         "maxdisk_gb",
         "env",
         "env_source",
+        "protected",
         # Not `is_self`: only set_self_host() may write it, because it has to
         # clear the previous holder in the same transaction.
     }
@@ -1075,6 +1077,95 @@ class Repository:
         )
         return [dict(r) for r in rows]
 
+    async def get_node_row(self, hostname: str) -> dict[str, Any] | None:
+        """The row the inventory sweep records a Proxmox node on.
+
+        The live node row first, then a retired node row, then (as before) any
+        row with that name. A bare hostname lookup returned whichever row
+        SQLite reached first, so with a retired duplicate beside the live row
+        (migration 41) the sweep could revive the retired one and stamp the
+        live one gone.
+        """
+        return await self.db.fetchone(
+            "SELECT * FROM hosts WHERE hostname = ? "
+            "ORDER BY (host_type = 'node') DESC, (absent_since IS NULL) DESC, rowid LIMIT 1",
+            (hostname,),
+        )
+
+    async def record_provisioned_guest(
+        self,
+        *,
+        hostname: str,
+        host_type: str,
+        proxmox_id: int,
+        node: str,
+        ip_address: str | None = None,
+        owner: str | None = None,
+        cpu_cores: int | None = None,
+        memory_mb: int | None = None,
+        disk_gb: int | None = None,
+    ) -> str:
+        """Record the guest provisioning just built: THE live row for its VMID.
+
+        Provisioning records the machine minutes after the clone (IP, cloud-init
+        and fence checks come first), and an inventory sweep in between finds
+        the new guest and records it as "discovered", pending adoption. That
+        used to leave two live rows for one machine. The database now holds one
+        live row per VMID (migration 41), so this is an upsert:
+
+        * a live row with this name IS this machine (the sweep got there
+          first): it becomes the provisioned record - HomePilot's own, owned,
+          managed, never pending adoption;
+        * a live row with another name is an earlier occupant the sweep has not
+          retired yet (#706): it is retired, never handed over;
+        * otherwise a new row.
+
+        A concurrent insert between the look-up and ours fails the unique
+        index - a statement-level failure, no transaction is lost - and the
+        look-up runs once more, now finding that row.
+        """
+        facts: dict[str, Any] = {
+            "hostname": hostname,
+            "host_type": host_type,
+            "node": node,
+            "ip_address": ip_address,
+            "ip_source": "pve" if ip_address else None,
+            "managed_by": "provisioned",
+            "managed": 1,
+            # 'hp_created', never 'discovered': it keeps the sweep from stamping
+            # import_state 'pending' on a guest HomePilot made itself.
+            "source": "hp_created",
+            "import_state": None,
+            "pve_status": "running",
+            "status": "online" if ip_address else "unknown",
+            "cpu_cores": cpu_cores,
+            "memory_mb": memory_mb,
+            "disk_gb": disk_gb,
+            "owner": owner,
+        }
+        wanted = hostname.strip().lower()
+        for attempt in (1, 2):
+            live = [
+                r for r in await self.list_hosts_by_proxmox_id(proxmox_id) if not r["absent_since"]
+            ]
+            mine = next(
+                (r for r in live if str(r.get("hostname") or "").strip().lower() == wanted), None
+            )
+            for row in live:
+                if row is not mine:
+                    await self.retire_host(str(row["id"]))
+            if mine is not None:
+                await self.update_host(str(mine["id"]), **facts)
+                return str(mine["id"])
+            try:
+                return await self.create_host(
+                    proxmox_id=proxmox_id, role_source="inferred", **facts
+                )
+            except sqlite3.IntegrityError:
+                if attempt == 2:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def proxmox_ids_ever_held(self, low: int, high: int) -> set[int]:
         """Every VMID in ``low..high`` that any `hosts` row has ever held (#718).
 
@@ -1296,14 +1387,18 @@ class Repository:
         # date in absent_since remains the precise fact. Guarded by
         # `absent_since IS NULL` like the stamp itself, so this happens once -
         # and a host that is SEEN again is restatused by the sync that saw it.
-        cursor = await self.db.execute(
+        #
+        # Executed AND read in one step (`Database.fetchall`): a RETURNING
+        # statement stays in progress until its last row is read, and another
+        # coroutine's commit in between fails on the shared connection.
+        stamped = await self.db.fetchall(
             f"UPDATE hosts SET absent_since = ?, updated_at = ?, "
             f"status = 'unknown', pve_status = 'unknown' "
             f"WHERE source IN ({placeholders}) AND absent_since IS NULL{seen_clause} "
             f"RETURNING id",
             [now(), now(), *params],
         )
-        newly_absent = [str(row["id"]) for row in await cursor.fetchall()]
+        newly_absent = [str(row["id"]) for row in stamped]
         # ...and KEEP it unknown. The stamp above runs once per absence, so a row
         # stamped before #613 kept the status it was last seen with, and a later
         # writer (an agent disconnect sets 'offline') could put one back. Dev

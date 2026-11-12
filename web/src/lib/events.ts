@@ -19,6 +19,7 @@ export const ARTIFACT_EVENT_TYPES = [
 	'artifact_failed',
 	'artifact_superseded',
 	'artifact_revoked',
+	'artifact_withdrawn',
 	'artifact_drifted',
 ] as const;
 

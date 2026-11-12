@@ -44,6 +44,7 @@ jobs:
               - 'src/**'
               - 'tests/**'
               - 'pyproject.toml'
+              - 'uv.lock'
               - '.github/workflows/ci.yml'
             web:
               - 'web/**'
@@ -87,7 +88,11 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        # The EXACT locked dependency set, like the image and the local gate
+        # (`make gate-lock`). `pip install -e .[dev]` resolved the newest of
+        # everything, so CI tested versions nothing else runs (3.10.0: a newer
+        # Playwright failed the run).
+        run: pip install uv && uv export --frozen --all-extras --no-emit-project --no-hashes -o /tmp/requirements.txt && pip install -r /tmp/requirements.txt && pip install --no-deps -e .
 
       - name: Lint
         run: ruff check src/
@@ -113,7 +118,11 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        # The EXACT locked dependency set, like the image and the local gate
+        # (`make gate-lock`). `pip install -e .[dev]` resolved the newest of
+        # everything, so CI tested versions nothing else runs (3.10.0: a newer
+        # Playwright failed the run).
+        run: pip install uv && uv export --frozen --all-extras --no-emit-project --no-hashes -o /tmp/requirements.txt && pip install -r /tmp/requirements.txt && pip install --no-deps -e .
       - name: Start server in background
         run: |
           uvicorn homepilot.main:app --host 0.0.0.0 --port 8000 &

@@ -5,6 +5,7 @@ from typing import Any
 
 from homepilot.artifacts.models import extract_composite_steps
 from homepilot.executor.composite_lib import _topological_sort
+from homepilot.runtime.blocking import run_blocking
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ async def execute(
 
             if artifact_store:
                 try:
-                    sub_fm, _ = artifact_store.read(sub_artifact_id)
+                    sub_fm, _ = await run_blocking("io", artifact_store.read, sub_artifact_id)
                     sub_status = ArtifactStatus(sub_fm.get("status", ""))
                     if sub_status == ArtifactStatus.APPLIED:
                         log_lines.append(f"[{sid}] already applied, skipping")
@@ -118,7 +119,7 @@ async def execute(
                 if not sub_artifact_id:
                     continue
                 try:
-                    sub_fm, _ = artifact_store.read(sub_artifact_id)
+                    sub_fm, _ = await run_blocking("io", artifact_store.read, sub_artifact_id)
                     sub_status = sub_fm.get("status", "")
                     if sub_status in ("applied", "approved"):
                         applied_ids.add(sub_artifact_id)

@@ -167,6 +167,31 @@ def proxmox_ui_url(proxmox: Any, host: dict[str, Any]) -> str | None:
     return None
 
 
+def proxmox_console_url(proxmox: Any, host: dict[str, Any]) -> str | None:
+    """The guest's console in the Proxmox web UI, or None when there is none to open.
+
+    noVNC for a VM, xterm.js for a container - the two consoles PVE's own UI
+    opens. Only a guest that exists, is not a template (a template never runs)
+    and has a node and VMID has one; the operator still logs in to Proxmox
+    there, HomePilot hands over no credential.
+    """
+    if proxmox is None or host.get("absent_since") or host.get("is_template"):
+        return None
+    base = proxmox_ui_url(proxmox, host)
+    host_type = host.get("host_type")
+    vmid = _int(host.get("proxmox_id"))
+    node = host.get("node")
+    if base is None or host_type not in ("qemu", "lxc") or vmid is None or not node:
+        return None
+    root = base.split("#", 1)[0]
+    kind = "kvm&novnc=1" if host_type == "qemu" else "lxc&xtermjs=1"
+    name = quote(str(host.get("hostname") or ""), safe="")
+    return (
+        f"{root}?console={kind}&vmid={vmid}&vmname={name}"
+        f"&node={quote(str(node), safe='')}&resize=off&cmd="
+    )
+
+
 __all__ = [
     "ENVS",
     "ENV_SOURCE_TAG",
@@ -177,5 +202,6 @@ __all__ = [
     "guest_facts",
     "imported_env",
     "parse_pve_tags",
+    "proxmox_console_url",
     "proxmox_ui_url",
 ]

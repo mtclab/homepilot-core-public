@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { page } from '$app/stores';
 	import { api, type KBEntry, sessionStore } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { groupByKind } from '$lib/grouping';
+	import Icon from '$lib/components/Icon.svelte';
 
 	let query = '';
 	let filterKind = '';
@@ -176,7 +177,23 @@
 		return 'text-muted';
 	}
 
-	onMount(search);
+	// The page is addressable (UI slice 2): `?q=` runs that search and `open=`
+	// expands that entry, so a knowledge row in the command palette lands on
+	// the entry itself rather than on an unfiltered list. Re-read on every
+	// URL change, so a second palette jump while already here still lands.
+	let routedSearch: string | null = null;
+	$: if ($page.url.search !== routedSearch) {
+		routedSearch = $page.url.search;
+		void fromUrl($page.url.searchParams);
+	}
+
+	async function fromUrl(params: URLSearchParams) {
+		const q = params.get('q');
+		if (q !== null) query = q;
+		await search();
+		const wanted = Number(params.get('open'));
+		if (wanted && items.some((e) => e.id === wanted)) openId = wanted;
+	}
 </script>
 
 <div class="page-stack">
@@ -356,7 +373,7 @@
 								{/if}
 								<span class="text-ink truncate">{summaryOf(entry)}</span>
 								<span class="text-muted ml-auto pl-2" aria-hidden="true"
-								>{openId === entry.id ? '▾' : '▸'}</span>
+								><Icon name={openId === entry.id ? 'chevron-down' : 'chevron-right'} /></span>
 							</button>
 							{#if openId === entry.id}
 								<div class="px-3 pb-3 space-y-2">

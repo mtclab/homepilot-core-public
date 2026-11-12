@@ -84,6 +84,11 @@ vi.mock('$lib/api', async () => {
 			revokeArtifact: vi.fn(),
 			getHostDoc: vi.fn(),
 			getHostNetwork: vi.fn().mockResolvedValue({ host_id: '', addresses: [], conflicts: [] }),
+			// Guest power (#781): unread by default; a test says what the guest is.
+			getGuestPower: vi.fn(),
+			powerGuest: vi.fn(),
+			approveAndApplyArtifact: vi.fn(),
+			withdrawArtifact: vi.fn(),
 			searchKB: vi.fn().mockResolvedValue({ results: [], total: 0 }),
 			listKB: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			// The Agents page: enough of the fleet surface that the route can be

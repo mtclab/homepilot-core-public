@@ -2,4 +2,4 @@
 	import Redirect from '$lib/Redirect.svelte';
 </script>
 
-<Redirect to="/changes/review" />
+<Redirect to="/changes/inbox" />

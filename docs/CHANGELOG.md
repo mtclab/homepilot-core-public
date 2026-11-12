@@ -1,5 +1,521 @@
 # Changelog
 
+## 3.10.0 - 2026-11-09
+
+Changes you can follow, power from the Hosts list, and a console you can search.
+An approved change no longer seems to vanish: Changes > Inbox keeps it as
+"Ready to run" until it runs, every change can be approved and applied in one
+press, and an approved change can be withdrawn. The Hosts list can start, shut
+down, reboot and stop a guest from its row menu and says in the row what
+happened, and a friend's guest portal now runs the same safety checks as the
+operator's button. `Ctrl+K` searches pages, hosts, changes and knowledge;
+Monitoring > Alerts is a full page; the Overview was relaid out.
+
+Two fixes you may notice. `docker stop` now shuts HomePilot down cleanly: since
+May 2026 the app ignored SIGTERM, so every stop waited for Docker's kill and
+skipped the shutdown that stops background jobs and closes the database. And
+the first request after a start no longer holds every other request for about
+a third of a second while the app builds its route table; it is built before
+the server starts listening.
+
+Two inventory syncs at once - the one that runs at every start and a Sync, an
+MCP refresh or a CLI sweep - could record a guest twice or stop with "cannot
+commit transaction - SQL statements in progress". Syncs now take turns, the
+database keeps one live row per machine, and migration 41 retires any duplicate
+an install already has.
+
+### Operator actions
+
+- Migrations 40 and 41 run at the first start, after the usual backup (`backups/pre-migration-v39.db`): 40 rebuilds `tasks`, keeping every row; 41 marks any duplicate host row gone (kept, and listed in the audit log). To go back, restore that backup with `hp db restore`.
+- Copy `proxy_read_timeout 360s;` from the reference vhosts into your nginx vhosts (`location /` and the portal's guest/invite block), then reload nginx.
+- MCP clients with a tool allow-list: add `withdraw_artifact`.
+
+### `docker stop` shuts HomePilot down cleanly
+
+The app installed its own SIGTERM handler at startup. That handler replaced
+uvicorn's, logged "initiating graceful shutdown" and then did nothing, so the
+server kept serving until Docker killed it. The handler is gone. uvicorn now
+handles SIGTERM itself and runs the shutdown: it stops the reconcilers, closes
+the agent hub, and checkpoints and closes the database.
+`tests/test_sigterm_stops_the_server.py` starts the real entry point, sends
+SIGTERM and requires a clean exit that completes the shutdown. With the old
+handler restored, the server is still running when the test's 30 s wait ends.
+
+### The browser tests pass again, and `make gate` runs them
+
+3.9.0's `e2e` job on the public mirror failed twice:
+
+- **Stale redirect expectations.** The test still expected `/tokens` to land on
+  Settings, but 3.9.0 moved tokens to Assistants on purpose. The redirect test
+  now lists every 3.9.0 move: `/tokens`, `/agents` and `/monitoring`, the
+  Settings tabs that left (`?tab=` and the old `#` links for monitoring,
+  alerts, guests and tokens), and query and fragment travelling with the
+  redirect. Each case must match the exact landing address. The old check
+  matched loosely, so a wrong target could pass by sharing a prefix (`/agents`
+  "passed" on `/ui/hosts`).
+- **A false alarm from the loop-block detector.** Playwright's sync API runs its
+  own event loop, and the test's code runs inside one of that loop's callbacks.
+  The detector timed a fixture's wait as a 62 s loop block. The browser tests
+  drive HomePilot in another process, so no loop in the test process is
+  HomePilot's: the detector now times nothing while a test of
+  `tests/test_e2e.py` runs, and every other test is timed as before. The rule
+  is the module, not Playwright's internals - a first version recognised
+  Playwright's loop by how Playwright builds it and stopped working on a newer
+  Playwright. `tests/test_loop_block_detector_e2e_module.py` proves both
+  halves without Playwright: a loop held in the e2e module is not reported, and
+  the same block in any other module of the same session still fails its test.
+
+The fixture was waiting because the suite exceeded its own rate limit. Token
+creation allows 5 attempts per IP per minute, refused attempts included. The
+CI harness used one, and the suite then tried eight more: a fixture minted
+spare tokens from before logout stopped deleting tokens (#389). The suite now
+makes four attempts. The table at the top of `tests/test_e2e.py` lists each
+one, and an attempt over the limit fails at once, naming the table, instead of
+sleeping for a minute. The product's limits are unchanged. The redirect test
+loads only the console shell and the session check, because loading every
+destination page in full used most of the per-IP request limit, and the tests
+after it then got 429s. The whole e2e run went from 80 s to about 30 s.
+
+`make gate` now includes `gate-e2e` (`scripts/gate-e2e.sh`), which runs the
+mirror workflow's steps locally:
+
+- build the web UI with `npm ci`;
+- start the server from this tree, with an empty environment and a throwaway
+  HOME and data directory, on free localhost ports;
+- create the run's token over HTTP;
+- run `tests/test_e2e.py` in headless chromium.
+
+It fails if any e2e test is skipped, or if the server does not stop cleanly
+on SIGTERM. The first run needs network for `playwright install chromium`,
+which goes into the user's Playwright cache, not the system.
+
+### Changes you can follow: the Inbox, approve and apply, withdraw (humane Changes queue)
+
+An approved change used to leave the review queue with nothing saying it still
+had to be applied, so the queue looked empty and the change looked lost. Now:
+
+- **Changes > Inbox** is the first tab (it replaces the review queue; old
+  `/changes/review` and `/review` links land there). It holds proposed changes
+  AND approved ones that have not run. An approved change stays as **Ready to
+  run** with **Apply** and **Withdraw** on its card; a running one says
+  "Running: <intent>, started 18:28" with the task's live state; a finished one
+  moves to **Finished today** with the outcome in words. The Inbox is empty only
+  when nothing waits. Keyboard: `j`/`k` move between cards, `a` approve and
+  apply (asks first), `r` reject, `Enter` opens.
+- **Approve and apply** is the primary action for every kind, in one press
+  (admin session). A composite or a `replay_safe: false` change keeps two
+  explicit steps and says why. A destroy or a forced stop asks for the guest's
+  name typed back first.
+- Every change shows a **plain-words summary** at the top (what it does, to
+  which guest); the raw spec is behind a disclosure. The same summary is in
+  `GET /api/artifacts/{id}` (`summary`) and the MCP `get_artifact`.
+- **Withdraw** takes back an approved change that has not run (#797): new
+  status `withdrawn`, terminal, runs nothing, audited, recorded as a task.
+  `POST /api/artifacts/{id}/withdraw`, MCP `withdraw_artifact`,
+  `hp artifacts withdraw <id>`. Refused while a run is in flight.
+- **Revoking an approved change that never ran no longer runs its rollback**:
+  nothing was applied, so there is nothing to undo.
+- **PVE task warnings** are read from the task log and shown verbatim with a
+  one-line explanation and a verdict (the UEFI `ms-cert=2023k` note is marked
+  harmless), never just "WARNINGS: 1".
+- The sidebar **Changes count** and the Overview include approved changes
+  ready to run (`changes: {proposed, ready, running}` in the dashboard
+  summary), and update when a change moves.
+
+Migration 40 rebuilds the `tasks` table so a task can record a `withdraw`;
+every task row is kept. Webhooks: a new event, `artifact_withdrawn`; re-import
+`n8n/artifact-notification.json` if you route events through n8n.
+
+### Fixes
+
+- **A busy machine is no longer called a frozen event loop.** The loop
+  watchdog counted every late heartbeat as "frozen by a blocking call", and the
+  Overview showed it as a fault. On a busy or paused machine the process is
+  simply not scheduled and the loop wakes late with no callback running (found
+  walking 3.10.0 on a two-core dev box: 554 ms, stack inside the loop's own run
+  call). A stall is now counted only when two samples caught a callback
+  running; anything else is a late wake-up, which the self-check mentions and
+  never reports as a fault.
+
+- **#797:** a DELETE step's options (`body: {purge: 1}`) went to PVE as a JSON
+  body and PVE answered `501 Unexpected content for method 'DELETE'`. A DELETE's
+  parameters are now always sent as URL query parameters, so existing
+  artifacts written with `body:` on a DELETE work as written. Options in the
+  path (`?purge=1`) keep working too, also next to a `query`.
+- **#796:** a run that changed part of what it was asked to is reported as
+  `partly applied: steps a, b done; step c failed: <reason>` instead of a bare
+  `failed`, on the artifact (`partial_apply`) and on its task. A failed config
+  write is read back, so a refused `delete=scsi2,hostpci0` that removed scsi2
+  says so.
+
+### Hosts list: power from the row menu (UI slice 5)
+
+- **Row menu:** Open host · Metrics · Open in Proxmox · **Console** (Proxmox's
+  noVNC for a VM, xterm.js for a container) · **Start / Shut down / Reboot /
+  Stop** · Adopt / Ignore · Forget. The verbs are judged by the guest's live
+  state, read from Proxmox when the menu opens; a verb that does not apply now
+  stays in the menu, disabled, and says why ("Already running", "Not running",
+  "Needs an admin session", "Could not read its state from Proxmox").
+- **Confirmation by tier:** Start, Shut down and Reboot of an ordinary guest
+  confirm in place ("Confirm start"). A forced Stop, and any verb on the
+  machine HomePilot runs on or a protected guest, open a dialog that names the
+  VMID and node, says what happens, and waits for the host name to be typed.
+- **Honest progress:** the row says "Starting... following Proxmox task" with
+  the old state chip kept and marked `pending`. When Proxmox has settled it,
+  the row shows the outcome and the chip the state the server read back. A
+  refusal names the reason and the holder in the row, for example "Start
+  refused: Address 192.0.2.20 is used by relay (VMID 112). Nothing was sent."
+  The row stays in its group until you reload, so nothing moves under the
+  cursor.
+- **The row is updated at once:** after a power action the server writes the
+  state Proxmox reported onto the inventory row, so the list, the guest portal
+  and the overview agree before the next sync. A state Proxmox did not confirm
+  is not written.
+- **State chip for guests** is Proxmox's word (`running`, `stopped`), not
+  `online`/`unknown` (a running guest without a known address used to read
+  `unknown`).
+- **`+ Add` menu:** Add a LAN device (the existing form), Provision a VM from
+  template (shown disabled: there is no operator provision form yet), Enrol an
+  agent (Hosts > Agents).
+- **Table:** group headings stay table sections; the header sticks on a long
+  fleet. The row menu opens above or below its row and is no longer cut off
+  by the table's edge. A hand-added host's source reads "Manual" (it was an
+  empty pill).
+- **Phones:** under 768 px the fleet is a card list (name and chips, then
+  addresses, VMID and env, the same row menu); the header buttons wrap.
+- Fixed: a menu item that changes into its own confirm on click closed the
+  whole menu in a real browser, before the confirm could be pressed.
+
+### Guest portal: the operator's power guards (#781 follow-up)
+
+The portal's `POST /guest/vms/{id}/power` had its own short copy of the
+checks (gone, and the name at the VMID). It now runs the operator's
+`PowerService`, the same guard function the operator's button and an approved
+`guest-power` change use: address clash before Start and before a Reboot that
+applies a pending address, a passthrough disk a running guest on the same node
+holds, a locked guest, the wrong state, a reused VMID, a gone or template
+guest, and a protected guest (off actions are refused on the portal; only the
+operator can switch a protected machine off). The friend reads a plain
+sentence; the operator's audit row keeps the full reason with the holder
+named. The portal page says "Starting... waiting for it to finish" and then
+the result.
+
+For portal clients: a refused power action now answers `409` with a `code`
+(for example `address_clash`, `disk_shared`, `locked`, `state`,
+`confirmation_required`) and a sentence that names nothing outside the
+friend's own machine. A power action that went through answers once it has
+settled, with `outcome` (`ok`, `timed_out` or `unknown`) and `status`. Audit
+rows for portal power actions are now `guest_start` / `guest_stop` /
+`guest_reboot` (and `guest_power_refused`) with `source = guest-portal`, the
+names the operator's actions use; they were `vm_start` and so on.
+
+Why the nginx timeout (Operator actions): a power action now answers once
+Proxmox has finished it, and a reboot can take five minutes at the default
+shutdown timeout. With nginx's 60 s default you would see an error while the
+action goes on. `deploy/control-plane/nginx-hp-proxy.conf` (`location /`) and
+`deploy/portal/nginx-guest-portal.conf` (`location ~ ^/(guest|invite)`) carry
+the line; `tests/test_power_proxy_timeouts.py` derives the bound from the
+power code.
+
+### Search from anywhere, alerts get their page, the Overview acts (UI slices 2-4)
+
+- **Command palette.** Press `Ctrl+K` (`Cmd+K` on a Mac), or `/` when you are
+  not typing in a field, or the Search box at the top of the sidebar (the
+  magnifier on a phone). It finds pages (every sidebar noun and every tab),
+  hosts, changes and knowledge-base entries; type a host's name and press
+  Enter to open its page. Each source answers on its own: when one cannot be
+  searched it says "could not search" in its own group instead of looking
+  empty. Arrow keys move, Enter opens, Tab switches what you search in (the
+  choice is remembered in this browser), Escape closes and puts you back where
+  you were. A knowledge result opens the knowledge base with that search run
+  and that entry expanded (`/ui/records/kb?q=...&open=...` now works as a
+  link).
+- **Monitoring > Alerts is a full page.** It starts with what is watched at
+  all: how many hosts have a connected agent, how many do not (with the way to
+  enrol them), and how many alert rules are on and how many match no host.
+  Each firing alert links to its rule, and a new Deliveries list shows every
+  alert sent in the window and who it reached, or "nobody was notified".
+  "Send test" sends a test message to every enabled channel and says what each
+  answered (admin sessions; others are told why there is no button).
+- **The Overview, relaid out.** Needs attention comes first, with the Alerts
+  strip beside it: two lines, how many fire and where alerts go, with the door
+  to Monitoring > Alerts. Lines now show since when (hover for the exact time)
+  and carry the fix where one exists today: Forget a gone host, Open window
+  for hosts waiting to join (admin), Re-check drift, Cancel a stuck task. The
+  ones that change something ask first, in place, and the page re-reads after,
+  so a line goes away only when the server says it is fixed. A calm Overview
+  says what it checked: "Nothing needs you - checked 6 sources just now." The
+  two donut charts are replaced by one row of numbers (hosts, watched by an
+  agent, agents, in spec, changes) above the host chips. Capacity numbers
+  (RAM allocated, storage use) will join that row once the backend measures
+  them; until then they are not shown.
+- **Fixes found on the way.** Host names on the Alerts page were plain text
+  instead of links when the inventory answered after the alerts; they link now.
+
+The Overview no longer shows the alert list (it moved to Monitoring > Alerts)
+or the two donut charts; nothing else about the pages you already use moved.
+
+### The lanes together (release integration)
+
+- **The first request no longer blocks the server.** FastAPI builds each
+  route's request handling the first time a request reaches it. On the
+  versions this release pins (`uv.lock`: fastapi 0.141.1, pydantic 2.13.4,
+  starlette 1.6.0) that was about 140 routes and ~290 ms of CPU on the event
+  loop, inside the first request after every start (usually the container's
+  own health check), so every other request and the agent hub waited. The app
+  now builds the whole table when it is loaded, before the server listens.
+  `tests/test_first_request_does_not_block.py` starts a fresh process, runs
+  the real startup, then times the first request: 0 routes built and 1.5 ms
+  now, 129 built and 289 ms with the fix removed.
+  The same release gate found one more first-use stall: the Proxmox library
+  (and the HTTP stack under it) was imported inside the claim's token check
+  and the guest-network reads, ~180 ms on the loop on a fresh install. It is
+  now loaded with the app as well.
+- **`make gate` refuses a venv that does not match `uv.lock`** (`gate-lock`,
+  first). The 3.9.0 gate passed in a venv that had drifted to newer
+  fastapi/pydantic/starlette, which is why it never saw the stall above.
+  The check is uv's own (`uv sync --locked --check --offline`) and names
+  every package that differs.
+- **One confirm dialog.** The Changes and the Hosts work each built a typed
+  confirm dialog; there is now one (`ConfirmDialog`), a real modal dialog that
+  both use, with both sets of tests.
+- **The palette and the Overview follow the Inbox.** The palette offered the
+  retired review queue, and the Overview's Changes number counted proposals
+  only. Both now read the same Changes tabs and count what waits in the Inbox
+  (proposed and ready to run).
+- **The SIGTERM test and `gate-e2e` boot from a data directory the app
+  accepts** (under `$HOME`, not `/tmp`, which the app refuses for artifacts);
+  they only passed where `TMPDIR` pointed under `/home`.
+- **Journeys on the built UI with guests.** `tests/test_e2e.py` gains
+  `TestFleetJourneys`: the real app and built UI over a fake Proxmox
+  (`tests/e2e_fleet_server.py`), so `make gate-e2e` now walks a row-menu Start
+  to `running`, a Start refused for an address clash naming the holder, the
+  390 px card list, the portal's `409 address_clash` naming no other machine,
+  `Ctrl+K` "llm" Enter, Monitoring > Alerts at 1280 and 390, and approve and
+  apply versus approve only.
+- **Read on the walk, fixed.** The Hosts row menu reads as one list (in Day
+  each item looked like a separate outlined button). The sidebar foot says
+  "Signed in as <name>" and the access in words ("Full access") instead of a
+  bare label over "all". On a phone, a change waiting in the Inbox keeps its
+  title readable, with the buttons under it inside the card.
+
+## 3.9.0 - 2026-11-08
+
+Four pieces of work in one release. You can now start, shut down, reboot and
+stop guests from HomePilot, with guards that refuse an unsafe action and say
+why (B3). The web console has a new look and a new sidebar (UI slices 0 and 1).
+Under the hood, nothing slow runs on the one event loop any more, so a slow git
+push or disk can no longer freeze the API (architecture step 1). Database
+migrations are checked when the app starts, and the schema is pinned in a lock
+file (architecture step 2).
+
+New setting, optional: `HP_LOOP_STALL_MS` (default 500, `0` turns it off)
+logs where the app was stuck whenever the event loop is held that long. Old
+console addresses (Settings tabs, `/tokens`, `/agents`) redirect to their new
+pages, so bookmarks keep working.
+
+### Operator actions
+
+- Migration 39 runs at the first start, after the usual backup
+  (`backups/pre-migration-v38.db`). It adds one empty column,
+  `hosts.protected`. To go back to 3.8.0, restore that backup with
+  `hp db restore`.
+- Check which guests are protected. By default the guest HomePilot runs on and
+  every `env = infra` guest need their name typed to shut down, reboot or stop.
+- MCP clients with a tool allow-list: add `get_guest_power` and `power_guest`
+  if your assistant should have them.
+
+### Migrations cannot drop a version, and the schema is locked (architecture step 2)
+
+Versions 1-38 are untouched: every one runs the
+same statements as in 3.8.0 (each version's statements hash identically, and
+the migrated schema's fingerprint is the same before and after), so an install
+at any schema version upgrades exactly as before. The pre-migration
+`VACUUM INTO` backup is unchanged.
+
+- The migration chain is an ordered tuple of `Migration(version, statements)`
+  instead of a `{version: [...]}` dict literal. A dict literal keeps only the
+  last of two equal keys, so two lanes that each added "the next" version could
+  merge into one that silently dropped the other's DDL (it nearly happened in
+  3.7.0). The module now refuses a repeated version, a gap or a reorder when it
+  is imported, and the runner re-checks the versions it is handed before it
+  touches a database. `tests/test_migrations_contiguous.py` replaces the
+  source-reading check that guarded the dict.
+- `src/homepilot/db/schema.lock` records the schema the chain produces (tables,
+  columns with type, NOT NULL, default and key, foreign keys, indexes, the
+  normalised `CREATE` text) and a content hash of every version.
+  `tests/test_schema_fingerprint.py` rebuilds it from a fresh install and from
+  an upgrade off every older version (0-37), and fails on any change nobody
+  recorded or on an edit to an already recorded version. After an intended
+  schema change: `make schema-lock`; it refuses to rewrite a recorded version's
+  hash unless `--rewrite-history` says the version was never released.
+- An orderly shutdown checkpoints the WAL explicitly
+  (`PRAGMA wal_checkpoint(TRUNCATE)`) once every writer has drained and before
+  the database closes, on its own daemon thread and bounded at 3 s (the #795
+  pattern, now one shared helper). The close then has no checkpoint left to do;
+  a checkpoint that cannot finish leaves the WAL for the close or the next
+  start, which is safe.
+
+### Nothing blocking runs on the event loop (architecture review F1, step 1)
+
+One asyncio loop carries the API, the SSE stream, the MCP transport, the agent
+hub's heartbeats and every reconciler. #795 moved one sqlite close off it after
+a WAL checkpoint froze the app for 16 s; the architecture review found the same
+shape everywhere git was used. Fixed as a class, not a call:
+
+- **`run_blocking(pool, fn, ...)`** (`homepilot/runtime/blocking.py`) runs
+  blocking work on named, bounded thread pools: `git` (ONE thread - every
+  repository operation runs there, in submission order, so commits, pushes and
+  remote changes never interleave), `io` (4: artifact reads and listings, KB
+  file walks, vault key derivation and writes, TLS material, sqlite integrity
+  checks, agent payload hashing) and `net` (4: DNS and socket probes, so a
+  hanging resolver cannot starve disk reads).
+- **Moved off the loop:** every git subprocess of the artifact store (commit,
+  push, pull, remote changes, the preview's `git diff`) and its `time.sleep`
+  lock spin; the blocking per-artifact `flock` - each lifecycle transition's
+  lock-read-check-write now runs as one serialised step on the `git` pool,
+  exactly as atomic as it was on the loop; propose's "id is free" check and
+  write, as one step; every artifact read and full-corpus listing (routes, MCP
+  tools, the executor, task runner, drift/apply/verify reconcilers, KB
+  service); startup's `git init` and store construction, hub certificate
+  generation and loading; the TLS migration's certificate; vault identity
+  creation/migration, passphrase rotation (two PBKDF2 derivations) and secret
+  writes (fsync); the archive push (was on the default pool, racing commits);
+  the agent payload digests (`/agents/dist*` hashed multi-MB binaries per
+  request - presence checks no longer hash at all).
+- Artifact files are now written atomically (temp file + rename): reads run
+  on another thread than writes and must never see half a file.
+- **Loop-stall watchdog** (`HP_LOOP_STALL_MS`, default 500, 0 = off): when one
+  callback holds the loop past the threshold, the loop thread's Python stack
+  is logged WHILE it is blocked, and `/admin/selfcheck` gains a
+  `loop_watchdog` line (a stall in the last 15 minutes reads as a fault).
+  Idle cost: four short wake-ups a second.
+- **Gates:** the test session fails any test whose product code blocks an
+  event loop - every loop in the process, timed per callback
+  (`HP_LOOP_BLOCK_BUDGET_MS`, default 250 ms, garbage collection excluded),
+  with the stack sampled while it blocks and the block attributed to the
+  coroutine running it (a test's own synchronous setup is not product code) -
+  and any product code reaching a blocking primitive (`assert_off_loop` in
+  git, the git lock and the file lock) on a loop however fast it is. The
+  allowlist is empty. A static gate lists every blocking primitive in `src/`
+  by file; a new one fails until it is routed and reviewed.
+- The first-run claim's code file and the claim's local CLI token are written
+  (fsync) off the loop too.
+- Application logging goes through a queue: a log call on the loop only
+  enqueues and one listener thread writes to stderr, so a slow log pipe can
+  no longer stall the loop inside `stream.write` (the detector caught a 359 ms
+  one).
+
+### Operator power controls: start, shut down, reboot, stop (lane B3, #781)
+
+The operator could not start a stopped VM or reboot one so a pending
+cloud-init change applied without writing a `proxmox-api-sequence` by hand or
+leaving for the Proxmox UI. Now, for VMs and containers alike:
+
+- **An operator acts directly.** `POST /api/inventory/{host_id}/power`
+  (admin scope) with `start`, `shutdown`, `reboot` or `stop`; the host page has
+  a Power card and the Hosts row menu a "Power..." entry. No propose/approve
+  round trip; one audit row per action names the actor, the guest, the PVE task
+  and the outcome (refusals are audited too).
+- **The result is honest.** The PVE task is followed to the end and the guest's
+  state read afterwards: `ok`, `failed`, `timed_out` or `unknown`. A shutdown is
+  always sent with `forceStop: 0`; a guest that ignores it ends `timed_out`,
+  still running, with Stop offered - never a silent escalation, never a false
+  success. A reboot is Proxmox's own (pending config applies) and waits for the
+  guest to come back; the pending changes are shown before it.
+- **Guards refuse with a reason and send nothing:** the guest is gone, a
+  template, locked, or another machine now holds its VMID (name checked live);
+  Start, and a Reboot that applies a pending address, would take an address a
+  RUNNING guest holds (the holder is named - the 2026-11-07 incident); Start
+  would open a `/dev/...` passthrough disk a running guest on the same node has
+  attached (the holder is named); shutting down, rebooting or stopping the
+  machine HomePilot runs on, or a protected guest, needs its name typed back.
+- **Protected guests:** new `hosts.protected` (operator-only via
+  `PATCH /api/inventory/{id}`; an assistant token is refused). Unset means the
+  default: the self guest and every `env = infra` machine are protected.
+- **Assistants propose, never power.** MCP `power_guest` runs every guard,
+  then proposes a one-step `guest-power` artifact (new kind, ARTIFACT_SPEC
+  §5.8) and powers nothing; the apply re-runs the guards. Switching off the
+  self guest or a protected one is never proposed. `get_guest_power` reads the
+  state, the pending changes and what each action needs.
+- **Approve and apply in one step** did not exist after 3.8.0, so it is added
+  for this kind only: `POST /api/artifacts/{id}/approve-and-apply` (admin) and
+  "Approve and apply" on the change page. Other kinds keep two steps until the
+  approval UX work settles one rule.
+- **Fix (lane B2's start guard):** a running guest's addresses are now read
+  with `current=1`. PVE's plain config read answers with pending changes
+  applied, so a running guest with a queued ipconfig change was judged by the
+  address it does not hold yet, and the one it does hold went unseen.
+
+### Web UI: the "Instrument" look and the new shell (UI slices 0 and 1)
+
+The first two slices of the console rethink (owner decisions of 2026-11-08:
+direction "Instrument", Monitoring as its own page, Agents under Hosts). Page
+internals are unchanged; they moved and took the new look. No backend change.
+
+**Look (slice 0).**
+- New design tokens in `web/src/app.css`: a neutral near-black **Night** theme
+  (the default) and a cool-grey **Day** theme, one phosphor-lilac accent for
+  what you can touch, and red / amber / green kept for status only. A hollow
+  grey lamp means "no data".
+- A theme control in the sidebar foot: **System / Night / Day**, remembered per
+  browser; System follows the OS live. `static/theme-boot.js` paints the choice
+  before first paint (an external file, because the CSP refuses inline scripts).
+- Self-hosted type under `/ui/fonts` with each family's OFL licence beside it:
+  Instrument Serif (page titles and the wordmark only), Source Serif 4 (reading
+  text), Atkinson Hyperlegible (chrome), JetBrains Mono (numbers, tags, ids).
+  Nothing is fetched from a font service.
+- Denser rows (about 26 px at 12.5 px text), 2 px panels, mono tags with the
+  status colour as their edge, and new `Lamp`, `Tag`, `Panel` and `Icon`
+  components. Every text glyph that stood in for an icon (refresh arrows,
+  crosses, ticks, chevrons, the menu glyph) is an inline SVG icon now.
+- Gates: the token test checks every text pair (WCAG AA) and every boundary
+  (3:1) in **both** themes, that Day redeclares every colour, that every font is
+  self-hosted, present and licensed, and that no gradient is painted; a new
+  glyph gate fails on any arrow, symbol, shape or emoji in rendering code.
+
+**Shell and navigation (slice 1).**
+- The sidebar groups seven nouns as four jobs: Overview; Estate (Hosts,
+  Monitoring, Guests); Change (Changes, Assistants); Record (Records, Settings).
+  Monitoring shows the number of firing alerts and Changes the number of
+  proposals, both from the dashboard summary; a count is absent, never zero,
+  when the summary cannot be read. Guests appears once a guest or an invite
+  exists (admin sessions). The maker's mark moved to the sidebar foot.
+- **Monitoring** is a page: Alerts (the alerts list) and Rules (alert rules,
+  notification channels and webhooks, moved out of Settings).
+- **Hosts > Agents** holds the join requests, the enrol one-liner and the hub
+  token; the fleet list keeps one line naming who is waiting, with the door.
+- **Guests** and **Assistants** are pages. Assistants is the token list for
+  now - naming assistants, limiting their tools and showing their activity are
+  not built yet, and the page says so. Settings keeps Connection, Proxmox,
+  Subsystems and About.
+- Every old address lands on the new home, keeping its query and fragment:
+  `/settings?tab=monitoring` and `#monitoring` / `#alerts` go to
+  `/monitoring/rules`; `/settings?tab=guests` and `#guests` to `/guests`;
+  `/settings?tab=tokens`, `#tokens` and `/tokens` to `/assistants`; `/agents`
+  to `/hosts/agents`; `/monitoring` to `/monitoring/alerts`. The redirects that
+  existed before all stay.
+
+### The lanes together
+
+- **Shutdown order.** When HomePilot stops, it now finishes background jobs
+  first. Then it lets work already handed to the git, disk and network threads
+  finish (up to 10 s), then folds the WAL into the database file, and only
+  then closes the database. Before this, a disk job still reading the database
+  could leave that last step half done.
+- **No slow import at start.** The MCP server module used to be loaded the
+  first time the app started up, on the event loop, holding it for about
+  0.4 s while the agent hub was already running. It is now loaded before the
+  loop starts.
+- **Power controls follow the no-blocking rule.** The new approve-and-apply
+  route reads the change from disk off the event loop, like every other route.
+  The WAL checkpoint's own database call is checked the same way.
+- **The power card follows the new look.** The arrow between a setting's old
+  and new value is an icon now, and a screen reader says "becomes".
+- **Migration 39 is part of the checked chain.** The power controls' new
+  column is entry 39 in the migration list that the app checks at start. The
+  schema lock records it, and every older version's record is unchanged.
+
 ## 3.8.0 - 2026-11-08
 
 Three lanes of the 2026-11 review in one release: HomePilot says when a newer

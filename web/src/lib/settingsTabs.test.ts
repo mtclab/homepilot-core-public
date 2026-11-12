@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SETTINGS_TABS, settingsTabFromHash } from './settingsTabs';
+import { SETTINGS_TABS, SETTINGS_MOVED, settingsTabFromHash, movedSettingsTarget } from './settingsTabs';
 import { activeQueryTab, queryTabs } from './tabs';
 
 /**
@@ -11,16 +11,10 @@ import { activeQueryTab, queryTabs } from './tabs';
  * Connection fallback instead of its own tab.
  */
 describe('Settings tab list', () => {
-	it('is exactly the seven sectors the design names, in order', () => {
-		expect(SETTINGS_TABS.map((t) => t.id)).toEqual([
-			'connection',
-			'proxmox',
-			'subsystems',
-			'guests',
-			'monitoring',
-			'tokens',
-			'about',
-		]);
+	// UI slice 1: Settings is plumbing only. Monitoring, Guests and Tokens
+	// left for pages of their own (SETTINGS_MOVED, asserted below).
+	it('is exactly the four plumbing sectors, in order', () => {
+		expect(SETTINGS_TABS.map((t) => t.id)).toEqual(['connection', 'proxmox', 'subsystems', 'about']);
 	});
 
 	it('addresses every sector with ?tab= on the settings route', () => {
@@ -29,16 +23,13 @@ describe('Settings tab list', () => {
 			'/ui/settings?tab=connection',
 			'/ui/settings?tab=proxmox',
 			'/ui/settings?tab=subsystems',
-			'/ui/settings?tab=guests',
-			'/ui/settings?tab=monitoring',
-			'/ui/settings?tab=tokens',
 			'/ui/settings?tab=about',
 		]);
 	});
 
 	it('selects the tab the URL names, and falls back to Connection', () => {
 		const at = (q: string) => activeQueryTab(SETTINGS_TABS, new URL('http://x/ui/settings' + q));
-		expect(at('?tab=tokens')).toBe('tokens');
+		expect(at('?tab=about')).toBe('about');
 		expect(at('?tab=subsystems')).toBe('subsystems');
 		// No tab, and a stale bookmark naming a sector that no longer exists:
 		// both land on a real sector rather than on nothing.
@@ -79,10 +70,49 @@ describe('Legacy links into a Settings section', () => {
 		expect(settingsTabFromHash('')).toBe('');
 	});
 
-	it('names a tab that exists', () => {
+	it('names a tab that exists, or a sector that moved to a page of its own', () => {
 		const ids = new Set(SETTINGS_TABS.map((t) => t.id));
 		for (const [hash] of CASES) {
-			expect(ids.has(settingsTabFromHash(hash))).toBe(true);
+			const tab = settingsTabFromHash(hash);
+			expect(ids.has(tab) || tab in SETTINGS_MOVED, `${hash} -> ${tab}`).toBe(true);
 		}
+	});
+});
+
+/**
+ * UI slice 1: the sectors that left Settings. Teeth: drop an entry from
+ * SETTINGS_MOVED and its case lands nowhere (null); stop carrying the query
+ * or the fragment and the intent cases fail.
+ */
+describe('A Settings URL that names a moved sector', () => {
+	const at = (u: string) => movedSettingsTarget(new URL('http://x/ui/settings' + u));
+
+	it('moves exactly Monitoring, Guests and Tokens', () => {
+		expect(SETTINGS_MOVED).toEqual({
+			monitoring: '/monitoring/rules',
+			guests: '/guests',
+			tokens: '/assistants',
+		});
+		// None of them is still a Settings tab: moved, not duplicated.
+		const ids = new Set(SETTINGS_TABS.map((t) => t.id));
+		for (const k of Object.keys(SETTINGS_MOVED)) expect(ids.has(k)).toBe(false);
+	});
+
+	it('leaves a sector Settings still has alone', () => {
+		expect(at('')).toBeNull();
+		expect(at('?tab=proxmox')).toBeNull();
+		expect(at('#health')).toBeNull();
+		expect(at('#somewhere-else')).toBeNull();
+	});
+
+	it('carries the rest of the query and an unrelated fragment', () => {
+		expect(at('?tab=monitoring&rule=r1')).toBe('/monitoring/rules?rule=r1');
+		expect(at('?tab=guests#invites')).toBe('/guests#invites');
+	});
+
+	it('lets an explicit ?tab= win over a fragment', () => {
+		expect(at('?tab=about#tokens')).toBeNull();
+		// A fragment that named a Settings card means nothing on the new page.
+		expect(at('?tab=tokens#about')).toBe('/assistants');
 	});
 });

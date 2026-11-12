@@ -39,6 +39,10 @@ from homepilot.inventory.self_guest import ControlPlaneAddress, self_guest_statu
 
 SCHEMA_3_7_0 = 36
 SCHEMA_3_8_0 = 38
+# 39 - operator power controls (lane B3): ``hosts.protected``.
+# Unreleased: 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept.
+# Unreleased: 41 - one live ``hosts`` row per VMID and per node (duplicates retired).
+SCHEMA_LATEST = 41
 
 _NOW = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -132,17 +136,17 @@ async def db_3_7_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 class TestADatabaseFrom370UpgradesInOneStart:
     async def test_one_start_reaches_the_release_schema_and_keeps_every_row(self, db_3_7_0):
-        assert max(MIGRATIONS) == SCHEMA_3_8_0, (
+        assert max(MIGRATIONS) == SCHEMA_LATEST, (
             "a migration was added after this test was last extended: extend it to cover it"
         )
         before = [dict(r) for r in await db_3_7_0.fetchall("SELECT * FROM hosts ORDER BY id")]
 
         await run_migrations(db_3_7_0)
 
-        assert await _version(db_3_7_0) == SCHEMA_3_8_0
+        assert await _version(db_3_7_0) == SCHEMA_LATEST
         new_columns = {
             "is_template", "pool", "pve_tags", "maxcpu", "maxmem_mb", "maxdisk_gb",
-            "env", "env_source", "is_self",
+            "env", "env_source", "is_self", "protected",
         }  # fmt: skip
         assert new_columns <= await _columns(db_3_7_0, "hosts")
         assert "host_addresses" in await _tables(db_3_7_0)
@@ -155,6 +159,11 @@ class TestADatabaseFrom370UpgradesInOneStart:
             "idx_hosts_one_self",
             "idx_host_addresses_address",
             "idx_host_addresses_host",
+            # 40 rebuilt `tasks` (#797); the run-slot index must survive it.
+            "idx_tasks_one_active_per_artifact",
+            # 41: one live row per machine.
+            "idx_hosts_one_live_per_vmid",
+            "idx_hosts_one_live_node",
         } <= indexes
 
         after = [dict(r) for r in await db_3_7_0.fetchall("SELECT * FROM hosts ORDER BY id")]
@@ -164,6 +173,9 @@ class TestADatabaseFrom370UpgradesInOneStart:
         # HomePilot's own until a sync or an operator says so.
         for r in after:
             assert (r["is_template"], r["is_self"], r["env"], r["env_source"]) == (0, 0, None, None)
+            # Protection is undecided too: the default rule applies until an
+            # operator answers (lane B3).
+            assert r["protected"] is None
         assert await db_3_7_0.fetchall("SELECT * FROM host_addresses") == []
 
         # The one restore an operator is told about takes them back to 3.7.0.
@@ -233,6 +245,6 @@ class TestADatabaseFrom370UpgradesInOneStart:
         await run_migrations(db_3_7_0)
         snapshot = [dict(r) for r in await db_3_7_0.fetchall("SELECT * FROM hosts ORDER BY id")]
         await run_migrations(db_3_7_0)
-        assert await _version(db_3_7_0) == SCHEMA_3_8_0
+        assert await _version(db_3_7_0) == SCHEMA_LATEST
         again = [dict(r) for r in await db_3_7_0.fetchall("SELECT * FROM hosts ORDER BY id")]
         assert again == snapshot

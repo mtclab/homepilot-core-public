@@ -23,13 +23,13 @@ the probe an orchestrator acts on can finally say `database: corrupt` instead of
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 
 from homepilot.db.backup import integrity_problems
 from homepilot.db.repository import now
+from homepilot.runtime.blocking import run_blocking
 
 from .base import Reconciler, ReconcilerResult
 
@@ -59,7 +59,7 @@ class DatabaseIntegrityReconciler(Reconciler):
             )
         # Its own connection, in a worker thread: quick_check walks every page,
         # which is a blocking read and must not sit on the event loop.
-        problems = await asyncio.to_thread(integrity_problems, self._db_path, _PROBLEM_LIMIT)
+        problems = await run_blocking("io", integrity_problems, self._db_path, _PROBLEM_LIMIT)
         joined = "; ".join(problems)[:500]
         try:
             await self._repo.set_setting(LAST_CHECK_AT, now())

@@ -5,6 +5,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // $lib/api and never sees the mock.
 import { setPage } from '../../lib/test-mocks';
 import SettingsPage from './+page.svelte';
+// UI slice 1 moved three sectors out of Settings. The F7 gate follows the
+// panels to their new pages: the explanations are the panels', not the
+// route's, and must survive the move.
+import GuestsPage from '../guests/+page.svelte';
+import MonitoringRulesPage from '../monitoring/rules/+page.svelte';
+import AssistantsPage from '../assistants/+page.svelte';
 import { api } from '$lib/api';
 
 /**
@@ -35,10 +41,10 @@ const getSelfcheck = api.getSelfcheck as ReturnType<typeof vi.fn>;
 const listSettingOverrides = api.listSettingOverrides as ReturnType<typeof vi.fn>;
 const listTokens = api.listTokens as ReturnType<typeof vi.fn>;
 
-/** The rendered settings panel, whichever tab is open. */
-function panel(): HTMLElement {
-	const el = document.getElementById('settings-panel');
-	if (!(el instanceof HTMLElement)) throw new Error('no settings panel');
+/** The rendered panel: Settings' tab panel, or a moved sector's page region. */
+function panel(id = 'settings-panel'): HTMLElement {
+	const el = document.getElementById(id);
+	if (!(el instanceof HTMLElement)) throw new Error(`no ${id}`);
 	return el;
 }
 
@@ -67,18 +73,18 @@ function nameOf(control: Element): string {
 	return control.outerHTML.slice(0, 120);
 }
 
-describe('F7: the Guests tab explains every value it asks for', () => {
+describe('F7: the Guests page explains every value it asks for', () => {
 	afterEach(() => cleanup());
 	beforeEach(() => {
 		vi.clearAllMocks();
-		setPage('/ui/settings?tab=guests');
+		setPage('/ui/guests');
 		getGuests.mockResolvedValue({ guests: [], invites: [] });
 	});
 
 	it('leads with what the guest portal actually is', async () => {
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-		const text = panel().textContent ?? '';
+		const text = panel('guests-panel').textContent ?? '';
 		// A friend, a certificate, a machine, a budget: the four nouns an operator
 		// needs before any of the boxes below mean anything.
 		expect(text).toMatch(/client certificate/i);
@@ -87,10 +93,10 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 	});
 
 	it('gives EVERY input on the tab its own explanation', async () => {
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
 
-		const controls = Array.from(panel().querySelectorAll('input, select, textarea'));
+		const controls = Array.from(panel('guests-panel').querySelectorAll('input, select, textarea'));
 		// A tab that renders no inputs would pass a per-input walk vacuously.
 		expect(controls.length).toBeGreaterThanOrEqual(10);
 
@@ -106,7 +112,7 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 	});
 
 	it('says that an empty node or template means the Provisioning default', async () => {
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
 
 		for (const id of ['guest-invite-node', 'guest-invite-template']) {
@@ -118,12 +124,12 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 		}
 		// And the explanation points at the place those defaults are set, rather
 		// than naming a page the operator then has to hunt for.
-		const link = panel().querySelector('a[href="/ui/settings?tab=subsystems"]');
+		const link = panel('guests-panel').querySelector('a[href="/ui/settings?tab=subsystems"]');
 		expect(link?.textContent).toMatch(/provisioning defaults/i);
 	});
 
 	it('separates the per-machine caps from the friend-wide budget', async () => {
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
 
 		expect(describedBy(document.getElementById('guest-invite-cores')!)).toMatch(
@@ -134,11 +140,11 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 		);
 		// Lowering a budget is the question an operator asks before typing a
 		// smaller number, so the answer is on the form, not in the docs.
-		expect(panel().textContent).toMatch(/never touches machines that already exist/i);
+		expect(panel('guests-panel').textContent).toMatch(/never touches machines that already exist/i);
 	});
 
 	it('explains the invite TTL, and offers it as a field at all', async () => {
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
 		const ttl = document.getElementById('guest-invite-ttl');
 		expect(ttl).toBeTruthy();
@@ -154,7 +160,7 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 			cn: 'friend.example',
 			caps: { node: 'pve1', template_vmid: 9000, pool: null, ipconfig0: null },
 		});
-		render(SettingsPage);
+		render(GuestsPage);
 		await waitFor(() => expect(getGuests).toHaveBeenCalled());
 
 		// The GOAL: an operator who names a person and a size gets an invite. The
@@ -173,13 +179,13 @@ describe('F7: the Guests tab explains every value it asks for', () => {
 		// The token once, and the resolved defaults next to it - the only place
 		// "empty" is shown to have meant something concrete.
 		const caps = await waitFor(() => {
-			const el = panel().querySelector('[data-minted-caps]');
+			const el = panel('guests-panel').querySelector('[data-minted-caps]');
 			if (!el) throw new Error('not yet');
 			return el;
 		});
 		expect(caps.textContent).toMatch(/template 9000/);
 		expect(caps.textContent).toMatch(/pve1/);
-		expect(panel().textContent).toMatch(/shown once and stored nowhere/i);
+		expect(panel('guests-panel').textContent).toMatch(/shown once and stored nowhere/i);
 	});
 });
 
@@ -188,23 +194,23 @@ describe('F7: the other Settings sectors lead in before they ask', () => {
 	beforeEach(() => vi.clearAllMocks());
 
 	it('Monitoring says what a rule does and where an alert surfaces', async () => {
-		setPage('/ui/settings?tab=monitoring');
-		render(SettingsPage);
+		setPage('/ui/monitoring/rules');
+		render(MonitoringRulesPage);
 		await waitFor(() => expect(api.listAlertRules).toHaveBeenCalled());
-		const text = panel().textContent ?? '';
+		const text = panel('monitoring-rules').textContent ?? '';
 		expect(text).toMatch(/held for the whole duration/i);
 		expect(text).toMatch(/Overview and on the affected host/i);
 		// And the compact rule row is explained as the sentence it is.
-		const rowNote = panel().querySelector('[data-alert-form-note]');
+		const rowNote = panel('monitoring-rules').querySelector('[data-alert-form-note]');
 		expect(rowNote?.textContent).toMatch(/fires when/i);
 	});
 
 	it('Tokens says what a token is for, the scope ladder, and the shown-once rule', async () => {
-		setPage('/ui/settings?tab=tokens');
+		setPage('/ui/assistants');
 		listTokens.mockResolvedValue({ items: [], total: 0 });
-		render(SettingsPage);
+		render(AssistantsPage);
 		await waitFor(() => expect(listTokens).toHaveBeenCalled());
-		const text = panel().textContent ?? '';
+		const text = panel('assistants-panel').textContent ?? '';
 		expect(text).toMatch(/not a browser signs in/i);
 		expect(text).toMatch(/read_only/);
 		expect(text).toMatch(/admin/);

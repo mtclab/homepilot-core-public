@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // $lib/api and never sees the mock.
 import '../lib/test-mocks';
 import Overview from './+page.svelte';
-import { api } from '$lib/api';
+import { api, sessionStore } from '$lib/api';
 
 /**
  * Overview zone 1 — "needs attention" (#549 F2).
@@ -204,8 +204,26 @@ describe('Overview: needs attention', () => {
 
 		expect(zone.getByRole('link', { name: /3 changes awaiting review/i })).toHaveAttribute(
 			'href',
-			'/ui/changes/review',
+			'/ui/changes/inbox',
 		);
+	});
+
+	it('says an approved change is still waiting to be run (owner feedback 2026-11-08)', async () => {
+		// Teeth: drop the `ready` line and an approved-but-unapplied change is
+		// on no screen the owner opens first - the "lost change" report.
+		seed({
+			summary: {
+				artifacts: { approved: 2 },
+				changes: { proposed: 0, ready: 2, running: 0 },
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(
+			zone.getByRole('link', { name: /2 approved changes ready to run/i }),
+		).toHaveAttribute('href', '/ui/changes/inbox');
 	});
 
 	it('calls a long-running task stuck, not busy', async () => {
@@ -323,7 +341,39 @@ describe('Overview: fleet at a glance', () => {
 
 		await waitFor(() => expect(getDashboard).toHaveBeenCalled());
 		expect(screen.queryByText(/hosts by role/i)).not.toBeInTheDocument();
-		expect(screen.getByText(/hosts by status/i)).toBeInTheDocument();
+	});
+
+	// UI slice 4 (review 01 step 13): the readout row replaced the two donuts.
+	// Teeth: put either donut back and this fails on its title or its <svg>.
+	it('shows the estate as one readout row, with no donut left', async () => {
+		seed({
+			hosts: [HEALTHY_HOST, AGENT_ABSENT_HOST],
+			summary: {
+				inventory: { ...summary().inventory, total: 2, managed: 2, templates: 3 },
+				agents: { known: 2, connected: 1 },
+				artifacts: { proposed: 2, applied: 5 },
+				changes: { proposed: 2, ready: 1, running: 0 },
+			},
+		});
+
+		render(Overview);
+
+		const estate = (await screen.findByRole('heading', { name: 'Estate' })).closest('section') as HTMLElement;
+		const readout = (label: string) => estate.querySelector(`[data-readout="${label}"]`) as HTMLElement;
+		expect(readout('Hosts').textContent).toMatch(/2\s*\+3 tpl/);
+		// Watched = hosts read whose agent is connected now: 1 of the 2.
+		expect(readout('Watched by agent').textContent).toMatch(/1\s*\/2/);
+		expect(readout('Watched by agent')).toHaveAttribute('href', '/ui/monitoring/alerts');
+		expect(readout('Agents').textContent).toMatch(/1\s*\/2/);
+		expect(readout('In spec').textContent).toMatch(/3\s*\/3/);
+		// 3.10.0: the Inbox's count (proposed + approved, not yet run), and its
+		// door - not the retired review queue, which counted proposals only.
+		expect(readout('Changes').textContent).toMatch(/3\s*waiting/);
+		expect(readout('Changes').textContent).toContain('2 proposed · 1 ready to run');
+		expect(readout('Changes')).toHaveAttribute('href', '/ui/changes/inbox');
+		expect(screen.queryByText(/hosts by status/i)).not.toBeInTheDocument();
+		expect(screen.queryByRole('heading', { name: /^artifacts$/i })).not.toBeInTheDocument();
+		expect(document.querySelector('main svg circle, svg circle')).toBeNull();
 	});
 
 	it('keeps the host chip strip as the door to each host', async () => {
@@ -454,9 +504,10 @@ describe('Overview: a read that did not come back', () => {
 			'href',
 			'/ui/hosts',
 		);
+		// Firing alerts are Monitoring's since UI slice 1, so that is the door.
 		expect(zone.getByText(/could not read firing alerts/i).closest('a')).toHaveAttribute(
 			'href',
-			'/ui/hosts',
+			'/ui/monitoring/alerts',
 		);
 		expect(zone.getByText(/could not read the journal/i).closest('a')).toHaveAttribute(
 			'href',
@@ -870,7 +921,7 @@ describe('Overview: attention honesty', () => {
 		expect(zone.queryByText(/never-adopted-vm/i)).not.toBeInTheDocument();
 
 		// Forget is the irreversible one, so it asks first.
-		const row = within(line.closest('[data-testid="attention-gone"]') as HTMLElement);
+		const row = within(line.closest('[data-attention="gone:h9"]') as HTMLElement);
 		await fireEvent.click(row.getByRole('button', { name: /^forget$/i }));
 		expect(forgetHost).not.toHaveBeenCalled();
 		await fireEvent.click(row.getByRole('button', { name: /confirm forget/i }));
@@ -1002,7 +1053,7 @@ describe('Overview: the Phase A lanes together', () => {
 		expect(typo.textContent).toContain('check the metric name');
 	});
 
-	it('says how many hosts are waiting to join, and links to Hosts', async () => {
+	it('says how many hosts are waiting to join, and links to Hosts > Agents', async () => {
 		getEnrolmentRequests.mockResolvedValue(knocking());
 		seed({});
 
@@ -1011,7 +1062,8 @@ describe('Overview: the Phase A lanes together', () => {
 
 		const line = zone.getByRole('link', { name: /waiting to join/i });
 		expect(line.textContent).toContain('1 host is waiting to join');
-		expect(line).toHaveAttribute('href', '/ui/hosts');
+		// The join panel lives on Hosts > Agents since UI slice 1.
+		expect(line).toHaveAttribute('href', '/ui/hosts/agents');
 		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
 	});
 
@@ -1215,5 +1267,185 @@ describe('Overview: updates available', () => {
 
 		render(Overview);
 		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+	});
+});
+
+/**
+ * The relaid-out attention zone (UI slice 4, review 01 step 13): every line
+ * has a door, says since when where the source knows, and carries the action
+ * that fixes it where the API offers one today - and the action completes on
+ * this page, re-reading so the line goes by what the server now says.
+ *
+ * Teeth (each verified by reverting the behaviour):
+ *   - drop the actions slot and the three action cases fail on the buttons;
+ *   - skip the confirm step and "asks first" fails (the API is called early);
+ *   - skip the re-read after an action and each case fails on the second load;
+ *   - drop `since` from a line and the <time> case fails;
+ *   - say "Nothing needs you." without the sources and the calm case fails.
+ */
+describe('Overview: lines that act (UI slice 4)', () => {
+	const getEnrolmentRequests = api.getEnrolmentRequests as ReturnType<typeof vi.fn>;
+	const openEnrolmentWindow = api.openEnrolmentWindow as ReturnType<typeof vi.fn>;
+	const getDriftStatus = api.getDriftStatus as ReturnType<typeof vi.fn>;
+	const cancelTask = api.cancelTask as ReturnType<typeof vi.fn>;
+	const ADMIN = { authenticated: true, token_label: 'test', capabilities: ['read', 'write', 'admin'] };
+
+	const WAITING = {
+		attempts: [
+			{
+				hostname: 'new-01',
+				peer: '192.0.2.10',
+				reason_code: 'window_closed',
+				reason: 'not accepting new hosts right now',
+				agent_id: null,
+				first_seen: minutesAgo(90),
+				last_seen: minutesAgo(1),
+				attempts: 12,
+				wants_to_join: true,
+			},
+		],
+		pending_tokens: [],
+		window: { open: false, expires_at: null, seconds_remaining: 0, fleet_empty: false },
+		summary: { wants_to_join: 1, refused: 0, pending_tokens: 0, expired_unused_tokens: 0 },
+	};
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		sessionStore.set(ADMIN as never);
+		getSelfcheck.mockResolvedValue({ timeout_seconds: 2, counts: {}, subsystems: [] });
+		getEnrolmentRequests.mockResolvedValue({ ...WAITING, attempts: [] });
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser */
+		}
+	});
+
+	function line(key: string): HTMLElement {
+		const el = document.querySelector(`[data-attention="${key}"]`);
+		expect(el, `no attention line ${key}`).not.toBeNull();
+		return el as HTMLElement;
+	}
+
+	it('gives every line a door, and the line a since where the source knows one', async () => {
+		const stuck = {
+			...FAILED_TASK,
+			id: 'task-stuck-9',
+			status: 'running',
+			error: null,
+			created_at: minutesAgo(40),
+			finished_at: null,
+		};
+		getEnrolmentRequests.mockResolvedValue(WAITING);
+		seed({
+			summary: {
+				drift: { total: 3, drifted: 1, in_spec: 2, unknown: 0, checked: 3, in_spec_pct: 66 },
+				artifacts: { proposed: 1 },
+			},
+			hosts: [HEALTHY_HOST, { ...AGENT_ABSENT_HOST, agent_offline_since: minutesAgo(30) }],
+			tasks: [FAILED_TASK, stuck],
+		});
+
+		render(Overview);
+		await attentionZone();
+
+		const lines = Array.from(document.querySelectorAll('[data-attention]'));
+		expect(lines.length).toBeGreaterThanOrEqual(6);
+		for (const l of lines) {
+			const door = l.querySelector('a[href]');
+			expect(door, `${l.getAttribute('data-attention')} has no door`).not.toBeNull();
+		}
+		// The waiting host: how long, as a real time with the moment on hover.
+		const waitingTime = line('agents:waiting').querySelector('time') as HTMLElement;
+		expect(waitingTime.textContent).toBe('for 1h');
+		expect(waitingTime.getAttribute('datetime')).toBe(WAITING.attempts[0].first_seen);
+		expect(waitingTime.getAttribute('title')).toBeTruthy();
+		expect(line('agent:h2').querySelector('time')?.getAttribute('datetime')).toBeTruthy();
+		expect(line('task:task-abcdef-1').querySelector('time')?.getAttribute('datetime')).toBe(
+			FAILED_TASK.finished_at,
+		);
+		// The head says how much it looked at.
+		expect(screen.getByText(/open · checked 6 of 6 sources/)).toBeInTheDocument();
+	});
+
+	it('opens the enrolment window from the line, asking first, and re-reads', async () => {
+		getEnrolmentRequests.mockResolvedValue(WAITING);
+		openEnrolmentWindow.mockResolvedValue({ open: true, expires_at: null, seconds_remaining: 900, fleet_empty: false });
+		seed({});
+
+		render(Overview);
+		await attentionZone();
+		const row = within(line('agents:waiting'));
+
+		await fireEvent.click(row.getByRole('button', { name: 'Open window' }));
+		expect(openEnrolmentWindow).not.toHaveBeenCalled();
+		const calls = getDashboard.mock.calls.length;
+		// With the window open the hosts get in on their next retry: no line.
+		getEnrolmentRequests.mockResolvedValue({ ...WAITING, window: { ...WAITING.window, open: true } });
+		await fireEvent.click(row.getByRole('button', { name: 'Open for 15 min' }));
+		await waitFor(() => expect(openEnrolmentWindow).toHaveBeenCalledWith(15));
+		await waitFor(() => expect(getDashboard.mock.calls.length).toBeGreaterThan(calls));
+		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
+	});
+
+	it('offers Open window only to a session that may open it', async () => {
+		sessionStore.set({ authenticated: true, token_label: 'w', capabilities: ['read', 'write'] } as never);
+		getEnrolmentRequests.mockResolvedValue(WAITING);
+		seed({});
+
+		render(Overview);
+		await attentionZone();
+		expect(within(line('agents:waiting')).queryByRole('button')).toBeNull();
+		// The door still goes where an admin can.
+		expect(line('agents:waiting').querySelector('a')).toHaveAttribute('href', '/ui/hosts/agents');
+	});
+
+	it('re-checks drift from the drift line without leaving the page', async () => {
+		seed({ summary: { drift: { total: 3, drifted: 2, in_spec: 1, unknown: 0, checked: 3, in_spec_pct: 33 } } });
+		getDriftStatus.mockResolvedValue({ items: [], total: 0 });
+
+		render(Overview);
+		await attentionZone();
+		const calls = getDashboard.mock.calls.length;
+		getDashboard.mockResolvedValue(summary());
+		await fireEvent.click(within(line('drift')).getByRole('button', { name: 'Re-check' }));
+		await waitFor(() => expect(getDriftStatus).toHaveBeenCalledWith({ refresh: true }));
+		await waitFor(() => expect(getDashboard.mock.calls.length).toBeGreaterThan(calls));
+		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
+	});
+
+	it('cancels a stuck task from its line, asking first', async () => {
+		const stuck = {
+			...FAILED_TASK,
+			id: 'task-stuck-2',
+			status: 'pending',
+			error: null,
+			created_at: minutesAgo(50),
+			finished_at: null,
+		};
+		seed({ tasks: [stuck] });
+		cancelTask.mockResolvedValue({ ...stuck, status: 'cancelled' });
+
+		render(Overview);
+		await attentionZone();
+		const row = within(line('stuck:task-stuck-2'));
+		await fireEvent.click(row.getByRole('button', { name: 'Cancel task' }));
+		expect(cancelTask).not.toHaveBeenCalled();
+		listTasks.mockResolvedValue({ items: [{ ...stuck, status: 'cancelled' }], total: 1 });
+		await fireEvent.click(row.getByRole('button', { name: 'Confirm cancel' }));
+		await waitFor(() => expect(cancelTask).toHaveBeenCalledWith('task-stuck-2'));
+		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
+	});
+
+	it('says what a calm screen checked, and when', async () => {
+		seed({ hosts: [HEALTHY_HOST] });
+
+		render(Overview);
+
+		const calm = await screen.findByText(/Nothing needs you/);
+		const sentence = calm.closest('[data-calm]') as HTMLElement;
+		expect(sentence.textContent).toMatch(/Nothing needs you - checked 6 sources just now\./);
+		expect(within(sentence).getByTitle(/the host inventory, firing alerts, recent tasks/)).toBeInTheDocument();
+		expect(screen.getByText(/last read just now/)).toBeInTheDocument();
 	});
 });

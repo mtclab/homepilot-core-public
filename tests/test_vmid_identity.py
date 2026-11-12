@@ -153,7 +153,7 @@ class TestPowerIsNeverSentAtAMachineThatIsNotTheirs:
         """The row still reads alive - no refresh has run yet - but the machine
         at 105 is now somebody else's. The name is checked before the stop."""
         app, pve, ids = stack
-        pve.guests[("pve1", 105)] = "operator-db"
+        pve.guests[105]["name"] = "operator-db"
         async with client_for(app) as client:
             res = await client.post(
                 f"/guest/vms/{ids['alice']}/power",
@@ -166,7 +166,7 @@ class TestPowerIsNeverSentAtAMachineThatIsNotTheirs:
 
     async def test_a_machine_that_cannot_be_found_is_not_acted_on(self, stack):  # noqa: F811
         app, pve, ids = stack
-        del pve.guests[("pve1", 105)]
+        del pve.guests[105]
         async with client_for(app) as client:
             res = await client.post(
                 f"/guest/vms/{ids['alice']}/power",

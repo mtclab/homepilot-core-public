@@ -43,6 +43,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ..runtime.blocking import run_blocking
 from .addresses import host_addresses
 
 logger = logging.getLogger(__name__)
@@ -175,7 +176,7 @@ async def _resolve(name: str) -> list[str]:
         return []
     try:
         infos = await asyncio.wait_for(
-            asyncio.to_thread(socket.getaddrinfo, name, None, socket.AF_INET),
+            run_blocking("net", socket.getaddrinfo, name, None, socket.AF_INET),
             timeout=_RESOLVE_TIMEOUT,
         )
     except (TimeoutError, OSError, UnicodeError) as exc:

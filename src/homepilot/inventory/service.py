@@ -6,6 +6,7 @@ import logging
 import re
 import socket
 import sqlite3
+import weakref
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ import httpx
 from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
+from homepilot.runtime.blocking import run_blocking
 
 from .addresses import (
     GUEST_CONFIG_SOURCES,
@@ -26,7 +28,7 @@ from .addresses import (
     parse_agent_interfaces,
     parse_guest_config,
 )
-from .fleet_model import env_update, guest_facts, proxmox_ui_url
+from .fleet_model import env_update, guest_facts, proxmox_console_url, proxmox_ui_url
 from .introspect import introspect_host
 
 logger = logging.getLogger(__name__)
@@ -157,9 +159,7 @@ def node_pve_status(raw_status: str | None) -> str:
 async def _guess_ip(hostname: str) -> str | None:
     """Resolve hostname to IP via DNS. Returns None on failure."""
     try:
-        loop = asyncio.get_event_loop()
-        ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
-        return ip
+        return await run_blocking("net", socket.gethostbyname, hostname)
     except socket.gaierror as exc:
         logger.debug("DNS resolution failed for %s: %s", hostname, exc)
         return None
@@ -208,6 +208,27 @@ def _target_names(target_json: str | None, target: str) -> bool:
             if isinstance(value, str) and value.strip().lower() == wanted:
                 return True
     return False
+
+
+# One sweep of an inventory at a time, per DATABASE (not per service: the HTTP
+# app and the MCP server each build an InventoryService over the same one).
+# A sweep is a long run of look-up-then-write steps with Proxmox reads between
+# them, over the one connection every repository shares. Two at once - the
+# inventory reconciler's first cycle (startup_delay 0) and a Sync, an MCP
+# refresh or the e2e fleet's seed - both looked a new guest up, both found
+# nothing and both inserted it: two live rows for one machine. A second sweep
+# now waits for the first and then runs in full, so its caller still gets a
+# sweep that started after it asked. Migration 41 makes the database refuse a
+# duplicate from any other writer (another process, provisioning).
+_SWEEP_LOCKS: weakref.WeakKeyDictionary[Any, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+
+def _sweep_lock(repo: Any) -> asyncio.Lock:
+    key = getattr(repo, "db", repo)
+    lock = _SWEEP_LOCKS.get(key)
+    if lock is None:
+        lock = _SWEEP_LOCKS[key] = asyncio.Lock()
+    return lock
 
 
 def _vmid_key(value: Any) -> int | None:
@@ -307,6 +328,7 @@ class InventoryService:
         host_dict["services"] = [dict(s) for s in services]
         # Here, not in the route, so the MCP `get_host` tool carries it too.
         host_dict["proxmox_url"] = proxmox_ui_url(self.proxmox, host_dict)
+        host_dict["console_url"] = proxmox_console_url(self.proxmox, host_dict)
         # Every address it holds, with provenance and age, and every clash it
         # is in (lane B2) - the same answer as its Network tab.
         network = await self.host_network(host_id)
@@ -542,6 +564,11 @@ class InventoryService:
         )
 
     async def refresh_inventory(self, scope: str | None = None) -> dict[str, Any]:
+        """Sweep the hypervisor into inventory. One sweep per database at a time."""
+        async with _sweep_lock(self.repo):
+            return await self._sweep(scope)
+
+    async def _sweep(self, scope: str | None) -> dict[str, Any]:
         # `complete` starts FALSE and is earned. Callers subtract this sweep's
         # ids from what they already have to decide what is GONE, so a partial
         # answer that looks like a whole one makes them declare live machines
@@ -616,7 +643,7 @@ class InventoryService:
                     or ""
                 )
                 node_addresses = self._node_addresses(node_network or [])
-                existing = await self.repo.get_host_by_hostname(node_name)
+                existing = await self.repo.get_node_row(node_name)
                 # Observe the node's real liveness from /nodes rather than
                 # assuming every node is up: an offline/unknown node must not be
                 # recorded as running.
@@ -680,12 +707,18 @@ class InventoryService:
                             g_description = (g_config or {}).get("description") or None
                             # The row that IS this machine: the one with its
                             # name, whatever order the rows of earlier
-                            # occupants sort in. Failing that, the newest row
-                            # still claiming the VMID is somebody else's.
+                            # occupants sort in - the LIVE one first, so a
+                            # retired duplicate (migration 41) is never
+                            # revived over the row that was kept. Failing that,
+                            # the newest row still claiming the VMID is
+                            # somebody else's.
                             g_rows = await self.repo.list_hosts_by_proxmox_id(vmid)
-                            g_existing = next(
-                                (r for r in g_rows if same_guest(r, g_hostname)), None
-                            ) or next((r for r in g_rows if not r.get("absent_since")), None)
+                            g_named = [r for r in g_rows if same_guest(r, g_hostname)]
+                            g_existing = (
+                                next((r for r in g_named if not r.get("absent_since")), None)
+                                or next(iter(g_named), None)
+                                or next((r for r in g_rows if not r.get("absent_since")), None)
+                            )
                             if g_existing and not same_guest(g_existing, g_hostname):
                                 # A VMID is not an identity (#706). PVE hands
                                 # a destroyed guest's number to the next VM

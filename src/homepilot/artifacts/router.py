@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import secrets
-import subprocess
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -19,10 +18,11 @@ from sse_starlette.sse import EventSourceResponse
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import audit_actor, principal_from_token
 from ..client_ip import client_ip as _client_ip
+from ..runtime.blocking import run_blocking
 from ..sse import bus as sse_bus
 from .lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
 from .models import ApprovalRefusedError, ArtifactBusyError
-from .store import ArtifactStore
+from .store import ArtifactStore, GitOperationError
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ async def list_artifacts(
     limit: int = Query(100, ge=1, le=1000),
 ) -> dict[str, Any]:
     store = _get_store(request)
-    items = store.list(status=status, kind=kind, q=q)
+    items = await run_blocking("io", store.list, status=status, kind=kind, q=q)
     return {"items": items[:limit], "total": len(items)}
 
 
@@ -164,7 +164,7 @@ async def get_drift_status(
 async def get_artifact(request: Request, artifact_id: str, token: _TokenDep) -> dict[str, Any]:
     store = _get_store(request)
     try:
-        fm, body = store.read(artifact_id)
+        fm, body = await run_blocking("io", store.read, artifact_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
     task_repo = request.app.state.task_repo
@@ -187,13 +187,40 @@ async def get_artifact(request: Request, artifact_id: str, token: _TokenDep) -> 
                 approval_code = format_for_display(code)
             row = await repo.get_approval_code_row(artifact_id)
             approval_locked = bool(row and int(row["locked"]))
+    from .summary import summarize
+
     return {
         "frontmatter": fm,
         "body": body,
         "active_task": active_task,
         "approval_code": approval_code,
         "approval_locked": approval_locked,
+        # What it does, in words, above the raw spec (owner feedback 2026-11-08).
+        "summary": summarize(fm, body),
+        # How the last run ended - the outcome the Changes page states in plain
+        # words, partial applies (#796) and PVE warnings included.
+        "last_task": await last_task_outcome(task_repo, artifact_id),
     }
+
+
+async def last_task_outcome(task_repo: Any, artifact_id: str) -> dict[str, Any] | None:
+    """The artifact's most recent task with its result parsed - minus the raw
+    execution log, which the artifact body already carries in full."""
+    rows = await task_repo.list_tasks(artifact_id=artifact_id, limit=1)
+    if not rows:
+        return None
+    row = dict(rows[0])
+    result: dict[str, Any] = {}
+    raw = row.pop("result_json", None)
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            result = {k: v for k, v in parsed.items() if k != "execution_log"}
+    row["result"] = result
+    return row
 
 
 @router.post(
@@ -329,7 +356,7 @@ async def build_artifact_plan(
     ``ArtifactActionError`` with the status the caller should surface.
     """
     try:
-        fm, body = store.read(artifact_id)
+        fm, body = await run_blocking("io", store.read, artifact_id)
     except FileNotFoundError:
         raise ArtifactActionError(404, f"Artifact not found: {artifact_id}") from None
 
@@ -391,14 +418,14 @@ async def build_artifact_plan(
     }
 
 
-def build_artifact_preview(artifact_id: str, *, store: ArtifactStore) -> dict[str, Any]:
+async def build_artifact_preview(artifact_id: str, *, store: ArtifactStore) -> dict[str, Any]:
     """A git diff of the artifact FILE against its previous committed version.
 
     Shared by the HTTP route and the MCP ``preview_artifact`` tool; raises
     ``ArtifactActionError`` with the status the caller should surface.
     """
     try:
-        fm, body = store.read(artifact_id)
+        fm, body = await run_blocking("io", store.read, artifact_id)
     except FileNotFoundError:
         raise ArtifactActionError(404, f"Artifact not found: {artifact_id}") from None
 
@@ -412,18 +439,14 @@ def build_artifact_preview(artifact_id: str, *, store: ArtifactStore) -> dict[st
         if not str(resolved).startswith(str(store.root.resolve())):
             raise ArtifactActionError(400, "Invalid artifact_id: path traversal detected")
         rel = path.relative_to(store.root)
-        result = subprocess.run(
-            ["git", "diff", "HEAD~1", "--", str(rel)],
-            cwd=store.root,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        diff = result.stdout
+        # On the git pool: serialised with the writes, never on the loop.
+        result = await run_blocking("git", store.diff_previous, str(rel))
+        diff = result.stdout.decode("utf-8", errors="replace")
         if result.returncode != 0:
-            logger.warning("git diff failed (rc=%d): %s", result.returncode, result.stderr.strip())
-    except subprocess.SubprocessError:
-        logger.warning("git diff timed out for artifact %s", artifact_id)
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("git diff failed (rc=%d): %s", result.returncode, stderr)
+    except GitOperationError as exc:
+        logger.warning("git diff failed for artifact %s: %s", artifact_id, exc)
         diff = ""
     except ArtifactActionError:
         raise
@@ -463,7 +486,7 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
 @router.post("/{artifact_id}/preview", dependencies=[Depends(require_scope("read"))])
 async def preview_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     try:
-        return build_artifact_preview(artifact_id, store=_get_store(request))
+        return await build_artifact_preview(artifact_id, store=_get_store(request))
     except ArtifactActionError as e:
         raise HTTPException(status_code=e.status, detail=e.detail) from e
 
@@ -569,13 +592,111 @@ async def apply_artifact(
             raise HTTPException(status_code=404, detail=str(e)) from e
         if task_result["status"] == "succeeded":
             store = _get_store(request)
-            fm, body_text = store.read(artifact_id)
+            fm, body_text = await run_blocking("io", store.read, artifact_id)
             task_repo = request.app.state.task_repo
             active_task = await task_repo.get_active_task(artifact_id)
             return {"frontmatter": fm, "body": body_text, "active_task": active_task}
         return task_result
 
     return JSONResponse(status_code=202, content=task_info)
+
+
+@router.post("/{artifact_id}/approve-and-apply", dependencies=[Depends(require_scope("admin"))])
+async def approve_and_apply_artifact(
+    request: Request,
+    artifact_id: str,
+    token: _TokenDep,
+    sync: bool = Query(False),
+    body: Annotated[ApproveBody | None, Body()] = None,
+) -> Any:
+    """Approve a proposed change and apply it at once - the owner's one tap.
+
+    Every kind (owner decision 5, 2026-11-08; generalised from guest-power,
+    #781). Two exceptions keep approve and apply as two explicit acts, as review
+    06 3.2 says: a composite (it approves and runs several changes) and a
+    ``replay_safe: false`` change (it cannot be run twice, so its one run is
+    started deliberately). ``summary.two_step`` names the reason, and the
+    Changes page offers "Approve" then "Apply" for those.
+
+    Admin scope: approving AND running in one step is the operator's authority,
+    never an assistant's (an assistant approves with a relayed code, then
+    applies - two separate, separately recorded acts). The guards are exactly
+    approve's (hash, composite cascade) and then apply's (task runner, one run
+    slot): the run is a task with an id like any ``/apply``. If the approval
+    lands and the run cannot start (another run holds the slot), the answer says
+    so: the change stays approved and Ready to run, never lost.
+    """
+    from ..tasks.runner import TaskRunner
+    from .summary import summarize
+
+    store = _get_store(request)
+    try:
+        # Off the loop like every other artifact read (runtime/blocking.py).
+        fm, artifact_body = await run_blocking("io", store.read, artifact_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
+    if fm.get("status") != "proposed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{artifact_id} is {fm.get('status')}, not proposed: only a proposed "
+            "change can be approved and applied in one step",
+        )
+    summary = summarize(fm, artifact_body)
+    if summary["two_step"]:
+        raise HTTPException(status_code=400, detail=summary["two_step_reason"])
+    lifecycle = _get_lifecycle(request)
+    body = body or ApproveBody()
+    try:
+        await lifecycle.approve(artifact_id, principal_from_token(token), body.reason)
+    except ApprovalRefusedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except (ConflictError, LifecycleError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    task_runner: TaskRunner = request.app.state.task_runner
+    try:
+        task_info = await task_runner.start_apply(artifact_id, audit_actor(token))
+    except ArtifactBusyError as e:
+        busy = e.detail()
+        busy["message"] = f"Approved, but not started: {busy['message']} It is ready to run."
+        raise HTTPException(status_code=409, detail=busy) from e
+    except (ConflictError, LifecycleError, ValueError) as e:
+        raise HTTPException(
+            status_code=409, detail=f"Approved, but not started: {e}. It is ready to run."
+        ) from e
+    if sync:
+        try:
+            return await task_runner.await_task(task_info["task_id"])
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+    return JSONResponse(status_code=202, content=task_info)
+
+
+@router.post("/{artifact_id}/withdraw", dependencies=[Depends(require_scope("write"))])
+async def withdraw_artifact(
+    request: Request,
+    artifact_id: str,
+    token: _TokenDep,
+    body: Annotated[ReasonBody | None, Body()] = None,
+) -> dict[str, Any]:
+    """Take back an approved change that has not run (#797): approved -> withdrawn.
+
+    Runs nothing. `reject` is for a proposal and refuses an approved change;
+    `revoke` undoes an applied one. Write scope like reject: withdrawing can
+    only stop a change, never make one. Who withdrew is the credential (#681).
+    """
+    from ..tasks.runner import TaskRunner
+
+    task_runner: TaskRunner = request.app.state.task_runner
+    reason = (body or ReasonBody()).reason
+    try:
+        return await task_runner.withdraw(artifact_id, audit_actor(token), reason)
+    except ArtifactBusyError as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
+    except (ConflictError, LifecycleError) as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 @router.post("/{artifact_id}/replay", dependencies=[Depends(require_scope("write"))])
@@ -657,7 +778,7 @@ async def revoke_artifact(
             raise HTTPException(status_code=404, detail=str(e)) from e
         if task_result["status"] == "succeeded":
             store = _get_store(request)
-            fm, body_text = store.read(artifact_id)
+            fm, body_text = await run_blocking("io", store.read, artifact_id)
             return {"frontmatter": fm, "body": body_text}
         return task_result
 

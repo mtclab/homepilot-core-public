@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from ..common import write_private
+from ..runtime.blocking import run_blocking
 from .repository import ClaimRepository, has_admin_credential
 from .tokens import generate_claim_code, validate_token
 
@@ -145,7 +146,7 @@ async def ensure_claim_code(
         # And drop the operator-facing copy of the code, which POST /claim
         # removes on its own path but which otherwise sits in the data directory
         # for the life of the instance.
-        clear_claim_code(data_dir)
+        await run_blocking("io", clear_claim_code, data_dir)
         return None
 
     row = await claims.get()
@@ -153,11 +154,11 @@ async def ensure_claim_code(
         # Already latched. POST /claim removes the file on its own path; this
         # covers a claim whose cleanup could not run (a read-only data dir at
         # the time, a restore from a backup taken before the claim).
-        clear_claim_code(data_dir)
+        await run_blocking("io", clear_claim_code, data_dir)
         return None
 
     if row is not None:
-        existing = read_claim_code(data_dir)
+        existing = await run_blocking("io", read_claim_code, data_dir)
         if existing and validate_token(existing, str(row["code_hash"])):
             _log_still_unclaimed(url_hint)
             return existing
@@ -165,5 +166,6 @@ async def ensure_claim_code(
     code, prefix, code_hash = generate_claim_code()
     await claims.install_code(prefix, code_hash)
     _log_first_boot(code, url_hint, rotated=row is not None)
-    _write_claim_code(data_dir, code)
+    # An fsync'd write: off the loop.
+    await run_blocking("io", _write_claim_code, data_dir, code)
     return code

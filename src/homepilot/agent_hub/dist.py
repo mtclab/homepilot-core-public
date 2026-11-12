@@ -159,14 +159,22 @@ def api_base_for(hub_host: str) -> str:
 
 def control_plane_can_serve() -> tuple[bool, str]:
     """Whether a host can install entirely from this control plane: the
-    installer plus at least one agent binary. Returns ``(ok, why_not)``."""
-    entries = manifest()
-    if not entries[INSTALLER_NAME]["available"]:
-        return False, str(entries[INSTALLER_NAME]["reason"])
-    arches = sorted(set(ARCH_ALIASES.values()))
-    if not any(entries[f"hp-agent-linux-{arch}"]["available"] for arch in arches):
-        return False, "no hp-agent binary is in this image"
-    return True, ""
+    installer plus at least one agent binary. Returns ``(ok, why_not)``.
+
+    Presence only: this runs inside a request on the event loop, and hashing
+    multi-megabyte binaries (``manifest()``) to answer "are they here" froze it
+    for no reason."""
+    try:
+        _resolve(INSTALLER_NAME)
+    except DistUnavailableError as exc:
+        return False, str(exc)
+    for arch in sorted(set(ARCH_ALIASES.values())):
+        try:
+            _resolve(f"hp-agent-linux-{arch}")
+        except DistUnavailableError:
+            continue
+        return True, ""
+    return False, "no hp-agent binary is in this image"
 
 
 # Printed when the one-liner fails, after whatever curl or the installer said.

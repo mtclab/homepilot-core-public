@@ -2,6 +2,6 @@
 	import Redirect from '$lib/Redirect.svelte';
 </script>
 
-<!-- Settings is tabbed since #549 F6, so the token panel is a sector, not the
-     top of a page: land on it rather than on the API-base form. -->
-<Redirect to="/settings?tab=tokens" />
+<!-- The token panel left Settings for Assistants (UI slice 1): an
+     assistant reaches HomePilot with a token, so that is where it lives. -->
+<Redirect to="/assistants" />

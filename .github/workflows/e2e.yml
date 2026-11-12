@@ -40,7 +40,11 @@ jobs:
           node-version: "22"
 
       - name: Install Python dependencies
-        run: pip install -e ".[dev]" && pip install playwright pytest-playwright && playwright install chromium
+        # The EXACT locked dependency set, like the image and the local gate
+        # (`make gate-lock`). `pip install -e .[dev]` resolved the newest of
+        # everything, so CI tested versions nothing else runs (3.10.0: a newer
+        # Playwright failed the run).
+        run: pip install uv && uv export --frozen --all-extras --no-emit-project --no-hashes -o /tmp/requirements.txt && pip install -r /tmp/requirements.txt && pip install --no-deps -e . && playwright install chromium
 
       - name: Build web UI
         run: |

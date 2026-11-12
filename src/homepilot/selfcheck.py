@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -889,6 +890,67 @@ def _reconcilers_subsystem(state: Any) -> Subsystem:
     )
 
 
+# A stall this recent is reported as a fault rather than as history.
+LOOP_STALL_RECENT_SECONDS = 15 * 60
+
+
+def _loop_watchdog_subsystem(state: Any) -> Subsystem:
+    """Whether the event loop has been frozen by a blocking call (runtime/loop_watchdog.py)."""
+    watchdog: Any = getattr(state, "loop_watchdog", None)
+
+    async def probe() -> ProbeVerdict:
+        snap = watchdog.snapshot()
+        threshold = snap["threshold_ms"]
+        if not snap["running"]:
+            return ProbeVerdict(
+                STATE_UNKNOWN,
+                "The loop watchdog is configured but not running, so a frozen event "
+                "loop would go unreported.",
+            )
+        # Late wake-ups with no callback running are the machine being busy,
+        # not a blocking call: said, never reported as a fault.
+        late = (
+            f" {snap['late_wakes']} late wake-up(s) with no callback running (a busy "
+            f"machine, not a blocking call), the worst {snap['late_worst_ms']:.0f} ms."
+            if snap.get("late_wakes")
+            else ""
+        )
+        if not snap["stalls"]:
+            return ProbeVerdict(
+                STATE_OK,
+                f"No callback has held the event loop longer than {threshold} ms since start."
+                + late,
+            )
+        age = time.time() - float(snap["last_at"] or 0)
+        detail = (
+            f"{snap['stalls']} stall(s) over {threshold} ms since start, the worst "
+            f"{snap['worst_ms']:.0f} ms, the last {_humanise(age)} ago."
+        )
+        if age <= LOOP_STALL_RECENT_SECONDS:
+            return ProbeVerdict(
+                STATE_UNREACHABLE,
+                "The event loop was recently frozen by a blocking call: every request, "
+                "the agent hub and every reconciler stood still meanwhile. "
+                + detail
+                + " The log holds the loop thread's stack from while it was blocked.",
+            )
+        return ProbeVerdict(STATE_OK, "The event loop is responsive. Earlier: " + detail + late)
+
+    return Subsystem(
+        name="loop_watchdog",
+        label="the event-loop stall watchdog",
+        configured=watchdog is not None,
+        target="",
+        off=(
+            "Nothing watches the event loop (HP_LOOP_STALL_MS=0): a blocking call that "
+            "freezes every request is only visible as its symptom."
+        ),
+        ok="The event loop is responsive.",
+        broken="The event loop was recently frozen by a blocking call.",
+        probe=probe if watchdog is not None else None,
+    )
+
+
 def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
     """The optional subsystems of a HomePilot instance, in report order.
 
@@ -908,6 +970,7 @@ def build_subsystems(state: Any, settings: Any) -> list[Subsystem]:
         _reconcilers_subsystem(state),
         _agent_versions_subsystem(state, settings),
         _update_check_subsystem(state, settings),
+        _loop_watchdog_subsystem(state),
     ]
 
 

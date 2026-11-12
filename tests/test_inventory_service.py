@@ -773,12 +773,16 @@ class TestAVmidIsNotAnIdentity:
         await repo.db.execute(
             "UPDATE hosts SET created_at = ? WHERE id = ?", ("2026-06-10T08:39:11Z", old)
         )
+        # Each earlier occupant is retired before the next one is recorded, as
+        # the sweep does (#706): one live row per VMID (migration 41).
+        await repo.retire_host(old)
         destroyed = await repo.create_host(
             hostname="kanasalaatti", host_type="qemu", role="guest", proxmox_id=116
         )
         await repo.db.execute(
             "UPDATE hosts SET created_at = ? WHERE id = ?", ("2026-08-28T18:46:33Z", destroyed)
         )
+        await repo.retire_host(destroyed)
         live = await repo.create_host(
             hostname="nakkisoppa", host_type="qemu", role="guest", proxmox_id=116
         )

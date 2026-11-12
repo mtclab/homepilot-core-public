@@ -30,8 +30,7 @@ import pytest
 class _LifespanManager:
     """Drive an ASGI app's lifespan protocol in the CURRENT (main) thread.
 
-    Starlette's TestClient runs the lifespan in a worker thread, where
-    ``loop.add_signal_handler`` (used by main.lifespan) raises. Driving the
+    Starlette's TestClient runs the lifespan in a worker thread. Driving the
     lifespan here keeps it on the pytest-asyncio main-thread loop.
     """
 

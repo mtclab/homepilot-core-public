@@ -1,12 +1,28 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, hostMetricsUrl, sessionStore, type Host, type SelfGuestStatus } from '$lib/api';
+	import {
+		api,
+		sessionStore,
+		type GuestPowerState,
+		type Host,
+		type PowerAction,
+		type SelfGuestStatus,
+	} from '$lib/api';
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { ENVS, envClass, envSourceLabel } from '$lib/fleet';
 	import { notify } from '$lib/stores';
-	import EnrollAgent from '$lib/components/EnrollAgent.svelte';
-	import JoinRequests from '$lib/components/JoinRequests.svelte';
 	import RowMenu from '$lib/components/RowMenu.svelte';
+	import HostRowMenu from '$lib/components/HostRowMenu.svelte';
+	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+	import {
+		VERB_LABEL,
+		outcomeLine,
+		refusalLine,
+		workingLine,
+		type LineTone,
+	} from '$lib/powerMenu';
+	import Icon from '$lib/components/Icon.svelte';
+	import Lamp from '$lib/components/Lamp.svelte';
 	import { pruneSelection } from '$lib/selection';
 	import { addressCell } from '$lib/addresses';
 	import { debounce } from '$lib/debounce';
@@ -60,10 +76,29 @@
 		'worker',
 	];
 	let selectedIds: Set<string> = new Set();
-	// Enrolment panels, folded in from the retired Agents tab (#514 S4).
-	let enrollShow: 'bootstrap' | 'hub' | null = null;
-	// Hosts knocking on the hub and refused, and unused bootstrap tokens (A3).
-	let joinRequests: JoinRequests | null = null;
+	// Who is knocking on the agent hub (A3). The panels themselves moved to
+	// Hosts > Agents (UI slice 1); the fleet list keeps ONE line naming how
+	// many are waiting, with the door, so the table is not pushed down on
+	// every visit when nobody is. `null` = not read yet; a failed read says
+	// so rather than going quiet.
+	let joining: { waiting: number; refused: number } | null = null;
+	let joiningUnread = false;
+	function joiningSentence(j: { waiting: number; refused: number }): string {
+		const parts: string[] = [];
+		if (j.waiting > 0) parts.push(`${j.waiting} host${j.waiting === 1 ? '' : 's'} waiting to join`);
+		if (j.refused > 0) parts.push(`${j.refused} refused`);
+		return parts.join(', ');
+	}
+	async function loadJoining() {
+		try {
+			const r = await api.getEnrolmentRequests();
+			joining = { waiting: r.summary.wants_to_join, refused: r.summary.refused };
+			joiningUnread = false;
+		} catch {
+			joining = null;
+			joiningUnread = true;
+		}
+	}
 	// Sync / Adopt / Ignore / Enrich are all write-scoped server-side. Offering
 	// them to a read-only session only produces 403s. Default-deny while loading.
 	$: canWrite = capCanWrite($sessionStore?.capabilities);
@@ -75,7 +110,13 @@
 	// The rows are the same rows and the same selection; what changes is that
 	// the page leads with the machines that want an operator instead of with
 	// whatever the server happened to return first.
-	$: groups = groupHosts(items);
+	//
+	// A row an operator just powered stays in the group it was in until they
+	// reload (plan 4.7: rows never move under the cursor on a live update) -
+	// a stopped guest started from "Needs attention" keeps its place, now
+	// reading `running`, instead of jumping into "Managed" mid-glance.
+	let pinnedGroups: Record<string, HostGroupId> = {};
+	$: groups = groupHosts(items, pinnedGroups);
 	// Collapse state is decided ONCE per fleet-size change, not on every render,
 	// or an operator's click to open the healthy group would be undone by the
 	// next reload. `collapseKey` is what makes that "once".
@@ -176,8 +217,7 @@
 	}
 
 	// Forgetting is irreversible (services and the observation note go with the
-	// host), so it is a two-step confirm inline.
-	let forgetConfirm: string | null = null;
+	// host), so it is a two-step confirm inline (in the row menu).
 	let forgetting: string | null = null;
 
 	async function forgetOne(h: Host) {
@@ -185,7 +225,6 @@
 		try {
 			await api.forgetHost(h.id);
 			notify(`Removed ${h.hostname} from inventory`);
-			forgetConfirm = null;
 			await load();
 		} catch (e) {
 			notify(e instanceof Error ? e.message : String(e), 'err');
@@ -241,10 +280,108 @@
 		return load();
 	}
 
+	// ── Power from the row (UI slice 5, plan 3.2 / 5.4). What the row says
+	// about an action: while it runs, "Starting... following Proxmox task"
+	// with the OLD chip kept and marked pending; then the settled outcome the
+	// server judged once the task ended, and the chip re-read from the server.
+	// A refusal names its reason and the holder, in the row, until dismissed.
+	interface PowerLine {
+		phase: 'working' | 'done' | 'refused';
+		action: PowerAction;
+		tone: LineTone;
+		text: string;
+	}
+	let powerLines: Record<string, PowerLine> = {};
+	// The typed dialog (plan 3.10) for a forced stop, and for any verb on the
+	// machine HomePilot runs on or a protected guest.
+	let typedAsk: { host: Host; action: PowerAction; state: GuestPowerState } | null = null;
+
+	function setLine(id: string, line: PowerLine | null) {
+		const next = { ...powerLines };
+		if (line) next[id] = line;
+		else delete next[id];
+		powerLines = next;
+	}
+
+	function onPowerAsk(h: Host, detail: { action: PowerAction; state: GuestPowerState; typed: boolean }) {
+		if (detail.typed) typedAsk = { host: h, action: detail.action, state: detail.state };
+		else void runPower(h, detail.action);
+	}
+
+	async function runPower(h: Host, action: PowerAction, confirmName?: string) {
+		// Pinned where it is until the operator reloads (see pinnedGroups).
+		const g = groups.find((x) => x.hosts.some((y) => y.id === h.id));
+		if (g) pinnedGroups = { ...pinnedGroups, [h.id]: g.id };
+		setLine(h.id, { phase: 'working', action, tone: 'muted', text: workingLine(action) });
+		let line: PowerLine;
+		try {
+			const result = await api.powerGuest(h.id, {
+				action,
+				...(confirmName ? { confirm_name: confirmName } : {}),
+			});
+			const o = outcomeLine(result);
+			line = { phase: 'done', action, tone: o.tone, text: o.text };
+		} catch (e) {
+			line = { phase: 'refused', action, tone: 'crit', text: refusalLine(action, e) };
+		}
+		// The chip changes only on the server's word: re-read the row (the
+		// server wrote Proxmox's answer onto it once the task settled).
+		try {
+			const fresh = await api.getHost(h.id);
+			if (fresh) {
+				items = items.map((x) =>
+					x.id === h.id
+						? {
+								...x,
+								status: fresh.status,
+								pve_status: fresh.pve_status,
+								absent_since: fresh.absent_since,
+							}
+						: x,
+				);
+			}
+		} catch {
+			line = { ...line, text: `${line.text} (Could not re-read the row; Reload to see its state.)` };
+		}
+		setLine(h.id, line);
+	}
+
+	async function confirmTyped(typed: string) {
+		if (!typedAsk) return;
+		const { host, action } = typedAsk;
+		// The dialog closes as the action starts: the row carries the progress.
+		typedAsk = null;
+		await runPower(host, action, typed);
+	}
+
+	// The chip that rides with the name. For a Proxmox guest it is the
+	// hypervisor's own word (running / stopped / paused) - "online" needed an
+	// address, so a running guest without one read "unknown".
+	function stateChip(h: Host): { text: string; cls: string } {
+		const guest = h.host_type === 'qemu' || h.host_type === 'lxc';
+		if (guest && h.pve_status && !h.absent_since) {
+			if (h.pve_status === 'running') return { text: 'running', cls: 'bg-ok-tint text-ok' };
+			return { text: h.pve_status, cls: 'bg-raised text-muted' };
+		}
+		return { text: h.status ?? 'unknown', cls: statusChip(h.status) };
+	}
+
+	// Phones get a card list (plan 3.2 mobile); the table stays from 768 px up.
+	let narrow = false;
+	onMount(() => {
+		const mq = typeof window !== 'undefined' ? window.matchMedia?.('(max-width: 767px)') : undefined;
+		if (!mq) return;
+		narrow = mq.matches;
+		const onChange = (e: MediaQueryListEvent) => (narrow = e.matches);
+		mq.addEventListener?.('change', onChange);
+		return () => mq.removeEventListener?.('change', onChange);
+	});
+
 	async function load() {
 		loading = true;
 		loadError = '';
-		void joinRequests?.load();
+		pinnedGroups = {};
+		void loadJoining();
 		try {
 			const res = await api.listInventory({
 				role: filterRole || undefined,
@@ -350,6 +487,8 @@
 		if (source === 'imported') return 'Imported';
 		if (source === 'discovered') return 'Discovered';
 		if (source === 'agent') return 'Agent';
+		// A hand-added host painted an empty pill (UI slice 5 walk).
+		if (source === 'manual') return 'Manual';
 		return '';
 	}
 
@@ -476,24 +615,43 @@
 </script>
 
 <div class="space-y-4">
-	<div class="flex items-center justify-between">
+	<div class="flex flex-wrap items-center justify-between gap-2">
 		<h1 class="page-title">Hosts</h1>
-		<div class="flex gap-2">
-			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}>↻ Reload</button>
+		<div class="flex flex-wrap gap-2">
+			<button class="btn btn-ghost text-xs" on:click={load} disabled={loading}><Icon name="refresh" />Reload</button>
 			{#if canWrite}
-				<button class="btn btn-primary text-xs" on:click={() => (showAdd = !showAdd)}>
-					{showAdd ? 'Cancel' : '+ Add host'}
-				</button>
+				<!-- `+ Add` (plan 3.2): the three doors a machine comes in by. -->
+				<RowMenu label="Add to the fleet" triggerClass="btn btn-primary text-xs" let:close>
+					<span slot="trigger" class="inline-flex items-center gap-1"
+						><Icon name="plus" />Add<Icon name="chevron-down" size={12} /></span
+					>
+					<button
+						type="button"
+						role="menuitem"
+						class="btn btn-ghost btn-xs text-left"
+						on:click={() => {
+							close();
+							showAdd = true;
+						}}>Add a LAN device</button
+					>
+					<!-- No operator provision form exists yet (review 02/11): the item
+					     stays, disabled, and says where provisioning is today. -->
+					<button
+						type="button"
+						role="menuitem"
+						class="btn btn-ghost btn-xs text-left add-later"
+						disabled
+						aria-label="Provision a VM from template (not built yet)"
+						><span>Provision a VM from template</span><span class="menu-why"
+							>Not built yet. Today a guest invite or an assistant's provision_guest does it.</span
+						></button
+					>
+					<a role="menuitem" class="btn btn-ghost btn-xs text-left" href="{base}/hosts/agents" on:click={close}
+						>Enrol an agent</a
+					>
+				</RowMenu>
 				<button class="btn btn-ghost text-xs" on:click={sync} disabled={syncing}>
-					{syncing ? 'Syncing…' : '⟳ Sync from Proxmox'}
-				</button>
-				<button class="btn btn-ghost text-xs"
-					on:click={() => (enrollShow = enrollShow === 'bootstrap' ? null : 'bootstrap')}>
-					{enrollShow === 'bootstrap' ? 'Cancel' : 'Enroll agent'}
-				</button>
-				<button class="btn btn-ghost text-xs"
-					on:click={() => (enrollShow = enrollShow === 'hub' ? null : 'hub')}>
-					{enrollShow === 'hub' ? 'Hide' : 'Hub token'}
+					{#if syncing}Syncing…{:else}<Icon name="refresh" />Sync from Proxmox{/if}
 				</button>
 			{/if}
 		</div>
@@ -598,9 +756,14 @@
 				Added by hand, so it is recorded as a manual host and adopted straight away - and a
 				Proxmox sync will never mark it gone, because Proxmox never looked for it.
 			</p>
-			<button class="btn btn-primary text-xs" type="submit" disabled={adding || !addForm.hostname.trim()}>
-				{adding ? 'Adding…' : 'Add host'}
-			</button>
+			<div class="flex gap-2">
+				<button class="btn btn-primary text-xs" type="submit" disabled={adding || !addForm.hostname.trim()}>
+					{adding ? 'Adding…' : 'Add host'}
+				</button>
+				<button class="btn btn-ghost text-xs" type="button" disabled={adding} on:click={() => (showAdd = false)}
+					>Cancel</button
+				>
+			</div>
 		</form>
 	{/if}
 
@@ -663,13 +826,19 @@
 		</span>
 	</div>
 
-	<JoinRequests
-		bind:this={joinRequests}
-		{canWrite}
-		on:enrolWithBootstrap={() => (enrollShow = 'bootstrap')}
-	/>
-
-	<EnrollAgent show={enrollShow} />
+	{#if joining && joining.waiting + joining.refused > 0}
+		<p class="text-xs flex flex-wrap items-center gap-x-s-2" data-testid="joining-strip">
+			<Lamp state={joining.waiting > 0 ? 'warn' : 'off'} />
+			<span class="text-ink">{joiningSentence(joining)}</span>
+			<a class="text-accent hover:underline" href="{base}/hosts/agents">Open Agents</a>
+		</p>
+	{:else if joiningUnread}
+		<p class="text-xs flex flex-wrap items-center gap-x-s-2" data-testid="joining-strip">
+			<Lamp state="off" />
+			<span class="text-muted">Could not read who is waiting to join the agent hub.</span>
+			<a class="text-accent hover:underline" href="{base}/hosts/agents">Open Agents</a>
+		</p>
+	{/if}
 
 	{#if items.some((h) => h.agent_id && !h.agent_connected)}
 		<div class="flex justify-end">
@@ -706,7 +875,7 @@
 		<div class="card p-6 text-center space-y-3">
 			<p class="text-danger">Could not load hosts.</p>
 			<p class="text-xs text-muted">{loadError}</p>
-			<button class="btn btn-ghost text-xs" on:click={load}>↻ Retry</button>
+			<button class="btn btn-ghost text-xs" on:click={load}><Icon name="refresh" />Retry</button>
 		</div>
 	{:else if items.length === 0 && hasActiveFilters}
 		<div class="card p-6 text-center space-y-3">
@@ -718,16 +887,105 @@
 			<p class="prose-note text-sm">No hosts yet.</p>
 			<p class="prose-note text-xs">
 				Sync from Proxmox to discover guests, add a host by hand, or enroll an
-				agent — any of the three puts a machine on this page.
+				agent on <a class="text-accent hover:underline" href="{base}/hosts/agents">Agents</a> —
+				any of the three puts a machine on this page.
 			</p>
 		</div>
 	{:else}
-		<div class="card overflow-x-auto">
+		{#if narrow}
+			<!-- Phones (plan 3.2 mobile): one card per machine - name and chips on
+			     line one, addresses and env on line two, the same row menu as a
+			     trailing button. Same groups, same menu, same power line. -->
+			<div class="host-cards section-stack" data-testid="host-cards">
+				{#each groups as g (g.id)}
+					<section aria-label="{g.label} ({g.hosts.length})" data-group={g.id}>
+						<h2 class="host-cards-head">
+							{#if isCollapsible(g.id)}
+								<button
+									type="button"
+									class="btn btn-ghost btn-xs"
+									aria-expanded={!collapsed[g.id]}
+									on:click={() => toggleGroup(g.id)}
+								><Icon name={collapsed[g.id] ? 'chevron-right' : 'chevron-down'} class="mr-1" />{g.label} ({g.hosts.length})</button>
+							{:else}
+								<span class="section-title">{g.label} ({g.hosts.length})</span>
+							{/if}
+						</h2>
+						{#if !collapsed[g.id]}
+							<ul class="host-card-list">
+								{#each g.hosts as h (h.id)}
+									{@const chip = stateChip(h)}
+									<li class="host-card" data-host={h.id}>
+										<div class="host-card-line">
+											<a href="{base}/hosts/{h.id}" class="text-accent font-mono host-card-name">{h.hostname}</a>
+											{#if h.is_self}<span class="badge bg-accent-tint text-accent-strong">HomePilot</span>{/if}
+											{#if h.is_template}
+												<span class="badge bg-raised text-muted">template</span>
+											{:else}
+												<span class="badge {chip.cls}">{chip.text}</span>
+											{/if}
+											{#if powerLines[h.id]?.phase === 'working'}<span class="badge badge-neutral">pending</span>{/if}
+											{#if h.absent_since}<span class="badge badge-failed">gone</span>{/if}
+											<span class="host-card-menu">
+												<HostRowMenu
+													host={h}
+													{canWrite}
+													{canAdmin}
+													busy={powerLines[h.id]?.phase === 'working'}
+													forgetting={forgetting === h.id}
+													on:power={(e) => onPowerAsk(h, e.detail)}
+													on:adopt={() => adoptOne(h)}
+													on:ignore={() => ignoreOne(h)}
+													on:forget={() => forgetOne(h)}
+												/>
+											</span>
+										</div>
+										<div class="host-card-line host-card-sub">
+											<span class="font-mono">
+												{#if h.addresses?.length}
+													{#each addressCell(h.addresses) as a, i (a.text)}
+														{#if i > 0}<span aria-hidden="true">, </span>{/if}
+														<span class={a.conflict ? 'text-danger' : ''}
+															>{a.text}{#if a.conflict}<span class="sr-only"> - address clash</span>{/if}</span
+														>
+													{/each}
+												{:else}
+													{h.ip_address || 'no address'}
+												{/if}
+											</span>
+											{#if h.proxmox_id != null}<span class="font-mono">VMID {h.proxmox_id}</span>{/if}
+											{#if h.env}<span class="badge {envClass(h.env)}">{h.env}</span>{/if}
+											{#if attentionReason(h)}<span class="text-warn">{attentionReason(h)}</span>{/if}
+										</div>
+										{#if powerLines[h.id]}
+											{@const pl = powerLines[h.id]}
+											<p
+												class="power-line power-{pl.tone}"
+												role={pl.phase === 'refused' ? 'alert' : 'status'}
+												data-power-line={pl.phase}
+											>
+												<Lamp state={pl.tone === 'muted' ? 'half' : pl.tone} />
+												<span>{pl.text}</span>
+												{#if pl.phase !== 'working'}
+													<button type="button" class="btn btn-ghost btn-xs" on:click={() => setLine(h.id, null)}>Dismiss</button>
+												{/if}
+											</p>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</section>
+				{/each}
+			</div>
+		{:else}
+		<div class="card hosts-table-scroll">
 			<!-- ONE table, grouped by tbody (#549 F3): the groups share a column
 			     system, so a host in "Needs attention" and one in "Managed" still
 			     line up down the page - which is the whole reason rows earn a
-			     table rather than a stack of cards. -->
-			<table class="data-table text-xs">
+			     table rather than a stack of cards. The header sticks to the top
+			     of this box on a long fleet (plan 4.6). -->
+			<table class="data-table hosts-table text-xs">
 				<thead>
 					<tr>
 						<th class="text-left pr-2">
@@ -749,7 +1007,7 @@
 				</thead>
 				{#each groups as g (g.id)}
 					<tbody data-group={g.id}>
-						<tr class="bg-raised">
+						<tr class="group-row">
 							<th colspan="9" scope="colgroup" class="text-left py-s-1">
 								{#if isCollapsible(g.id)}
 									<button
@@ -757,8 +1015,7 @@
 										class="btn btn-ghost btn-xs"
 										aria-expanded={!collapsed[g.id]}
 										on:click={() => toggleGroup(g.id)}
-									><span aria-hidden="true" class="mr-1">{collapsed[g.id] ? '▸' : '▾'}</span
-										>{g.label} ({g.hosts.length})</button>
+									><Icon name={collapsed[g.id] ? 'chevron-right' : 'chevron-down'} class="mr-1" />{g.label} ({g.hosts.length})</button>
 								{:else}
 									<span class="section-title">{g.label} ({g.hosts.length})</span>
 								{/if}
@@ -766,6 +1023,7 @@
 						</tr>
 						{#if !collapsed[g.id]}
 							{#each g.hosts as h (h.id)}
+								{@const chip = stateChip(h)}
 								<tr class="border-b border-divider hover:bg-raised transition-colors">
 									<td class="pr-2">
 										<input
@@ -792,7 +1050,7 @@
 												<!-- A template never runs: "offline" would be noise. -->
 												<span class="badge bg-raised text-muted" title="Proxmox template: a provisioning input">template</span>
 											{:else}
-												<span class="badge {statusChip(h.status)}">{h.status ?? 'unknown'}</span>
+												<span class="badge {chip.cls}">{chip.text}</span>
 											{/if}
 											{#if h.agent_id}
 												<span
@@ -803,6 +1061,10 @@
 														? `Agent ${h.agent_version ?? ''} connected`
 														: 'Agent enrolled but not connected'}
 												>{h.agent_connected ? 'agent ·' : 'agent ∅'}{h.agent_connected && h.agent_version ? ` ${h.agent_version}` : ''}</span>
+											{/if}
+											{#if powerLines[h.id]?.phase === 'working'}
+												<!-- The old chip stays until the server says otherwise (plan 5.4). -->
+												<span class="badge badge-neutral" title="A power action is running">pending</span>
 											{/if}
 											{#if h.absent_since}
 												<!-- A destroyed guest used to look exactly like a powered-off
@@ -853,86 +1115,50 @@
 										{/if}
 									</td>
 									<td class="col-secondary">{h.node ?? '—'}</td>
-									<!-- ONE actions affordance per row (#549 F1 / #514 P7). The
-									     GATING is unchanged - the same capability check, the same
-									     source/state branches, the same two-step Forget - only the
-									     four-to-six buttons that used to sit open on every row now
-									     live behind the row's own menu. -->
+									<!-- ONE actions affordance per row (#549 F1 / #514 P7), now with
+									     Console and the state-aware power verbs (UI slice 5). -->
 									<td>
-										<RowMenu label="Actions for {h.hostname}" let:close>
-											<a
-												role="menuitem"
-												class="btn btn-ghost btn-xs text-left"
-												href="{base}/hosts/{h.id}"
-												on:click={close}>Open host</a>
-											{#if h.hostname}
-												<a
-													role="menuitem"
-													class="btn btn-ghost btn-xs text-left"
-													href={hostMetricsUrl(base, h.hostname, h.id)}
-													title="Open this host's recent metrics"
-													on:click={close}>Metrics</a>
-											{/if}
-											{#if h.proxmox_url}
-												<a
-													role="menuitem"
-													class="btn btn-ghost btn-xs text-left"
-													href={h.proxmox_url}
-													target="_blank"
-													rel="noopener noreferrer"
-													title="This host's page in the Proxmox web UI"
-													on:click={close}>Open in Proxmox ↗</a>
-											{/if}
-											{#if canWrite && h.source === 'discovered' && h.import_state !== 'ignored' && !h.is_template}
-												<button
-													type="button"
-													role="menuitem"
-													class="btn btn-ghost btn-xs text-left"
-													on:click={() => {
-														close();
-														void adoptOne(h);
-													}}>Adopt</button>
-												<button
-													type="button"
-													role="menuitem"
-													class="btn btn-ghost btn-xs text-left"
-													on:click={() => {
-														close();
-														void ignoreOne(h);
-													}}>Ignore</button>
-											{/if}
-											{#if canWrite && (h.source === 'manual' || h.absent_since)}
-												{#if forgetConfirm === h.id}
-													<button
-														type="button"
-														role="menuitem"
-														class="btn btn-danger btn-xs text-left"
-														disabled={forgetting === h.id}
-														on:click={() => forgetOne(h)}
-													>{forgetting === h.id ? 'Removing…' : 'Confirm forget'}</button>
-													<button
-														type="button"
-														role="menuitem"
-														class="btn btn-ghost btn-xs text-left"
-														on:click={() => (forgetConfirm = null)}>Cancel</button>
-												{:else}
-													<button
-														type="button"
-														role="menuitem"
-														class="btn btn-ghost btn-xs text-left text-danger"
-														title="Remove this host from inventory, with its services and observation note"
-														on:click={() => (forgetConfirm = h.id)}>Forget</button>
-												{/if}
-											{/if}
-										</RowMenu>
+										<HostRowMenu
+											host={h}
+											{canWrite}
+											{canAdmin}
+											busy={powerLines[h.id]?.phase === 'working'}
+											forgetting={forgetting === h.id}
+											on:power={(e) => onPowerAsk(h, e.detail)}
+											on:adopt={() => adoptOne(h)}
+											on:ignore={() => ignoreOne(h)}
+											on:forget={() => forgetOne(h)}
+										/>
 									</td>
 								</tr>
+								{#if powerLines[h.id]}
+									{@const pl = powerLines[h.id]}
+									<!-- The action's own line, under its row: working, settled, or
+									     refused with the reason and the holder named. -->
+									<tr class="power-row" data-power-for={h.id}>
+										<td></td>
+										<td colspan="8">
+											<p
+												class="power-line power-{pl.tone}"
+												role={pl.phase === 'refused' ? 'alert' : 'status'}
+												data-power-line={pl.phase}
+											>
+												<Lamp state={pl.tone === 'muted' ? 'half' : pl.tone} />
+												<span>{pl.text}</span>
+												{#if pl.phase !== 'working'}
+													<button type="button" class="btn btn-ghost btn-xs" on:click={() => setLine(h.id, null)}>Dismiss</button>
+												{/if}
+											</p>
+										</td>
+									</tr>
+								{/if}
 							{/each}
 						{/if}
 					</tbody>
 				{/each}
 			</table>
 		</div>
+		{/if}
 		{#if total > PAGE_SIZE}
 			<div class="flex gap-2 items-center justify-end">
 				<button
@@ -941,7 +1167,7 @@
 					on:click={() => {
 						page -= 1;
 						load();
-					}}>← Previous</button
+					}}><Icon name="arrow-left" />Previous</button
 				>
 				<span class="text-xs text-muted">
 					Page {page + 1} of {Math.ceil(total / PAGE_SIZE)}
@@ -952,7 +1178,7 @@
 					on:click={() => {
 						page += 1;
 						load();
-					}}>Next →</button
+					}}>Next<Icon name="arrow-right" /></button
 				>
 			</div>
 		{/if}
@@ -986,3 +1212,157 @@
 		</div>
 	</div>
 {/if}
+
+{#if typedAsk}
+	{@const t = typedAsk}
+	<ConfirmDialog
+		title={t.action === 'stop' ? `Stop ${t.host.hostname} (forced)` : `${VERB_LABEL[t.action]} ${t.host.hostname}`}
+		confirmName={t.host.hostname}
+		confirmLabel="{VERB_LABEL[t.action]} {t.host.hostname}"
+		danger={t.action !== 'start'}
+		on:cancel={() => (typedAsk = null)}
+		on:confirm={(e) => confirmTyped(e.detail.typed)}
+	>
+		<p data-confirm-consequence>
+			{#if t.action === 'stop'}
+				This cuts power to VMID {t.state.vmid} on {t.state.node} without a shutdown. Open files
+				may be lost.
+			{:else if t.action === 'shutdown'}
+				This asks VMID {t.state.vmid} on {t.state.node} to shut down. If it has not within two
+				minutes it is left running and you are told; nothing is forced.
+			{:else if t.action === 'reboot'}
+				A Proxmox reboot of VMID {t.state.vmid} on {t.state.node}: it shuts down and starts
+				again{#if t.state.pending.length}, applying {t.state.pending.length} pending change{t.state
+						.pending.length === 1
+						? ''
+						: 's'}{/if}.
+			{:else}
+				This starts VMID {t.state.vmid} on {t.state.node}. It is refused, with the holder named,
+				if a running guest holds one of its addresses or its passthrough disk.
+			{/if}
+		</p>
+		{#if t.state.is_self}
+			<p class="text-danger" data-confirm-self>
+				This is the machine HomePilot runs on. HomePilot goes down with it and this page will stop
+				responding.
+			</p>
+		{:else if t.state.protected}
+			<p data-confirm-protected>
+				{t.host.hostname} is protected{t.host.env === 'infra' && t.host.protected == null
+					? ' (env infra)'
+					: ''}: switching it off takes its name typed back.
+			</p>
+		{/if}
+	</ConfirmDialog>
+{/if}
+
+<style>
+	/* The fleet table scrolls in its own box so its header can stick on a long
+	   fleet (plan 4.6); a short fleet never fills it and never scrolls. */
+	.hosts-table-scroll {
+		overflow: auto;
+		max-height: calc(100dvh - 7rem);
+		padding-top: 0;
+	}
+	.hosts-table thead th {
+		position: sticky;
+		top: 0;
+		z-index: 2;
+		background: var(--color-surface);
+	}
+	.hosts-table tr.group-row th {
+		background: var(--color-surface-raised);
+	}
+	.hosts-table tr.power-row td {
+		padding-top: 0;
+	}
+	/* The line wraps inside the row's width and never widens a column: a
+	   long refusal must not shift every row of the table sideways. */
+	.hosts-table tr.power-row .power-line {
+		width: 0;
+		min-width: 100%;
+	}
+
+	/* A power action's line: a sentence, so it is set in the reading serif;
+	   the lamp and the word carry the tone together, never colour alone. */
+	.power-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--space-2);
+		margin: 0;
+		font-family: var(--font-serif);
+		font-size: 0.8125rem;
+		line-height: 1.45;
+		color: var(--color-text);
+	}
+	.power-muted {
+		color: var(--color-muted);
+	}
+	.power-warn {
+		color: var(--color-warn);
+	}
+	.power-crit {
+		color: var(--color-danger);
+	}
+
+	/* The disabled "Provision" door in `+ Add`: it says why, legibly. */
+	.add-later {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		opacity: 1;
+		border-style: dashed;
+	}
+	.add-later:disabled {
+		opacity: 1;
+	}
+	.menu-why {
+		font-size: 0.6875rem;
+		line-height: 1.3;
+		font-weight: 400;
+		color: var(--color-muted);
+		white-space: normal;
+	}
+
+	/* Phones: one card per machine (plan 3.2 mobile). */
+	.host-cards-head {
+		margin: 0 0 var(--space-1);
+	}
+	.host-card-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+	}
+	.host-card {
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		padding: var(--space-2) var(--space-3);
+	}
+	.host-card-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--space-1) var(--space-2);
+		min-width: 0;
+	}
+	.host-card-name {
+		font-size: 0.875rem;
+		overflow-wrap: anywhere;
+	}
+	.host-card-menu {
+		margin-left: auto;
+	}
+	.host-card-sub {
+		margin-top: var(--space-1);
+		font-size: 0.75rem;
+		color: var(--color-muted);
+	}
+	.host-card .power-line {
+		margin-top: var(--space-2);
+	}
+</style>
