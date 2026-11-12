@@ -314,8 +314,17 @@ if command -v file >/dev/null 2>&1 && ! file "$BIN" | grep -q "ELF"; then
     echo "Downloaded file is not a valid binary. Check the release exists." >&2
     exit 1
 fi
+# >>> binary-swap block (executed verbatim by tests/test_agent_upgrade.py)
+# Over an existing agent (an upgrade or a reinstall) the binary it is running is
+# kept as hp-agent.prev first: the running process keeps its own copy until the
+# restart, and if the new one never reaches the hub, HomePilot's upgrade task
+# puts this one back instead of leaving the host without a working agent.
+if [ -f "$INSTALL_DIR/hp-agent" ]; then
+    $SUDO cp -p "$INSTALL_DIR/hp-agent" "$INSTALL_DIR/hp-agent.prev"
+fi
 $SUDO install -m 0755 "$BIN" "$INSTALL_DIR/hp-agent"
 echo "Installed to $INSTALL_DIR/hp-agent"
+# <<< end binary-swap block
 # <<< end download block
 
 # ─── Create the service user (no login, no home writes needed) ───
@@ -369,6 +378,21 @@ else
 fi
 printf '%s' "$AGENT_ID" | $SUDO tee "$CONF_DIR/agent.id" >/dev/null
 $SUDO chmod 600 "$CONF_DIR/agent.id"
+
+# This run was given a token, and that token is the operator's CURRENT intent:
+# the agent presents a persisted agent.token in preference to it, so a
+# credential left by an earlier install must not stay in its way. A re-install
+# used to rewrite agent.env with a fresh one-time bootstrap token and leave the
+# old agent.token behind; the agent kept presenting the old one, the hub refused
+# it, and the bootstrap token was never used (#815). It is moved aside, never
+# deleted: agent.token.prev is the ONE previous copy, and the agent falls back
+# to it once if the hub refuses the new token, so re-running the installer over
+# a healthy host cannot lock it out (#789).
+if [ -s "$CONF_DIR/agent.token" ]; then
+    $SUDO mv -f "$CONF_DIR/agent.token" "$CONF_DIR/agent.token.prev"
+    $SUDO chmod 600 "$CONF_DIR/agent.token.prev"
+    echo "Moved the credential from the previous install aside to $CONF_DIR/agent.token.prev"
+fi
 
 $SUDO tee "$CONF_DIR/agent.env" >/dev/null <<EOF
 HP_AGENT_HUB_HOST=$HUB_HOST

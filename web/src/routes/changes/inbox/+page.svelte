@@ -22,6 +22,7 @@
 		type Artifact,
 		type ArtifactDetail,
 		type ArtifactPlan,
+		type ArtifactTarget,
 	} from '$lib/api';
 	import { canWrite as capCanWrite, isAdmin } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
@@ -29,7 +30,14 @@
 	import { base } from '$app/paths';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
-	import { inboxState, recentlyFinished } from '$lib/changes';
+	import {
+		approvalAge,
+		cannotRun,
+		inboxState,
+		liveConfirm,
+		recentlyFinished,
+		type LiveConfirm,
+	} from '$lib/changes';
 	import ApprovalCodePanel from '$lib/components/ApprovalCodePanel.svelte';
 	import ChangeOutcome from '$lib/components/ChangeOutcome.svelte';
 	import ChangeSummary from '$lib/components/ChangeSummary.svelte';
@@ -56,6 +64,11 @@
 	/** Ids whose detail fetch has been issued — an empty error is not a marker. */
 	let detailRequested: Record<string, boolean> = {};
 	let rejectReasons: Record<string, string> = {};
+	// Who each Ready-to-run change is for, read live (#813): the approval's age,
+	// and whether the machine at its VMID is still the one it was written for.
+	// An approved change the server will not run says so on its card.
+	let targets: Record<string, ArtifactTarget> = {};
+	$: blockedReady = ready.filter((a) => cannotRun(targets[a.id]));
 	let plans: Record<string, ArtifactPlan> = {};
 	let planErrors: Record<string, string> = {};
 	let planLoading: Record<string, boolean> = {};
@@ -107,6 +120,7 @@
 				if (known && known.frontmatter.status !== a.status) delete detailRequested[a.id];
 			}
 			loadDetails([...ready, ...visible, ...finished.slice(0, FINISHED_MAX)]);
+			void loadTargets(ready);
 			if (queuePage >= Math.ceil(items.length / QUEUE_PAGE_SIZE)) queuePage = 0;
 			selected = pruneSelection(selected, items);
 		} catch (e) {
@@ -117,6 +131,33 @@
 			else notify(msg, 'err');
 		} finally {
 			loading = false;
+		}
+	}
+
+	/** Ask the server who each ready change is for and who is there now (#813). */
+	async function loadTargets(list: Artifact[]) {
+		const read = await Promise.all(
+			list.map(async (a) => [a.id, await api.getArtifactTarget(a.id).catch(() => null)] as const),
+		);
+		const next: Record<string, ArtifactTarget> = {};
+		for (const [id, t] of read) if (t) next[id] = t;
+		targets = next;
+	}
+
+	/**
+	 * Send an approval the server will not run back to review (#813). The
+	 * server's run guard decides, so this can never move a change it would run.
+	 */
+	async function backToReview(id: string) {
+		working = { ...working, [id]: true };
+		try {
+			const res = await api.recheckArtifact(id);
+			notify(res.may_run ? 'It may run after all - left Ready to run' : 'Back in review');
+			await load(false);
+		} catch (e) {
+			notify(String(e), 'err');
+		} finally {
+			working = { ...working, [id]: false };
 		}
 	}
 
@@ -332,12 +373,26 @@
 	// Running a destroy or a forced stop asks for the target's name typed back
 	// (UI_PLAN 3.10); any other change runs on one press. From the keyboard every
 	// approve-and-apply asks first, since a key is easier to hit by accident.
-	let confirming: { id: string; run: 'approve-and-apply' | 'apply'; typed: boolean } | null =
-		null;
-	function requestRun(id: string, run: 'approve-and-apply' | 'apply', fromKey = false) {
+	// The typed name is the guest's name AS READ LIVE (#813), never its VMID -
+	// a VMID is what a different machine at the same number shares - and a
+	// change whose machine is not the recorded one is not offered at all.
+	let confirming: {
+		id: string;
+		run: 'approve-and-apply' | 'apply';
+		typed: boolean;
+		live: LiveConfirm | null;
+	} | null = null;
+	async function requestRun(id: string, run: 'approve-and-apply' | 'apply', fromKey = false) {
 		const danger = details[id]?.summary?.danger;
-		if (danger || fromKey) {
-			confirming = { id, run, typed: !!danger };
+		if (danger) {
+			working = { ...working, [id]: true };
+			const t = await api.getArtifactTarget(id).catch(() => null);
+			working = { ...working, [id]: false };
+			confirming = { id, run, typed: true, live: liveConfirm(t) };
+			return;
+		}
+		if (fromKey) {
+			confirming = { id, run, typed: false, live: null };
 			return;
 		}
 		void (run === 'apply' ? applyNow(id) : approveAndApply(id));
@@ -424,7 +479,7 @@
 		} else if (e.key === 'a' && a.status === 'proposed' && canApprove) {
 			if (details[a.id]?.summary?.two_step) return;
 			e.preventDefault();
-			requestRun(a.id, 'approve-and-apply', true);
+			void requestRun(a.id, 'approve-and-apply', true);
 		} else if (e.key === 'r' && a.status === 'proposed' && canWrite) {
 			e.preventDefault();
 			void reject(a.id);
@@ -470,9 +525,17 @@
 		     a lost one). -->
 		<section class="section-stack" aria-labelledby="ready-title">
 			<h2 class="section-title" id="ready-title">Ready to run</h2>
+			{#if blockedReady.length}
+				<p class="text-xs text-warn" role="status" data-testid="cannot-run-banner">
+					{blockedReady.length === 1 ? '1 approved change' : `${blockedReady.length} approved changes`}
+					will not run as written: an approval too old, or a machine that is not the one it
+					was written for. Each card says why.
+				</p>
+			{/if}
 			{#each ready as a (a.id)}
 				{@const d = details[a.id]}
 				{@const state = inboxState(a, d?.active_task)}
+				{@const why = cannotRun(targets[a.id])}
 				<article
 					class="card section-stack"
 					data-testid="ready-card"
@@ -487,15 +550,27 @@
 							<p class="text-xs text-muted">
 								{a.kind} · <span class="font-mono text-ink">{targetStr(a)}</span>
 								{#if a.approved_by?.user}· approved by {a.approved_by.user}{/if}
+								· <span data-testid="approval-age">{approvalAge(a.approved_by?.at)}</span>
 							</p>
+							{#if why}
+								<p class="text-xs text-warn" data-testid="cannot-run">Will not run: {why}.</p>
+							{/if}
 						</div>
 						{#if canWrite && state === 'ready'}
 							<div class="flex gap-2 shrink-0 flex-wrap">
-								<button
-									class="btn btn-primary text-xs"
-									disabled={working[a.id] || !d}
-									on:click={() => requestRun(a.id, 'apply')}>Apply</button
-								>
+								{#if why}
+									<button
+										class="btn btn-ghost text-xs"
+										disabled={working[a.id]}
+										on:click={() => backToReview(a.id)}>Back to review</button
+									>
+								{:else}
+									<button
+										class="btn btn-primary text-xs"
+										disabled={working[a.id] || !d}
+										on:click={() => requestRun(a.id, 'apply')}>Apply</button
+									>
+								{/if}
 								{#if withdrawArmed === a.id}
 									<button
 										class="btn btn-danger text-xs"
@@ -619,6 +694,11 @@
 						{/if}
 						<div class="flex-[1_1_14rem] min-w-0 space-y-1" data-card-what>
 							<h3 class="text-sm text-ink-strong font-medium">{a.intent}</h3>
+							{#if a.returned_for_review?.reason}
+								<p class="text-xs text-warn" data-testid="returned-for-review">
+									Back for review: {a.returned_for_review.reason}.
+								</p>
+							{/if}
 							<div class="flex gap-2 flex-wrap items-center text-xs text-muted">
 								<span>{a.kind}</span>
 								<span>·</span>
@@ -826,9 +906,16 @@
 	<ConfirmDialog
 		title={confirmTitle(c)}
 		consequence={confirmBody(c)}
-		confirmName={c.typed ? (details[c.id]?.summary?.confirm_name ?? null) : null}
+		confirmName={c.typed ? (c.live?.name ?? null) : null}
+		blocked={c.typed ? (c.live?.blocked ?? null) : null}
 		confirmLabel={c.run === 'approve-and-apply' ? 'Approve and apply' : 'Apply'}
 		on:confirm={confirmRun}
 		on:cancel={() => (confirming = null)}
-	/>
+	>
+		{#if c.typed && c.live?.name}
+			<p class="text-xs text-muted" data-testid="confirm-live-state">
+				At VMID {c.live.vmid} now: <span class="font-mono text-ink">{c.live.name}</span>, {c.live.state}
+			</p>
+		{/if}
+	</ConfirmDialog>
 {/if}

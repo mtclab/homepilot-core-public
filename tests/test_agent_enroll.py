@@ -671,3 +671,96 @@ class TestShellSafety:
         assert task["status"] == "failed"
         assert task["error"].startswith("stage_credentials:")
         assert "cannot be staged" in task["error"]
+
+
+class TestAStaleCredentialIsNamed:
+    """#815: the install's verify step timed out on hosts that DID dial in - with a
+    credential an earlier install left behind, refused by the hub - and the task
+    said "Check journalctl" on the guest. The hub already knows the host knocked
+    and why (``enrolment_attempts``), so the task says that in plain words.
+
+    Teeth: drop the ``_refusal_since`` branch in ``_wait_for_enrolment`` and
+    ``test_a_host_refused_during_the_install_is_named`` fails (the generic
+    journalctl text comes back).
+    """
+
+    async def _knocking_install(
+        self, db: Database, registry: AgentRegistry, proxmox: AsyncMock
+    ) -> _FakeGuest:
+        from homepilot.agent_hub.join_requests import record_attempt
+
+        guest = _FakeGuest(registry, "web-01", connects=False)
+        exec_status = guest.exec_status
+
+        async def knocks(node: str, vmid: int, pid: int) -> dict[str, Any]:
+            # The restarted agent presents its OLD credential and is refused.
+            await record_attempt(
+                Repository(db),
+                hostname="web-01",
+                peer="192.0.2.9",
+                code="window_closed",
+                reason="shared-token enrolment refused: no enrolment window is open",
+                agent_id=GUEST_AGENT_ID,
+            )
+            return await exec_status(node, vmid, pid)
+
+        proxmox.agent_write_file = AsyncMock(side_effect=guest.write_file)
+        proxmox.agent_exec = AsyncMock(side_effect=guest.exec)
+        proxmox.agent_exec_status = AsyncMock(side_effect=knocks)
+        return guest
+
+    async def test_a_host_refused_during_the_install_is_named(
+        self,
+        db: Database,
+        service: AgentEnrollService,
+        host: dict[str, Any],
+        registry: AgentRegistry,
+        proxmox: AsyncMock,
+    ):
+        await self._knocking_install(db, registry, proxmox)
+
+        task = await _run_to_completion(service, host)
+
+        assert task["status"] == "failed"
+        error = task["error"]
+        assert error.startswith("verify: the agent on web-01 presented an old credential"), error
+        assert "no enrolment window is open" in error, "the hub's own reason is carried"
+        assert "Install again" in error
+        assert "journalctl" not in error
+        for token in registry.hub_server._token_store.created:  # type: ignore[union-attr]
+            assert token not in error
+
+    async def test_a_knock_from_before_the_install_is_not_blamed(
+        self,
+        db: Database,
+        service: AgentEnrollService,
+        host: dict[str, Any],
+        registry: AgentRegistry,
+        proxmox: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        from homepilot.agent_hub import join_requests
+
+        monkeypatch.setattr(
+            join_requests, "_utcnow", lambda: datetime.now(UTC) - timedelta(hours=1)
+        )
+        await join_requests.record_attempt(
+            Repository(db),
+            hostname="web-01",
+            peer="192.0.2.9",
+            code="window_closed",
+            reason="an hour-old refusal",
+        )
+        monkeypatch.undo()
+        guest = _FakeGuest(registry, "web-01", connects=False)
+        proxmox.agent_write_file = AsyncMock(side_effect=guest.write_file)
+        proxmox.agent_exec = AsyncMock(side_effect=guest.exec)
+        proxmox.agent_exec_status = AsyncMock(side_effect=guest.exec_status)
+
+        task = await _run_to_completion(service, host)
+
+        assert task["status"] == "failed"
+        assert "no agent connected" in task["error"]
+        assert "old credential" not in task["error"]

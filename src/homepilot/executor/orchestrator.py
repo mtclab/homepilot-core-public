@@ -11,6 +11,7 @@ import httpx
 
 from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError, ProxmoxTaskStillRunningError
+from homepilot.artifacts import target_identity
 from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.models import (
     ArtifactKind,
@@ -125,6 +126,10 @@ class ExecutionResult:
     # The warnings PVE logged on tasks that SUCCEEDED ("WARNINGS: n"), each
     # with a plain-words explanation where one is known (pve_warnings.py).
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    # Set when the run was refused before anything was sent (#813): the
+    # refusal's code (`target_identity.CODE_*`). The artifact is not failed -
+    # nothing ran - and an approved one is back in review.
+    refused: str | None = None
 
 
 @dataclass
@@ -208,6 +213,13 @@ class ArtifactExecutor:
         # `approved`, so its `status == applied` test was dead. The real guard is
         # in `replay()`, which is the path an already-applied artifact takes.)
 
+        # Before anything is sent, the snapshot included: is the approval still
+        # good, and is every guest it acts on still the machine it was written
+        # for (#813)?
+        refusal = await self.check_run(fm, body, "apply")
+        if refusal is not None:
+            return await self.refuse_run(artifact_id, fm, "apply", approved_by, *refusal)
+
         snapshot_id: str | None = None
         mutating = fm.get("mutating", True)
         target_data = fm.get("target", {})
@@ -240,6 +252,7 @@ class ArtifactExecutor:
             await self._record_unsettled(artifact_id, "apply", approved_by, result, snapshot_id)
         elif result.success:
             await self.lifecycle.mark_applied(artifact_id, result.execution_log)
+            await self._record_after_run(artifact_id, fm, body)
             # The single actor-bearing record of this apply. The snapshot id rides
             # here because it is what an operator needs to undo the change.
             await self.lifecycle._log_audit(
@@ -292,6 +305,10 @@ class ArtifactExecutor:
             # Same as apply: never re-run the steps over a task still in flight.
             return await self._settle(artifact_id, fm)
 
+        refusal = await self.check_run(fm, body, "replay")
+        if refusal is not None:
+            return await self.refuse_run(artifact_id, fm, "replay", "replay", *refusal)
+
         target_data = fm.get("target", {})
         target_kind = target_data.get("kind", "")
         snapshot_id: str | None = None
@@ -332,6 +349,7 @@ class ArtifactExecutor:
         elif result.success:
             if status == ArtifactStatus.APPROVED:
                 await self.lifecycle.mark_applied(artifact_id, result.execution_log)
+            await self._record_after_run(artifact_id, fm, body)
             await self.lifecycle._log_audit("replay", artifact_id, "replay")
         else:
             if status == ArtifactStatus.APPROVED:
@@ -347,6 +365,98 @@ class ArtifactExecutor:
 
         result.snapshot_id = snapshot_id
         return result
+
+    async def check_run(self, fm: dict[str, Any], body: str, action: str) -> tuple[str, str] | None:
+        """Why this run may not happen, as ``(code, reason)``; None when it may (#813).
+
+        THE guard every execution path passes before anything is sent: apply,
+        replay (and through them approve-and-apply, the task runner, auto-apply,
+        a composite's steps, MCP and the CLI) and a revoke's rollback.
+
+        * apply / replay: an approval older than ``approval_max_age_days`` may
+          not run - the cluster it was reviewed against may be gone;
+        * every action: each guest the change acts on must still be the machine
+          recorded for it (``target_identity.check``) - a different machine at
+          the VMID, the machine gone, a VMID it creates taken, nothing recorded,
+          or Proxmox unable to say, all refuse.
+        """
+        if action in ("apply", "replay"):
+            limit = await target_identity.approval_limit_days()
+            stale = target_identity.stale_reason(fm, limit)
+            if stale:
+                return target_identity.CODE_STALE, f"this approval may not run: {stale}"
+        verdict = await target_identity.check(self.proxmox, fm, body)
+        if not verdict.ok:
+            return str(verdict.code), str(verdict.message)
+        return None
+
+    async def refuse_run(
+        self, artifact_id: str, fm: dict[str, Any], action: str, actor: str, code: str, reason: str
+    ) -> ExecutionResult:
+        """Record a refused run (#813): audited, nothing sent, never `failed`.
+
+        An APPROVED change goes back to review with the reason - an approval
+        that may not run is not one to keep pressing Apply on (and auto-apply
+        would otherwise try it on every tick). An applied one keeps its status.
+        """
+        returned = False
+        if ArtifactStatus(fm["status"]) is ArtifactStatus.APPROVED:
+            # A bool, never the frontmatter: it rides into the audit row.
+            returned = bool(await self.lifecycle.return_for_review(artifact_id, code, reason))
+        await self.lifecycle._log_audit(
+            f"{action}_refused",
+            artifact_id,
+            actor,
+            {"code": code, "reason": reason, "returned_for_review": returned},
+        )
+        said = f"{reason}. Nothing was sent."
+        if returned:
+            said += " It is back in review; approving it again is a fresh decision."
+        elif ArtifactStatus(fm["status"]) is ArtifactStatus.APPLIED:
+            said += " Propose the change again to run it now."
+        return ExecutionResult(
+            success=False,
+            execution_log=f"[target] REFUSED ({code}): {said}",
+            failure_reason=said,
+            refused=code,
+        )
+
+    async def preflight(self, artifact_id: str, action: str, actor: str) -> None:
+        """The run guard, asked BEFORE a task is started (#813).
+
+        So the API, MCP and the CLI answer a refused run at once (a 409 naming
+        the machine) instead of a task that fails a second later. The executor
+        asks again when the run starts; the world may move in between.
+        Raises ``ConflictError`` with the refusal; nothing was sent.
+        """
+        fm, body = await run_blocking("io", self.store.read, artifact_id)
+        if fm.get("unsettled_task") or fm.get("kind") == ArtifactKind.KB_NOTE.value:
+            return  # settling sends nothing; the run itself decides
+        refusal = await self.check_run(fm, body, action)
+        if refusal is not None:
+            refused = await self.refuse_run(artifact_id, fm, action, actor, *refusal)
+            raise ConflictError(str(refused.failure_reason))
+
+    async def _record_after_run(self, artifact_id: str, fm: dict[str, Any], body: str) -> None:
+        """Re-record who the change's guests are after a run that succeeded (#813).
+
+        The run may have created a guest or renamed one; a later rollback or
+        replay is checked against what it LEFT. A read that fails keeps the
+        earlier record - a later run is then refused rather than guessed at.
+        """
+        # A guest the run created exists now: it is recorded as the machine it
+        # is, no longer as a number that must be free.
+        refs = [
+            target_identity.GuestRef(r.vmid, r.node, r.guest_type)
+            for r in target_identity.guest_refs(fm, body)
+        ]
+        if not refs or self.proxmox is None:
+            return
+        try:
+            identity = await target_identity.read_identity(self.proxmox, refs)
+            await self.lifecycle.record_target_identity(artifact_id, identity)
+        except Exception as exc:  # the run succeeded; the record is best-effort
+            logger.warning("Could not re-record the target identity of %s: %s", artifact_id, exc)
 
     async def _record_unsettled(
         self,
@@ -511,7 +621,21 @@ class ArtifactExecutor:
                 reason="it was approved but never run, so there was nothing to roll back",
             )
         elif kind != ArtifactKind.KB_NOTE:
-            if fm.get("rollback"):
+            refusal = await self.check_run(fm, body, "revoke") if fm.get("rollback") else None
+            if refusal is not None:
+                # A rollback for a machine that is not there any more is not run
+                # (#813); the revoke still lands, honestly as "relabelled".
+                await self.lifecycle._log_audit(
+                    "rollback_refused",
+                    artifact_id,
+                    user,
+                    {"code": refusal[0], "reason": refusal[1]},
+                )
+                outcome = RevokeResult(
+                    rolled_back=False,
+                    reason=f"the rollback was not run: {refusal[1]}; nothing was sent",
+                )
+            elif fm.get("rollback"):
                 outcome = await self._run_rollback(kind, fm, body)
             elif kind_can_roll_back(kind):
                 outcome = RevokeResult(

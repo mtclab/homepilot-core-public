@@ -26,6 +26,8 @@ import { api } from '$lib/api';
 const getBootstrapToken = api.getBootstrapToken as ReturnType<typeof vi.fn>;
 const getEnrolmentRequests = api.getEnrolmentRequests as ReturnType<typeof vi.fn>;
 const openEnrolmentWindow = api.openEnrolmentWindow as ReturnType<typeof vi.fn>;
+const installAgent = api.installAgent as ReturnType<typeof vi.fn>;
+const getTask = api.getTask as ReturnType<typeof vi.fn>;
 
 const FROM_HERE =
 	"( f=\"$(mktemp)\" && trap 'rm -f \"$f\"' EXIT && curl -fsSL -H 'x-hp-agent-token: hpbat_x' http://hub.example.com:8000/agents/dist/install-agent.sh -o \"$f\" && bash \"$f\" --hp-api http://hub.example.com:8000 --hub hub.example.com:8443 --token hpbat_x ) || { echo 'HomePilot agent install FAILED - see the error above' >&2; false; }";
@@ -55,6 +57,7 @@ const KNOCKING = {
 	last_seen: '2026-11-07T10:30:00Z',
 	attempts: 61,
 	wants_to_join: true,
+	install_host_id: null,
 };
 
 describe('EnrollAgent: the one-liner installs from this control plane', () => {
@@ -162,6 +165,54 @@ describe('JoinRequests: a refused agent is seen and can be let in', () => {
 		expect(row.textContent).toMatch(/typo-box/);
 		expect(row.textContent).toMatch(/matched nothing/);
 		expect(screen.queryByRole('button', { name: /Open enrolment window/ })).toBeNull();
+	});
+
+	// #815: a QEMU guest knocking with a credential left by an earlier install is
+	// fixed from this line by running the install again - never by opening the
+	// window. Teeth: drop the "Install again" button from JoinRequests.svelte and
+	// this fails.
+	it('offers Install again on a knocking QEMU guest, and runs the install without a window', async () => {
+		const stuck = {
+			...KNOCKING,
+			hostname: 'old-guest',
+			reason_code: 'host_holds_credential',
+			wants_to_join: false,
+			reason: 'shared-token enrolment refused: host old-guest already holds a live per-agent credential',
+			install_host_id: 'host-42',
+		};
+		getEnrolmentRequests.mockResolvedValue({
+			attempts: [stuck, { ...KNOCKING, hostname: 'not-a-guest' }],
+			pending_tokens: [],
+			window: CLOSED,
+			summary: { ...EMPTY_SUMMARY, wants_to_join: 1, refused: 1 },
+		});
+		installAgent.mockResolvedValue({ task_id: 't-1', status: 'pending', host_id: 'host-42' });
+		getTask.mockResolvedValue({ id: 't-1', status: 'succeeded', error: null });
+
+		render(JoinRequests, { props: { canWrite: true } });
+
+		const row = await screen.findByTestId('refused-host');
+		const buttons = await screen.findAllByRole('button', { name: 'Install again' });
+		// Only the line HomePilot can install on offers it.
+		expect(buttons).toHaveLength(1);
+		expect(row.contains(buttons[0])).toBe(true);
+
+		await fireEvent.click(buttons[0]);
+		await waitFor(() => expect(installAgent).toHaveBeenCalledWith('host-42'));
+		await waitFor(() => expect(getTask).toHaveBeenCalledWith('t-1'));
+		expect(openEnrolmentWindow).not.toHaveBeenCalled();
+	});
+
+	it('offers a reader no Install again', async () => {
+		getEnrolmentRequests.mockResolvedValue({
+			attempts: [{ ...KNOCKING, install_host_id: 'host-42' }],
+			pending_tokens: [],
+			window: CLOSED,
+			summary: { ...EMPTY_SUMMARY, wants_to_join: 1 },
+		});
+		render(JoinRequests, { props: { canWrite: false } });
+		await screen.findByTestId('wants-to-join');
+		expect(screen.queryByRole('button', { name: 'Install again' })).toBeNull();
 	});
 
 	it('lists unused bootstrap tokens with who minted them and when they expire', async () => {

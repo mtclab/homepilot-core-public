@@ -199,6 +199,40 @@ export interface Artifact {
 	partial_apply?: PartialApply;
 	approved_by?: { user?: string; at?: string };
 	withdrawn_by?: { user?: string; at?: string; reason?: string };
+	/** An approval the run guard would not run on, sent back to review (#813). */
+	returned_for_review?: { at?: string; code?: string; reason?: string };
+}
+
+/** One guest a change acts on, as recorded and as read live (#813). */
+export interface LiveGuest {
+	vmid: number;
+	node?: string;
+	type?: string;
+	name?: string;
+	status?: string;
+	cpus?: number;
+	maxmem?: number;
+	maxdisk?: number;
+	owner?: string | null;
+}
+
+/** GET /artifacts/{id}/target: who the change is for, who is there now. */
+export interface ArtifactTarget {
+	identity: {
+		ok: boolean;
+		code: string | null;
+		message: string | null;
+		guests: { vmid: number; live: LiveGuest | null; problem: string | null }[];
+	};
+	approval: {
+		approved_at: string | null;
+		age_days: number | null;
+		limit_days: number;
+		stale: string | null;
+	};
+	/** The live guest a destroy / forced stop is confirmed against, by its name. */
+	confirm: LiveGuest | null;
+	may_run: boolean;
 }
 
 /** A change in plain words, from the server (artifacts/summary.py). */
@@ -208,8 +242,10 @@ export interface ArtifactSummary {
 	steps: string[];
 	/** The worst irreversible thing it does; guarded by a typed confirmation. */
 	danger: 'destroy' | 'stop' | null;
-	/** What the operator types back to confirm a dangerous change. */
+	/** The name the change was written with; never a VMID. The confirm asks for the LIVE name. */
 	confirm_name: string | null;
+	/** The guest the danger falls on (#813). */
+	danger_vmid?: number | null;
 	/** Composite / replay_safe:false: approved, then applied, as two acts. */
 	two_step: boolean;
 	two_step_reason: string | null;
@@ -355,6 +391,19 @@ export interface EnrolmentAttempt {
 	attempts: number;
 	// Holds a genuine token, refused only because no enrolment window is open.
 	wants_to_join: boolean;
+	// The inventory QEMU guest "Install again" re-enrols with no window (#815).
+	install_host_id: string | null;
+}
+
+// A connected agent "Upgrade agent" can bring to this control plane's version.
+export interface AgentUpgrade {
+	agent_id: string;
+	hostname: string;
+	agent_version: string | null;
+	control_version: string;
+	// true: older; null: no version (or one that cannot be compared).
+	behind: boolean | null;
+	host_id: string | null;
 }
 
 export interface PendingBootstrapToken {
@@ -469,7 +518,7 @@ export interface DashboardSummary {
 	};
 	artifacts: Record<string, number>;
 	/** What waits on the owner in Changes > Inbox. Absent on an older backend. */
-	changes?: { proposed: number; ready: number; running: number };
+	changes?: { proposed: number; ready: number; running: number; expired?: number };
 	tasks: Record<string, number>;
 	/** Address clashes (lane B2). Absent on an older backend. */
 	addresses?: { conflicts: AddressConflict[] };
@@ -1191,6 +1240,20 @@ export const api = {
 			{ method: 'POST', body: JSON.stringify({}) },
 		);
 	},
+	/** Who the change is for and who is at its VMIDs now (#813). A read. */
+	getArtifactTarget(id: string) {
+		return req<ArtifactTarget>(`/artifacts/${id}/target`);
+	},
+	/**
+	 * Ask the run guard now, sending nothing (#813): an approval it would not run
+	 * on goes back to review with the reason; one it would run is left alone.
+	 */
+	recheckArtifact(id: string) {
+		return req<{ id: string; may_run: boolean; status: string; code?: string; reason?: string }>(
+			`/artifacts/${id}/recheck`,
+			{ method: 'POST' },
+		);
+	},
 	applyArtifact(id: string) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(`/artifacts/${id}/apply`, {
 			method: 'POST',
@@ -1460,11 +1523,16 @@ export const api = {
 	agentInstallEligibility(hostId: string) {
 		return req<AgentInstallEligibility>(`/agents/install/${hostId}`);
 	},
-	installAgent(hostId: string) {
+	// `upgrade` reinstalls over the host's live agent: same agent, current binary.
+	installAgent(hostId: string, upgrade = false) {
 		return req<{ task_id: string; status: string; host_id: string }>('/agents/install', {
 			method: 'POST',
-			body: JSON.stringify({ host_id: hostId }),
+			body: JSON.stringify(upgrade ? { host_id: hostId, upgrade: true } : { host_id: hostId }),
 		});
+	},
+	// Connected agents older than this control plane or reporting no version.
+	getAgentUpgrades() {
+		return req<AgentUpgrade[]>('/agents/upgrades');
 	},
 	async getHealth(): Promise<HealthInfo> {
 		// `/health` returns 503 when a dependency is degraded — exactly when the

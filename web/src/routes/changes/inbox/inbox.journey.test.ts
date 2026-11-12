@@ -21,7 +21,11 @@ import { hhmm } from '$lib/changes';
  *   - list only `proposed` in load() (the old queue) -> "approve only" fails:
  *     the approved change is on no list;
  *   - drop the poll (syncPoll) -> "approve and apply" never sees the outcome;
- *   - drop the typed confirmation in requestRun -> the destroy test fails.
+ *   - drop the typed confirmation in requestRun -> the destroy test fails;
+ *   - type the summary's name (or a VMID) instead of the live read -> the
+ *     "another machine" test offers Apply and fails (#813);
+ *   - drop the cannot-run branch on the ready card -> the stale card shows
+ *     Apply and the "will not run" test fails.
  */
 const listArtifacts = api.listArtifacts as ReturnType<typeof vi.fn>;
 const getArtifact = api.getArtifact as ReturnType<typeof vi.fn>;
@@ -29,6 +33,29 @@ const approveArtifact = api.approveArtifact as ReturnType<typeof vi.fn>;
 const approveAndApply = api.approveAndApplyArtifact as ReturnType<typeof vi.fn>;
 const withdrawArtifact = api.withdrawArtifact as ReturnType<typeof vi.fn>;
 const applyArtifact = api.applyArtifact as ReturnType<typeof vi.fn>;
+const getArtifactTarget = api.getArtifactTarget as ReturnType<typeof vi.fn>;
+const recheckArtifact = api.recheckArtifact as ReturnType<typeof vi.fn>;
+
+/** GET /artifacts/{id}/target: by default the recorded machine is there and the approval is fresh. */
+function target(over: Record<string, unknown> = {}) {
+	return {
+		identity: { ok: true, code: null, message: null, guests: [] },
+		approval: { approved_at: null, age_days: 0, limit_days: 7, stale: null },
+		confirm: {
+			vmid: 104,
+			node: 'pve1',
+			type: 'qemu',
+			name: 'retire-104',
+			status: 'running',
+			cpus: 1,
+			maxmem: 8 * 1024 ** 3,
+			maxdisk: 30 * 1024 ** 3,
+			owner: 'alice',
+		},
+		may_run: true,
+		...over,
+	};
+}
 
 const STARTED = new Date(2026, 10, 8, 18, 28).toISOString();
 const EFI =
@@ -113,6 +140,7 @@ describe('Changes > Inbox journeys', () => {
 		vi.useFakeTimers({ shouldAdvanceTime: true });
 		world = { status: 'proposed', active: null, last: null, fmExtra: {}, summary: backupSummary() };
 		serve();
+		getArtifactTarget.mockImplementation(() => Promise.resolve(target()));
 		approveAndApply.mockImplementation(() => {
 			world.status = 'approved';
 			world.fmExtra = { approved_by: { user: 'owner (hp_owner)' } };
@@ -230,12 +258,89 @@ describe('Changes > Inbox journeys', () => {
 		const go = within(dialog).getByRole('button', { name: 'Approve and apply' });
 		expect(go).toBeDisabled();
 		expect(approveAndApply).not.toHaveBeenCalled();
+		// The guest as it is now, beside the name asked for (#813).
+		expect(within(dialog).getByTestId('confirm-live-state').textContent).toContain(
+			'retire-104, running · 1 core · 8 GB RAM · 30 GB disk · owner alice',
+		);
+		await fireEvent.input(within(dialog).getByRole('textbox'), {
+			target: { value: '104' },
+		});
+		expect(go).toBeDisabled();
 		await fireEvent.input(within(dialog).getByRole('textbox'), {
 			target: { value: 'retire-104' },
 		});
 		expect(go).not.toBeDisabled();
 		await fireEvent.click(go);
 		await waitFor(() => expect(approveAndApply).toHaveBeenCalledWith(ID));
+	});
+
+	it('a destroy whose VMID another machine holds now offers no Apply at all (#813)', async () => {
+		world.status = 'approved';
+		world.fmExtra = { approved_by: { user: 'owner (hp_owner)', at: new Date().toISOString() } };
+		world.summary = {
+			...backupSummary(),
+			steps: ['Destroy VM 104 on pve1, with its disks'],
+			danger: 'destroy',
+			confirm_name: 'retire-104',
+		};
+		const changed =
+			"VMID 104 is now 'alice-web' (VM, running, on pve1), not 'retire-104' - Proxmox reused the number or the guest was renamed";
+		let reads = 0;
+		getArtifactTarget.mockImplementation(() => {
+			// The card's read finds the machine still there; by the time Apply is
+			// pressed, PVE has given the number to someone else.
+			reads += 1;
+			return Promise.resolve(
+				reads === 1
+					? target()
+					: target({
+							identity: { ok: false, code: 'changed', message: changed, guests: [] },
+							confirm: null,
+							may_run: false,
+						}),
+			);
+		});
+		render(Inbox);
+		const ready = await screen.findByTestId('ready-card');
+		await waitFor(() => expect(getArtifactTarget).toHaveBeenCalledTimes(1));
+		await fireEvent.click(await within(ready).findByRole('button', { name: 'Apply' }));
+
+		const dialog = await screen.findByTestId('confirm-dialog');
+		expect(within(dialog).getByRole('alert').textContent).toContain("'alice-web'");
+		expect(within(dialog).queryByRole('textbox')).toBeNull();
+		expect(within(dialog).queryByRole('button', { name: 'Apply' })).toBeNull();
+		expect(applyArtifact).not.toHaveBeenCalled();
+	});
+
+	it('an approval that will not run says why, and its age, instead of offering Apply (#813)', async () => {
+		const at = new Date(Date.now() - 74 * 24 * 3600 * 1000).toISOString();
+		world.status = 'approved';
+		world.fmExtra = { approved_by: { user: 'owner (hp_owner)', at } };
+		const stale =
+			'it was approved 74 days ago and approvals expire after 7 days (setting approval_max_age_days); the cluster may have changed since - review it again';
+		getArtifactTarget.mockImplementation(() =>
+			Promise.resolve(
+				target({ approval: { approved_at: at, age_days: 74, limit_days: 7, stale }, may_run: false }),
+			),
+		);
+		recheckArtifact.mockImplementation(() => {
+			world.status = 'proposed';
+			world.fmExtra = { returned_for_review: { code: 'stale', reason: stale } };
+			return Promise.resolve({ id: ID, may_run: false, status: 'proposed' });
+		});
+		render(Inbox);
+		const ready = await screen.findByTestId('ready-card');
+		expect(within(ready).getByTestId('approval-age').textContent).toBe('approved 74 days ago');
+		expect((await within(ready).findByTestId('cannot-run')).textContent).toContain('74 days ago');
+		expect(screen.getByTestId('cannot-run-banner').textContent).toContain('1 approved change');
+		expect(within(ready).queryByRole('button', { name: 'Apply' })).toBeNull();
+
+		await fireEvent.click(within(ready).getByRole('button', { name: 'Back to review' }));
+
+		await waitFor(() => expect(recheckArtifact).toHaveBeenCalledWith(ID));
+		const card = await screen.findByTestId('review-card');
+		expect(within(card).getByTestId('returned-for-review').textContent).toContain('74 days ago');
+		expect(applyArtifact).not.toHaveBeenCalled();
 	});
 
 	it('a partly applied run names what happened, not just "failed" (#796)', async () => {

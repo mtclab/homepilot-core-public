@@ -70,6 +70,10 @@ class _BlockingExecutor:
         self.calls: list[tuple[str, str]] = []
         self.lifecycle = MagicMock(mark_failed=AsyncMock())
 
+    async def preflight(self, artifact_id: str, action: str, actor: str) -> None:
+        """The run guard (#813) lets every run here start; it is proven in
+        tests/test_target_identity.py."""
+
     async def apply(self, artifact_id: str, _by: str) -> ExecutionResult:
         self.calls.append(("apply", artifact_id))
         await self.release.wait()

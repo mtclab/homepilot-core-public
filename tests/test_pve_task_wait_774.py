@@ -98,6 +98,14 @@ class FakePve(ProxmoxClient):
             if self.clock.now < self.tasks[upid]:
                 return {"data": {"status": "running", "upid": upid}}
             return {"data": {"status": "stopped", "exitstatus": self.exitstatus, "upid": upid}}
+        if method == "GET" and path == "/cluster/resources":
+            # Who is at each VMID (#813): the three guests being backed up.
+            return {
+                "data": [
+                    {"vmid": v, "node": "pve", "type": "qemu", "name": f"guest-{v}"}
+                    for v in (101, 102, 103)
+                ]
+            }
         return {"data": None}
 
     def posts(self, suffix: str) -> int:
@@ -230,6 +238,7 @@ async def _approved(tmp_artifacts_dir: Path, pve: FakePve, body: str) -> tuple[A
         vault=AsyncMock(),
         pve_nodes=["pve"],
     )
+    lifecycle._proxmox = pve  # propose records which machines it acts on (#813)
     aid = await lifecycle.propose(_spec(body))
     await lifecycle.approve(aid, Principal.operator("admin"))
     return store, lifecycle, executor, aid

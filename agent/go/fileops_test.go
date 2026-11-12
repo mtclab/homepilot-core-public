@@ -135,7 +135,7 @@ func TestReadDeniesTheAgentsOwnCredentialFiles(t *testing.T) {
 	// yet, and agent.env holds the shared token either way.
 	t.Setenv("HP_AGENT_TOKEN_FILE", "")
 
-	for _, name := range []string{"agent.env", "agent.token"} {
+	for _, name := range []string{"agent.env", "agent.token", "agent.token.prev"} {
 		path := filepath.Join(conf, name)
 		secret := []byte("HP_AGENT_AUTH_TOKEN=fleet-enrolment-secret\n")
 		if err := os.WriteFile(path, secret, 0o600); err != nil {

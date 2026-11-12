@@ -102,6 +102,7 @@
       "/root",
       "/etc/homepilot/agent.env",
       "/etc/homepilot/agent.token",
+      "/etc/homepilot/agent.token.prev",
       "/etc/corosync/authkey"
     ],
     "deny_prefixes": [

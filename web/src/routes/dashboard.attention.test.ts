@@ -226,6 +226,25 @@ describe('Overview: needs attention', () => {
 		).toHaveAttribute('href', '/ui/changes/inbox');
 	});
 
+	it('says an expired approval apart from the ready ones (#813)', async () => {
+		// Teeth: count expired approvals as ready and the owner reads "3 ready
+		// to run" over a change that will only go back to review.
+		seed({
+			summary: {
+				artifacts: { approved: 3 },
+				changes: { proposed: 0, ready: 3, running: 0, expired: 1 },
+			},
+		});
+
+		render(Overview);
+		const zone = within(await attentionZone());
+
+		expect(
+			zone.getByRole('link', { name: /1 approved change has an approval too old to run on/i }),
+		).toHaveAttribute('href', '/ui/changes/inbox');
+		expect(zone.getByRole('link', { name: /2 approved changes ready to run/i })).toBeInTheDocument();
+	});
+
 	it('calls a long-running task stuck, not busy', async () => {
 		const started = new Date(Date.now() - 40 * 60 * 1000).toISOString();
 		seed({

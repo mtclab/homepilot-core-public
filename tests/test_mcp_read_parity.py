@@ -141,6 +141,12 @@ ROUTE_TO_TOOL: dict[str, str] = {
 }
 
 EXCLUDED_GET_ROUTES: dict[str, str] = {
+    # ── Who a change is for, read live (#813). ───────────────────────────────
+    "/artifacts/{artifact_id}/target": (
+        "the live read behind the Inbox card and the typed confirm dialog; an "
+        "assistant meets the same check as apply_artifact's refusal, and the "
+        "recorded machine rides on get_artifact as target_identity"
+    ),
     # ── The self-guest prompt (lane B1). ─────────────────────────────────────
     "/inventory/self-guest": (
         "an operator confirmation prompt built from the address the browser reached "
@@ -174,6 +180,12 @@ EXCLUDED_GET_ROUTES: dict[str, str] = {
         "install eligibility - the read half of POST /agents/install, which is "
         "itself provisioning-adjacent and excluded. It only means anything paired "
         "with the install it gates, so it ships with the provisioning surface"
+    ),
+    "/agents/upgrades": (
+        "the Upgrade agent list - the read half of POST /agents/install with "
+        "upgrade, which is excluded with the provisioning surface. The facts it "
+        "joins are already readable: each agent's version via list_agents, the "
+        "fleet's version skew via get_selfcheck (agent_versions)"
     ),
     "/agents/test/adapter": (
         "a diagnostic that EXECUTES a command on a connected host; despite being "
@@ -345,6 +357,11 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
+    # ── The run guard, asked without running (#813). ──
+    ("POST", "/artifacts/{artifact_id}/recheck"): (
+        "the Inbox's 'Back to review' for an approval the run guard refuses; over "
+        "MCP, apply_artifact meets the same guard and sends the change back itself"
+    ),
     # ── Operator power controls (lane B3, #781). ──
     ("POST", "/inventory/{host_id}/power"): (
         "powers a guest DIRECTLY - the operator's own act, admin scope. An assistant "

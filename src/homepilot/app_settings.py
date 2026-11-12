@@ -354,6 +354,17 @@ REGISTRY: dict[str, SettingSpec] = {
             parse=_positive_int,
         ),
         SettingSpec(
+            key="approval_max_age_days",
+            type_="int",
+            description=(
+                "How many days an approved change may wait before it runs. An older "
+                "approval goes back to review with the reason, because the cluster it "
+                "was reviewed against may have changed. 0 = approvals never expire."
+            ),
+            hot_reloadable=True,
+            parse=_unset_or_positive_int,
+        ),
+        SettingSpec(
             key="metrics_retention_days",
             type_="int",
             description=(

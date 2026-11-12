@@ -183,7 +183,7 @@ and restart to manage the setting from the product instead.
 Editable today: `HP_ARTIFACTS_REMOTE`, `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS`,
 `HP_EMBEDDING_SERVICE_URL`, `HP_EMBEDDING_MODEL`, `HP_RETENTION_DAYS`,
 `HP_METRICS_RETENTION_DAYS`, `HP_EVENTS_WEBHOOK_URL`, `HP_UPDATE_CHECK_ENABLED`,
-`HP_UPDATE_CHECK_INTERVAL_SECONDS` and the provisioning
+`HP_UPDATE_CHECK_INTERVAL_SECONDS`, `HP_APPROVAL_MAX_AGE_DAYS` and the provisioning
 defaults of 2.2 below. Each is re-read at use time - the next push, the next
 prune, the next event, the next provision - so a change takes effect
 on the next cycle without a restart. **Secrets are not on this surface at all**:
@@ -1221,7 +1221,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.10.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.11.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1272,6 +1272,7 @@ forward.
 | `HP_COOKIE_SECURE` | `true` | Session cookies are `Secure` whenever the client leg is or may be TLS: backend https, `X-Forwarded-Proto: https`, or a `HP_TRUSTED_PROXIES` peer that did not say `http`. A direct plain-HTTP connection (the first-run LAN path) gets non-`Secure` cookies so login works. `false` turns `Secure` off everywhere (plain-HTTP dev only) |
 | `HP_TRUSTED_PROXIES` | — | Comma-separated proxy IPs/CIDRs trusted for `X-Forwarded-For` / `X-Real-IP`. From a trusted peer the client is found by walking `X-Forwarded-For` right to left past every trusted proxy (the leftmost hop is client-written and never believed); from any other peer the headers are ignored. One resolver feeds the first-run claim, the rate limits, the SSE cap and the token-mint limit |
 | `HP_METRICS_RETENTION_DAYS` | `7` | How long raw metric samples are kept before the pruner deletes them |
+| `HP_APPROVAL_MAX_AGE_DAYS` | `7` | How many days an approved change may wait before it runs. An older approval is not run - every path (Apply, approve-and-apply, replay, MCP, the CLI, auto-apply) sends it back to review with the reason, because the cluster it was reviewed against may have changed. `0` = approvals never expire. Editable on Settings > Changes |
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
 | `HP_DB_INTEGRITY_INTERVAL_SECONDS` | `21600` | How often `PRAGMA quick_check` runs against the database file, on its own read-only connection. `0` turns it off. `/health` reports the verdict as `database: corrupt`; `hp db check` runs it on demand |

@@ -661,15 +661,112 @@ async def approve_and_apply_artifact(
         busy["message"] = f"Approved, but not started: {busy['message']} It is ready to run."
         raise HTTPException(status_code=409, detail=busy) from e
     except (ConflictError, LifecycleError, ValueError) as e:
-        raise HTTPException(
-            status_code=409, detail=f"Approved, but not started: {e}. It is ready to run."
-        ) from e
+        # A run the guard refused (#813) has sent the change back to review;
+        # anything else leaves it approved and ready.
+        after, _ = await run_blocking("io", store.read, artifact_id)
+        where = " It is ready to run." if after.get("status") == "approved" else ""
+        raise HTTPException(status_code=409, detail=f"Approved, but not started: {e}{where}") from e
     if sync:
         try:
             return await task_runner.await_task(task_info["task_id"])
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
     return JSONResponse(status_code=202, content=task_info)
+
+
+@router.get("/{artifact_id}/target", dependencies=[Depends(require_scope("read"))])
+async def get_artifact_target(request: Request, artifact_id: str) -> dict[str, Any]:
+    """Who the change is for, who is there NOW, and how old its approval is (#813).
+
+    What the Inbox shows on a Ready-to-run card and what the confirm dialog of a
+    destroy or a forced stop asks against: the typed confirmation is the
+    guest's name as read live here, never its VMID. A read, nothing is sent;
+    the same check the executor refuses on (``target_identity.check``).
+    """
+    from homepilot.inventory.service import same_guest
+
+    from . import target_identity
+    from .summary import summarize
+
+    store = _get_store(request)
+    try:
+        fm, body = await run_blocking("io", store.read, artifact_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
+    verdict = await target_identity.check(getattr(request.app.state, "proxmox", None), fm, body)
+    limit = await target_identity.approval_limit_days()
+    approved = fm.get("status") == "approved"
+    age = target_identity.approval_age_days(fm) if approved else None
+    stale = target_identity.stale_reason(fm, limit) if approved else None
+
+    confirm: dict[str, Any] | None = None
+    danger_vmid = summarize(fm, body).get("danger_vmid")
+    guest = next((g for g in verdict.guests if g["vmid"] == danger_vmid), None)
+    if guest is not None and guest.get("live") and not guest.get("problem"):
+        live = dict(guest["live"])
+        repo = getattr(request.app.state, "repo", None)
+        if repo is not None:
+            for row in await repo.list_hosts_by_proxmox_id(int(live["vmid"])):
+                if same_guest(dict(row), live.get("name")):
+                    live["owner"] = dict(row).get("owner")
+                    break
+        confirm = live
+    return {
+        "identity": verdict.as_dict(),
+        "approval": {
+            "approved_at": (fm.get("approved_by") or {}).get("at") if approved else None,
+            "age_days": round(age, 2) if age is not None else None,
+            "limit_days": limit,
+            "stale": stale,
+        },
+        # The live guest whose name a destroy / forced stop is confirmed with;
+        # None when there is no such step or the machine is not the recorded one.
+        "confirm": confirm,
+        "may_run": verdict.ok and not stale,
+    }
+
+
+@router.post("/{artifact_id}/recheck", dependencies=[Depends(require_scope("write"))])
+async def recheck_artifact(request: Request, artifact_id: str, token: _TokenDep) -> dict[str, Any]:
+    """Ask the run guard now, sending nothing (#813).
+
+    An approved change the guard refuses - its approval too old, its machine
+    changed or gone, nothing recorded for it - goes back to review with the
+    reason, exactly as an apply would have sent it; one it would let run is
+    left as it is. Write scope like withdraw: this can only stop a change. The
+    one way back to review is the guard itself, so this can never move a
+    change the guard would have run.
+    """
+    store = _get_store(request)
+    try:
+        fm, body = await run_blocking("io", store.read, artifact_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}") from None
+    if fm.get("status") != "approved":
+        raise HTTPException(
+            status_code=409, detail=f"{artifact_id} is {fm.get('status')}, not approved"
+        )
+    executor = getattr(request.app.state, "artifact_executor", None)
+    if executor is None:
+        raise HTTPException(status_code=503, detail="this instance has no executor")
+    active = await request.app.state.task_repo.get_active_task(artifact_id)
+    if active is not None:
+        # A run in flight already passed the guard; it is not moved under it.
+        raise HTTPException(
+            status_code=409, detail=f"{artifact_id} is running ({active['action']}); wait for it"
+        )
+    refusal = await executor.check_run(fm, body, "apply")
+    if refusal is None:
+        return {"id": artifact_id, "may_run": True, "status": "approved"}
+    refused = await executor.refuse_run(artifact_id, fm, "recheck", audit_actor(token), *refusal)
+    after, _ = await run_blocking("io", store.read, artifact_id)
+    return {
+        "id": artifact_id,
+        "may_run": False,
+        "code": refusal[0],
+        "reason": refused.failure_reason,
+        "status": after.get("status"),
+    }
 
 
 @router.post("/{artifact_id}/withdraw", dependencies=[Depends(require_scope("write"))])

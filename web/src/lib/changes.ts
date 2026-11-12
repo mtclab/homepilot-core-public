@@ -6,7 +6,7 @@
 // in says, in plain words, what happens next. These helpers are pure so the
 // words are tested without a page around them.
 
-import type { Artifact, LastTask, PveWarning } from './api';
+import type { Artifact, ArtifactTarget, LastTask, LiveGuest, PveWarning } from './api';
 /** Lamp.svelte's states, repeated here so this module stays plain TS. */
 type LampState = 'ok' | 'warn' | 'crit' | 'accent' | 'off' | 'half';
 
@@ -137,4 +137,71 @@ export function recentlyFinished(items: Artifact[], now: number = Date.now()): A
 	return items
 		.filter((a) => now - when(a) <= RECENT_MS && when(a) > 0)
 		.sort((a, b) => when(b) - when(a));
+}
+
+/** Whole days since an ISO stamp; null for a missing or unreadable one. */
+export function daysSince(iso: string | null | undefined, now: number = Date.now()): number | null {
+	if (!iso) return null;
+	const t = new Date(iso).getTime();
+	if (Number.isNaN(t)) return null;
+	return Math.max(0, Math.floor((now - t) / (24 * 3600 * 1000)));
+}
+
+/** "approved today" / "approved 1 day ago" / "approved 74 days ago" (#813). */
+export function approvalAge(iso: string | null | undefined, now: number = Date.now()): string {
+	const days = daysSince(iso, now);
+	if (days === null) return 'approval time unknown';
+	if (days === 0) return 'approved today';
+	return `approved ${days} day${days === 1 ? '' : 's'} ago`;
+}
+
+function gib(bytes: number | undefined): string | null {
+	if (!bytes || bytes <= 0) return null;
+	const g = bytes / 1024 ** 3;
+	return `${g >= 10 ? Math.round(g) : Math.round(g * 10) / 10} GB`;
+}
+
+/** "running · 2 cores · 8 GB RAM · 30 GB disk · owner alice": the guest as it is now. */
+export function liveStateLine(g: LiveGuest): string {
+	const parts: string[] = [g.status ?? 'state unknown'];
+	if (g.cpus) parts.push(`${g.cpus} core${g.cpus === 1 ? '' : 's'}`);
+	const mem = gib(g.maxmem);
+	if (mem) parts.push(`${mem} RAM`);
+	const disk = gib(g.maxdisk);
+	if (disk) parts.push(`${disk} disk`);
+	if (g.owner) parts.push(`owner ${g.owner}`);
+	return parts.join(' · ');
+}
+
+/** Why the server's run guard will not run this change, or null when it will. */
+export function cannotRun(t: ArtifactTarget | null | undefined): string | null {
+	if (!t || t.may_run) return null;
+	return t.approval.stale ?? t.identity.message ?? 'its target could not be confirmed';
+}
+
+/**
+ * What the confirm dialog of a destroy or forced stop offers (#813), from a
+ * live read of the target. The typed name is the guest's name AS READ NOW -
+ * never its VMID, which a different machine at the same number shares - and
+ * a change whose machine is not the recorded one is not offered at all.
+ */
+export interface LiveConfirm {
+	/** Why nothing is offered, or null. */
+	blocked: string | null;
+	/** The name to type back: the guest's name as read now. */
+	name: string | null;
+	vmid: number | null;
+	/** The guest as it is now, beside the name. */
+	state: string;
+}
+
+export function liveConfirm(t: ArtifactTarget | null): LiveConfirm {
+	const none = { name: null, vmid: null, state: '' };
+	if (!t) return { ...none, blocked: 'Could not ask who is at the VMID now; nothing can be confirmed.' };
+	const why = cannotRun(t);
+	if (why) return { ...none, blocked: `This change will not run: ${why}.` };
+	if (!t.confirm?.name) {
+		return { ...none, blocked: 'The guest this change acts on could not be read, so nothing can be confirmed.' };
+	}
+	return { blocked: null, name: t.confirm.name, vmid: t.confirm.vmid, state: liveStateLine(t.confirm) };
 }

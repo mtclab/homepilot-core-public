@@ -189,6 +189,12 @@ func resolveToken(tokenFile, envToken string) string {
 	return envToken
 }
 
+// prevTokenFilePath is where the installer keeps the ONE previous copy of the
+// credential when it moves it aside to enrol with a fresh token (#815).
+func prevTokenFilePath(tokenFile string) string {
+	return tokenFile + ".prev"
+}
+
 // agentIDFilePath decides where a generated agent id is persisted:
 // HP_AGENT_ID_FILE when set, else "agent.id" next to the token file, else the
 // packaged default. Keeping it beside the token means the id and the credential

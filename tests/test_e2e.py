@@ -1255,3 +1255,74 @@ class TestFleetJourneys:
             assert errors == []
         finally:
             context.close()
+
+    # -- An approved change never acts on another machine (#813) ---------------
+
+    def test_a_destroy_for_a_reused_vmid_is_not_offered_and_is_refused(self, fleet, browser):
+        """The fleet server approved "Destroy probe-1" for VMID 150, then PVE
+        gave 150 to alice-db. The card says it will not run, naming alice-db;
+        Apply is not offered; the API refuses it, and alice-db is still there."""
+        from playwright.sync_api import expect
+
+        status, listing = _fleet_api(fleet, "GET", "/artifacts?status=approved")
+        assert status == 200, listing
+        (seeded,) = [a for a in listing["items"] if a["intent"] == "Destroy probe-1"]
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/changes/inbox")
+            card = page.get_by_test_id("ready-card").filter(has_text="Destroy probe-1")
+            expect(card.get_by_test_id("cannot-run")).to_contain_text("alice-db", timeout=15000)
+            expect(card.get_by_role("button", name="Apply")).to_have_count(0)
+            expect(page.get_by_test_id("cannot-run-banner")).to_be_visible()
+            assert errors == []
+        finally:
+            context.close()
+
+        status, body = _fleet_api(fleet, "POST", f"/artifacts/{seeded['id']}/apply", {})
+        assert status == 409, body
+        assert "alice-db" in body["detail"] and "Nothing was sent" in body["detail"], body
+        status, after = _fleet_api(fleet, "GET", f"/artifacts/{seeded['id']}/target")
+        assert status == 200, after
+        (guest,) = after["identity"]["guests"]
+        assert guest["live"]["name"] == "alice-db", after
+        status, detail = _fleet_api(fleet, "GET", f"/artifacts/{seeded['id']}")
+        assert detail["frontmatter"]["status"] == "proposed", detail["frontmatter"]
+        assert detail["frontmatter"]["returned_for_review"]["code"] == "changed"
+
+    def test_a_destroy_is_confirmed_by_the_guest_name_read_live(self, fleet, browser):
+        from playwright.sync_api import expect
+
+        spec = _start_spec("llm-test", 121)
+        spec["intent"] = "Destroy llm-test"
+        spec["body"] = (
+            "Destroy llm-test.\n\n```yaml proxmox-api-spec\nsteps:\n  - id: destroy\n"
+            "    method: DELETE\n    path: /nodes/{{ target.node }}/qemu/{{ target.vmid }}\n```\n"
+        )
+        status, made = _fleet_api(fleet, "POST", "/artifacts", spec)
+        assert status == 200, made
+        status, body = _fleet_api(fleet, "POST", f"/artifacts/{made['id']}/approve", {})
+        assert status == 200, body
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/changes/inbox")
+            card = page.get_by_test_id("ready-card").filter(has_text="Destroy llm-test")
+            expect(card.get_by_test_id("approval-age")).to_have_text("approved today")
+            card.get_by_role("button", name="Apply").click()
+            dialog = page.get_by_test_id("confirm-dialog")
+            expect(dialog.get_by_test_id("confirm-live-state")).to_contain_text(
+                "At VMID 121 now: llm-test, stopped"
+            )
+            go = dialog.get_by_role("button", name="Apply")
+            box = dialog.get_by_role("textbox")
+            box.fill("121")
+            expect(go).to_be_disabled()
+            box.fill("llm-test")
+            expect(go).to_be_enabled()
+            dialog.get_by_role("button", name="Cancel").click()
+            assert errors == []
+        finally:
+            context.close()
+        # Nothing ran; take it back so the fleet stays as it was.
+        status, body = _fleet_api(fleet, "POST", f"/artifacts/{made['id']}/withdraw", {})
+        assert status == 200, body
+        assert _fleet_host(fleet, "llm-test")["pve_status"] == "stopped"

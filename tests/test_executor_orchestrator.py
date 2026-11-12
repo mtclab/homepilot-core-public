@@ -10,6 +10,10 @@ from homepilot.artifacts.store import ArtifactStore
 from homepilot.auth.principal import Principal
 from homepilot.executor.orchestrator import ArtifactExecutor, ExecutorError, TamperError
 
+# Proxmox is an AsyncMock here: it cannot say who is at a VMID, so the run
+# guard (#813) is off for this module; tests/test_target_identity.py proves it.
+pytestmark = pytest.mark.usefixtures("no_target_guard")
+
 ANSIBLE_SPEC_BODY = """\
 ## Plan
 Install nginx

@@ -101,6 +101,7 @@ class TaskRunner:
             raise ConflictError(f"Invalid transition: {status.value} → apply")
 
         task_id = await self._claim(artifact_id, "apply")
+        await self._preflight(task_id, artifact_id, "apply", approved_by)
         task = asyncio.create_task(self._run_apply(task_id, artifact_id, approved_by))
         self._track_task(task, task_id)
 
@@ -110,6 +111,22 @@ class TaskRunner:
             "action": "apply",
             "status": "pending",
         }
+
+    async def _preflight(self, task_id: str, artifact_id: str, action: str, actor: str) -> None:
+        """Ask the executor's run guard before the task starts (#813).
+
+        Inside the run slot, so a refusal cannot race another run of the same
+        artifact. A refused run raises ConflictError (a 409 / tool error naming
+        the machine) and its task row says why; nothing was sent.
+        """
+        if self.executor is None:
+            return
+        try:
+            await self.executor.preflight(artifact_id, action, actor)
+        except BaseException as exc:
+            # Never strand the slot: a pending row blocks every later run.
+            await self.repo.update_task_status(task_id, "failed", error=str(exc))
+            raise
 
     async def start_revoke(
         self, artifact_id: str, user: str = "system", reason: str | None = None
@@ -200,6 +217,7 @@ class TaskRunner:
             raise ConflictError(f"Invalid transition: {status.value} -> replay")
 
         task_id = await self._claim(artifact_id, "replay")
+        await self._preflight(task_id, artifact_id, "replay", "replay")
         task = asyncio.create_task(self._run_replay(task_id, artifact_id))
         self._track_task(task, task_id)
 

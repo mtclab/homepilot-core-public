@@ -33,7 +33,9 @@ from homepilot.executor.orchestrator import (
 )
 from tests.test_one_apply_engine import _spec, engine  # noqa: F401 - the real runner fixture
 
-pytestmark = pytest.mark.asyncio
+# SnapPVE answers snapshots only, so it cannot say who is at a VMID: the run
+# guard (#813) is off for this module; tests/test_target_identity.py proves it.
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("no_target_guard")]
 
 # PVE's `pve-configid` format for snapname: a letter, then letters, digits, _ -.
 _PVE_SNAPNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]+$")

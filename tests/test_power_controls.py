@@ -727,6 +727,7 @@ async def http(world, tmp_path: Path):
     executor = ArtifactExecutor(
         store=store, lifecycle=lifecycle, repo=repo, proxmox=pve, vault=None
     )
+    lifecycle._proxmox = pve  # propose records which machine it is for (#813)
     runner = TaskRunner(
         repo=TaskRepository(repo.db),
         lifecycle=lifecycle,

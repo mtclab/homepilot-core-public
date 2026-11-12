@@ -69,6 +69,29 @@ def _parse_ts(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+async def _expired_approvals(db: Any) -> int:
+    """How many approved changes carry an approval too old to run on (#813)."""
+    from ..artifacts.target_identity import approval_limit_days, stale_reason
+
+    limit = await approval_limit_days()
+    if limit <= 0:
+        return 0
+    rows = await db.fetchall(
+        "SELECT approved_by_json FROM artifacts WHERE status = 'approved' AND NOT EXISTS "
+        "(SELECT 1 FROM tasks t WHERE t.artifact_id = artifacts.id "
+        "AND t.status IN ('pending', 'running'))"
+    )
+    expired = 0
+    for row in rows:
+        try:
+            approved_by = json.loads(row["approved_by_json"] or "null")
+        except (TypeError, ValueError):
+            approved_by = None
+        if stale_reason({"approved_by": approved_by}, limit):
+            expired += 1
+    return expired
+
+
 async def build_summary(repo: Any) -> dict[str, Any]:
     db = repo.db
 
@@ -182,6 +205,10 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         "proposed": artifacts_by_status.get("proposed", 0),
         "ready": int((approved_split["ready"] if approved_split else 0) or 0),
         "running": int((approved_split["running"] if approved_split else 0) or 0),
+        # Approved, and older than approval_max_age_days (#813): they will not
+        # run as they stand - Apply sends them back to review - so the Overview
+        # says so rather than counting them as ready.
+        "expired": await _expired_approvals(db),
     }
 
     # ── Agent fleet (persisted + live) ─────────────────────────────────────────

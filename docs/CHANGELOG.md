@@ -1,5 +1,88 @@
 # Changelog
 
+## 3.11.0 - 2026-11-12
+
+Three safety and upkeep fixes from running 3.10.0 on a real estate. An approved
+change can no longer act on a different machine than the one it was written
+for, and approvals expire. Re-installing an agent over an old credential works,
+and an old agent can be upgraded in place - both from Hosts > Agents, with no
+enrolment window and no files edited on the host.
+
+### Operator actions
+
+- Changes approved before this version, or more than 7 days ago, go back to review on Apply, naming the machine at their VMID now; approve again to confirm it. New setting `approval_max_age_days` (0 = never expire).
+- Hosts > Agents: press **Install again** on a host stuck waiting to join, and **Upgrade agent** on an old agent. Do not revoke first or open the enrolment window.
+- No migration.
+
+### An approved change never acts on a different machine (#813)
+
+An approved change can no longer act on a different machine than the one it
+was written for (#813). PVE reuses VMIDs: on 3.10.0 a destroy approved two
+months earlier for a throw-away probe guest sat in the Inbox as "Ready to run"
+while a friend's live machine held its VMID, and the typed confirmation asked
+for the number both machines shared.
+
+- A change that acts on a guest records who the guest is when it is proposed:
+  its name, its type and, for a VM, its creation time (`meta ctime`, which
+  survives a rename, a migration and a snapshot rollback; `vmgenid` does not
+  survive a rollback, so it is not used). A container is known by name and type
+  - PVE records no creation time for one. A change that creates a guest at a
+  VMID (create, restore, clone) records the number as one that must be free.
+- Before anything is sent - the pre-apply snapshot included - every run asks
+  Proxmox who is at each VMID the change acts on, on every path: Apply,
+  approve-and-apply, replay, MCP, the CLI, auto-apply, a composite's steps, the
+  artifact path of power, and a revoke's rollback. A different machine, the
+  machine gone, a VMID it creates taken, or Proxmox not answering: the run is
+  refused, nothing is sent, and the refusal names the machine there now.
+- An approval goes stale: one older than `approval_max_age_days` (default 7) is
+  not run. A refused approved change goes back to review with the reason
+  (shown on its card); approving it again is a fresh decision. A rollback that
+  is refused is not run; the revoke still lands, saying the host was not put
+  back and why.
+- The typed confirmation of a destroy or a forced stop is the guest's name as
+  read live, never its VMID, with its state beside it (running/stopped, cores,
+  memory, disk, owner). If another machine holds the VMID, the dialog offers no
+  Apply at all.
+- Changes > Inbox shows each Ready-to-run card's approval age ("approved 74 days
+  ago") and, for one that will not run, why, with "Back to review" in place of
+  Apply; the Overview counts expired approvals apart from the ready ones.
+
+### Agents: Install again, and bring an old agent to the current version (#815)
+
+Re-installing an agent over an old one works again (#815). On a guest that had
+an agent months ago, Install agent rewrote the agent's settings with a fresh
+one-time token but left the old install's credential file (`agent.token`) in
+place. The agent presented the old credential, the hub refused it ("no
+enrolment window is open"), the new token was never used, and the task failed
+with "no agent connected within 120s. Check journalctl". Now:
+
+- The installer moves an old `agent.token` aside to `agent.token.prev` (one
+  copy kept, mode 0600, never deleted) before it starts the agent with the new
+  token.
+- The agent, when the hub refuses one of its credentials for enrolment, tries
+  its other one once: the new token after a refused old credential, or the kept
+  `agent.token.prev` after a refused new token, so re-running the installer over
+  a healthy host never locks it out (#789). It never switches back and forth.
+  `agent.token.prev` is refused to `read_file`, `write_file` and the read-only
+  commands, like `agent.token`.
+- An install whose agent did dial in but was refused now says so: "the agent on
+  <host> presented an old credential that this hub refused ..." with the hub's
+  reason, instead of "check journalctl".
+- Hosts > Agents: a host waiting to join or refused that is a Proxmox QEMU guest
+  HomePilot knows offers **Install again** on its line. No enrolment window is
+  opened.
+
+**An old agent, brought to the current version.** Nothing upgraded an enrolled agent: Install refused a host
+with a live agent ("Revoke it ... before enrolling again"), and revoking left a
+dead credential on the host. Hosts > Agents now lists connected agents older
+than HomePilot, or reporting no version, with **Upgrade agent**
+(`POST /agents/install` with `"upgrade": true`; `GET /agents/upgrades` lists
+them). It reinstalls the agent and its settings over qemu-guest-agent and
+succeeds only when the same agent is back on a new connection and is current.
+The agent gets a new credential (the old one stays valid until that moment).
+If the new agent does not connect, the previous binary (`hp-agent.prev`, kept
+by the installer) and credential are put back and the old agent reconnects.
+
 ## 3.10.0 - 2026-11-09
 
 Changes you can follow, power from the Hosts list, and a console you can search.

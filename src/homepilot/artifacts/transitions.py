@@ -40,6 +40,11 @@ LIFECYCLE_OWNED_FIELDS = frozenset(
         "superseded_by",
         "withdrawn_by",
         "partial_apply",
+        # Which machine the change is for (#813): recorded by the lifecycle from a
+        # live read, never typed - an edit that could rewrite it could point an
+        # approved destroy at any guest.
+        "target_identity",
+        "returned_for_review",
     }
 )
 
@@ -132,6 +137,7 @@ class ArtifactTransitionManager:
         reason: str | None = None,
         role: str | None = None,
         authority: str | None = None,
+        identity: dict[str, Any] | None = None,
     ) -> None:
         def _locked() -> tuple[dict[str, Any], list[str]]:
             with self.file_store.file_lock(id):
@@ -153,6 +159,11 @@ class ArtifactTransitionManager:
                 now = utcnow_iso()
                 fm["status"] = ArtifactStatus.APPROVED.value
                 fm["approved_by"] = {"user": user, "at": now}
+                # Approved again: why it came back is history now (the audit
+                # row keeps it), not something the Inbox still has to say.
+                fm.pop("returned_for_review", None)
+                if identity is not None:
+                    fm["target_identity"] = identity
                 if role:
                     fm["approved_by"]["role"] = role
                 # WHERE the human decision came from (#681): "operator" (an operator
@@ -578,6 +589,58 @@ class ArtifactTransitionManager:
 
         await self.file_store.run_serialized(_locked)
         await self._audit("unsettled", id, details={"upid": entry.get("upid")})
+
+    async def return_for_review(self, id: str, code: str, reason: str) -> dict[str, Any] | None:
+        """approved -> proposed, running nothing, with the reason (#813).
+
+        What an apply that may not run does to the approval it found: one too old
+        to run on, or one whose machine is no longer the machine it was written
+        for. The change is not lost and not failed - nothing ran - it is back in
+        review saying why, and approving it again is a fresh decision. None when
+        the artifact was no longer approved (another run moved it first).
+        """
+
+        def _locked() -> dict[str, Any] | None:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                if ArtifactStatus(fm["status"]) is not ArtifactStatus.APPROVED:
+                    return None
+                validate_transition(ArtifactStatus.APPROVED, ArtifactStatus.PROPOSED)
+                fm["status"] = ArtifactStatus.PROPOSED.value
+                fm["returned_for_review"] = {
+                    "at": utcnow_iso(),
+                    "code": code,
+                    "reason": reason,
+                    "approved_by": fm.pop("approved_by", None),
+                }
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "return-for-review")
+                return fm
+
+        fm = await self.file_store.run_serialized(_locked)
+        if fm is None:
+            return None
+        await self._audit("returned_for_review", id, "system", {"code": code, "reason": reason})
+        await self._sync_to_db(id, fm)
+        return fm
+
+    async def record_target_identity(self, id: str, identity: dict[str, Any]) -> None:
+        """Store who the change's guests are now, after a run that changed them (#813).
+
+        A successful run may have created a guest or renamed one; a later
+        rollback or replay is then checked against what this change LEFT, not
+        against what it found. No status change; the body (and its hash) is
+        untouched.
+        """
+
+        def _locked() -> None:
+            with self.file_store.file_lock(id):
+                fm, body = self.file_store.read(id)
+                fm["target_identity"] = identity
+                fm_yml = self.file_store.serialize_frontmatter(fm)
+                self.file_store.write(id, fm_yml, body, "target-identity")
+
+        await self.file_store.run_serialized(_locked)
 
     async def clear_unsettled(self, id: str) -> None:
         """Drop the unknown-outcome record without a status change - for a run

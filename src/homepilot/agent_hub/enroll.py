@@ -140,8 +140,11 @@ class AgentEnrollService:
     def is_inflight(self, host_id: str) -> bool:
         return host_id in self._inflight_hosts
 
-    async def check(self, host: dict[str, Any], hub_host: str) -> None:
+    async def check(self, host: dict[str, Any], hub_host: str, upgrade: bool = False) -> None:
         """Refuse, with the reason, every host this channel cannot enrol.
+
+        ``upgrade`` turns the live-agent rule around: an install is refused over a
+        connected agent, an upgrade is refused without one.
 
         Checked in the order an operator would: what HomePilot itself is missing
         first, then what the host is, then what the guest is doing right now.
@@ -186,13 +189,20 @@ class AgentEnrollService:
                 "through. Run scripts/install-agent.sh on the host instead.",
             )
 
-        if registry.is_connected(hostname):
+        if registry.is_connected(hostname) and not upgrade:
             agent = registry.get_by_hostname(hostname)
             agent_id = agent.agent_id if agent is not None else "unknown"
+            # Not "revoke it first": revoking leaves a dead credential on the host,
+            # which is the very state a reinstall then has to dig it out of (#815).
             raise EnrollPreconditionError(
                 "already_enrolled",
-                f"{hostname} already has a live agent ({agent_id}). Revoke it on the "
-                "Agents page, or stop hp-agent on the host, before enrolling again.",
+                f"{hostname} already has a live agent ({agent_id}). To put the current "
+                "agent on it, use Upgrade agent: the same agent stays enrolled.",
+            )
+        if upgrade and not registry.is_connected(hostname):
+            raise EnrollPreconditionError(
+                "not_connected",
+                f"{hostname} has no live agent to upgrade. Use Install agent instead.",
             )
 
         status = await self._guest_status(str(node), int(vmid))
@@ -236,21 +246,28 @@ class AgentEnrollService:
         hub_host: str,
         hub_port: int,
         actor: str = "system",
+        upgrade: bool = False,
     ) -> str:
-        """Check the preconditions, then queue the install as a tracked task."""
+        """Check the preconditions, then queue the install as a tracked task.
+
+        ``upgrade`` reinstalls over a LIVE agent (binary and config, same agent
+        id): the task succeeds only once that agent has reconnected on a new
+        connection, and if it never does the previous binary is put back."""
         host_id = str(host["id"])
         if host_id in self._inflight_hosts:
             raise EnrollConflictError(
                 f"An agent install for {host.get('hostname') or host_id!r} is already in flight"
             )
-        await self.check(host, hub_host)
+        await self.check(host, hub_host, upgrade=upgrade)
         self._inflight_hosts.add(host_id)
         try:
             task_id = await self.task_repo.create_task(None, ACTION)
         except Exception:
             self._inflight_hosts.discard(host_id)
             raise
-        self._track_task(asyncio.create_task(self._run(task_id, host, hub_host, hub_port, actor)))
+        self._track_task(
+            asyncio.create_task(self._run(task_id, host, hub_host, hub_port, actor, upgrade))
+        )
         return task_id
 
     async def _run(
@@ -260,6 +277,7 @@ class AgentEnrollService:
         hub_host: str,
         hub_port: int,
         actor: str,
+        upgrade: bool = False,
     ) -> None:
         # `step` names the stage a failure happened at, so the task's error tells
         # an operator WHERE the install died, not just that it did.
@@ -269,6 +287,10 @@ class AgentEnrollService:
         node = str(host.get("node"))
         vmid = int(host.get("proxmox_id") or 0)
         token = ""
+        # The live agent an upgrade replaces: its id, version and the connection
+        # record it holds now, so verification can tell the NEW connection apart.
+        prior: Any = None
+        swapped = False
         try:
             await self.task_repo.update_task_status(task_id, "running")
             proxmox = self.proxmox
@@ -300,7 +322,15 @@ class AgentEnrollService:
             await proxmox.agent_write_file(node, vmid, _ENV_PATH, env_body)
 
             step = "install"
+            from .join_requests import install_started_at
+
+            started_at = install_started_at()
+            if upgrade and registry is not None:
+                prior = registry.get_by_hostname(hostname)
             exit_code, stdout, stderr = await self._install(node, vmid)
+            # The binary-swap block announces the swap; only then is there a
+            # previous binary of THIS run to put back.
+            swapped = "Installed to " in (stdout or "")
             if exit_code != 0:
                 raise RuntimeError(
                     f"the installer exited {exit_code} in the guest: "
@@ -309,7 +339,14 @@ class AgentEnrollService:
 
             step = "verify"
             agent_id = _parse_agent_id(stdout)
-            enrolled_id, verified_by = await self._wait_for_enrolment(agent_id, hostname)
+            if prior is not None:
+                enrolled_id, verified_by = await self._wait_for_upgrade(
+                    prior, agent_id, hostname, since=started_at
+                )
+            else:
+                enrolled_id, verified_by = await self._wait_for_enrolment(
+                    agent_id, hostname, since=started_at
+                )
 
             result = {
                 "host_id": host_id,
@@ -322,6 +359,10 @@ class AgentEnrollService:
                 "connected": True,
                 "verified_by": verified_by,
             }
+            if prior is not None:
+                result["upgrade"] = True
+                result["previous_version"] = _agent_version(prior)
+                result["agent_version"] = _agent_version(registry.get(enrolled_id))
             await self.task_repo.update_task_status(
                 task_id, "succeeded", result_json=json.dumps(result)
             )
@@ -330,6 +371,8 @@ class AgentEnrollService:
             # Never log or store the exception body raw: a PVE error echoes the
             # command back, and captured guest output could carry the token.
             error = f"{step}: {_redact(str(exc), token)}"
+            if prior is not None:
+                error += " " + await self._roll_back(node, vmid, prior, swapped)
             logger.error("Agent install task %s failed at step %s", task_id, step)
             await self._cleanup(node, vmid)
             try:
@@ -365,7 +408,9 @@ class AgentEnrollService:
             poll_interval=self.poll_interval,
         )
 
-    async def _wait_for_enrolment(self, agent_id: str | None, hostname: str) -> tuple[str, str]:
+    async def _wait_for_enrolment(
+        self, agent_id: str | None, hostname: str, since: str | None = None
+    ) -> tuple[str, str]:
         """Wait until the installed agent is CONNECTED to this hub.
 
         This is the outcome the action promises. `agent_id` is what the installer
@@ -387,11 +432,128 @@ class AgentEnrollService:
                 if by_host is not None:
                     return by_host.agent_id, "hostname"
             if time.monotonic() >= deadline:
+                refused = await self._refusal_since(hostname, since)
+                if refused is not None:
+                    # The host DID dial in and was turned away: it presented a
+                    # credential other than the bootstrap token this install
+                    # handed it (#815). Say that, with the hub's own reason,
+                    # rather than send the operator to a journal on the guest.
+                    raise RuntimeError(
+                        f"the agent on {hostname} presented an old credential that this hub "
+                        f"refused, so the new enrolment token was never used (the hub said: "
+                        f"{refused.get('reason') or refused.get('reason_code')}). Press Install "
+                        "again: the installer moves the old credential aside to "
+                        "agent.token.prev and enrols with a fresh token."
+                    )
                 raise RuntimeError(
                     f"the installer finished but no agent connected to the hub within "
                     f"{self.connect_wait_s:.0f}s. Check `journalctl -u hp-agent` on {hostname}."
                 )
             await asyncio.sleep(self.connect_interval)
+
+    async def _wait_for_upgrade(
+        self, prior: Any, agent_id: str | None, hostname: str, since: str | None
+    ) -> tuple[str, str]:
+        """Wait until the upgraded agent is back: the SAME agent id, on a NEW
+        connection (a different registry record than the one it held before the
+        installer ran), and no longer older than this control plane.
+
+        The old connection being still there proves nothing - it is the old
+        binary - so it never satisfies this.
+        """
+        from .version_skew import control_plane_version, is_behind
+
+        registry = self.registry
+        if registry is None:
+            raise RuntimeError("the agent hub went away before the upgrade could be verified")
+        expected_id = agent_id or prior.agent_id
+        if expected_id != prior.agent_id:
+            raise RuntimeError(
+                f"the installer reported agent id {expected_id}, not the live agent "
+                f"{prior.agent_id}; refusing to treat a second agent as the upgrade"
+            )
+        deadline = time.monotonic() + self.connect_wait_s
+        while True:
+            agent = registry.get(expected_id)
+            if agent is not None and agent is not prior:
+                version = _agent_version(agent)
+                control = control_plane_version()
+                if is_behind(version, control) is True:
+                    raise RuntimeError(
+                        f"the agent on {hostname} reconnected on {version}, still older than "
+                        f"HomePilot {control}: the binary this control plane served is not "
+                        "the current one"
+                    )
+                return expected_id, "upgrade"
+            if time.monotonic() >= deadline:
+                refused = await self._refusal_since(hostname, since)
+                why = (
+                    f" The hub refused it: {refused.get('reason') or refused.get('reason_code')}."
+                    if refused is not None
+                    else ""
+                )
+                raise RuntimeError(
+                    f"the upgraded agent on {hostname} did not reconnect within "
+                    f"{self.connect_wait_s:.0f}s.{why}"
+                )
+            await asyncio.sleep(self.connect_interval)
+
+    async def _roll_back(self, node: str, vmid: int, prior: Any, swapped: bool) -> str:
+        """After a failed upgrade, leave the host with a working agent.
+
+        Nothing to do while the OLD connection is still live: the installer never
+        restarted the service, so the old agent is running and stays enrolled.
+        Otherwise - and only when this run swapped the binary, so hp-agent.prev
+        is the one that was running - put the previous binary back, restore the
+        previous credential if the new agent never got one, restart, and wait
+        for the agent to return. Returns the sentence the task error ends with.
+        """
+        registry = self.registry
+        if registry is None or self.proxmox is None:
+            return "The previous agent could not be checked."
+        if registry.get(prior.agent_id) is prior:
+            return (
+                f"The previous agent ({_agent_version(prior)}) was never stopped and is "
+                "still connected; nothing was rolled back."
+            )
+        if not swapped:
+            return "The binary was not replaced, so there was nothing to roll back."
+        try:
+            exit_code, _out, _err = await self.proxmox.agent_run(
+                node,
+                vmid,
+                _rollback_script(),
+                timeout_s=self.install_timeout_s,
+                poll_interval=self.poll_interval,
+            )
+        except Exception:
+            logger.warning("Agent upgrade rollback on vmid %s failed", vmid, exc_info=True)
+            return "Putting the previous agent back failed; see the host's journal."
+        if exit_code != 0:
+            return f"Putting the previous agent back exited {exit_code}."
+        deadline = time.monotonic() + self.connect_wait_s
+        while time.monotonic() < deadline:
+            agent = registry.get(prior.agent_id)
+            if agent is not None and agent is not prior:
+                return (
+                    f"HomePilot put the previous agent back and it is connected again "
+                    f"({_agent_version(agent)})."
+                )
+            await asyncio.sleep(self.connect_interval)
+        return "HomePilot put the previous agent back, but it has not reconnected yet."
+
+    async def _refusal_since(self, hostname: str, since: str | None) -> dict[str, Any] | None:
+        """The hub's latest refusal of this host since the install began, if any.
+        Best effort: a store that cannot answer leaves the generic message."""
+        if since is None:
+            return None
+        from .join_requests import refusal_since
+
+        try:
+            return await refusal_since(self.repo, hostname, since)
+        except Exception:
+            logger.warning("Could not read enrolment refusals for %s", hostname, exc_info=True)
+            return None
 
     async def _cleanup(self, node: str, vmid: int) -> None:
         """Best effort: the wrapper deletes the staged file itself, but if the exec
@@ -470,6 +632,31 @@ def _install_script() -> str:
         f"rm -f {_INSTALLER_PATH}; "
         f"printf '{_AGENT_ID_MARKER}%s\\n' \"$(cat /etc/homepilot/agent.id)\""
     )
+
+
+def _rollback_script() -> str:
+    """Put the agent that was running before a failed upgrade back.
+
+    The binary the installer kept as hp-agent.prev replaces the new one; the
+    credential it kept as agent.token.prev comes back only if the new agent never
+    persisted one (if it did, that new credential is the live one on the hub and
+    works with either binary). Paths default to the installer's; INSTALL_DIR and
+    CONF_DIR exist so a test can run this very text in a sandbox.
+    """
+    return (
+        'I="${INSTALL_DIR:-/usr/local/bin}"; C="${CONF_DIR:-/etc/homepilot}"; '
+        'if [ -f "$I/hp-agent.prev" ]; then mv -f "$I/hp-agent.prev" "$I/hp-agent"; fi; '
+        'if [ ! -s "$C/agent.token" ] && [ -s "$C/agent.token.prev" ]; then '
+        'cp -p "$C/agent.token.prev" "$C/agent.token"; chmod 600 "$C/agent.token"; fi; '
+        "systemctl restart hp-agent"
+    )
+
+
+def _agent_version(agent: Any) -> str:
+    """What a connected agent reported about its build, for task text."""
+    info = getattr(agent, "system_info", None) or {}
+    version = info.get("agent_version") if isinstance(info, dict) else None
+    return str(version) if version else "no version reported"
 
 
 def _exec_pid(payload: dict[str, Any] | None) -> int | None:

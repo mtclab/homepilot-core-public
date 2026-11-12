@@ -13,7 +13,7 @@
 	import ChangeOutcome from '$lib/components/ChangeOutcome.svelte';
 	import ChangeSummary from '$lib/components/ChangeSummary.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-	import { runningLine } from '$lib/changes';
+	import { liveConfirm, runningLine, type LiveConfirm } from '$lib/changes';
 
 	let detail: ArtifactDetail | null = null;
 	let loading = true;
@@ -38,6 +38,8 @@
 		consequence?: string;
 	};
 	let confirmAction: Action | null = null;
+	// For a typed confirm: the guest as read live when the dialog opened (#813).
+	let confirmLive: LiveConfirm | null = null;
 
 	$: id = $page.params.id ?? '';
 	// Approve/Reject/Apply/Revoke all 403 without write scope — don't offer them.
@@ -318,8 +320,14 @@
 		}
 	}
 
-	function handleAction(action: Action) {
-		if (action.destructive) {
+	async function handleAction(action: Action) {
+		if (action.typed) {
+			// The name typed back is the guest's name AS READ NOW, never its
+			// VMID; a machine that is not the recorded one is not offered (#813).
+			confirmLive = liveConfirm(await api.getArtifactTarget(id).catch(() => null));
+			confirmAction = action;
+		} else if (action.destructive) {
+			confirmLive = null;
 			confirmAction = action;
 		} else {
 			action.fn();
@@ -372,6 +380,11 @@
 				activeTask={detail.active_task}
 				lastTask={detail.last_task}
 			/>
+			{#if status === 'proposed' && detail.frontmatter.returned_for_review?.reason}
+				<p class="text-xs text-warn" data-testid="returned-for-review">
+					Back for review: {detail.frontmatter.returned_for_review.reason}.
+				</p>
+			{/if}
 			<ChangeSummary summary={detail.summary} />
 		</div>
 
@@ -473,9 +486,16 @@
 	<ConfirmDialog
 		title="{action.label} {detail?.summary?.target ?? targetStr()}"
 		consequence={action.consequence ?? ''}
-		confirmName={action.typed ? (detail?.summary?.confirm_name ?? null) : null}
+		confirmName={action.typed ? (confirmLive?.name ?? null) : null}
+		blocked={action.typed ? (confirmLive?.blocked ?? null) : null}
 		confirmLabel={action.label}
 		on:confirm={confirmDestructive}
 		on:cancel={() => (confirmAction = null)}
-	/>
+	>
+		{#if action.typed && confirmLive?.name}
+			<p class="text-xs text-muted" data-testid="confirm-live-state">
+				At VMID {confirmLive.vmid} now: <span class="font-mono text-ink">{confirmLive.name}</span>, {confirmLive.state}
+			</p>
+		{/if}
+	</ConfirmDialog>
 {/if}

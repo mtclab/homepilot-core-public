@@ -100,17 +100,20 @@ GENERIC_AUTH_ERROR = "invalid auth_token"
 # alternative is an unexplained silent failure (#537). It carries no secret: it
 # tells the holder of a valid shared token that the hub is not accepting new
 # hostnames right now. Deliberately free of the word "auth" - the Go agent
-# treats an auth-ish refusal as "try the other credential", and no credential
-# the agent holds would help here.
+# treats an auth-ish refusal as "try the other credential" on every refusal.
+# The agent matches the "enrolment refused" prefix instead and switches
+# credential ONCE (#815: a re-installed host whose old agent.token held this
+# shared token must get to the bootstrap token it was given), so keep the prefix.
 ENROLMENT_WINDOW_CLOSED_ERROR = (
     "enrolment refused: this hub is not accepting new hosts right now. Ask an "
     "operator to open the enrolment window (or enrol with a bootstrap token)."
 )
 
 # What a shared-token register is told when its hostname already holds a live
-# per-agent credential (#683). Also free of the word "auth", for the same reason:
-# the refused peer holds no credential that would help, and the host's real agent
-# never sees this - it authenticates with its own credential before this rule.
+# per-agent credential (#683). Also free of the word "auth", and with the same
+# prefix, for the same reason: the agent tries its other credential once (a host
+# re-installed with the shared token falls back to the credential the installer
+# kept as agent.token.prev, #815/#789), and an impostor holds no other one.
 HOST_HOLDS_CREDENTIAL_ERROR = (
     "enrolment refused: this hostname already holds its own agent credential. "
     "Reconnect with that credential, or ask an operator to revoke it (or enrol "

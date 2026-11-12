@@ -11,7 +11,7 @@ services:
   # chown on a fresh host and changes nothing on an existing one. It uses the
   # backend's own image, so the uid is the image's, never a guessed number.
   hp-data-init:
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.10.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.11.0}
     build:
       context: .
       dockerfile: Dockerfile
@@ -30,7 +30,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.10.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.11.0}
     build:
       context: .
       dockerfile: Dockerfile

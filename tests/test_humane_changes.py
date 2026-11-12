@@ -127,6 +127,14 @@ class FakePve:
 
         parts = path.strip("/").split("/")
         if request.method == "GET":
+            if path == "/cluster/resources":
+                # Who is at each VMID (#813): the guests this fake holds.
+                return ok(
+                    [
+                        {"vmid": v, "node": NODE, "type": "qemu", "name": c.get("name")}
+                        for v, c in sorted(self.config.items())
+                    ]
+                )
             if len(parts) == 5 and parts[2] == "tasks":
                 upid = unquote(parts[3])
                 if parts[4] == "status":
@@ -234,6 +242,8 @@ async def world(tmp_path: Path):
     executor = ArtifactExecutor(
         store=store, lifecycle=lifecycle, repo=repo, proxmox=_client(pve), vault=None
     )
+    # Propose records which machine a change is for (#813), as the app wires it.
+    lifecycle._proxmox = executor.proxmox
     task_repo = TaskRepository(db)
     runner = TaskRunner(
         repo=task_repo, lifecycle=lifecycle, executor=executor, apply_reconciler=None, store=store
@@ -311,7 +321,7 @@ class TestTheQueueNeverLosesAChange:
         # The plain-words summary is there before anyone decides.
         assert before["summary"]["steps"] == ["Back up retire-104 (VM 104 on pve1) to fast1"]
         assert before["summary"]["two_step"] is False
-        assert await _waiting(client) == {"proposed": 1, "ready": 0, "running": 0}
+        assert await _waiting(client) == {"proposed": 1, "ready": 0, "running": 0, "expired": 0}
 
         pve.hold = True
         resp = await client.post(f"/artifacts/{aid}/approve-and-apply", json={})
@@ -323,11 +333,11 @@ class TestTheQueueNeverLosesAChange:
         assert running["frontmatter"]["status"] == "approved"
         assert running["active_task"] is not None
         assert running["active_task"]["id"] == task_id
-        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 1}
+        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 1, "expired": 0}
 
         pve.release()
         done = await _until(client, aid, "applied")
-        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0}
+        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0, "expired": 0}
         last = done["last_task"]
         assert last["id"] == task_id and last["status"] == "succeeded"
         # The PVE warning is shown, explained and judged - never "WARNINGS: 1".
@@ -350,7 +360,7 @@ class TestTheQueueNeverLosesAChange:
         # no run in flight - the Apply press is the one thing it waits for.
         listed = (await client.get("/artifacts", params={"status": "approved"})).json()
         assert [a["id"] for a in listed["items"]] == [aid]
-        assert await _waiting(client) == {"proposed": 0, "ready": 1, "running": 0}
+        assert await _waiting(client) == {"proposed": 0, "ready": 1, "running": 0, "expired": 0}
         detail = await _detail(client, aid)
         assert detail["frontmatter"]["status"] == "approved"
         assert detail["active_task"] is None
@@ -359,7 +369,7 @@ class TestTheQueueNeverLosesAChange:
         resp = await client.post(f"/artifacts/{aid}/apply", json={})
         assert resp.status_code == 202, resp.text
         await _until(client, aid, "applied")
-        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0}
+        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0, "expired": 0}
 
     async def test_withdraw_takes_back_an_approved_change_and_runs_nothing(self, world):
         client, _token, pve, ctx = world
@@ -379,7 +389,7 @@ class TestTheQueueNeverLosesAChange:
         assert detail["frontmatter"]["withdrawn_by"]["reason"] == "wrong VM"
         assert detail["last_task"]["action"] == "withdraw"
         assert detail["last_task"]["status"] == "succeeded"
-        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0}
+        assert await _waiting(client) == {"proposed": 0, "ready": 0, "running": 0, "expired": 0}
         assert pve.writes == [], "withdrawing must not touch Proxmox"
         assert "withdraw" in await _audit_actions(ctx, aid)
         # Terminal: it cannot be run any more.

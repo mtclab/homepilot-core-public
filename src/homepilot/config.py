@@ -196,6 +196,11 @@ class Settings(BaseSettings):
     # Artifacts are never pruned - they are the record of intent, not history.
     retention_days: int = 90
     retention_interval_seconds: int = 21600
+    # How long an approval stays good to run on (#813). An approved change
+    # describes the cluster as it was when it was reviewed; one that sat two
+    # months was found one click from deleting a different machine. Older
+    # approvals go back to review instead of running. 0 = never expire.
+    approval_max_age_days: int = 7
     # How often `PRAGMA quick_check` is run against the database FILE, on its own
     # read-only connection (#648 tranche 4). The backend's own connection cannot
     # answer this: its page cache serves rows out of memory long after the file

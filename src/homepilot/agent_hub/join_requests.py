@@ -92,6 +92,26 @@ async def record_attempt(
     )
 
 
+def install_started_at() -> str:
+    """The moment an install began, in the stamp format the knocks are kept in."""
+    return _stamp(_utcnow())
+
+
+async def refusal_since(repo: Any, hostname: str, since: str) -> dict[str, Any] | None:
+    """The newest refusal ``hostname`` received at or after ``since``, or None.
+
+    An install's verify step asks this when its agent never connected: a host
+    that knocked and was turned away after the installer ran presented a
+    credential other than the bootstrap token the install handed it (#815).
+    """
+    if not hostname:
+        return None
+    for row in await repo.list_enrolment_attempts(since):
+        if row.get("hostname") == hostname:
+            return dict(row)
+    return None
+
+
 def _iso(epoch: float | None) -> str | None:
     if epoch is None:
         return None
@@ -121,6 +141,30 @@ async def pending_tokens(repo: Any) -> list[dict[str, Any]]:
     return out
 
 
+async def install_host_id(repo: Any, hostname: str) -> str | None:
+    """The inventory host a knocking hostname can be re-installed on from HomePilot.
+
+    A host that knocks with a credential the hub refuses - most often one left by
+    an earlier install (#815) - is fixed by running the zero-touch install again,
+    which moves that credential aside and enrols with a fresh bootstrap token. That
+    needs a live Proxmox QEMU guest HomePilot knows the node and VMID of; whether
+    its guest agent answers is checked when the install is asked for.
+    """
+    get_host = getattr(repo, "get_host_by_hostname", None)
+    if not hostname or get_host is None:
+        return None
+    host = await get_host(hostname)
+    if (
+        not host
+        or host.get("host_type") != "qemu"
+        or not host.get("node")
+        or host.get("proxmox_id") is None
+        or host.get("absent_since")
+    ):
+        return None
+    return str(host["id"])
+
+
 async def payload(repo: Any) -> dict[str, Any]:
     """Everything the Hosts page's "wants to join" panel shows, in one read."""
     stale_before = _stamp(_utcnow() - ATTEMPT_MAX_AGE)
@@ -132,6 +176,8 @@ async def payload(repo: Any) -> dict[str, Any]:
                 # Holds a genuine token and is only waiting for a window: the
                 # "Open enrolment window" button lets it in on its next retry.
                 "wants_to_join": row["reason_code"] == DENY_WINDOW_CLOSED,
+                # Set when "Install again" can re-enrol it with no window (#815).
+                "install_host_id": await install_host_id(repo, row["hostname"]),
             }
         )
     tokens = await pending_tokens(repo)
