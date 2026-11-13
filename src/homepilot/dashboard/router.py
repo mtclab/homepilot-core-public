@@ -7,12 +7,14 @@ in an external monitoring server" boundary is gone.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 
 from ..app_settings import resolver_from_state
 from ..auth.deps import require_scope
+from ..auth.principal import audit_actor
 from ..config import get_settings
 from ..updates.checker import update_status
 from .service import build_summary
@@ -49,3 +51,41 @@ async def updates(request: Request) -> dict[str, Any]:
     verdict - read from its state row, never a live request to GitHub. Notify
     only: nothing here or anywhere upgrades the control plane."""
     return await update_status(request.app.state.repo)
+
+
+class SnoozeIn(BaseModel):
+    """Put one Overview line off ("Not now, 7 days")."""
+
+    # The line's stable key as the summary and the Overview name it, e.g.
+    # `gone:machines`, `task:<id>`, `alert:<rule>:<host>`.
+    key: str = Field(min_length=1, max_length=300)
+    # How serious the line is NOW: if it becomes more serious, it shows again.
+    severity: Literal["notice", "warning", "critical"]
+
+
+_admin = Depends(require_scope("admin"))
+
+
+@router.post("/attention/snoozes")
+async def snooze_line(
+    request: Request, body: SnoozeIn, token: dict[str, Any] = _admin
+) -> dict[str, Any]:
+    """Hide one attention line for 7 days, or until it becomes more serious.
+
+    Journaled (`attention_snoozed`). Snoozing a key again restarts its week.
+    Read back through GET /dashboard/summary (`attention.snoozes`, `put_off`)."""
+    from .attention import snooze
+
+    return await snooze(request.app.state.repo, body.key, body.severity, audit_actor(token))
+
+
+@router.delete("/attention/snoozes/{key:path}")
+async def unsnooze_line(
+    request: Request, key: str, token: dict[str, Any] = _admin
+) -> dict[str, Any]:
+    """Bring a put-off line back now. 404 when nothing is put off under `key`."""
+    from .attention import unsnooze
+
+    if not await unsnooze(request.app.state.repo, key, audit_actor(token)):
+        raise HTTPException(status_code=404, detail=f"Nothing is put off under {key!r}")
+    return {"key": key, "snoozed": False}

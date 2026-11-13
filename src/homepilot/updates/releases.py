@@ -97,6 +97,7 @@ def _clean_text(value: str, limit: int) -> str:
 _ACTION_LEAD_RE = re.compile(r"^\*\*\s*(upgrade|operator action)\b[^*]*[:.]\s*\*\*", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _ACTION_HEADING_RE = re.compile(r"upgrad|operator action", re.IGNORECASE)
+_NOTHING_TO_DO_RE = re.compile(r"^(-\s*)?none\.?$", re.IGNORECASE)
 
 
 def operator_actions(body: str | None) -> list[str]:
@@ -115,7 +116,10 @@ def operator_actions(body: str | None) -> list[str]:
     def flush_section() -> None:
         if section:
             text = _clean_text(" ".join(section), MAX_ACTION_CHARS)
-            if text:
+            # "### Operator actions" + "None." is how a release says there is
+            # nothing to do; lifted, it became an update notice telling the
+            # operator to do "None.".
+            if text and not _NOTHING_TO_DO_RE.match(text):
                 actions.append(text)
         section.clear()
 

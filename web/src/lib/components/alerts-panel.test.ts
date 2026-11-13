@@ -18,9 +18,9 @@ import { api, sessionStore, type AlertEvent, type ChannelSummary } from '$lib/ap
  *   - render only the firing list and the resolved episode case fails;
  *   - drop the destination line and the "no channel" case fails;
  *   - treat a rejected history read as empty and the unread case fails;
- *   - remove the alert strip from the Overview and the Overview case fails;
+ *   - remove the Alerts number from the Overview and the Overview case fails;
  *     put the full list back on the Overview and it fails too (UI slice 3:
- *     the list lives on Monitoring > Alerts, the Overview keeps two lines).
+ *     the list lives on Monitoring > Alerts, the Overview keeps one number).
  */
 const listFiringAlerts = api.listFiringAlerts as ReturnType<typeof vi.fn>;
 const listAlertEvents = api.listAlertEvents as ReturnType<typeof vi.fn>;
@@ -135,7 +135,9 @@ describe('AlertsPanel', () => {
 	});
 });
 
-describe('Overview carries the alert strip', () => {
+// 3.12: the strip became the Estate panel's Alerts number - how many fire, how
+// many resolved, where an alert goes in a few words - with the same door.
+describe('Overview carries the Alerts number', () => {
 	beforeEach(() => vi.clearAllMocks());
 
 	it('counts the resolved dark-host episode in two lines and doors to Monitoring > Alerts', async () => {
@@ -158,12 +160,12 @@ describe('Overview carries the alert strip', () => {
 		listAlertEvents.mockResolvedValue(history([DARK_RESOLVED], [PHONE_OK]));
 
 		render(Overview);
-		const heading = await screen.findByRole('heading', { name: 'Alerts' });
-		const strip = heading.closest('section') as HTMLElement;
-		const count = await within(strip).findByText(/firing/);
-		expect(count.closest('p')?.textContent).toMatch(/0\s*firing\s*· 1 resolved in the last 24 h/);
-		expect(within(strip).getByText(/Alerts go to phone \(ntfy, last delivery ok\)/)).toBeInTheDocument();
-		expect(within(strip).getByRole('link', { name: /monitoring/i })).toHaveAttribute('href', '/ui/monitoring/alerts');
+		await screen.findByRole('heading', { name: 'Estate' });
+		const alerts = () => document.querySelector('[data-readout="Alerts"]') as HTMLElement;
+		await waitFor(() => expect(alerts().textContent).toContain('1 resolved in 24 h'));
+		expect(alerts().textContent).toMatch(/^\s*Alerts\s*0/);
+		expect(alerts().textContent).toContain('phone ok');
+		expect(alerts()).toHaveAttribute('href', '/ui/monitoring/alerts');
 		// The list is the Alerts page's; the Overview never repeats it.
 		expect(screen.queryByText('went dark for 7 min')).not.toBeInTheDocument();
 		expect(document.querySelector('[data-alerts-panel]')).toBeNull();
@@ -186,10 +188,11 @@ describe('Overview carries the alert strip', () => {
 		listAlertEvents.mockRejectedValue(new Error('503'));
 
 		render(Overview);
-		const strip = (await screen.findByRole('heading', { name: 'Alerts' })).closest('section') as HTMLElement;
-		expect(await within(strip).findByText('Could not read what is firing.')).toBeInTheDocument();
-		expect(within(strip).getByText(/Could not read the alert history/)).toBeInTheDocument();
-		expect(strip.textContent).not.toMatch(/0\s*firing/);
+		await screen.findByRole('heading', { name: 'Estate' });
+		const alerts = () => document.querySelector('[data-readout="Alerts"]') as HTMLElement;
+		await waitFor(() => expect(alerts().textContent).toContain('could not read what is firing'));
+		expect(alerts().textContent).toMatch(/^\s*Alerts\s*\?/);
+		expect(alerts().textContent).not.toMatch(/Alerts\s*0/);
 	});
 });
 

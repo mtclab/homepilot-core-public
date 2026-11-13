@@ -713,31 +713,10 @@ async def agent_upgrades(request: Request) -> list[dict[str, Any]]:
     Nothing upgraded an enrolled agent before this, so a fix shipped in the agent
     never reached a host that already had one.
     """
-    from .join_requests import install_host_id
-    from .version_skew import control_plane_version, is_behind
+    # The same list the Overview's "N agents are older" line counts.
+    from ..dashboard.attention import outdated_agents
 
-    registry = _get_registry()
-    repo = getattr(request.app.state, "repo", None)
-    control = control_plane_version()
-    out: list[dict[str, Any]] = []
-    for agent in registry.list_connected():
-        info = agent.get("system_info") or {}
-        version = info.get("agent_version") if isinstance(info, dict) else None
-        behind = is_behind(version, control)
-        if behind is False:
-            continue
-        hostname = str(agent.get("hostname") or "")
-        out.append(
-            {
-                "agent_id": agent.get("agent_id"),
-                "hostname": hostname,
-                "agent_version": version or None,
-                "control_version": control,
-                "behind": behind,
-                "host_id": await install_host_id(repo, hostname) if repo is not None else None,
-            }
-        )
-    return out
+    return await outdated_agents(_get_registry(), getattr(request.app.state, "repo", None))
 
 
 @router.get("/install/{host_id}", dependencies=[_admin_only])

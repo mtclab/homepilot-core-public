@@ -548,6 +548,18 @@ async def test_operator_actions_follow_the_changelog_conventions() -> None:
     assert releases.operator_actions("Just notes.\n\n## Docker\n") == []
 
 
+async def test_an_operator_actions_section_that_says_none_is_no_action() -> None:
+    """A release with nothing to do says so under its heading ("None.", as the
+    CHANGELOG convention asks); the notice must not tell the operator to do
+    "None."."""
+    for nothing in ("None.", "None", "- None.", "none."):
+        body = f"## 3.12.0\n\n### Operator actions\n\n{nothing}\n\n### Guests\n\nNotes.\n"
+        assert releases.operator_actions(body) == [], nothing
+    # A real action that merely starts with the word is still an action.
+    body = "### Operator actions\n\nNone of the old tokens work: mint new ones.\n"
+    assert releases.operator_actions(body) == ["None of the old tokens work: mint new ones."]
+
+
 async def test_a_notes_link_off_github_is_not_followed() -> None:
     parsed = releases.parse_latest(_release(html_url="https://evil.example.com/x"))
     assert parsed is not None

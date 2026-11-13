@@ -53,6 +53,10 @@
 	let filterImportState = '';
 	// Which part of the estate (lane B1): "which VMs are dev" is one filter.
 	let filterEnv = '';
+	// The Overview's doors (3.12): "Review" on the gone-machines line opens
+	// `?gone=1`, the strip's "N stopped" opens `?pve_status=stopped`.
+	let filterGone = false;
+	let filterPveStatus = '';
 	// Proxmox templates are provisioning inputs, not fleet members: hidden
 	// unless asked for, and the number hidden is always on screen.
 	let showTemplates = false;
@@ -389,6 +393,8 @@
 				source: filterSource || undefined,
 				import_state: filterImportState || undefined,
 				env: filterEnv || undefined,
+				pve_status: filterPveStatus || undefined,
+				absent: filterGone ? true : undefined,
 				templates: showTemplates ? 'include' : 'exclude',
 				q: search.trim() || undefined,
 				limit: PAGE_SIZE,
@@ -460,6 +466,8 @@
 		filterSource !== '' ||
 		filterImportState !== '' ||
 		filterEnv !== '' ||
+		filterGone ||
+		filterPveStatus !== '' ||
 		search.trim() !== '';
 
 	function clearFilters() {
@@ -468,6 +476,8 @@
 		filterSource = '';
 		filterImportState = '';
 		filterEnv = '';
+		filterGone = false;
+		filterPveStatus = '';
 		search = '';
 		page = 0;
 		load();
@@ -609,6 +619,9 @@
 	}
 
 	onMount(async () => {
+		const params = new URLSearchParams(window.location.search);
+		filterGone = params.get('gone') === '1';
+		filterPveStatus = params.get('pve_status') === 'stopped' ? 'stopped' : '';
 		await load();
 		await Promise.all([loadRoleCounts(), loadSelfGuest()]);
 	});
@@ -814,6 +827,11 @@
 			<input type="checkbox" bind:checked={showTemplates} on:change={firstPage} />
 			Show templates{#if !showTemplates && templatesHidden > 0}&nbsp;<span class="num-inline">({templatesHidden} hidden)</span>{/if}
 		</label>
+		{#if filterGone || filterPveStatus}
+			<span class="text-xs text-muted self-center" data-url-filter
+				>{filterGone ? 'Showing the machines Proxmox no longer reports' : 'Showing stopped machines'}</span
+			>
+		{/if}
 		{#if hasActiveFilters}
 			<button class="btn btn-ghost text-xs self-center" on:click={clearFilters}>Clear filters</button>
 		{/if}

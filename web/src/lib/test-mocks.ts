@@ -165,6 +165,9 @@ vi.mock('$lib/api', async () => {
 			agentInstallEligibility: vi.fn().mockResolvedValue({ eligible: false, message: 'not in test' }),
 			installAgent: vi.fn(),
 			getAgentUpgrades: vi.fn().mockResolvedValue([]),
+			// "Not now, 7 days" on an Overview line (3.12).
+			snoozeAttention: vi.fn(),
+			unsnoozeAttention: vi.fn(),
 			getTask: vi.fn(),
 			adoptHost: vi.fn(),
 			ignoreHost: vi.fn(),
@@ -222,6 +225,24 @@ vi.mock('$lib/api', async () => {
 			saveProxmoxSettings: vi.fn().mockResolvedValue({ status: 'ok', reloaded: [] }),
 			testProxmoxConnection: vi.fn().mockResolvedValue({ status: 'ok', message: 'ok' }),
 			getGuests: vi.fn().mockResolvedValue({ guests: [], invites: [] }),
+			// The Guests page's one read (3.12): no friends on a fresh install.
+			getGuestFriends: vi.fn().mockResolvedValue({
+				friends: [],
+				sizing: {
+					presets: [
+						{ name: 'small', cores: 1, memory_mb: 1024, disk_gb: 20 },
+						{ name: 'medium', cores: 2, memory_mb: 2048, disk_gb: 20 },
+					],
+					bounds: {
+						cores: { min: 1, max: 32 },
+						memory_mb: { min: 256, max: 65536 },
+						disk_gb: { min: 1, max: 2000 },
+					},
+					ttl_days: { min: 1, max: 90, default: 7 },
+				},
+				defaults: { node: null, template_vmid: null },
+				portal_origin: null,
+			}),
 			mintGuestInvite: vi.fn(),
 			setGuestQuota: vi.fn(),
 			deleteGuestQuota: vi.fn(),

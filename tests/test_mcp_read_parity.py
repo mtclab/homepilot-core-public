@@ -73,6 +73,12 @@ pytestmark = pytest.mark.asyncio
 ROUTE_TO_TOOL: dict[str, str] = {
     # Admin
     "/admin/guests": "query_guests",
+    # The Guests page's per-friend read (3.12). Its `friends` list is query_guests'
+    # `friends`, built by one function (same-answer gate in test_guest_friends.py);
+    # the route's other keys are console furniture - size presets/bounds, the
+    # provisioning defaults (get_proxmox_settings / query_settings_overrides) and
+    # the portal origin used only to print the link the mint returns.
+    "/admin/guests/friends": "query_guests",
     "/admin/selfcheck": "get_selfcheck",
     # The persisted operator settings (#553 C2/C3), reachable over MCP since C4.
     # The route is API `admin`, so the tool is an admin-tier READ.
@@ -357,6 +363,16 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
 }
 
 EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
+    # ── "Not now, 7 days" on an Overview line (3.12, quiet Overview). ──
+    ("POST", "/dashboard/attention/snoozes"): (
+        "the owner putting a line off their OWN screen - admin scope. An assistant "
+        "that could snooze could hide from the owner what it was asked to watch; it "
+        "reads every snooze (and the lines they hold) in get_dashboard_summary"
+    ),
+    ("DELETE", "/dashboard/attention/snoozes/{key:path}"): (
+        "the owner's 'bring it back' for a line they put off - admin scope, the "
+        "twin of the snooze above; read through get_dashboard_summary"
+    ),
     # ── The run guard, asked without running (#813). ──
     ("POST", "/artifacts/{artifact_id}/recheck"): (
         "the Inbox's 'Back to review' for an approval the run guard refuses; over "

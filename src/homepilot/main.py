@@ -363,6 +363,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     inventory_reconciler = InventoryReconciler(
         inventory_service=inventory_service,
         repo=state.repo,
+        artifact_store=state.artifact_store,
     )
     reconciler_scheduler.register(
         inventory_reconciler,

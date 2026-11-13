@@ -47,9 +47,10 @@ SCHEMA_3_7_0 = 36
 # * 39 - operator power controls (lane B3): ``hosts.protected``
 # * 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept
 # * 41 - one live ``hosts`` row per VMID and per node (duplicates retired)
+# * 42 - put-off Overview lines (quiet Overview, 3.12): ``attention_snoozes``
 # tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
 # through both.
-SCHEMA_LATEST = 41
+SCHEMA_LATEST = 42
 
 
 async def _version(db: Database) -> int:
@@ -142,6 +143,8 @@ class TestADatabaseFrom3625UpgradesInOneStart:
         assert "idx_tasks_one_active_per_artifact" in indexes
         # 41: one live row per machine.
         assert {"idx_hosts_one_live_per_vmid", "idx_hosts_one_live_node"} <= indexes
+        # 42: the snooze table exists, and an upgrade puts nothing off.
+        assert await db_3_6_25.fetchall("SELECT * FROM attention_snoozes") == []
 
         # The pre-migration snapshot is of the 3.6.25 database, so the one
         # restore an operator is told about takes them back to what they had.

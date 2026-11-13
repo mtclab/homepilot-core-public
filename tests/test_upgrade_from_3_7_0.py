@@ -42,7 +42,8 @@ SCHEMA_3_8_0 = 38
 # 39 - operator power controls (lane B3): ``hosts.protected``.
 # Unreleased: 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept.
 # Unreleased: 41 - one live ``hosts`` row per VMID and per node (duplicates retired).
-SCHEMA_LATEST = 41
+# Unreleased: 42 - put-off Overview lines (quiet Overview): ``attention_snoozes``.
+SCHEMA_LATEST = 42
 
 _NOW = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -177,6 +178,8 @@ class TestADatabaseFrom370UpgradesInOneStart:
             # operator answers (lane B3).
             assert r["protected"] is None
         assert await db_3_7_0.fetchall("SELECT * FROM host_addresses") == []
+        # 42: the snooze table exists, and an upgrade puts nothing off.
+        assert await db_3_7_0.fetchall("SELECT * FROM attention_snoozes") == []
 
         # The one restore an operator is told about takes them back to 3.7.0.
         backup = Path(db_3_7_0.db_path).parent / "backups" / f"pre-migration-v{SCHEMA_3_7_0}.db"

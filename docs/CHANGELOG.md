@@ -1,5 +1,89 @@
 # Changelog
 
+## 3.12.0 - 2026-11-13
+
+The Overview only says what needs you, and Guests starts from your friends.
+"Needs you" replaces the long attention list: one sentence per thing you can
+act on, with its action on the line, and "Not now, 7 days" for the rest. The
+Guests page shows each friend with their machines and budget, and inviting is
+one short dialog.
+
+### Operator actions
+
+- Migration 42 adds the table that holds put-off lines. Nothing else to do.
+
+### A quiet Overview
+
+The Overview only says what needs you. On prod 3.11.0 it showed 14 attention
+lines, 3 of them decisions; the rest were failed runs later runs had already
+superseded, one line per deleted machine, a note about how many tasks it had
+read, and reconciler chatter under "Recent movement".
+
+- **Needs you** shows a line only if you can act on it, as a sentence with its
+  action on the line. A failed run leaves it when a later run of the same
+  change succeeded, or after a day; it stays in Records, and the footer says
+  how many were left out, with the way to them. Notes about what the page read
+  are gone from the list; a source that could not be read is one line naming
+  it, with **Read again**.
+- Machines Proxmox no longer reports are **one** line, with **Review** (Hosts,
+  filtered to them) and **Forget all**, which asks first and names any machine
+  it could not forget. A machine HomePilot destroyed itself through an applied
+  change is forgotten by the next inventory sweep, with a journal row naming
+  the change; a machine that vanished any other way is left for you.
+- Agents older than HomePilot are one line with **Upgrade N agents**: the
+  per-agent upgrade, one host at a time, with progress per host. It stops at
+  the first failure and says which host and why (an agent installed before
+  3.11 can still fail its first upgrade, #823).
+- **Not now, 7 days** on any line puts it off for a week, on the server (every
+  browser and an assistant see the same list). It comes back early if it
+  becomes more serious. The footer counts what is put off, and **Bring back**
+  returns a line at once.
+- Calm reads "Nothing needs you." with what was checked. **Estate** is four
+  numbers - machines running and stopped, watched (running machines with an
+  agent), alerts, changes waiting - and a strip of running machines only.
+  **What happened** says what people and assistants did in words; the
+  reconcilers' work is behind a toggle with its count.
+- For assistants: `get_dashboard_summary` carries the same `attention`
+  (failed and stuck runs, gone machines, agents behind, put-off lines and
+  their snoozes). `get_audit_log` and `GET /audit` take `actor` (`people` or
+  `system`) and `since`; `GET /inventory` takes `absent`.
+
+### Guests shows your friends and their machines
+
+The Guests page starts from people. Owner on 3.11.0: "Guests is a bit too
+simple at the moment, and clunky" - it was two paragraphs, two raw tables and
+two always-open forms, and nothing showed a friend's actual machine.
+
+- One row per friend (their certificate name): each machine they hold with its
+  state (running / stopped, as the inventory last read it), its size and a link
+  to its host page; their budget as a bar per axis that has a limit ("1 of 1",
+  "30 of 30 GB"), and a plain sentence when it is used up; Invite and Budget on
+  the row. A friend with no machine says so.
+- The invite history folds under the friend: the latest in words ("redeemed 2
+  months ago", "open, expires in 5 days") with its prefix, the rest behind
+  "show all". An open invite is never folded away and offers Revoke, now behind
+  a confirm. Dates are in words, the exact time on hover.
+- **Invite a friend** is a dialog (from the page, or from a row with the name
+  filled in): certificate name, a size preset (Small 1 core / 1 GB / 20 GB,
+  Medium 2 cores / 2 GB / 20 GB) or Custom, how long the link is valid, and the
+  template and node under More options (open by itself when the instance has no
+  provisioning default for them). It says before minting whether the friend's
+  budget would refuse the machine when they open the link. HomePilot has no read
+  of a node's free capacity, so it says nothing about the node.
+- The link is shown once, in the dialog, with a copy button (and the link
+  selected where the browser refuses the clipboard), and complete when
+  `HP_PORTAL_BASE_URL` is set. It is gone when the dialog closes and is in no
+  later read.
+- **Budget** is a dialog for that friend: four axes, blank = no limit, what they
+  use now beside each, and Remove budget.
+- On a phone each friend is a card. With no friends yet the page is one sentence
+  and the Invite button; how the guest portal works is one click away.
+- New read `GET /admin/guests/friends` (admin): the page in one call. Its
+  `friends` list is also `friends` in the MCP tool `query_guests`. Minting,
+  redeeming, budgets and what the guest portal shows a friend are unchanged.
+- The update notice no longer lists "None." as an operator action when a
+  release's Operator actions section says there is nothing to do.
+
 ## 3.11.0 - 2026-11-12
 
 Three safety and upkeep fixes from running 3.10.0 on a real estate. An approved

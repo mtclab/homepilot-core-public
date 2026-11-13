@@ -58,6 +58,7 @@ class TestInventoryRouter:
             status=None,
             env=None,
             is_template=None,
+            absent=None,
             limit=100,
             offset=0,
         )

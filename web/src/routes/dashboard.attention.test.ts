@@ -48,8 +48,47 @@ function summary(over: Record<string, unknown> = {}) {
 		tasks: {},
 		agents: { known: 2, connected: 2 },
 		metrics: { firing_alerts: 0, retention_days: 7, rules_enabled: 1, rules_watching_nothing: 0 },
+		attention: attention(),
 		...over,
 	};
+}
+
+/** The server's share of "Needs you" (3.12): nothing, unless a test says so. */
+function attention(over: Record<string, unknown> = {}) {
+	return {
+		failed_runs: [],
+		left_out: { superseded: 0, older: 0, since: '2026-08-17T00:00:00Z' },
+		stuck_runs: [],
+		gone: null,
+		agents_behind: null,
+		put_off: [],
+		snoozes: [],
+		checked_at: '2026-08-24T12:00:00Z',
+		...over,
+	};
+}
+
+/** A task as the server's attention line for it (failed: critical; stuck: warning). */
+function run(t: Record<string, unknown>, kind: 'task' | 'stuck' = 'task') {
+	const host = t.result_json ? JSON.parse(String(t.result_json)) : {};
+	return {
+		key: `${kind}:${t.id}`,
+		severity: kind === 'task' ? 'critical' : 'warning',
+		task_id: t.id,
+		action: t.action,
+		status: t.status,
+		artifact_id: t.artifact_id ?? null,
+		host_id: host.host_id ?? null,
+		hostname: host.hostname ?? null,
+		error: t.error ?? null,
+		created_at: t.created_at,
+		finished_at: t.finished_at ?? null,
+	};
+}
+
+/** How serious the attention line holding `el` is said to be. */
+function severityOf(el: Element | null): string | null {
+	return el?.closest('[data-attention]')?.getAttribute('data-severity') ?? null;
 }
 
 const HEALTHY_HOST = {
@@ -94,7 +133,7 @@ function seed(opts: {
 
 /** The zone itself, so a match cannot come from some other part of the page. */
 async function attentionZone(): Promise<HTMLElement> {
-	const heading = await screen.findByRole('heading', { name: /needs attention/i });
+	const heading = await screen.findByRole('heading', { name: /needs you/i });
 	const section = heading.closest('section');
 	expect(section).not.toBeNull();
 	return section as HTMLElement;
@@ -114,9 +153,9 @@ describe('Overview: needs attention', () => {
 		seed({
 			summary: {
 				drift: { total: 3, drifted: 2, in_spec: 1, unknown: 0, checked: 3, in_spec_pct: 33 },
+				attention: attention({ failed_runs: [run(FAILED_TASK)] }),
 			},
 			hosts: [HEALTHY_HOST, AGENT_ABSENT_HOST],
-			tasks: [FAILED_TASK],
 		});
 
 		render(Overview);
@@ -247,19 +286,16 @@ describe('Overview: needs attention', () => {
 
 	it('calls a long-running task stuck, not busy', async () => {
 		const started = new Date(Date.now() - 40 * 60 * 1000).toISOString();
-		seed({
-			tasks: [
-				{
-					...FAILED_TASK,
-					id: 'task-stuck-1',
-					artifact_id: null,
-					status: 'running',
-					error: null,
-					created_at: started,
-					finished_at: null,
-				},
-			],
-		});
+		const stuck = {
+			...FAILED_TASK,
+			id: 'task-stuck-1',
+			artifact_id: null,
+			status: 'running',
+			error: null,
+			created_at: started,
+			finished_at: null,
+		};
+		seed({ summary: { attention: attention({ stuck_runs: [run(stuck, 'stuck')] }) } });
 
 		render(Overview);
 		const zone = within(await attentionZone());
@@ -318,7 +354,9 @@ describe('Overview: needs attention', () => {
 		render(Overview);
 
 		expect(await screen.findByText(/nothing needs you/i)).toBeInTheDocument();
-		expect(screen.queryByRole('heading', { name: /needs attention/i })).not.toBeInTheDocument();
+		// No line, and no count of nothing: the calm sentence is the zone.
+		expect(document.querySelector('[data-attention]')).toBeNull();
+		expect(screen.queryByText(/0 things/i)).not.toBeInTheDocument();
 		// No zero-stat noise standing in for the zone either.
 		expect(screen.queryByText(/0 failed/i)).not.toBeInTheDocument();
 	});
@@ -343,14 +381,13 @@ describe('Overview: fleet at a glance', () => {
 
 		render(Overview);
 
-		const sub = await screen.findByText(/nothing checked yet/i);
-		// Scoped to the In-spec card on purpose: coverage may legitimately be
-		// 100% on the same screen, and a page-wide "no 100% anywhere" assertion
-		// would pass for the wrong reason the day coverage is 90%.
-		const card = sub.closest('a') as HTMLElement;
-		expect(within(card).getByText(/in spec/i)).toBeInTheDocument();
-		expect(within(card).getByText('—')).toBeInTheDocument();
-		expect(card.textContent).not.toMatch(/\d+%/);
+		// 3.12: the Estate panel carries no drift number at all (four numbers:
+		// machines, watched, alerts, changes), and with nothing checked there is
+		// no drift line either - so no "100%" can stand in for "never looked".
+		const estate = (await screen.findByRole('heading', { name: 'Estate' })).closest('section') as HTMLElement;
+		expect(estate.textContent).not.toMatch(/\d+%/);
+		expect(estate.querySelector('[data-readout="In spec"]')).toBeNull();
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
 	});
 
 	it('does not carry the hosts-by-role breakdown any more (it moved to Hosts)', async () => {
@@ -362,13 +399,19 @@ describe('Overview: fleet at a glance', () => {
 		expect(screen.queryByText(/hosts by role/i)).not.toBeInTheDocument();
 	});
 
-	// UI slice 4 (review 01 step 13): the readout row replaced the two donuts.
-	// Teeth: put either donut back and this fails on its title or its <svg>.
-	it('shows the estate as one readout row, with no donut left', async () => {
+	// 3.12 (quiet Overview): four numbers - machines running/stopped, watched
+	// (running machines with an agent), alerts, changes waiting - from the
+	// server's counts, so a gone machine is in none of them.
+	// Teeth: put the gone machine back into Machines, or count Watched over
+	// every host read, and this fails on the numbers.
+	it('shows the estate as four numbers, never counting a gone machine', async () => {
 		seed({
 			hosts: [HEALTHY_HOST, AGENT_ABSENT_HOST],
 			summary: {
-				inventory: { ...summary().inventory, total: 2, managed: 2, templates: 3 },
+				inventory: {
+					...summary().inventory,
+					machines: { running: 11, stopped: 4, gone: 7, other: 0, watched: 6 },
+				},
 				agents: { known: 2, connected: 1 },
 				artifacts: { proposed: 2, applied: 5 },
 				changes: { proposed: 2, ready: 1, running: 0 },
@@ -379,19 +422,18 @@ describe('Overview: fleet at a glance', () => {
 
 		const estate = (await screen.findByRole('heading', { name: 'Estate' })).closest('section') as HTMLElement;
 		const readout = (label: string) => estate.querySelector(`[data-readout="${label}"]`) as HTMLElement;
-		expect(readout('Hosts').textContent).toMatch(/2\s*\+3 tpl/);
-		// Watched = hosts read whose agent is connected now: 1 of the 2.
-		expect(readout('Watched by agent').textContent).toMatch(/1\s*\/2/);
-		expect(readout('Watched by agent')).toHaveAttribute('href', '/ui/monitoring/alerts');
-		expect(readout('Agents').textContent).toMatch(/1\s*\/2/);
-		expect(readout('In spec').textContent).toMatch(/3\s*\/3/);
-		// 3.10.0: the Inbox's count (proposed + approved, not yet run), and its
-		// door - not the retired review queue, which counted proposals only.
-		expect(readout('Changes').textContent).toMatch(/3\s*waiting/);
-		expect(readout('Changes').textContent).toContain('2 proposed · 1 ready to run');
+		expect(estate.querySelectorAll('[data-readout]')).toHaveLength(4);
+		expect(readout('Machines').textContent).toMatch(/15/);
+		expect(readout('Machines').textContent).toContain('11 running · 4 stopped');
+		expect(readout('Machines').textContent).not.toMatch(/22|gone/);
+		expect(readout('Watched').textContent).toMatch(/6\s*\/11/);
+		expect(readout('Watched').textContent).toContain('running machines with an agent');
+		expect(readout('Alerts').textContent).toMatch(/^\s*Alerts\s*0/);
+		// The Inbox's count (proposed + approved, not yet run), and its door.
+		expect(readout('Changes').textContent).toMatch(/3/);
+		expect(readout('Changes').textContent).toContain('2 to review · 1 ready to run');
 		expect(readout('Changes')).toHaveAttribute('href', '/ui/changes/inbox');
 		expect(screen.queryByText(/hosts by status/i)).not.toBeInTheDocument();
-		expect(screen.queryByRole('heading', { name: /^artifacts$/i })).not.toBeInTheDocument();
 		expect(document.querySelector('main svg circle, svg circle')).toBeNull();
 	});
 
@@ -407,9 +449,38 @@ describe('Overview: fleet at a glance', () => {
 	});
 });
 
-describe('Overview: recent movement', () => {
+/** A journal row, as GET /audit returns it. */
+function entry(over: Record<string, unknown>) {
+	return {
+		id: 1,
+		timestamp: new Date().toISOString(),
+		user_id: 'owner (hp_owner000001)',
+		source: 'api',
+		action: 'host_added',
+		artifact_id: null,
+		target_host: null,
+		target_service: null,
+		command: null,
+		exit_code: null,
+		snapshot_id: null,
+		duration_ms: null,
+		details_json: null,
+		...over,
+	};
+}
+
+/**
+ * What happened (3.12): actions by people and assistants in words, newest
+ * first; the system's own work (reconcilers) behind a toggle with its count.
+ *
+ * Teeth: drop `actor: 'people'` from the read and the reconciler rows are
+ * back in the list; drop the formatter and the sentences are raw action names;
+ * show the system rows without the toggle and the toggle test fails.
+ */
+describe('Overview: what happened', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		sessionStore.set({ authenticated: true, token_label: 'owner', prefix: 'hp_owner000001', capabilities: ['read'] } as never);
 		try {
 			localStorage.clear();
 		} catch {
@@ -417,63 +488,95 @@ describe('Overview: recent movement', () => {
 		}
 	});
 
-	it('merges tasks and journal into one feed with a door to Records', async () => {
-		seed({
-			tasks: [
-				{
-					...FAILED_TASK,
-					id: 'task-ok-1',
-					artifact_id: 'nginx-conf',
-					status: 'succeeded',
-					error: null,
-				},
-			],
-			audit: [
-				{
-					id: 7,
-					timestamp: '2026-08-24T11:00:00Z',
-					user_id: 'olli',
-					source: 'ui',
-					action: 'propose',
-					artifact_id: 'pg-tune',
-					target_host: 'db-01',
-					target_service: null,
-					command: null,
-					exit_code: null,
-					snapshot_id: null,
-					duration_ms: null,
-					details_json: null,
-				},
-			],
-		});
+	function feed(): HTMLElement {
+		return screen.getByRole('heading', { name: /what happened/i }).closest('section') as HTMLElement;
+	}
+
+	it('says what people and assistants did, in words, newest first', async () => {
+		seed({});
+		listAudit.mockImplementation(async (p: { actor?: string }) =>
+			p.actor === 'people'
+				? {
+						items: [
+							entry({
+								id: 9,
+								action: 'install_agent',
+								target_host: 'infra-docker',
+								details_json: JSON.stringify({ upgrade: true, agent_version: 'v3.11.0' }),
+							}),
+							entry({ id: 8, user_id: 'claude (hp_asst0000001)', action: 'withdraw', artifact_id: 'a-4' }),
+							entry({ id: 7, user_id: 'claude (hp_asst0000001)', action: 'withdraw', artifact_id: 'a-3' }),
+							entry({ id: 6, user_id: 'claude (hp_asst0000001)', action: 'withdraw', artifact_id: 'a-2' }),
+							entry({ id: 5, user_id: 'claude (hp_asst0000001)', action: 'withdraw', artifact_id: 'a-1' }),
+						],
+						total: 5,
+					}
+				: { items: [], total: 0 },
+		);
 
 		render(Overview);
-
-		const heading = await screen.findByRole('heading', { name: /recent movement/i });
-		const feed = within(heading.closest('section') as HTMLElement);
-		// The task half and the journal half are BOTH in the one feed.
-		expect(feed.getByText(/nginx-conf · succeeded/)).toBeInTheDocument();
-		expect(feed.getByText(/pg-tune · db-01 · ui/)).toBeInTheDocument();
-		expect(feed.getByRole('link', { name: /records/i })).toHaveAttribute('href', '/ui/records');
+		await waitFor(() => expect(feed().querySelectorAll('[data-happened] li')).toHaveLength(2));
+		const rows = Array.from(feed().querySelectorAll('[data-happened] li')).map((li) => li.textContent ?? '');
+		expect(rows[0]).toContain('You upgraded the agent on infra-docker to v3.11.0');
+		expect(rows[1]).toContain('claude withdrew 4 approved changes');
+		expect(within(feed()).getByRole('link', { name: /records/i })).toHaveAttribute('href', '/ui/records');
+		// People and assistants only: the read asks the server for that set.
+		expect(listAudit).toHaveBeenCalledWith(expect.objectContaining({ actor: 'people' }));
 	});
 
-	it('caps the feed rather than growing an unbounded list', async () => {
-		const many = Array.from({ length: 30 }, (_, i) => ({
-			...FAILED_TASK,
-			id: `task-${i}`,
-			artifact_id: `art-${i}`,
-			status: 'succeeded',
-			error: null,
-			created_at: new Date(Date.now() - i * 60000).toISOString(),
-			finished_at: new Date(Date.now() - i * 60000).toISOString(),
-		}));
-		seed({ tasks: many });
+	it('keeps system activity behind a toggle with its count', async () => {
+		seed({});
+		listAudit.mockImplementation(async (p: { actor?: string }) =>
+			p.actor === 'system'
+				? {
+						items: [
+							entry({ id: 3, user_id: 'system', source: 'reconciler:drift', action: 'check_drift', artifact_id: 'nginx-conf' }),
+							entry({ id: 2, user_id: 'system', source: 'reconciler:inventory', action: 'refresh' }),
+						],
+						total: 41,
+					}
+				: { items: [entry({ id: 1, action: 'host_added', target_host: 'nas' })], total: 1 },
+		);
 
 		render(Overview);
+		const toggle = await screen.findByRole('button', { name: 'Show system activity (41 today)' });
+		expect(within(feed()).queryByText(/check_drift|read the inventory/)).toBeNull();
+		expect(feed().textContent).toContain('You added the host nas');
+		await fireEvent.click(toggle);
+		const system = feed().querySelector('[data-system-activity]') as HTMLElement;
+		expect(system.textContent).toContain('HomePilot checked for drift: nginx-conf');
+		expect(system.textContent).toContain('HomePilot read the inventory from Proxmox');
+		expect(system.textContent).toContain('39 more in Records');
+		expect(screen.getByRole('button', { name: 'Hide system activity' })).toHaveAttribute('aria-expanded', 'true');
+	});
 
-		const heading = await screen.findByRole('heading', { name: /recent movement/i });
-		const rows = (heading.closest('section') as HTMLElement).querySelectorAll('ul > li');
-		expect(rows.length).toBe(10);
+	it('says an action it has no words for as recorded, never a paraphrase', async () => {
+		seed({});
+		listAudit.mockImplementation(async (p: { actor?: string }) =>
+			p.actor === 'people'
+				? { items: [entry({ user_id: 'operator (hp_x)', action: 'tailnet_join', target_host: 'relay' })], total: 1 }
+				: { items: [], total: 0 },
+		);
+
+		render(Overview);
+		await waitFor(() => expect(feed().textContent).toContain('operator: tailnet_join (relay)'));
+	});
+
+	it('caps the list rather than growing an unbounded one', async () => {
+		seed({});
+		listAudit.mockImplementation(async (p: { actor?: string }) =>
+			p.actor === 'people'
+				? {
+						items: Array.from({ length: 30 }, (_, i) =>
+							entry({ id: 100 - i, action: 'approve', artifact_id: `art-${i}`, user_id: i % 2 ? 'a (hp_1)' : 'b (hp_2)' }),
+						),
+						total: 30,
+					}
+				: { items: [], total: 0 },
+		);
+
+		render(Overview);
+		await waitFor(() => expect(feed().querySelectorAll('[data-happened] li')).toHaveLength(8));
 	});
 });
 
@@ -503,13 +606,17 @@ describe('Overview: a read that did not come back', () => {
 
 	it('never says nothing needs you when it could not ask', async () => {
 		seed({});
-		listTasks.mockRejectedValue(new Error('502 Bad Gateway'));
+		listFiringAlerts.mockRejectedValue(new Error('502 Bad Gateway'));
 
 		render(Overview);
 
 		const zone = within(await attentionZone());
-		expect(zone.getByText(/could not read recent tasks/i)).toBeInTheDocument();
+		expect(zone.getByText(/could not read firing alerts/i)).toBeInTheDocument();
 		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
+		// A failed read is not a choice: it cannot be put off, only read again.
+		const row = within(zone.getByText(/could not read firing alerts/i).closest('[data-attention]') as HTMLElement);
+		expect(row.queryByRole('button', { name: /not now/i })).toBeNull();
+		expect(row.getByRole('button', { name: 'Read again' })).toBeInTheDocument();
 	});
 
 	it('names each unread source separately and doors it to the page that owns it', async () => {
@@ -534,17 +641,16 @@ describe('Overview: a read that did not come back', () => {
 		);
 	});
 
-	it('does not call an unreadable feed "nothing has happened yet"', async () => {
+	it('does not call an unreadable journal "nobody has done anything"', async () => {
 		seed({});
-		listTasks.mockRejectedValue(new Error('down'));
 		listAudit.mockRejectedValue(new Error('down'));
 
 		render(Overview);
 
-		const heading = await screen.findByRole('heading', { name: /recent movement/i });
+		const heading = await screen.findByRole('heading', { name: /what happened/i });
 		const feed = within(heading.closest('section') as HTMLElement);
-		expect(feed.getByText(/could not be read, not because nothing happened/i)).toBeInTheDocument();
-		expect(feed.queryByText(/Nothing has happened yet/i)).not.toBeInTheDocument();
+		expect(await feed.findByText(/could not be read, not because nothing happened/i)).toBeInTheDocument();
+		expect(feed.queryByText(/Nobody has done anything yet/i)).not.toBeInTheDocument();
 	});
 
 	it('still reaches the calm screen when every read actually answered', async () => {
@@ -560,16 +666,16 @@ describe('Overview: a read that did not come back', () => {
 });
 
 /**
- * Claims the Overview made about sets it had only partly read (#704).
+ * Claims the Overview made about sets it had only partly read (#704), and -
+ * since 3.12 - where it says so: in the Estate panel, never as an attention
+ * line (rule 4: no plumbing notes in the list; the operator cannot act on
+ * "read 100 of 240"). The failed and stuck runs are the server's, over the
+ * whole task table, so there is no task slice left to confess to.
  *
- * "agent offline" was computed from the first 100 hosts and "failed"/"stuck"
- * from the 50 most recent tasks, with nothing on the page saying so; "stuck"
- * looked at `running` only, so a task that never left `pending` was invisible;
- * and a journal action with no chip was coloured as a pending review.
- *
- * Teeth: drop the `partial:*` pushes in `load()` and the first test fails;
- * drop `pending` from the stuck filter and the second fails; put the
- * `badge-proposed` fallback back and the third fails.
+ * Teeth: push the partial note back into the attention list and the first test
+ * fails on the line and on the calm sentence; drop `pending` from the server's
+ * stuck filter and test_quiet_overview fails; put the old chip back and the
+ * journal test in "what happened" fails on its words.
  */
 describe('Overview: says how much it read', () => {
 	beforeEach(() => {
@@ -581,39 +687,29 @@ describe('Overview: says how much it read', () => {
 		}
 	});
 
-	it('marks the host and task lines partial when the set is bigger than the page read', async () => {
-		seed({ hosts: [HEALTHY_HOST], tasks: [] });
-		listInventory.mockResolvedValue({ items: [HEALTHY_HOST], total: 240 });
-		listTasks.mockResolvedValue({ items: [], total: 900 });
+	it('says how much of the fleet it read in the Estate panel, not as a line', async () => {
+		seed({ hosts: [HEALTHY_HOST] });
+		listInventory.mockResolvedValue({ items: [HEALTHY_HOST], total: 640 });
 
 		render(Overview);
-		const zone = within(await attentionZone());
 
-		expect(zone.getByText(/checked here for 1 of 240 hosts/i).closest('a')).toHaveAttribute(
-			'href',
-			'/ui/hosts',
-		);
-		expect(zone.getByText(/0 most recent of 900/i).closest('a')).toHaveAttribute(
-			'href',
-			'/ui/records/tasks',
-		);
-		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
+		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
+		expect(document.querySelector('[data-attention]')).toBeNull();
+		expect(screen.getByText(/first 1 of 640 machines/)).toBeInTheDocument();
+		expect(listTasks).not.toHaveBeenCalled();
 	});
 
 	it('calls a task that never left pending stuck', async () => {
 		const queued = new Date(Date.now() - 40 * 60 * 1000).toISOString();
-		seed({
-			tasks: [
-				{
-					...FAILED_TASK,
-					id: 'task-pending-1',
-					status: 'pending',
-					error: null,
-					created_at: queued,
-					finished_at: null,
-				},
-			],
-		});
+		const pending = {
+			...FAILED_TASK,
+			id: 'task-pending-1',
+			status: 'pending',
+			error: null,
+			created_at: queued,
+			finished_at: null,
+		};
+		seed({ summary: { attention: attention({ stuck_runs: [run(pending, 'stuck')] }) } });
 
 		render(Overview);
 		const zone = within(await attentionZone());
@@ -621,34 +717,6 @@ describe('Overview: says how much it read', () => {
 		expect(zone.getByText(/nginx-conf is still pending/i)).toBeInTheDocument();
 	});
 
-	it('gives a journal action it has no chip for a neutral chip, not the review colour', async () => {
-		seed({
-			audit: [
-				{
-					id: 9,
-					timestamp: '2026-08-24T11:00:00Z',
-					user_id: 'operator',
-					source: 'api',
-					action: 'token_minted',
-					artifact_id: null,
-					target_host: null,
-					target_service: null,
-					command: null,
-					exit_code: null,
-					snapshot_id: null,
-					duration_ms: null,
-					details_json: null,
-				},
-			],
-		});
-
-		render(Overview);
-		const heading = await screen.findByRole('heading', { name: /recent movement/i });
-		const chip = within(heading.closest('section') as HTMLElement).getByText('token_minted');
-
-		expect(chip).toHaveClass('badge-neutral');
-		expect(chip).not.toHaveClass('badge-proposed');
-	});
 });
 
 /**
@@ -671,10 +739,9 @@ function minutesAgo(n: number): string {
 	return new Date(Date.now() - n * 60 * 1000).toISOString();
 }
 
-/** The severity chip of the attention line whose text matches. */
-function chipOf(zone: ReturnType<typeof within>, text: RegExp): HTMLElement {
-	const line = zone.getByText(text).closest('a, div') as HTMLElement;
-	return line.querySelector('.badge') as HTMLElement;
+/** The severity of the attention line whose text matches. */
+function chipOf(zone: ReturnType<typeof within>, text: RegExp): string | null {
+	return severityOf(zone.getByText(text));
 }
 
 describe('Overview: attention honesty', () => {
@@ -734,7 +801,7 @@ describe('Overview: attention honesty', () => {
 		expect(fleet).toHaveAttribute('href', '/ui/hosts');
 		expect(fleet.textContent).toContain('2 alert rules watch nothing');
 		expect(fleet.textContent).toContain('for 3d');
-		expect(fleet.querySelector('.badge')).toHaveClass('badge-critical');
+		expect(severityOf(fleet)).toBe('critical');
 		// The cause absorbed its effects: no per-host agent lines, no separate
 		// "rules match no host" line saying the same thing again.
 		expect(zone.queryByText(/agent enrolled but not connected/i)).not.toBeInTheDocument();
@@ -761,10 +828,10 @@ describe('Overview: attention honesty', () => {
 
 		const long = zone.getByRole('link', { name: /db-01: agent enrolled/i });
 		expect(long.textContent).toContain('for 2h');
-		expect(long.querySelector('.badge')).toHaveClass('badge-critical');
+		expect(severityOf(long)).toBe('critical');
 		const blip = zone.getByRole('link', { name: /app-01: agent enrolled/i });
 		expect(blip.textContent).toContain('for 7m');
-		expect(blip.querySelector('.badge')).toHaveClass('badge-warning');
+		expect(severityOf(blip)).toBe('warning');
 	});
 
 	it('puts a subsystem the self-check cannot reach on the Overview, in its own words', async () => {
@@ -804,11 +871,13 @@ describe('Overview: attention honesty', () => {
 		render(Overview);
 		const zone = within(await attentionZone());
 
-		const versions = zone.getByText(skew).closest('a') as HTMLElement;
-		expect(versions).toHaveAttribute('href', '/ui/settings?tab=subsystems');
-		expect(versions.querySelector('.badge')).toHaveClass('badge-warning');
-		expect(chipOf(zone, /Proxmox refused the token/)).toHaveClass('badge-critical');
-		expect(chipOf(zone, /Could not check the reconcilers/)).toHaveClass('badge-warning');
+		// "Agents are OLDER" is the grouped agents line (3.12), with its Upgrade
+		// action - not a second line in the self-check's words.
+		expect(zone.queryByText(skew)).toBeNull();
+		const proxmox = zone.getByText(/Proxmox refused the token/).closest('a') as HTMLElement;
+		expect(proxmox).toHaveAttribute('href', '/ui/settings?tab=subsystems');
+		expect(chipOf(zone, /Proxmox refused the token/)).toBe('critical');
+		expect(chipOf(zone, /Could not check the reconcilers/)).toBe('warning');
 		// ok and off are not attention.
 		expect(zone.queryByText(/Vault is unlocked/)).not.toBeInTheDocument();
 		expect(zone.queryByText(/nowhere else/)).not.toBeInTheDocument();
@@ -828,123 +897,95 @@ describe('Overview: attention honesty', () => {
 		expect(screen.queryByText(/Nothing needs you/i)).not.toBeInTheDocument();
 	});
 
-	it('drops a failure a later run settled, and an install the agent made moot', async () => {
+	// 3.12: which failures a later run superseded, and which are older than a
+	// day, is the SERVER's rule over the whole task table (dashboard/attention.py,
+	// proven in tests/test_quiet_overview.py). The page asks about exactly the
+	// runs the server still asks about, and says in the footer what it left out.
+	// Teeth: drop the footer and the first test fails; re-derive failures from a
+	// task read and the second fails on the extra line.
+	it('says what it left out in the footer, with the way to it', async () => {
 		seed({
 			hosts: [HEALTHY_HOST],
-			tasks: [
-				// Newest first, as the API returns them.
-				{
-					...FAILED_TASK,
-					id: 'task-replay-ok',
-					action: 'replay',
-					status: 'succeeded',
-					error: null,
-					created_at: minutesAgo(60 * 24 * 9),
-					finished_at: minutesAgo(60 * 24 * 9),
-				},
-				{
-					...FAILED_TASK,
-					id: 'task-apply-failed',
-					created_at: minutesAgo(60 * 24 * 10),
-					finished_at: minutesAgo(60 * 24 * 10),
-				},
-				{
-					...FAILED_TASK,
-					id: 'task-install-failed',
-					artifact_id: null,
-					action: 'install_agent',
-					error: 'install: the installer exited 7',
-					result_json: JSON.stringify({ host_id: 'h1', hostname: 'web-01' }),
-					created_at: minutesAgo(60 * 24 * 10),
-					finished_at: minutesAgo(60 * 24 * 10),
-				},
-			],
+			summary: { attention: attention({ left_out: { superseded: 8, older: 0, since: '2026-08-17T00:00:00Z' } }) },
 		});
 
 		render(Overview);
 
 		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
-		expect(screen.queryByText(/apply nginx-conf failed/i)).not.toBeInTheDocument();
-		expect(screen.queryByText(/installer exited 7/i)).not.toBeInTheDocument();
+		const foot = document.querySelector('[data-attention-footer]') as HTMLElement;
+		expect(foot.textContent).toContain('8 failed runs were superseded by later successes and are in Records.');
+		const show = within(foot).getByRole('button', { name: 'Show what was left out' });
+		await fireEvent.click(show);
+		expect(screen.getByRole('link', { name: 'The failed runs, in Records' })).toHaveAttribute('href', '/ui/records/tasks');
+		expect(within(foot).getByRole('button', { name: 'Hide what was left out' })).toHaveAttribute('aria-expanded', 'true');
 	});
 
-	it('keeps an unsettled failure, critical for a day and a warning after', async () => {
+	it('asks about the failed runs the server asks about, critical, and no other', async () => {
+		const fresh = { ...FAILED_TASK, id: 'task-fresh', artifact_id: 'pg-tune', created_at: minutesAgo(90), finished_at: minutesAgo(89) };
 		seed({
-			tasks: [
-				{
-					...FAILED_TASK,
-					id: 'task-fresh',
-					artifact_id: 'pg-tune',
-					created_at: minutesAgo(90),
-					finished_at: minutesAgo(89),
-				},
-				{
-					...FAILED_TASK,
-					id: 'task-old',
-					created_at: minutesAgo(60 * 24 * 3),
-					finished_at: minutesAgo(60 * 24 * 3),
-				},
-				// A failure on ANOTHER artifact does not settle it, nor does an
-				// install whose host cannot be told (recorded before tasks named it).
-				{
-					...FAILED_TASK,
-					id: 'task-legacy-install',
-					artifact_id: null,
-					action: 'install_agent',
-					error: 'install: the installer exited 7',
-					result_json: null,
-					created_at: minutesAgo(60 * 24 * 70),
-					finished_at: minutesAgo(60 * 24 * 70),
-				},
-			],
+			summary: {
+				attention: attention({
+					failed_runs: [run(fresh)],
+					left_out: { superseded: 1, older: 2, since: '2026-08-17T00:00:00Z' },
+				}),
+			},
 		});
 
 		render(Overview);
 		const zone = within(await attentionZone());
 
-		expect(chipOf(zone, /apply pg-tune failed/)).toHaveClass('badge-critical');
-		expect(chipOf(zone, /apply nginx-conf failed/)).toHaveClass('badge-warning');
-		expect(chipOf(zone, /installer exited 7/)).toHaveClass('badge-warning');
+		expect(chipOf(zone, /apply pg-tune failed/)).toBe('critical');
+		expect(zone.queryByText(/apply nginx-conf failed/)).toBeNull();
+		expect(listTasks).not.toHaveBeenCalled();
+		expect(document.querySelector('[data-attention-footer]')?.textContent).toContain(
+			'1 failed run was superseded by later successes and 2 are more than a day old; all are in Records.',
+		);
 	});
 
-	it('names a host Proxmox stopped reporting, with how long and a Forget', async () => {
-		const GONE = {
-			id: 'h9',
-			hostname: 'old-build-vm',
-			status: 'unknown',
-			source: 'hp_created',
-			import_state: 'adopted',
-			absent_since: minutesAgo(60 * 24 * 70),
-			agent_id: 'ag-9',
-			agent_connected: false,
-			agent_offline_since: minutesAgo(60 * 24 * 70),
-		};
+	// Rule 3: machines Proxmox no longer reports are ONE line (prod had seven,
+	// each with its own Forget). Teeth: map each gone host to its own line again
+	// and the count assertion fails; skip the confirm and forgetHost is called
+	// early; stop at the first failure and the report names one host, not both.
+	it('says the machines Proxmox no longer reports as ONE line, with Review and Forget all', async () => {
+		sessionStore.set({ authenticated: true, token_label: 'o', capabilities: ['read', 'write'] } as never);
+		const seven = ['old-web', 'old-db', 'old-cache', 'probe-1', 'probe-2', 'retired-104', 'lab-x'];
 		seed({
-			hosts: [
-				HEALTHY_HOST,
-				GONE,
-				// Never adopted: not news, as on the Hosts page.
-				{ ...GONE, id: 'h10', hostname: 'never-adopted-vm', import_state: 'pending' },
-			],
+			hosts: [HEALTHY_HOST],
+			summary: {
+				attention: attention({
+					gone: {
+						key: 'gone:machines',
+						severity: 'warning',
+						hosts: seven.map((name, i) => ({ id: `g${i}`, hostname: name, absent_since: minutesAgo(60 * 24 * (i + 1)) })),
+					},
+				}),
+			},
 		});
 
 		render(Overview);
 		const zone = within(await attentionZone());
 
-		const line = zone.getByRole('link', { name: /old-build-vm: proxmox no longer reports/i });
-		expect(line).toHaveAttribute('href', '/ui/hosts/h9');
-		expect(line.textContent).toContain('for 70d');
-		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
-		// One reason per host: gone, not also "agent offline".
-		expect(zone.queryByText(/old-build-vm: agent enrolled/i)).not.toBeInTheDocument();
-		expect(zone.queryByText(/never-adopted-vm/i)).not.toBeInTheDocument();
+		expect(document.querySelectorAll('[data-attention^="gone"]')).toHaveLength(1);
+		const row = document.querySelector('[data-attention="gone:machines"]') as HTMLElement;
+		expect(row.textContent).toContain('7 machines no longer exist in Proxmox');
+		expect(row.textContent).toContain('old-web, old-db, old-cache, probe-1, probe-2, retired-104 and 1 more');
+		expect(severityOf(row)).toBe('warning');
+		expect(within(row).getByRole('link', { name: 'Review' })).toHaveAttribute('href', '/ui/hosts?gone=1');
+		expect(zone.queryByText(/old-web: proxmox no longer reports/i)).toBeNull();
 
-		// Forget is the irreversible one, so it asks first.
-		const row = within(line.closest('[data-attention="gone:h9"]') as HTMLElement);
-		await fireEvent.click(row.getByRole('button', { name: /^forget$/i }));
+		// Forget all asks first, then runs the Hosts page's forget for exactly
+		// the seven the line names - and reports the ones that failed by name.
+		forgetHost.mockImplementation(async (id: string) => {
+			if (id === 'g3' || id === 'g5') throw new Error(`409 ${id} is still reported`);
+			return { forgotten: true };
+		});
+		await fireEvent.click(within(row).getByRole('button', { name: 'Forget all 7' }));
 		expect(forgetHost).not.toHaveBeenCalled();
-		await fireEvent.click(row.getByRole('button', { name: /confirm forget/i }));
-		await waitFor(() => expect(forgetHost).toHaveBeenCalledWith('h9'));
+		await fireEvent.click(within(row).getByRole('button', { name: 'Confirm forget 7' }));
+		await waitFor(() => expect(forgetHost).toHaveBeenCalledTimes(7));
+		expect(forgetHost.mock.calls.map((c) => c[0])).toEqual(['g0', 'g1', 'g2', 'g3', 'g4', 'g5', 'g6']);
+		const note = await within(document.querySelector('[data-attention="gone:machines"]') as HTMLElement).findByRole('status');
+		expect(note.textContent).toContain('Forgot 5 of 7. Could not forget probe-1 (409 g3 is still reported), retired-104');
 	});
 
 	it('says why drift is unverified, and stays calm when it is only by design', async () => {
@@ -987,7 +1028,9 @@ describe('Overview: attention honesty', () => {
 		});
 		render(Overview);
 		expect(await screen.findByText(/Nothing needs you/i)).toBeInTheDocument();
-		expect(screen.getByText(/2 not established \(2 describe-only\)/)).toBeInTheDocument();
+		// ...and no line at all: the Overview no longer carries a drift number
+		// (3.12); the drift page names them.
+		expect(document.querySelector('[data-attention]')).toBeNull();
 	});
 });
 
@@ -1083,7 +1126,7 @@ describe('Overview: the Phase A lanes together', () => {
 		expect(line.textContent).toContain('1 host is waiting to join');
 		// The join panel lives on Hosts > Agents since UI slice 1.
 		expect(line).toHaveAttribute('href', '/ui/hosts/agents');
-		expect(line.querySelector('.badge')).toHaveClass('badge-warning');
+		expect(severityOf(line)).toBe('warning');
 	});
 
 	it('stays calm about knocking hosts while the window is open', async () => {
@@ -1129,8 +1172,7 @@ describe('Overview: the Phase A lanes together', () => {
 		expect(line.textContent).toContain('web-01 (VM 101, running)');
 		expect(line.textContent).toContain('db-01 (VM 102, stopped)');
 		expect(line.textContent).toContain('takes the address over');
-		expect(line.querySelector('.badge')).toHaveClass('badge-critical');
-		expect(line.querySelector('.badge')?.textContent).toBe('address clash');
+		expect(severityOf(line)).toBe('critical');
 		// The door is the first holder's Network tab, where every holder is listed.
 		expect(line).toHaveAttribute('href', '/ui/hosts/h1?tab=network');
 	});
@@ -1208,7 +1250,7 @@ describe('Overview: updates available', () => {
 		expect(line).toHaveAttribute('href', RELEASE.url);
 		expect(line).toHaveAttribute('target', '_blank');
 		expect(line).toHaveAttribute('rel', 'noopener noreferrer');
-		expect(line.querySelector('.badge')).toHaveClass('badge-notice');
+		expect(severityOf(line)).toBe('notice');
 		const actions = within(line).getAllByRole('listitem').map((li) => li.textContent);
 		expect(actions).toEqual(RELEASE.operator_actions);
 	});
@@ -1266,14 +1308,14 @@ describe('Overview: updates available', () => {
 			RELEASE.operator_actions,
 		);
 		for (const [line, href, chip] of [
-			[clashes[0], '/ui/hosts/h1?tab=network', 'badge-critical'],
-			[own[0], '/ui/hosts/h-self', 'badge-warning'],
+			[clashes[0], '/ui/hosts/h1?tab=network', 'critical'],
+			[own[0], '/ui/hosts/h-self', 'warning'],
 		] as const) {
 			expect(line).toHaveAttribute('href', href);
 			expect(line).not.toHaveAttribute('target');
 			expect(line).not.toHaveAttribute('rel');
 			expect(line.querySelector('ul')).toBeNull();
-			expect(line.querySelector('.badge')).toHaveClass(chip);
+			expect(severityOf(line)).toBe(chip);
 		}
 	});
 
@@ -1360,9 +1402,9 @@ describe('Overview: lines that act (UI slice 4)', () => {
 			summary: {
 				drift: { total: 3, drifted: 1, in_spec: 2, unknown: 0, checked: 3, in_spec_pct: 66 },
 				artifacts: { proposed: 1 },
+				attention: attention({ failed_runs: [run(FAILED_TASK)], stuck_runs: [run(stuck, 'stuck')] }),
 			},
 			hosts: [HEALTHY_HOST, { ...AGENT_ABSENT_HOST, agent_offline_since: minutesAgo(30) }],
-			tasks: [FAILED_TASK, stuck],
 		});
 
 		render(Overview);
@@ -1383,8 +1425,8 @@ describe('Overview: lines that act (UI slice 4)', () => {
 		expect(line('task:task-abcdef-1').querySelector('time')?.getAttribute('datetime')).toBe(
 			FAILED_TASK.finished_at,
 		);
-		// The head says how much it looked at.
-		expect(screen.getByText(/open · checked 6 of 6 sources/)).toBeInTheDocument();
+		// The head says how many things, and how much it looked at.
+		expect(screen.getByText(/\d+ things · checked 6 of 6 sources/)).toBeInTheDocument();
 	});
 
 	it('opens the enrolment window from the line, asking first, and re-reads', async () => {
@@ -1442,7 +1484,7 @@ describe('Overview: lines that act (UI slice 4)', () => {
 			created_at: minutesAgo(50),
 			finished_at: null,
 		};
-		seed({ tasks: [stuck] });
+		seed({ summary: { attention: attention({ stuck_runs: [run(stuck, 'stuck')] }) } });
 		cancelTask.mockResolvedValue({ ...stuck, status: 'cancelled' });
 
 		render(Overview);
@@ -1450,7 +1492,7 @@ describe('Overview: lines that act (UI slice 4)', () => {
 		const row = within(line('stuck:task-stuck-2'));
 		await fireEvent.click(row.getByRole('button', { name: 'Cancel task' }));
 		expect(cancelTask).not.toHaveBeenCalled();
-		listTasks.mockResolvedValue({ items: [{ ...stuck, status: 'cancelled' }], total: 1 });
+		getDashboard.mockResolvedValue(summary());
 		await fireEvent.click(row.getByRole('button', { name: 'Confirm cancel' }));
 		await waitFor(() => expect(cancelTask).toHaveBeenCalledWith('task-stuck-2'));
 		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
@@ -1463,8 +1505,217 @@ describe('Overview: lines that act (UI slice 4)', () => {
 
 		const calm = await screen.findByText(/Nothing needs you/);
 		const sentence = calm.closest('[data-calm]') as HTMLElement;
-		expect(sentence.textContent).toMatch(/Nothing needs you - checked 6 sources just now\./);
-		expect(within(sentence).getByTitle(/the host inventory, firing alerts, recent tasks/)).toBeInTheDocument();
+		// 3.12: "Nothing needs you." plus what was checked, in one small line.
+		expect(sentence.textContent).toMatch(/^Nothing needs you\.\s*6 sources checked just now · 2 of 2 agents connected · no alert firing$/);
+		expect(within(sentence).getByTitle(/the host inventory, firing alerts, the self-check, enrolment requests, the journal/)).toBeInTheDocument();
 		expect(screen.getByText(/last read just now/)).toBeInTheDocument();
+	});
+});
+
+/**
+ * The quiet Overview's acting lines (3.12): "Upgrade N agents", "Not now, 7
+ * days", and the Estate strip of running machines.
+ *
+ * Teeth (each verified by reverting the behaviour, see the PR):
+ *   - run the upgrades in parallel (or keep going after a failure) and the
+ *     "one at a time, stops at the first failure" test fails on the order and
+ *     on the third host being tried;
+ *   - drop the snooze filter and the snoozed line stays in the list; drop the
+ *     severity comparison and the "more serious" test finds no line;
+ *   - feed the strip every host read and the gone / stopped chips appear.
+ */
+describe('Overview: the quiet lines act', () => {
+	const ADMIN = { authenticated: true, token_label: 'owner', prefix: 'hp_owner000001', capabilities: ['read', 'write', 'admin'] };
+	const installAgent = api.installAgent as ReturnType<typeof vi.fn>;
+	const getTask = api.getTask as ReturnType<typeof vi.fn>;
+	const snoozeAttention = api.snoozeAttention as ReturnType<typeof vi.fn>;
+	const unsnoozeAttention = api.unsnoozeAttention as ReturnType<typeof vi.fn>;
+
+	function agent(name: string, hostId: string | null, version: string | null = 'v3.10.0') {
+		return {
+			agent_id: `ag-${name}`,
+			hostname: name,
+			agent_version: version,
+			control_version: '3.11.0',
+			behind: version ? true : null,
+			host_id: hostId,
+		};
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		sessionStore.set(ADMIN as never);
+		getSelfcheck.mockResolvedValue({ timeout_seconds: 2, counts: {}, subsystems: [] });
+		try {
+			localStorage.clear();
+		} catch {
+			/* storage-less browser */
+		}
+	});
+
+	it('upgrades older agents one at a time and stops at the first failure, naming it', async () => {
+		const agents = [agent('relay', 'h-relay'), agent('llm', 'h-llm'), agent('dns', 'h-dns')];
+		seed({
+			summary: {
+				attention: attention({
+					agents_behind: { key: 'agents:behind:3.11.0', severity: 'warning', control_version: '3.11.0', agents },
+				}),
+			},
+		});
+		const order: string[] = [];
+		installAgent.mockImplementation(async (hostId: string, upgrade: boolean) => {
+			expect(upgrade).toBe(true);
+			// One at a time: the previous host's task is finished before the next starts.
+			order.push(hostId);
+			return { task_id: `t-${hostId}`, status: 'pending', host_id: hostId };
+		});
+		getTask.mockImplementation(async (id: string) =>
+			id === 't-h-llm'
+				? { id, status: 'failed', error: 'verify: the installer reported agent id X, not the live agent Y' }
+				: { id, status: 'succeeded', error: null },
+		);
+
+		render(Overview);
+		await attentionZone();
+		const row = document.querySelector('[data-attention="agents:behind:3.11.0"]') as HTMLElement;
+		expect(row.textContent).toContain('3 agents are older than HomePilot 3.11.0');
+		expect(row.textContent).toContain('relay, llm, dns · on v3.10.0');
+		await fireEvent.click(within(row).getByRole('button', { name: 'Upgrade 3 agents' }));
+		expect(installAgent).not.toHaveBeenCalled();
+		await fireEvent.click(within(row).getByRole('button', { name: 'Confirm upgrade of 3' }));
+
+		const live = () => document.querySelector('[data-attention="agents:behind:3.11.0"]') as HTMLElement;
+		const note = await within(live()).findByRole('status');
+		expect(order).toEqual(['h-relay', 'h-llm']);
+		expect(note.textContent).toContain(
+			'Stopped at llm: verify: the installer reported agent id X, not the live agent Y. 1 agent was upgraded before it; the rest were not tried.',
+		);
+		const states = Array.from(live().querySelectorAll('[data-upgrade-state]')).map((li) => [
+			li.textContent?.trim().split(/\s+/)[0],
+			li.getAttribute('data-upgrade-state'),
+		]);
+		expect(states).toEqual([
+			['relay', 'done'],
+			['llm', 'failed'],
+			['dns', 'waiting'],
+		]);
+	});
+
+	it('offers the upgrade to an admin only, and skips a host it cannot reach', async () => {
+		sessionStore.set({ authenticated: true, token_label: 'w', capabilities: ['read', 'write'] } as never);
+		seed({
+			summary: {
+				attention: attention({
+					agents_behind: {
+						key: 'agents:behind:3.11.0',
+						severity: 'warning',
+						control_version: '3.11.0',
+						agents: [agent('relay', 'h-relay'), agent('nas', null, null)],
+					},
+				}),
+			},
+		});
+		render(Overview);
+		await attentionZone();
+		const row = document.querySelector('[data-attention="agents:behind:3.11.0"]') as HTMLElement;
+		expect(row.textContent).toContain('2 agents are older than HomePilot 3.11.0 or do not say their version');
+		expect(within(row).queryByRole('button', { name: /upgrade/i })).toBeNull();
+	});
+
+	it('puts a line off for 7 days, counts it in the footer, and brings it back', async () => {
+		const until = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+		const drifted = { drift: { total: 3, drifted: 2, in_spec: 1, unknown: 0, checked: 3, in_spec_pct: 33 } };
+		seed({ summary: drifted });
+		snoozeAttention.mockResolvedValue({ key: 'drift', severity: 'critical', until, by: 'owner (hp_owner000001)', at: until });
+
+		render(Overview);
+		await attentionZone();
+		const row = document.querySelector('[data-attention="drift"]') as HTMLElement;
+		// Now the server holds the snooze; the next read carries it.
+		getDashboard.mockResolvedValue(
+			summary({
+				...drifted,
+				attention: attention({
+					snoozes: [{ key: 'drift', severity: 'critical', until, by: 'owner (hp_owner000001)', at: until }],
+				}),
+			}),
+		);
+		await fireEvent.click(within(row).getByRole('button', { name: 'Not now, 7 days' }));
+		await waitFor(() => expect(snoozeAttention).toHaveBeenCalledWith('drift', 'critical'));
+		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
+		const foot = document.querySelector('[data-attention-footer]') as HTMLElement;
+		const day = new Date(until).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+		expect(foot.textContent).toContain(`1 put off until ${day}.`);
+
+		await fireEvent.click(within(foot).getByRole('button', { name: 'Show what was left out' }));
+		const held = document.querySelector('[data-put-off="drift"]') as HTMLElement;
+		expect(held.textContent).toContain('2 artifacts disagree with the host');
+		expect(held.textContent).toContain('by owner (hp_owner000001)');
+		getDashboard.mockResolvedValue(summary(drifted));
+		await fireEvent.click(within(held).getByRole('button', { name: 'Bring back' }));
+		await waitFor(() => expect(unsnoozeAttention).toHaveBeenCalledWith('drift'));
+		expect(await screen.findByText(/artifacts disagree with the host/)).toBeInTheDocument();
+	});
+
+	it('shows a put-off line again at once when it has become more serious', async () => {
+		const until = new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString();
+		// Put off while the agent had been dark for minutes (a warning); it is now
+		// two hours (critical).
+		seed({
+			hosts: [{ ...AGENT_ABSENT_HOST, agent_offline_since: minutesAgo(125) }],
+			summary: {
+				attention: attention({
+					snoozes: [{ key: 'agent:h2', severity: 'warning', until, by: 'owner (hp_owner000001)', at: until }],
+				}),
+			},
+		});
+		render(Overview);
+		const zone = within(await attentionZone());
+		expect(chipOf(zone, /db-01: agent enrolled/)).toBe('critical');
+		expect(document.querySelector('[data-attention-footer]')).toBeNull();
+	});
+
+	it("lists the server's put-off lines in the footer in their own words", async () => {
+		const until = new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString();
+		const snooze = { key: 'gone:machines', severity: 'warning', until, by: 'owner (hp_owner000001)', at: until };
+		seed({
+			summary: {
+				attention: attention({
+					put_off: [
+						{
+							kind: 'gone',
+							line: { key: 'gone:machines', severity: 'warning', hosts: [{ id: 'g1', hostname: 'old-web', absent_since: null }] },
+							snooze,
+						},
+					],
+					snoozes: [snooze],
+				}),
+			},
+		});
+		render(Overview);
+		expect(await screen.findByText(/Nothing needs you/)).toBeInTheDocument();
+		await fireEvent.click(screen.getByRole('button', { name: 'Show what was left out' }));
+		expect((document.querySelector('[data-put-off="gone:machines"]') as HTMLElement).textContent).toContain(
+			'1 machine no longer exists in Proxmox',
+		);
+	});
+
+	it('shows RUNNING machines in the strip, with stopped ones as a link and gone ones nowhere', async () => {
+		seed({
+			hosts: [
+				HEALTHY_HOST,
+				{ id: 'h4', hostname: 'forge-dev', status: 'offline', pve_status: 'stopped', agent_id: null, agent_connected: null },
+				{ id: 'h5', hostname: 'old-web', status: 'unknown', pve_status: 'unknown', absent_since: minutesAgo(60), import_state: 'adopted' },
+			],
+			summary: {
+				inventory: { ...summary().inventory, machines: { running: 1, stopped: 1, gone: 1, other: 0, watched: 1 } },
+			},
+		});
+		render(Overview);
+		const strip = (await screen.findByLabelText('Running machines')) as HTMLElement;
+		expect(within(strip).getByRole('link', { name: /web-01/ })).toHaveAttribute('href', '/ui/hosts/h1');
+		expect(within(strip).queryByText('forge-dev')).toBeNull();
+		expect(within(strip).queryByText('old-web')).toBeNull();
+		expect(within(strip).getByRole('link', { name: '1 stopped' })).toHaveAttribute('href', '/ui/hosts?pve_status=stopped');
 	});
 });

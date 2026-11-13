@@ -132,10 +132,10 @@ describe('the moved panels render on their new pages', () => {
 		expect(screen.getByRole('button', { name: 'Hub token' })).toBeInTheDocument();
 	});
 
-	it('Guests reads the guest overview', async () => {
+	it('Guests reads its friends in one read', async () => {
 		setPage('/ui/guests');
 		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
+		await waitFor(() => expect(api.getGuestFriends).toHaveBeenCalled());
 	});
 
 	it('Assistants is the token list and says what is not built', async () => {
