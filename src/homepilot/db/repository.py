@@ -932,6 +932,7 @@ class Repository:
         q: str | None = None,
         env: str | None = None,
         is_template: bool | None = None,
+        absent: bool | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(limit, 1000)
         offset = max(offset, 0)
@@ -945,6 +946,7 @@ class Repository:
             q=q,
             env=env,
             is_template=is_template,
+            absent=absent,
         )
         params.extend([limit, offset])
         rows = await self.db.fetchall(f"SELECT * FROM hosts{where} LIMIT ? OFFSET ?", params)
@@ -962,6 +964,7 @@ class Repository:
         q: str | None = None,
         env: str | None = None,
         is_template: bool | None = None,
+        absent: bool | None = None,
     ) -> tuple[str, list[Any]]:
         """The filter clauses, in ONE place, for both the list and the count.
 
@@ -995,6 +998,9 @@ class Repository:
         if is_template is not None:
             clauses.append("is_template = ?")
             params.append(int(is_template))
+        if absent is not None:
+            # Gone from Proxmox, or not (the Overview's "Review" door, 3.12).
+            clauses.append("absent_since IS NOT NULL" if absent else "absent_since IS NULL")
         if q:
             # Free text over what an operator types when looking for a machine:
             # its name, where it lives, what it is for. Searched in SQL rather
@@ -1640,6 +1646,16 @@ class Repository:
         "details_json",
     )
 
+    # Who counts as "the system" in the journal (3.12, quiet Overview): the
+    # reconcilers and migrations, and anything recorded with no person or
+    # credential behind it. Everything else is a person or an assistant. The
+    # Overview's "What happened" shows people and assistants and puts this
+    # behind a toggle; ONE predicate, so its count and its list agree.
+    _AUDIT_SYSTEM = (
+        "(COALESCE(user_id, '') IN ('', 'system') "
+        "OR source LIKE 'reconciler:%' OR source LIKE 'migration:%')"
+    )
+
     @classmethod
     def _audit_where(
         cls,
@@ -1648,9 +1664,20 @@ class Repository:
         target_host: str | None,
         source: str | None,
         q: str | None,
+        actor: str | None = None,
+        since: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
+        if actor == "system":
+            clauses.append(cls._AUDIT_SYSTEM)
+        elif actor == "people":
+            clauses.append(f"NOT {cls._AUDIT_SYSTEM}")
+        elif actor is not None:
+            raise ValueError("actor must be 'people' or 'system'")
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since)
         if action is not None:
             clauses.append("action = ?")
             params.append(action)
@@ -1682,10 +1709,12 @@ class Repository:
         limit: int = 100,
         offset: int = 0,
         q: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(limit, 10000)
         offset = max(offset, 0)
-        where, params = self._audit_where(action, artifact_id, target_host, source, q)
+        where, params = self._audit_where(action, artifact_id, target_host, source, q, actor, since)
         params.extend([limit, offset])
         rows = await self.db.fetchall(
             f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -1700,8 +1729,10 @@ class Repository:
         target_host: str | None = None,
         source: str | None = None,
         q: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
     ) -> int:
-        where, params = self._audit_where(action, artifact_id, target_host, source, q)
+        where, params = self._audit_where(action, artifact_id, target_host, source, q, actor, since)
         row = await self.db.fetchone(f"SELECT COUNT(*) as cnt FROM audit_log{where}", params)
         return row["cnt"] if row else 0
 

@@ -1508,6 +1508,25 @@ MIGRATION_CHAIN: tuple[Migration, ...] = (
             ),
         ],
     ),
+    Migration(
+        42,
+        [
+            # "Not now, 7 days" on an Overview line (3.12, quiet Overview). One
+            # row per attention line an operator put off, keyed by the line's
+            # stable key. `severity` is how serious the line was when it was put
+            # off: a line that has become MORE serious since shows again before
+            # `until` (dashboard/attention.py). Not the Phase D attention
+            # service - no history, no per-user state; un-snoozing deletes the
+            # row, and the journal keeps who did what.
+            """CREATE TABLE IF NOT EXISTS attention_snoozes (
+            key         TEXT PRIMARY KEY NOT NULL,
+            severity    TEXT NOT NULL CHECK(severity IN ('notice', 'warning', 'critical')),
+            until       TEXT NOT NULL,
+            snoozed_by  TEXT NOT NULL,
+            snoozed_at  TEXT NOT NULL
+        )""",
+        ],
+    ),
 )
 
 

@@ -472,7 +472,64 @@ export interface UpdateStatus {
 	releases_url: string;
 }
 
+export type AttentionSeverity = 'critical' | 'warning' | 'notice';
+
+/** A run the server asks about: failed in the last day, or stuck (3.12). */
+export interface AttentionRun {
+	key: string;
+	severity: AttentionSeverity;
+	task_id: string;
+	action: string;
+	status: string;
+	artifact_id: string | null;
+	host_id?: string | null;
+	hostname?: string | null;
+	error: string | null;
+	created_at: string;
+	finished_at: string | null;
+}
+
+/** "Not now, 7 days" on one line: until when, and how serious it was then. */
+export interface AttentionSnooze {
+	key: string;
+	severity: AttentionSeverity;
+	until: string;
+	by: string;
+	at: string;
+}
+
+/**
+ * The share of "Needs you" that needs the server's knowledge (3.12): the whole
+ * task table, the hub registry, the snooze table. Snoozed server lines are in
+ * `put_off`, not in their section.
+ */
+export interface ServerAttention {
+	failed_runs: AttentionRun[];
+	/** Failed runs of the last `since`.. that are NOT asked about, and why. */
+	left_out: { superseded: number; older: number; since: string };
+	stuck_runs: AttentionRun[];
+	gone: {
+		key: string;
+		severity: AttentionSeverity;
+		hosts: { id: string; hostname: string; absent_since: string | null }[];
+	} | null;
+	agents_behind: {
+		key: string;
+		severity: AttentionSeverity;
+		control_version: string;
+		agents: AgentUpgrade[];
+	} | null;
+	put_off: { kind: string; line: { key: string; severity: AttentionSeverity } & Record<string, unknown>; snooze: AttentionSnooze }[];
+	/** Every snooze still running, whether or not its line is there now. */
+	snoozes: AttentionSnooze[];
+	checked_at: string;
+}
+
 export interface DashboardSummary {
+	/** What needs the operator that the server decides (3.12). Absent on an older backend. */
+	attention?: ServerAttention;
+	/** When a change last reached a host. Absent on an older backend. */
+	last_applied_at?: string | null;
 	/** Is a newer HomePilot released? Absent on an older backend. */
 	updates?: UpdateStatus;
 	/**
@@ -501,6 +558,8 @@ export interface DashboardSummary {
 			has_agent: boolean;
 			absent: boolean;
 		} | null;
+		/** Machines by state, gone never counted as running or stopped (3.12). */
+		machines?: { running: number; stopped: number; gone: number; other: number; watched: number };
 	};
 	drift: {
 		total: number;
@@ -1066,6 +1125,65 @@ export interface GuestOverview {
 	}>;
 }
 
+/** One machine a friend holds, as the inventory last read it (3.12). */
+export interface FriendMachine {
+	host_id: string;
+	name: string;
+	vmid: number | null;
+	node: string | null;
+	/** The hypervisor's word: running / stopped / paused, or a derived status. */
+	state: string;
+	cores: number | null;
+	memory_mb: number | null;
+	disk_gb: number | null;
+}
+
+/** One invite under a friend; never a token, only its prefix. */
+export interface FriendInvite {
+	id: string;
+	prefix: string;
+	state: 'open' | 'redeemed' | 'expired' | 'revoked' | string;
+	caps: { template_vmid: number; node: string; cores: number | null; memory_mb: number | null; disk_gb: number | null };
+	created_at: string;
+	expires_at: string;
+	redeemed_at: string | null;
+	revoked_at: string | null;
+	host_id: string | null;
+}
+
+export type GuestAxes = { vms: number; cores: number; memory_mb: number; disk_gb: number };
+export type GuestLimits = { vms: number | null; cores: number | null; memory_mb: number | null; disk_gb: number | null };
+
+export interface Friend {
+	cn: string;
+	machines: FriendMachine[];
+	usage: GuestAxes;
+	/** null: no budget at all. A null axis inside: no limit on that axis. */
+	limits: GuestLimits | null;
+	/** Newest first. */
+	invites: FriendInvite[];
+}
+
+export interface InviteSize {
+	cores: number;
+	memory_mb: number;
+	disk_gb: number;
+}
+
+/** GET /admin/guests/friends: the Guests page in one read (3.12). */
+export interface GuestFriends {
+	friends: Friend[];
+	sizing: {
+		presets: Array<InviteSize & { name: string }>;
+		bounds: Record<keyof InviteSize, { min: number; max: number }>;
+		ttl_days: { min: number; max: number; default: number };
+	};
+	/** The provisioning defaults an invite falls back to; null = not set. */
+	defaults: { node: string | null; template_vmid: number | null };
+	/** HP_PORTAL_BASE_URL, so the one-time link can be shown complete. */
+	portal_origin: string | null;
+}
+
 export interface KBEntry {
 	id: number;
 	source: string;
@@ -1298,12 +1416,12 @@ export const api = {
 	},
 
 	// --- Audit ---
-	listAudit(params: { action?: string; artifact_id?: string; source?: string; target_host?: string; q?: string; limit?: number; offset?: number } = {}) {
+	listAudit(params: { action?: string; artifact_id?: string; source?: string; target_host?: string; q?: string; actor?: 'people' | 'system'; since?: string; limit?: number; offset?: number } = {}) {
 		return req<{ items: AuditEntry[]; total: number }>('/audit' + qs(params as Record<string, string | number | boolean | undefined>));
 	},
 
 	// --- Inventory ---
-	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string; env?: string; templates?: 'include' | 'exclude' | 'only'; q?: string; limit?: number; offset?: number } = {}) {
+	listInventory(params: { role?: string; status?: string; managed?: boolean; source?: string; import_state?: string; pve_status?: string; env?: string; templates?: 'include' | 'exclude' | 'only'; absent?: boolean; q?: string; limit?: number; offset?: number } = {}) {
 		return req<{ items: Host[]; total: number; templates_hidden?: number }>('/inventory' + qs(params));
 	},
 	/** Which host HomePilot runs on: confirmed, or proposed for confirmation. */
@@ -1530,6 +1648,19 @@ export const api = {
 			body: JSON.stringify(upgrade ? { host_id: hostId, upgrade: true } : { host_id: hostId }),
 		});
 	},
+	/** "Not now, 7 days" on an Overview line; admin. */
+	snoozeAttention(key: string, severity: AttentionSeverity) {
+		return req<AttentionSnooze>('/dashboard/attention/snoozes', {
+			method: 'POST',
+			body: JSON.stringify({ key, severity }),
+		});
+	},
+	/** Bring a put-off line back now; admin. */
+	unsnoozeAttention(key: string) {
+		return req<{ key: string; snoozed: false }>(`/dashboard/attention/snoozes/${encodeURIComponent(key)}`, {
+			method: 'DELETE',
+		});
+	},
 	// Connected agents older than this control plane or reporting no version.
 	getAgentUpgrades() {
 		return req<AgentUpgrade[]>('/agents/upgrades');
@@ -1664,6 +1795,9 @@ export const api = {
 	// --- Guests (#442 G3) ---
 	getGuests() {
 		return req<GuestOverview>('/admin/guests');
+	},
+	getGuestFriends() {
+		return req<GuestFriends>('/admin/guests/friends');
 	},
 	// `template_vmid` and `node` are nullable because they are OPTIONAL server-side
 	// since #553 C3: omitting them means "use this instance's provisioning

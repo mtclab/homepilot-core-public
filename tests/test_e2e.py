@@ -25,6 +25,7 @@ admin are minted - see the mint budget below.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -1128,6 +1129,137 @@ class TestFleetJourneys:
             assert other not in text, f"the portal told a friend {other!r}: {text}"
         assert _fleet_host(fleet, "alice-web")["pve_status"] == "stopped"
 
+    # -- Guests (3.12) ----------------------------------------------------------
+    # None of these mints a TOKEN (the budget table at the top is POST
+    # /auth/tokens). The one invite minted is POST /admin/guests/invites on the
+    # fleet server's own process and rate window, and it is revoked again.
+
+    def _friend_row(self, page, cn: str):
+        return page.locator(f'[data-friend="{cn}"]')
+
+    @pytest.mark.parametrize("width", [1280, 390])
+    def test_guests_lists_the_friend_with_their_machine_and_the_link_lands_on_its_host_page(
+        self, fleet, browser, width
+    ):
+        from playwright.sync_api import expect
+
+        alice = _fleet_host(fleet, "alice-web")
+        context, page, errors = _fleet_page(
+            fleet, browser, width=width, height=844 if width < 768 else 900
+        )
+        try:
+            page.goto(f"{fleet['base']}/ui/guests")
+            row = self._friend_row(page, "alice")
+            expect(row).to_be_visible()
+            machine = row.locator('[data-machine="alice-web"]')
+            # The live word is the one the inventory holds for that machine.
+            expect(machine.get_by_text(alice["pve_status"], exact=True)).to_be_visible()
+            expect(row.get_by_role("button", name="Invite alice")).to_be_visible()
+            expect(row.get_by_role("button", name="Budget for alice")).to_be_visible()
+            if width < 768:
+                _no_sideways_scroll(page)
+                # A card: who, machines, budget and actions stacked, each below
+                # the last, not squeezed side by side into 390 px.
+                boxes = [
+                    row.locator(f":scope > .{part}").bounding_box()
+                    for part in ("who", "machines", "budget", "acts")
+                ]
+                for above, below in itertools.pairwise(boxes):
+                    assert above and below, boxes
+                    assert below["y"] >= above["y"] + above["height"] - 1, boxes
+            machine.get_by_role("link", name="alice-web").click()
+            page.wait_for_url(f"**/ui/hosts/{alice['id']}")
+            expect(page.get_by_role("heading", name="alice-web")).to_be_visible()
+            assert errors == []
+        finally:
+            context.close()
+
+    def test_the_invite_dialog_mints_shows_the_link_once_and_the_invite_lands_under_the_friend(
+        self, fleet, browser
+    ):
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/guests")
+            row = self._friend_row(page, "alice")
+            row.get_by_role("button", name="Invite alice").click()
+            dialog = page.get_by_test_id("invite-dialog")
+            expect(dialog.get_by_label("Certificate name")).to_have_value("alice")
+            # The fleet has no provisioning defaults, so More options is open and
+            # the dialog asks for the template and node itself.
+            dialog.get_by_label("Template VMID").fill("9000")
+            dialog.get_by_label("Node").fill("pve1")
+            dialog.get_by_role("button", name="Create invite link").click()
+            panel = dialog.locator("[data-invite-link-panel]")
+            expect(panel).to_be_visible()
+            expect(panel).to_contain_text("only time the link is shown")
+            link = panel.get_by_label("Invite link for alice").input_value()
+            token = link.rsplit("/invite/", 1)[1]
+            assert token.startswith("hpi_") and len(token) > 16, link
+            prefix = token[:16]
+            # The page re-read the friends while the link was shown: the invite is
+            # under alice, by its prefix, open.
+            invite = row.locator(f'[data-invite="{prefix}"]')
+            expect(invite).to_have_attribute("data-state", "open")
+
+            panel.get_by_role("button", name="Done").click()
+            expect(dialog).to_have_count(0)
+            assert token[16:] not in page.content()
+            for path in ("/admin/guests/friends", "/admin/guests"):
+                status, body = _fleet_api(fleet, "GET", path)
+                assert status == 200, body
+                assert token[16:] not in json.dumps(body), f"{path} carries the invite token"
+
+            # Revoke it from the row, through the confirm; the server agrees.
+            row.get_by_role("button", name=f"Revoke invite {prefix}").click()
+            page.get_by_test_id("confirm-dialog").get_by_role(
+                "button", name="Revoke invite"
+            ).click()
+            expect(invite).to_have_attribute("data-state", "revoked")
+            _status, body = _fleet_api(fleet, "GET", "/admin/guests/friends")
+            (alice,) = [f for f in body["friends"] if f["cn"] == "alice"]
+            assert [i["state"] for i in alice["invites"] if i["prefix"] == prefix] == ["revoked"]
+            assert errors == []
+        finally:
+            context.close()
+
+    def test_a_budget_set_in_the_dialog_moves_the_bars_and_a_used_up_one_says_so(
+        self, fleet, browser
+    ):
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/guests")
+            row = self._friend_row(page, "alice")
+
+            def set_machines(n: str) -> None:
+                row.get_by_role("button", name="Budget for alice").click()
+                dialog = page.get_by_test_id("budget-dialog")
+                dialog.get_by_label("Machines").fill(n)
+                dialog.get_by_role("button", name="Save budget").click()
+                expect(dialog).to_have_count(0)
+
+            # alice holds alice-web: one machine of one is the whole budget.
+            set_machines("1")
+            expect(row.locator('[data-budget-axis="vms"]')).to_have_text("1 of 1")
+            expect(row.locator("[data-used-up]")).to_contain_text(
+                "alice cannot build another machine until you raise it"
+            )
+            _status, body = _fleet_api(fleet, "GET", "/admin/guests/friends")
+            (alice,) = [f for f in body["friends"] if f["cn"] == "alice"]
+            assert alice["limits"]["vms"] == 1 and alice["usage"]["vms"] == 1, alice
+
+            set_machines("2")
+            expect(row.locator('[data-budget-axis="vms"]')).to_have_text("1 of 2")
+            expect(row.locator("[data-used-up]")).to_have_count(0)
+            assert errors == []
+        finally:
+            context.close()
+            # The fleet is shared by the class: leave alice without a budget.
+            _fleet_api(fleet, "DELETE", "/admin/guests/quota/alice")
+
     # -- Command palette (#806) -------------------------------------------------
 
     def test_ctrl_k_llm_enter_lands_on_the_host_page(self, fleet, browser):
@@ -1326,3 +1458,118 @@ class TestFleetJourneys:
         status, body = _fleet_api(fleet, "POST", f"/artifacts/{made['id']}/withdraw", {})
         assert status == 200, body
         assert _fleet_host(fleet, "llm-test")["pve_status"] == "stopped"
+
+    # -- The quiet Overview (3.12) ----------------------------------------------
+
+    def test_the_overview_says_gone_machines_once_and_a_put_off_line_in_the_footer(
+        self, fleet, browser
+    ):
+        """The fleet server seeds three adopted machines deleted in Proxmox. The
+        Overview says them as ONE line with Review and Forget all 3; "Not now,
+        7 days" takes the line to the footer's count, and Bring back returns it -
+        each step re-read from the server."""
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/")
+            zone = page.locator("section", has=page.get_by_role("heading", name="Needs you"))
+            gone = zone.locator('[data-attention="gone:machines"]')
+            expect(gone).to_contain_text("3 machines no longer exist in Proxmox", timeout=15000)
+            for name in ("old-web", "old-db", "old-cache"):
+                expect(gone).to_contain_text(name)
+            expect(zone.locator('[data-attention^="gone"]')).to_have_count(1)
+            expect(gone.get_by_role("link", name="Review")).to_have_attribute(
+                "href", "/ui/hosts?gone=1"
+            )
+            expect(gone.get_by_role("button", name="Forget all 3")).to_be_visible()
+
+            gone.get_by_role("button", name="Not now, 7 days").click()
+            footer = zone.locator("[data-attention-footer]")
+            expect(footer).to_contain_text(re.compile(r"1 put off until \d+ \w+\."))
+            expect(zone.locator('[data-attention="gone:machines"]')).to_have_count(0)
+            _status, summary = _fleet_api(fleet, "GET", "/dashboard/summary")
+            assert summary["attention"]["gone"] is None
+            assert [p["kind"] for p in summary["attention"]["put_off"]] == ["gone"]
+
+            footer.get_by_role("button", name="Show what was left out").click()
+            held = zone.locator('[data-put-off="gone:machines"]')
+            expect(held).to_contain_text("3 machines no longer exist in Proxmox")
+            held.get_by_role("button", name="Bring back").click()
+            expect(zone.locator('[data-attention="gone:machines"]')).to_have_count(1)
+            _status, summary = _fleet_api(fleet, "GET", "/dashboard/summary")
+            assert len(summary["attention"]["gone"]["hosts"]) == 3
+
+            # Review opens the Hosts list filtered to exactly them.
+            zone.locator('[data-attention="gone:machines"]').get_by_role(
+                "link", name="Review"
+            ).click()
+            page.wait_for_url("**/ui/hosts?gone=1")
+            expect(
+                page.get_by_text("Showing the machines Proxmox no longer reports")
+            ).to_be_visible()
+            for name in ("old-web", "old-db", "old-cache"):
+                expect(page.get_by_role("link", name=name, exact=True).first).to_be_visible()
+            expect(page.get_by_role("link", name="llm", exact=True)).to_have_count(0)
+            assert errors == []
+        finally:
+            context.close()
+
+    def test_what_happened_says_people_in_words_and_system_only_after_the_toggle(
+        self, fleet, browser
+    ):
+        from playwright.sync_api import expect
+
+        # A person's act, through the API with the fleet's own token ("You").
+        status, body = _fleet_api(
+            fleet,
+            "POST",
+            "/dashboard/attention/snoozes",
+            {"key": "e2e:probe", "severity": "notice"},
+        )
+        assert status == 200, body
+        status, body = _fleet_api(fleet, "DELETE", "/dashboard/attention/snoozes/e2e:probe")
+        assert status == 200, body
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/")
+            happened = page.locator(
+                "section", has=page.get_by_role("heading", name="What happened")
+            )
+            people = happened.locator("[data-happened]")
+            expect(people).to_contain_text("You brought back a line on the Overview", timeout=15000)
+            # The reconcilers' work is not among them...
+            expect(people).not_to_contain_text("read the inventory from Proxmox")
+            expect(happened.locator("[data-system-activity]")).to_have_count(0)
+            toggle = happened.get_by_role(
+                "button", name=re.compile(r"^Show system activity \(\d+ today\)$")
+            )
+            expect(toggle).to_be_visible()
+            count = int(re.search(r"\((\d+) today\)", toggle.inner_text()).group(1))
+            assert count >= 1, toggle.inner_text()
+            # ...and are there after the toggle.
+            toggle.click()
+            expect(happened.locator("[data-system-activity]")).to_contain_text(
+                "HomePilot read the inventory from Proxmox"
+            )
+            assert errors == []
+        finally:
+            context.close()
+
+    def test_the_overview_reads_on_a_phone(self, fleet, browser):
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser, width=390, height=844)
+        try:
+            page.goto(f"{fleet['base']}/ui/")
+            gone = page.locator('[data-attention="gone:machines"]')
+            expect(gone).to_be_visible(timeout=15000)
+            # The actions wrap UNDER the sentence on a phone, not beside it.
+            text_box = gone.locator(".attn-say").bounding_box()
+            acts_box = gone.locator(".attn-acts").bounding_box()
+            assert acts_box["y"] >= text_box["y"] + text_box["height"] - 1, (text_box, acts_box)
+            expect(page.get_by_label("Running machines")).to_be_visible()
+            _no_sideways_scroll(page)
+            assert errors == []
+        finally:
+            context.close()

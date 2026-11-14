@@ -10,8 +10,8 @@ until now needed root on the PVE node and so had no product path at all.
 What is deliberately NOT here: minting invites. A minted token is a secret
 that provisions a machine, and an MCP transcript is not a safe place for one -
 the console and the CLI both show it exactly once to a human. The assistant
-can prepare everything about a guest and then say "mint it in Settings ->
-Guests"; it cannot be the channel the secret travels through.
+can prepare everything about a guest and then say "mint it on the Guests
+page"; it cannot be the channel the secret travels through.
 """
 
 from __future__ import annotations
@@ -26,7 +26,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Every portal guest: their machines' total usage (count, cores, memory, "
             "disk) next to their budget limits, plus their invites (prefix, state, "
-            "caps - never tokens)."
+            "caps - never tokens). `friends` is the same per person, as the console's "
+            "Guests page shows it: each friend's machines (host_id, name, vmid, node, "
+            "state as the inventory last read it, size), usage, limits and invites "
+            "(newest first, with created/expires/redeemed/revoked times)."
         ),
         "inputSchema": {"type": "object", "properties": {}},
         "outputSchema": {
@@ -34,8 +37,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "guests": {"type": "array", "items": {"type": "object"}},
                 "invites": {"type": "array", "items": {"type": "object"}},
+                "friends": {"type": "array", "items": {"type": "object"}},
             },
-            "required": ["guests", "invites"],
+            "required": ["guests", "invites", "friends"],
         },
     },
     {
@@ -395,7 +399,15 @@ async def handle_query_guests(arguments: dict[str, Any], ctx: dict[str, Any]) ->
                 },
             }
         )
-    return {"guests": guests, "invites": invites}
+    # The console's per-friend read (GET /admin/guests/friends), built by the
+    # same function so the assistant and the Guests page cannot disagree.
+    from ...guest.friends import friends
+
+    return {
+        "guests": guests,
+        "invites": invites,
+        "friends": await friends(repo, invites_repo),
+    }
 
 
 async def handle_set_guest_quota(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:

@@ -31,9 +31,14 @@ class InventoryReconciler(Reconciler):
         inventory_service: InventoryService,
         repo: Repository,
         neighbour_probe: NeighbourProbe = NO_PROBE,
+        artifact_store: Any = None,
     ) -> None:
         self.inventory_service = inventory_service
         self.repo = repo
+        # Where the changes live, to tell a machine HomePilot destroyed itself
+        # from one that vanished (3.12, inventory/retired.py). None: no
+        # machine is forgotten automatically.
+        self.artifact_store = artifact_store
         # The active ARP probe (lane B2): a seam with no implementation yet,
         # see inventory/addresses.py NeighbourProbe.
         self.neighbour_probe = neighbour_probe
@@ -157,6 +162,20 @@ class InventoryReconciler(Reconciler):
             }
             if address_conflicts is not None:
                 details["address_conflicts"] = address_conflicts
+
+            # Machines HomePilot destroyed through an applied change are
+            # forgotten here, each with its own journal row (3.12). Only off a
+            # COMPLETE sweep - this one - so "gone" is a fact, not a misread.
+            if self.artifact_store is not None:
+                from homepilot.inventory.retired import forget_destroyed_by_homepilot
+
+                try:
+                    retired = await forget_destroyed_by_homepilot(self.repo, self.artifact_store)
+                except sqlite3.Error:
+                    logger.warning("InventoryReconciler retired-host pass failed", exc_info=True)
+                    retired = []
+                if retired:
+                    details["forgotten_destroyed"] = sorted(r["hostname"] for r in retired)
 
             if absent_ids:
                 details["absent_host_ids"] = sorted(absent_ids)

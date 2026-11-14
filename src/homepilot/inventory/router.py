@@ -244,11 +244,15 @@ async def list_inventory(
         ),
     ),
     q: str | None = Query(None, description="Free text over hostname, address, role, tags"),
+    absent: bool | None = Query(
+        None, description="true: only machines Proxmox no longer reports; false: only the rest"
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     repo = request.app.state.repo
     filters: dict[str, Any] = {
+        "absent": absent,
         "q": q,
         "managed": managed,
         "role": role,
@@ -499,7 +503,15 @@ async def create_manual_host_record(
     return dict(host) if host else {"id": host_id}
 
 
-async def forget_host_record(repo: Any, host_id: str, *, actor: str, source: str) -> dict[str, Any]:
+async def forget_host_record(
+    repo: Any,
+    host_id: str,
+    *,
+    actor: str,
+    source: str,
+    artifact_id: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Remove a host from inventory, with its services and observation note.
 
     Refused for a host the hypervisor still reports: deleting it would be undone
@@ -513,8 +525,9 @@ async def forget_host_record(repo: Any, host_id: str, *, actor: str, source: str
     host = await repo.get_host(host_id)
     if host is None:
         raise InventoryError(404, f"Host not found: {host_id}")
-    source = host.get("source")
-    if source != "manual" and not host.get("absent_since"):
+    # The HOST's source, not the caller's: the audit row below records who
+    # forgot it and from where (it used to record the host's source instead).
+    if host.get("source") != "manual" and not host.get("absent_since"):
         raise InventoryError(
             409,
             f"{host.get('hostname')} is still reported by the hypervisor, so the next "
@@ -526,7 +539,9 @@ async def forget_host_record(repo: Any, host_id: str, *, actor: str, source: str
         user_id=actor,
         source=source,
         action="host_forgotten",
+        artifact_id=artifact_id,
         target_host=str(host.get("hostname") or ""),
+        details_json=_json.dumps(details) if details else None,
     )
     return {"id": host_id, "forgotten": True}
 

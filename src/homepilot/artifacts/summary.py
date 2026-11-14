@@ -183,6 +183,27 @@ def _proxmox_step_sentence(
     return f"{method} {path}", None
 
 
+def destroyed_vmids(fm: dict[str, Any], body: str) -> list[int]:
+    """Every guest this change DESTROYS, by VMID - the steps ``summarize`` calls a
+    destroy (``DELETE /nodes/<n>/qemu|lxc/<vmid>``), rendered the way the
+    executor renders them. Empty for any other kind of change."""
+    from homepilot.executor.jinja_utils import interpolation_context
+
+    if fm.get("kind") != ArtifactKind.PROXMOX_API_SEQUENCE.value:
+        return []
+    target = fm.get("target") or {}
+    context = interpolation_context(target, fm)
+    out: list[int] = []
+    for step in _proxmox_steps(body):
+        _, danger = _proxmox_step_sentence(step, context, target_label(target))
+        if danger != "destroy":
+            continue
+        g = _GUEST_PATH.match(_render(step.get("path", ""), context).split("?", 1)[0])
+        if g and str(g["vmid"]).isdigit() and int(g["vmid"]) not in out:
+            out.append(int(g["vmid"]))
+    return out
+
+
 def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
     """The plain-words summary of one artifact.
 

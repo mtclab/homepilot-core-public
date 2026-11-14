@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -17,6 +17,14 @@ async def list_audit(
     target_host: str | None = Query(None),
     source: str | None = Query(None),
     q: str | None = Query(None, description="Free text over artifact, host, command, actor"),
+    actor: Literal["people", "system"] | None = Query(
+        None,
+        description=(
+            "`system`: reconcilers, migrations and rows with no actor; "
+            "`people`: everything else (people and assistants)"
+        ),
+    ),
+    since: str | None = Query(None, description="Only entries at or after this ISO time"),
     limit: int = Query(100, ge=1, le=10000),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -27,6 +35,8 @@ async def list_audit(
         target_host=target_host,
         source=source,
         q=q,
+        actor=actor,
+        since=since,
         limit=limit,
         offset=offset,
     )
@@ -38,5 +48,7 @@ async def list_audit(
         target_host=target_host,
         source=source,
         q=q,
+        actor=actor,
+        since=since,
     )
     return {"items": rows, "total": total}

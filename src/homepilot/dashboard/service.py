@@ -59,6 +59,15 @@ def unknown_reason_bucket(details_json: str | None) -> str:
     return _REASON_TO_BUCKET.get(str(reason or ""), "other")
 
 
+def is_running(row: Any) -> bool:
+    """A machine that is up: Proxmox says running, or - for a machine Proxmox
+    does not describe (a hand-added host, a node) - its own status says so."""
+    pve = row["pve_status"] or ""
+    if pve == "running":
+        return True
+    return pve in ("", "unknown") and row["status"] in ("online", "running")
+
+
 def _parse_ts(value: Any) -> datetime | None:
     if not value:
         return None
@@ -267,6 +276,27 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             or (datetime.now(UTC) - quiet_from).total_seconds() >= FLEET_OFFLINE_GRACE_SECONDS
         )
 
+    # ── Machines (3.12, quiet Overview) ──────────────────────────────────────
+    # The Estate panel's four numbers start here: running and stopped, never
+    # counting a machine Proxmox no longer reports (gone) - a deleted machine
+    # in the count was half the noise on prod's strip. "Watched" is a RUNNING
+    # machine whose agent is connected now. `is_running` is the strip's rule
+    # too (web/src/lib/attention.ts isRunning MUST equal it).
+    machines = {"running": 0, "stopped": 0, "gone": 0, "other": 0, "watched": 0}
+    for row in await db.fetchall(
+        "SELECT agent_id, status, pve_status, absent_since FROM hosts WHERE is_template = 0"
+    ):
+        if row["absent_since"]:
+            machines["gone"] += 1
+        elif is_running(row):
+            machines["running"] += 1
+            if row["agent_id"] in live_ids:
+                machines["watched"] += 1
+        elif row["pve_status"] == "stopped":
+            machines["stopped"] += 1
+        else:
+            machines["other"] += 1
+
     # ── Address clashes (lane B2) ────────────────────────────────────────────
     # Two machines configured onto one address, or one holding an address
     # configured on another. Computed from the address table the inventory
@@ -324,7 +354,16 @@ async def build_summary(repo: Any) -> dict[str, Any]:
 
     updates = await update_status(repo)
 
+    # ── What needs the operator (3.12) ───────────────────────────────────────
+    # The rules that need the whole task table, the registry or the snooze
+    # table (dashboard/attention.py); the browser words them.
+    from .attention import build_attention
+
+    attention = await build_attention(repo, registry, live_ids)
+    last_applied = await db.fetchone("SELECT MAX(applied_at) AS at FROM artifacts")
+
     return {
+        "attention": attention,
         "updates": updates,
         "onboarding": {
             "steps": onboarding_steps,
@@ -343,6 +382,7 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             # left out, so "12 hosts" and the 14 rows Proxmox lists reconcile.
             "templates": templates,
             "self_guest": self_guest,
+            "machines": machines,
         },
         "drift": {
             "total": drift_total,
@@ -358,6 +398,9 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         },
         "artifacts": artifacts_by_status,
         "changes": changes_waiting,
+        # When a change last reached a host, for the calm line ("last change
+        # applied 2 h ago").
+        "last_applied_at": last_applied["at"] if last_applied else None,
         "tasks": tasks_by_status,
         "addresses": {"conflicts": address_conflicts},
         "agents": {

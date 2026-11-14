@@ -1,4 +1,4 @@
-import { render, screen, waitFor, cleanup } from '@testing-library/svelte';
+import { render, screen, waitFor, cleanup, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // test-mocks MUST come before the component, or the component resolves the real
@@ -35,7 +35,6 @@ import { api } from '$lib/api';
  *    unlock-sentence case fails;
  *  - delete a tab's lead-in paragraph -> that tab's case fails.
  */
-const getGuests = api.getGuests as ReturnType<typeof vi.fn>;
 const mintGuestInvite = api.mintGuestInvite as ReturnType<typeof vi.fn>;
 const getSelfcheck = api.getSelfcheck as ReturnType<typeof vi.fn>;
 const listSettingOverrides = api.listSettingOverrides as ReturnType<typeof vi.fn>;
@@ -74,100 +73,138 @@ function nameOf(control: Element): string {
 }
 
 describe('F7: the Guests page explains every value it asks for', () => {
+	// 3.12 moved the two always-open forms into dialogs and the two paragraphs
+	// behind "How the guest portal works". The gate follows them: every field
+	// either dialog asks for still carries its own description, wired the way a
+	// screen reader reads it - now one line, not a paragraph.
+	const getGuestFriends = api.getGuestFriends as ReturnType<typeof vi.fn>;
+	const sizing = {
+		presets: [
+			{ name: 'small', cores: 1, memory_mb: 1024, disk_gb: 20 },
+			{ name: 'medium', cores: 2, memory_mb: 2048, disk_gb: 20 },
+		],
+		bounds: { cores: { min: 1, max: 32 }, memory_mb: { min: 256, max: 65536 }, disk_gb: { min: 1, max: 2000 } },
+		ttl_days: { min: 1, max: 90, default: 7 },
+	};
+	const friend = {
+		cn: 'friend.example',
+		machines: [],
+		usage: { vms: 0, cores: 0, memory_mb: 0, disk_gb: 0 },
+		limits: { vms: 1, cores: null, memory_mb: null, disk_gb: null },
+		invites: [],
+	};
+	function seed(defaults = { node: 'pve1', template_vmid: 9000 }) {
+		getGuestFriends.mockResolvedValue({ friends: [friend], sizing, defaults, portal_origin: null });
+	}
+	async function openInvite() {
+		render(GuestsPage);
+		await userEvent.click(await screen.findByRole('button', { name: 'Invite a friend' }));
+		const dlg = await screen.findByTestId('invite-dialog');
+		await userEvent.click(within(dlg).getByRole('button', { name: 'Custom' }));
+		const more = within(dlg).queryByRole('button', { name: /more options/i });
+		if (more) await userEvent.click(more);
+		return dlg;
+	}
+
 	afterEach(() => cleanup());
 	beforeEach(() => {
 		vi.clearAllMocks();
 		setPage('/ui/guests');
-		getGuests.mockResolvedValue({ guests: [], invites: [] });
+		seed();
 	});
 
-	it('leads with what the guest portal actually is', async () => {
+	it('says what the guest portal actually is, one click away', async () => {
 		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-		const text = panel('guests-panel').textContent ?? '';
+		await waitFor(() => expect(getGuestFriends).toHaveBeenCalled());
+		const summary = await screen.findByText('How the guest portal works');
+		const text = summary.closest('details')?.textContent ?? '';
 		// A friend, a certificate, a machine, a budget: the four nouns an operator
-		// needs before any of the boxes below mean anything.
+		// needs before any of the boxes mean anything.
 		expect(text).toMatch(/client certificate/i);
 		expect(text).toMatch(/guest portal/i);
-		expect(text).toMatch(/budget caps the TOTAL/i);
+		expect(text).toMatch(/budget\s+caps\s+the\s+total/i);
 	});
 
-	it('gives EVERY input on the tab its own explanation', async () => {
-		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-
-		const controls = Array.from(panel('guests-panel').querySelectorAll('input, select, textarea'));
-		// A tab that renders no inputs would pass a per-input walk vacuously.
-		expect(controls.length).toBeGreaterThanOrEqual(10);
-
-		const undescribed = controls.filter((c) => describedBy(c).length < 20).map(nameOf);
-		expect(undescribed).toEqual([]);
-
-		// And every input is labelled, so the description has something to describe.
-		const unlabelled = controls.filter((c) => {
-			const id = c.getAttribute('id');
-			return !id || !document.querySelector(`label[for="${id}"]`);
-		});
-		expect(unlabelled.map(nameOf)).toEqual([]);
+	it('gives EVERY input in both dialogs its own explanation', async () => {
+		// Walked while each dialog is open: a closed dialog's descriptions are
+		// gone from the document with it.
+		function walk(scope: HTMLElement): { count: number; undescribed: string[]; unlabelled: string[] } {
+			const controls = Array.from(scope.querySelectorAll('input, select, textarea'));
+			return {
+				count: controls.length,
+				undescribed: controls.filter((c) => describedBy(c).length < 20).map(nameOf),
+				unlabelled: controls
+					.filter((c) => {
+						const id = c.getAttribute('id');
+						return !id || !document.querySelector(`label[for="${id}"]`);
+					})
+					.map(nameOf),
+			};
+		}
+		const dlg = await openInvite();
+		const invite = walk(dlg);
+		await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }));
+		await userEvent.click(await screen.findByRole('button', { name: 'Budget for friend.example' }));
+		const budget = walk(await screen.findByTestId('budget-dialog'));
+		// cn, cores, memory, disk, ttl, template, node + four budget axes. A
+		// dialog that renders no inputs would pass a per-input walk vacuously.
+		expect(invite.count).toBeGreaterThanOrEqual(7);
+		expect(budget.count).toBe(4);
+		expect([...invite.undescribed, ...budget.undescribed]).toEqual([]);
+		expect([...invite.unlabelled, ...budget.unlabelled]).toEqual([]);
 	});
 
 	it('says that an empty node or template means the Provisioning default', async () => {
-		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-
-		for (const id of ['guest-invite-node', 'guest-invite-template']) {
-			const input = document.getElementById(id);
-			expect(input, id).toBeTruthy();
-			const note = describedBy(input!);
-			expect(note, id).toMatch(/leave it empty/i);
-			expect(note, id).toMatch(/provisioning default/i);
+		const dlg = await openInvite();
+		for (const name of ['Template VMID', 'Node']) {
+			const note = describedBy(within(dlg).getByLabelText(name));
+			expect(note, name).toMatch(/leave it empty/i);
+			expect(note, name).toMatch(/provisioning default/i);
 		}
-		// And the explanation points at the place those defaults are set, rather
-		// than naming a page the operator then has to hunt for.
-		const link = panel('guests-panel').querySelector('a[href="/ui/settings?tab=subsystems"]');
-		expect(link?.textContent).toMatch(/provisioning defaults/i);
 	});
 
-	it('separates the per-machine caps from the friend-wide budget', async () => {
+	it('with no default set, opens More options itself and points at where defaults are set', async () => {
+		seed({ node: null, template_vmid: null } as never);
 		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
+		await userEvent.click(await screen.findByRole('button', { name: 'Invite a friend' }));
+		const dlg = await screen.findByTestId('invite-dialog');
+		const note = describedBy(within(dlg).getByLabelText('Template VMID'));
+		expect(note).toMatch(/no provisioning default is set/i);
+		const link = dlg.querySelector('a[href="/ui/settings?tab=subsystems"]');
+		expect(link?.textContent).toMatch(/subsystems/i);
+	});
 
-		expect(describedBy(document.getElementById('guest-invite-cores')!)).toMatch(
-			/not on the friend/i,
-		);
-		expect(describedBy(document.getElementById('guest-quota-cores')!)).toMatch(
-			/across every machine/i,
-		);
+	it('separates the per-machine size from the friend-wide budget', async () => {
+		const dlg = await openInvite();
+		expect(describedBy(within(dlg).getByLabelText('Cores'))).toMatch(/this one machine/i);
+		await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }));
+		await userEvent.click(await screen.findByRole('button', { name: 'Budget for friend.example' }));
+		const budget = await screen.findByTestId('budget-dialog');
+		expect(describedBy(within(budget).getByLabelText('Cores'))).toMatch(/across all their machines/i);
 		// Lowering a budget is the question an operator asks before typing a
 		// smaller number, so the answer is on the form, not in the docs.
-		expect(panel('guests-panel').textContent).toMatch(/never touches machines that already exist/i);
+		expect(budget.textContent).toMatch(/never touches machines that already exist/i);
 	});
 
-	it('explains the invite TTL, and offers it as a field at all', async () => {
-		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-		const ttl = document.getElementById('guest-invite-ttl');
-		expect(ttl).toBeTruthy();
-		const note = describedBy(ttl!);
-		expect(note).toMatch(/redeemable/i);
-		expect(note).toMatch(/one-time/i);
+	it('explains how long the link lives, and offers it as a field at all', async () => {
+		const dlg = await openInvite();
+		const note = describedBy(within(dlg).getByLabelText('Link valid for'));
+		expect(note).toMatch(/stops working/i);
+		expect(note).toMatch(/once/i);
 	});
 
 	it('mints with no node or template, and shows which defaults the invite got', async () => {
 		mintGuestInvite.mockResolvedValue({
 			id: 'inv1',
-			token: 'abcd.secret',
+			token: 'hpi_abcdabcdabcd.secret',
 			cn: 'friend.example',
 			caps: { node: 'pve1', template_vmid: 9000, pool: null, ipconfig0: null },
 		});
 		render(GuestsPage);
-		await waitFor(() => expect(getGuests).toHaveBeenCalled());
-
-		// The GOAL: an operator who names a person and a size gets an invite. The
-		// infra half is optional server-side (#553 C3) and the form must not
-		// re-impose it.
-		await userEvent.type(document.getElementById('guest-invite-cn')!, 'friend.example');
-		await userEvent.click(screen.getByRole('button', { name: 'Mint' }));
+		await userEvent.click(await screen.findByRole('button', { name: 'Invite a friend' }));
+		const dlg = await screen.findByTestId('invite-dialog');
+		await userEvent.type(within(dlg).getByLabelText('Certificate name'), 'friend.example');
+		await userEvent.click(within(dlg).getByRole('button', { name: 'Create invite link' }));
 
 		await waitFor(() => expect(mintGuestInvite).toHaveBeenCalled());
 		expect(mintGuestInvite.mock.calls[0][0]).toMatchObject({
@@ -175,17 +212,14 @@ describe('F7: the Guests page explains every value it asks for', () => {
 			node: null,
 			template_vmid: null,
 		});
-
-		// The token once, and the resolved defaults next to it - the only place
-		// "empty" is shown to have meant something concrete.
 		const caps = await waitFor(() => {
-			const el = panel('guests-panel').querySelector('[data-minted-caps]');
+			const el = document.querySelector('[data-minted-caps]');
 			if (!el) throw new Error('not yet');
 			return el;
 		});
 		expect(caps.textContent).toMatch(/template 9000/);
 		expect(caps.textContent).toMatch(/pve1/);
-		expect(panel('guests-panel').textContent).toMatch(/shown once and stored nowhere/i);
+		expect(document.querySelector('[data-invite-link-panel]')?.textContent).toMatch(/only time the link is shown/i);
 	});
 });
 

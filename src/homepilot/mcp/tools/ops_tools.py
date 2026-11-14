@@ -85,11 +85,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "never established and why: no agent / check failed / no Proxmox / by "
             "design / other), artifacts and tasks by status, the changes waiting on "
             "the owner (`changes`: proposed, ready to run = approved and not running, "
-            "running), agents known vs connected "
+            "running), when a change was last applied (`last_applied_at`), machines "
+            "running / stopped / gone and how many running ones an agent watches "
+            "(`inventory.machines`), agents known vs connected "
             "(and, when none is connected, since when and whether that has outlasted "
             "the grace period - `offline_alarm`), firing alert "
             "count and metrics retention, plus the first-run onboarding checklist and "
-            "whether it is complete. Current-state aggregates only - use "
+            "whether it is complete. `attention` is what the Overview asks the operator "
+            "about that needs the server's knowledge: failed runs from the last 24 h no "
+            "later run superseded, runs stuck pending/running, the machines Proxmox no "
+            "longer reports (one grouped line), agents older than this HomePilot, the "
+            "lines an operator put off ('Not now, 7 days') with their snoozes, and how "
+            "many failed runs were left out (superseded / older than a day). Current-state "
+            "aggregates only - use "
             "get_host_metrics_series for history. Read-only."
         ),
         "inputSchema": {"type": "object", "properties": {}},
@@ -104,8 +112,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "tasks": {"type": "object"},
                 "agents": {"type": "object"},
                 "metrics": {"type": "object"},
+                "attention": {"type": "object"},
             },
-            "required": ["inventory", "drift", "artifacts", "tasks", "agents"],
+            "required": ["inventory", "drift", "artifacts", "tasks", "agents", "attention"],
         },
     },
     {
@@ -151,6 +160,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "q": {
                     "type": ["string", "null"],
                     "description": "Free text over artifact, host, command, actor",
+                },
+                "actor": {
+                    "type": ["string", "null"],
+                    "enum": ["people", "system", None],
+                    "description": (
+                        "`system`: reconcilers, migrations and rows with no actor; "
+                        "`people`: everything else (people and assistants)"
+                    ),
+                },
+                "since": {
+                    "type": ["string", "null"],
+                    "description": "Only entries at or after this ISO time",
                 },
                 "limit": {
                     "type": "integer",
@@ -357,6 +378,8 @@ async def handle_get_audit_log(arguments: dict[str, Any], ctx: dict[str, Any]) -
         "target_host": arguments.get("target_host"),
         "source": arguments.get("source"),
         "q": arguments.get("q"),
+        "actor": arguments.get("actor"),
+        "since": arguments.get("since"),
     }
     items = await repo.query_audit_log(
         limit=limit,

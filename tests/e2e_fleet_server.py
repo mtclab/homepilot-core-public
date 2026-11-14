@@ -61,6 +61,14 @@ pve.add(130, "alice-web", "stopped", qemu_net("192.0.2.20", "BC:24:11:00:00:30")
 pve.add(141, "batch-1", "stopped", qemu_net("192.0.2.41", "BC:24:11:00:00:41"))
 pve.add(142, "batch-2", "stopped", qemu_net("192.0.2.42", "BC:24:11:00:00:42"))
 pve.add(110, "dns", "running", lxc_net("192.0.2.3", "BC:24:11:00:00:10"), guest_type="lxc")
+# Machines that were adopted and then deleted in Proxmox (3.12, quiet Overview):
+# the Overview says them as ONE line. Removed from the fake after the first
+# sweep has recorded them, so a second sweep marks them gone.
+GONE = {160: "old-web", 161: "old-db", 162: "old-cache"}
+for _vmid, _name in GONE.items():
+    pve.add(
+        _vmid, _name, "stopped", qemu_net(f"192.0.2.{_vmid - 100}", f"BC:24:11:00:01:{_vmid - 100}")
+    )
 
 ENVS = {
     "atlas": "prod",
@@ -118,6 +126,15 @@ async def _seeded(app: Any) -> Any:
                 source="imported",
                 managed=1,
             )
+        for name in GONE.values():
+            row = await repo.get_host_by_hostname(name)
+            assert row is not None, name
+            await repo.update_host(str(row["id"]), import_state="adopted", managed=1)
+        for vmid in GONE:
+            pve.guests.pop(vmid)
+        result = await app.state.inventory_service.refresh_inventory()
+        if not result["complete"] or len(result.get("absent_host_ids", [])) != len(GONE):
+            raise RuntimeError(f"the gone machines were not marked gone: {result}")
         # The friend's machine, as provisioning hands it over.
         alice = await repo.get_host_by_hostname("alice-web")
         await repo.update_host(str(alice["id"]), owner="alice")

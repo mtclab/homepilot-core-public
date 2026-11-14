@@ -162,6 +162,40 @@ async def overview(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/friends", dependencies=[_admin])
+async def friends_overview(request: Request) -> dict[str, Any]:
+    """The Guests page in one read (3.12): friends with their machines, budget
+    use and invites, plus what the Invite dialog needs to offer a size.
+
+    `friends` is the same list `query_guests` returns under that key (one
+    function builds both). The rest is console furniture read from settings the
+    instance already has: the size presets and bounds an invite may carry, the
+    provisioning defaults an invite falls back to, and the portal's public
+    origin so the one-time link can be shown complete. No Proxmox call is made:
+    the page must render while the cluster is unreachable, and there is no
+    node-capacity read to offer.
+    """
+    from ..config import get_settings
+    from .friends import SIZE_BOUNDS, SIZE_PRESETS, TTL_DAYS, friends
+
+    repo = _repo(request)
+    defaults = await provisioning_defaults(request.app.state)
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    return {
+        "friends": await friends(repo, _invites(request)),
+        "sizing": {
+            "presets": list(SIZE_PRESETS),
+            "bounds": SIZE_BOUNDS,
+            "ttl_days": TTL_DAYS,
+        },
+        "defaults": {
+            "node": defaults.node or None,
+            "template_vmid": defaults.template_vmid or None,
+        },
+        "portal_origin": str(getattr(settings, "portal_base_url", "") or "").rstrip("/") or None,
+    }
+
+
 @router.post("/quota", dependencies=[_admin])
 async def put_quota(
     request: Request, body: QuotaIn, token: dict[str, Any] = _principal
