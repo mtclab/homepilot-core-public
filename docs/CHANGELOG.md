@@ -12,6 +12,15 @@ one short dialog.
 
 - Migration 42 adds the table that holds put-off lines. Nothing else to do.
 
+### Security updates
+
+Two dependencies with advisories published on 13 November are updated:
+dnspython 2.9.2 (CVE-2026-128089, a crafted zone file could exhaust memory) and
+opentelemetry-api 1.45.2 (CVE-2026-126360, a crafted trace header could cause a
+regular-expression slowdown). Neither path takes untrusted input in HomePilot's
+normal use; they are updated because the security audit gate refuses known
+advisories.
+
 ### A quiet Overview
 
 The Overview only says what needs you. On prod 3.11.0 it showed 14 attention
