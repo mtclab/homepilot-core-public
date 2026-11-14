@@ -227,8 +227,9 @@ def _emit(data: Any, table: bool) -> None:
         if rows is None:
             click.echo("The answer is not a list of flat objects; printing JSON.", err=True)
         else:
-            from rich.console import Console
             from rich.table import Table
+
+            from homepilot.cli.output import CliConsole
 
             columns: list[str] = []
             for row in rows:
@@ -236,7 +237,7 @@ def _emit(data: Any, table: bool) -> None:
             out = Table(*columns)
             for row in rows:
                 out.add_row(*("" if row.get(c) is None else str(row.get(c)) for c in columns))
-            Console().print(out)
+            CliConsole().print(out)
             return
     click.echo(json.dumps(data, indent=2, default=str))
 

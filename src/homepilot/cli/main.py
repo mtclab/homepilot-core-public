@@ -25,6 +25,7 @@ from homepilot.artifacts.store import ArtifactStore
 from homepilot.auth.principal import Principal
 from homepilot.auth.tokens import generate_api_token
 from homepilot.cli import remote
+from homepilot.cli.output import CliConsole
 from homepilot.common import format_validation_error, write_private
 from homepilot.config import get_settings
 from homepilot.tasks.repository import TERMINAL_TASK_STATUSES
@@ -36,8 +37,13 @@ if TYPE_CHECKING:  # imports kept out of CLI startup, present for type checking 
     from homepilot.db.connection import Database
     from homepilot.portal.repository import InviteRepository
 
-console = Console()
-err_console = Console(stderr=True)
+
+console = CliConsole()
+# soft_wrap: a message is one line, whatever its length (a terminal still wraps
+# it on screen). Hard-wrapping at the console width split "other users can
+# read" across lines when the token file's path was long, so a script grepping
+# stderr - or a test - missed the reason.
+err_console = Console(stderr=True, soft_wrap=True)
 
 app = typer.Typer(
     name="hp",
@@ -197,7 +203,35 @@ def _refuse_if_server_running(settings: Any, what: str) -> None:
         raise typer.Exit(1)
 
 
+class _NoServerSettings:
+    """What `_get_settings()` gives in remote mode: no server configuration at all.
+
+    Building the server's `Settings` is not a read. It resolves the admin
+    secret and hub token through the LOCAL vault, and when there is no hub
+    token it generates one and writes it, with a vault passphrase, into the
+    local data dir (`~/.hp`). A workstation running `hp status` against a
+    remote server minted and kept server secrets of its own, and printed
+    vault warnings on every command (found on the 3.13.0 dev walk).
+
+    Remote paths pass this object through (`_server_is_running`,
+    `_backend_base_url`, `_ephemeral_token` take a `settings` argument and
+    ignore it in remote mode). A remote path that READS server configuration
+    is a bug, and fails here naming the attribute instead of quietly reaching
+    for this machine's data dir.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(
+            f"remote mode read the server setting {name!r}; a remote command must not "
+            "use this machine's HomePilot configuration"
+        )
+
+
 def _get_settings() -> Any:
+    """The server's settings - on the control-plane host only. In remote mode,
+    `_NoServerSettings`: nothing local is constructed, read or written."""
+    if remote.active_target() is not None:
+        return _NoServerSettings()
     return get_settings()
 
 
@@ -4131,7 +4165,7 @@ def agent_revoke(
     async def _revoke() -> bool:
         from homepilot.db.repository import Repository
 
-        settings = get_settings()
+        settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
@@ -4190,7 +4224,7 @@ def agent_remove(
     async def _remove() -> bool:
         from homepilot.db.repository import Repository
 
-        settings = get_settings()
+        settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")

@@ -605,3 +605,73 @@ def test_an_exact_release_version_builds_the_tag_spec() -> None:
 
     assert remote.release_version("v3.12.0") == "3.12.0"
     assert remote.install_spec("3.12.0").endswith("@v3.12.0")
+
+
+def test_remote_mode_touches_nothing_of_this_machines_homepilot(
+    fleet: Fleet, tmp_path: Path
+) -> None:
+    """A workstation is not a server (3.13.0 dev walk).
+
+    Remote commands used to build the SERVER's Settings: that looked up the
+    admin secret and hub token in the local vault (a "vault lookup ... failed"
+    line on every command) and, finding no hub token, generated one and wrote
+    it with a vault passphrase into ~/.hp - server secrets minted on a client.
+    Here HOME and XDG point at an EMPTY directory and HP_DATA_DIR is unset, so
+    any such write lands in that HOME and is seen.
+
+    Also: off a terminal (no COLUMNS, stdout captured), tables print in full -
+    they used to be cut to 80 columns ("2026-11-14-destroy-pro…").
+    """
+    import os
+
+    from .cli_live_server import HP, REPO
+
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "LANG": "C.UTF-8",
+        "PYTHONPATH": str(REPO / "src"),
+        "PROXMOX_SECRETS": "/nonexistent",
+    }
+
+    def hp(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            [str(HP), *args],
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=str(home),
+        )
+        assert result.returncode == 0, f"{args}: {result.stderr}"
+        assert "vault" not in result.stderr.lower(), f"{args} reached a vault: {result.stderr}"
+        _assert_no_token(result, fleet.token)
+        return result
+
+    hp("login", "--url", fleet.base, stdin=fleet.token)
+    hp("status")
+    hosts = hp("hosts", "list", "--gone").stdout
+    changes = hp("changes", "list").stdout
+    hp("api", "raw", "GET", "/health")
+    hp("whoami")
+
+    created = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    allowed = (".config", ".config/homepilot", ".cache", ".cache/homepilot")
+    stray = [
+        p
+        for p in created
+        if p not in allowed
+        and not p.startswith(".config/homepilot/")
+        and not p.startswith(".cache/homepilot/")
+    ]
+    assert not stray, f"remote mode wrote outside the client's own dirs: {stray}"
+
+    assert "…" not in changes and "…" not in hosts, "a table was truncated off a terminal"
+    assert "destroy-probe-1-e2e813" in changes
+    assert "old-cache" in hosts and "Gone since" in hosts

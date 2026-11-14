@@ -43,7 +43,9 @@ def _cli() -> Any:
 def _print(text: str = "", *, err: bool = False) -> None:
     """Plain text that may hold names from the server: never Rich markup."""
     console = _cli().err_console if err else _cli().console
-    console.print(text, markup=False, highlight=False)
+    # soft_wrap: a long line is one line (the terminal may wrap it); off a
+    # terminal Rich would otherwise break it at 80 columns.
+    console.print(text, markup=False, highlight=False, soft_wrap=True)
 
 
 def _table(*columns: str) -> Table:
