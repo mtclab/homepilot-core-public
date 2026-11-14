@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from ..auth.deps import SCOPE_ENFORCER_ATTR, require_scope
+from ..common import OPENAPI_DESTRUCTIVE
 from .audit import ActionType, set_audit_caller
 from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
 from .enrolment_window import (
@@ -899,7 +900,7 @@ async def write_file_to_agent(agent_id: str, body: WriteFileRequest) -> dict[str
     return result
 
 
-@router.post("/{agent_id}/revoke", dependencies=[_admin_only])
+@router.post("/{agent_id}/revoke", dependencies=[_admin_only], openapi_extra=OPENAPI_DESTRUCTIVE)
 async def revoke_agent(agent_id: str, request: Request) -> dict[str, Any]:
     """Revoke an agent's per-agent credential (admin only).
 

@@ -388,29 +388,45 @@ hp agent remove <id>    # Forget a decommissioned agent (revoke, then delete)
 
 ## CLI
 
+`hp` runs on the control-plane host, and from any other machine as a client of
+the server (install, login, profiles and self-update: [docs/cli.md](docs/cli.md)).
+Commands that work on the host's own files say so and refuse in remote mode.
+`hp changes`, `hp hosts` and `hp agents` were `hp artifacts`, `hp inventory` and
+`hp agent`; the old names still work.
+
 ```bash
+hp login                      # save a server profile (--url, --profile); token from stdin or a hidden prompt
+hp whoami                     # server URL and version, the token's label and scope
+hp self-update                # reinstall this CLI at the server's release (uv tool / pipx)
+hp api <group> <operation>    # every API operation, generated from the server's OpenAPI
+                              #   (`hp api --list`, `hp api raw METHOD /path`)
 hp init                       # scripted setup: .env, database, vault secrets, API token
                               #   (the browser claim replaces this for a normal install)
 hp claim-code                 # print the claim code of an unclaimed instance
                               #   (only needed when it is reached from outside its own network)
 hp mcp-serve                  # start the MCP server (stdio or HTTP)
-hp status                     # show daemon info, vault state, artifact counts
-hp artifacts list             # list artifacts
-hp artifacts show <id>        # show artifact detail
-hp artifacts approve <id>     # approve a proposed artifact
-hp artifacts reject <id>      # reject a proposed artifact
-hp artifacts reset-approval <id>  # clear a brute-force approval-code lock
-hp artifacts apply <id>       # apply an approved artifact (via the backend's executor)
-hp artifacts withdraw <id>    # take back an approved artifact that has not run (runs nothing)
-hp artifacts edit <id>        # open artifact in editor
-hp artifacts revoke <id>      # revoke an applied artifact
-hp artifacts replay <id>      # re-apply an already-applied artifact
-hp artifacts push             # push artifact git repo to remote
-hp artifacts pull             # pull artifact git repo from remote
-hp artifacts sync-status      # show git sync status of artifacts
-hp inventory refresh          # sync inventory from Proxmox
-hp inventory list             # list hosts and services
-hp inventory show <host>      # show host detail
+hp status                     # what needs you, machines, agents, alerts, version (remote);
+                              #   on the host with no profile: daemon, vault, artifact counts
+hp changes list               # list changes (--inbox: what waits for review or a run)
+hp changes propose <file>     # propose a change from a YAML/JSON spec
+hp changes approve-and-apply <id>  # approve and run, following it (--no-wait to only start it)
+hp changes show <id>          # show artifact detail
+hp changes approve <id>       # approve a proposed artifact
+hp changes reject <id>        # reject a proposed artifact
+hp changes reset-approval <id>  # clear a brute-force approval-code lock
+hp changes apply <id>         # apply an approved artifact (via the backend's executor)
+hp changes withdraw <id>      # take back an approved artifact that has not run (runs nothing)
+hp changes edit <id>          # open artifact in editor
+hp changes revoke <id>        # revoke an applied artifact
+hp changes replay <id>        # re-apply an already-applied artifact
+hp changes push               # push artifact git repo to remote
+hp changes pull               # pull artifact git repo from remote
+hp changes sync-status        # show git sync status of artifacts
+hp hosts refresh              # sync inventory from Proxmox
+hp hosts list                 # list hosts and services
+hp hosts show <host>          # show host detail
+hp hosts forget <host...>     # forget hosts (--gone: every machine Proxmox no longer reports);
+                              #   names them all and asks first unless --yes
 hp drift                      # detect drift across all applied artifacts
 hp doc <topic>                # look up environment documentation
 hp export                     # export DB + artifacts as tarball (NO secrets - cannot restore a host)
@@ -437,12 +453,28 @@ hp webhook add                # register a webhook endpoint
 hp webhook list               # list webhook configurations
 hp webhook delete             # remove a webhook endpoint
 hp webhook test               # send a test event to a webhook
-hp agent token                # show hub auth token for agent config
-hp agent bootstrap            # generate one-time bootstrap token
-hp agent enrolment-window <action>  # open | close | status the shared-token enrolment window
-hp agent list                 # list connected agents
-hp agent revoke               # revoke an agent's per-agent credential
-hp agent remove <id>          # forget a decommissioned agent (revokes its credential, then deletes the row)
+hp agents token               # show hub auth token for agent config
+hp agents bootstrap           # generate one-time bootstrap token
+hp agents enrolment-window <action># open | close | status the shared-token enrolment window
+hp agents list                # list connected agents
+hp agents upgrade <host...>   # upgrade agents one host at a time (--all: every agent behind)
+hp agents install <host>      # install and enrol the agent through qemu-guest-agent
+hp agents revoke              # revoke an agent's per-agent credential
+hp agents remove <id>         # forget a decommissioned agent (revokes its credential, then deletes the row)
+hp agents forget <id>         # the same as remove
+hp tasks list                 # recent runs (applies, installs, upgrades)
+hp tasks follow <id>          # follow a run to its outcome, printing each change of status
+hp tasks cancel <id>          # cancel a running task
+hp kb list                    # knowledge-base entries (--kind, --target)
+hp kb show <id>               # one entry
+hp kb search <query>          # search the knowledge base
+hp kb add <file>              # record a note from a file or stdin (--target, --kind)
+hp alerts                     # the alerts firing now
+hp channels list              # notification channels (endpoints redacted)
+hp channels test <id>         # send a test message and say whether it arrived
+hp guests list                # friends with their machines, budgets and open invites
+hp power <host> <action>      # start | shutdown | reboot | stop, directly (asks; stop and
+                              #   protected machines need the name typed back)
 ```
 
 ## Tokens

@@ -1110,12 +1110,13 @@ wheels = [
 
 [[package]]
 name = "homepilot"
-version = "3.12.0"
+version = "3.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "asyncssh" },
+    { name = "click" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "homepilot-proxmox-mcp" },
@@ -1166,6 +1167,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.21" },
     { name = "asyncssh", specifier = ">=2.17" },
     { name = "bandit", marker = "extra == 'security'", specifier = ">=1.9.4,<2" },
+    { name = "click", specifier = ">=8.1" },
     { name = "cryptography", specifier = ">=44.0" },
     { name = "detect-secrets", marker = "extra == 'security'", specifier = ">=1.5" },
     { name = "faker", marker = "extra == 'dev'", specifier = ">=37.0" },

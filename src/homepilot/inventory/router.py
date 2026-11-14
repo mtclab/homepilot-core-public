@@ -18,6 +18,7 @@ from ..agent_hub.version_skew import control_plane_version as _control_plane_ver
 from ..agent_hub.version_skew import is_behind as _is_behind
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import ACTOR_ADMIN_SECRET, audit_actor, principal_from_token
+from ..common import OPENAPI_DESTRUCTIVE
 from .addresses import find_conflicts
 from .fleet_model import (
     ENV_SOURCE_USER,
@@ -778,7 +779,11 @@ async def get_power_state(request: Request, host_id: str) -> dict[str, Any]:
     return result
 
 
-@router.post("/{host_id}/power", dependencies=[Depends(require_scope("admin"))])
+@router.post(
+    "/{host_id}/power",
+    dependencies=[Depends(require_scope("admin"))],
+    openapi_extra=OPENAPI_DESTRUCTIVE,
+)
 async def power_host(
     request: Request, host_id: str, body: PowerRequest, token: dict[str, Any] = _principal
 ) -> Any:

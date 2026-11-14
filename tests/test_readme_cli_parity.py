@@ -8,10 +8,9 @@ the reference block).
 A documented-but-absent command is the worse half: an operator (or an LLM
 reading the README) plans around a command that exits with a usage error.
 
-Commands are discovered by parsing ``cli/main.py`` for ``@<app>.command(...)``
-decorators and mapping each Typer sub-app to its ``add_typer(name=...)`` group,
-rather than importing and walking Typer internals - the parse is stable across
-Typer versions and needs no app instantiation.
+Commands are discovered by walking the real Typer command tree (visible
+commands only): since remote mode (#remote-cli) commands are registered from
+more than one module and old group names stay as hidden aliases.
 
 Teeth: add a command to ``cli/main.py`` without documenting it, or document one
 that does not exist, and this fails naming it.
@@ -23,7 +22,6 @@ import re
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_CLI_SOURCE = _REPO_ROOT / "src" / "homepilot" / "cli" / "main.py"
 _README = _REPO_ROOT / "README.md"
 
 # Commands intentionally absent from the README reference block, each with a
@@ -37,21 +35,29 @@ def _strip_args(command: str) -> str:
 
 
 def _registered_commands() -> set[str]:
-    """Every `hp ...` command registered in cli/main.py."""
-    if not _CLI_SOURCE.exists():
-        raise AssertionError(f"CLI source not found at {_CLI_SOURCE}")
-    src = _CLI_SOURCE.read_text(encoding="utf-8")
+    """Every visible `hp ...` command, walked from the real command tree.
 
-    groups: dict[str, str] = dict(re.findall(r'app\.add_typer\((\w+),\s*name="([^"]+)"\)', src))
-    groups["app"] = ""  # the root Typer app contributes no group prefix
+    The tree, not a parse of ``cli/main.py``: the operator commands are
+    registered from ``cli/ops.py`` and the groups have pre-3.13 names kept as
+    hidden aliases (`hp artifacts` = `hp changes`), which a regex over one file
+    cannot see. Hidden commands and groups are not documented, by design.
+    """
+    import typer
+
+    from homepilot.cli.main import app
 
     commands: set[str] = set()
-    for match in re.finditer(r'@(\w+)\.command\(\s*(?:"([^"]+)")?[^)]*\)\s*\ndef (\w+)', src):
-        app_var, explicit_name, func_name = match.groups()
-        if app_var not in groups:
-            continue
-        name = explicit_name or func_name.replace("_", "-")
-        commands.add(f"hp {groups[app_var]} {name}".replace("  ", " ").strip())
+
+    def walk(cmd: object, prefix: str) -> None:
+        # Typer vendors its own click, so its groups are duck-typed here.
+        subs = getattr(cmd, "commands", None) or {}
+        if not subs:
+            commands.add(prefix)
+        for name, sub in subs.items():
+            if not getattr(sub, "hidden", False):
+                walk(sub, f"{prefix} {name}")
+
+    walk(typer.main.get_command(app), "hp")
     return commands
 
 

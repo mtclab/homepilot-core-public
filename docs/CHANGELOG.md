@@ -1,5 +1,65 @@
 # Changelog
 
+## 3.13.0 - 2026-11-14
+
+`hp` works from any machine. Install it on a workstation, log in to a server
+once, and it talks to that server over the API, tells you when it is older than
+the server, and reinstalls itself at the server's release. Every operation the
+API has is reachable from it, so an operator or an assistant no longer needs
+raw API calls, and no session restart to pick up a newer server.
+
+### Operator actions
+
+None.
+
+### A CLI for any machine
+
+- **Install** with one command, at your server's release:
+  `uv tool install git+https://github.com/mtclab/homepilot-core-public@vX.Y.Z`
+  (or the same spec with `pipx install`). See docs/cli.md.
+- **`hp login --url https://... --profile prod`** reads the token from stdin or
+  a hidden prompt - never from the command line - checks it against the server,
+  and saves a profile in `~/.config/homepilot/client.toml`. The token goes in its
+  own file, 0600 in a 0700 directory; a token file other users can read is
+  refused with the `chmod` that fixes it. TLS is always verified; a server with
+  a self-signed certificate is trusted by naming its CA (`--ca-file`), and plain
+  http is refused to anything but loopback unless the profile opts in.
+- **Profiles**: `--profile/-p` or `HP_PROFILE` picks one; the first one saved is
+  the default. Scripts can skip the file with `--url`/`HP_URL` and `HP_TOKEN`.
+  With no profile, `hp` on the server behaves exactly as before.
+- **`hp whoami`** shows the server, its version, and the token's label and scope.
+- **Keeping up**: on its first call to a server each run, `hp` reads the
+  server's version and, when it is older, says so in one line on stderr
+  ("run `hp self-update`") - never on stdout, so `--json` output stays clean.
+  **`hp self-update`** reinstalls a `uv tool` or pipx install at the server's
+  release from the mirror's tag and checks the version that landed.
+- **`hp api`** is every operation of the API, built at run time from the
+  server's own OpenAPI document (cached per server version), so a route a newer
+  server adds is usable before the CLI is updated: `hp api --list`,
+  `hp api inventory get-host ID`, `hp api monitoring create-rule --name ...`,
+  `hp api raw GET /path`. JSON out, `--table` for lists of flat objects. A
+  DELETE, or an operation the server marks destructive (new OpenAPI extension
+  `x-hp-destructive` on revoke, reject, withdraw, cancel and power), names what
+  it will affect and asks first; without a terminal it refuses unless `--yes`.
+- **Everyday commands over the API**, tables by default and `--json` for
+  scripts, exit codes that mean something (0 done, 1 refused with the server's
+  reason, 2 usage, 3 outcome unknown): `hp status` (Needs you, machines,
+  agents, alerts, changes waiting, version, update), `hp hosts list --gone`,
+  `hp hosts forget NAME... | --gone` (names every host and asks first),
+  `hp agents upgrade NAME... | --all` (one host at a time, stops at the first
+  failure and says why), `hp agents install`, `hp agents forget`,
+  `hp changes list --inbox | show | propose | approve | apply | approve-and-apply
+  | withdraw | reject`, `hp tasks list | follow | cancel` (live status),
+  `hp kb list | show | search | add`, `hp alerts`, `hp channels list | test`,
+  `hp guests list`, and `hp power NAME start|shutdown|reboot|stop` with the
+  console's guards (a hard stop or a protected machine needs its name typed).
+- `hp changes`, `hp hosts` and `hp agents` are the new names of `hp artifacts`,
+  `hp inventory` and `hp agent`, which keep working. JSON from
+  `hp hosts list|show` is now printed unwrapped, so it always parses.
+- Commands that work on the server's own files (`hp vault`, `hp db`,
+  `hp export`, `hp artifacts edit`, ...) refuse in remote mode and say why,
+  naming the `hp api` command that does the same over the API where there is one.
+
 ## 3.12.0 - 2026-11-13
 
 The Overview only says what needs you, and Guests starts from your friends.
