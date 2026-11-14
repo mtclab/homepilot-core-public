@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import audit_actor
-from ..common import format_validation_error
+from ..common import OPENAPI_DESTRUCTIVE, format_validation_error
 from ..portal.models import InviteCaps
 from ..portal.repository import InviteRepository, invite_state
 from ..provision.defaults import (
@@ -375,7 +375,7 @@ async def mint_invite(
     }
 
 
-@router.post("/invites/{prefix}/revoke", dependencies=[_admin])
+@router.post("/invites/{prefix}/revoke", dependencies=[_admin], openapi_extra=OPENAPI_DESTRUCTIVE)
 async def revoke_invite(
     request: Request, prefix: str, token: dict[str, Any] = _principal
 ) -> dict[str, Any]:

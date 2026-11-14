@@ -24,6 +24,8 @@ from homepilot.artifacts.lifecycle import ArtifactLifecycle
 from homepilot.artifacts.store import ArtifactStore
 from homepilot.auth.principal import Principal
 from homepilot.auth.tokens import generate_api_token
+from homepilot.cli import remote
+from homepilot.cli.output import CliConsole
 from homepilot.common import format_validation_error, write_private
 from homepilot.config import get_settings
 from homepilot.tasks.repository import TERMINAL_TASK_STATUSES
@@ -35,8 +37,13 @@ if TYPE_CHECKING:  # imports kept out of CLI startup, present for type checking 
     from homepilot.db.connection import Database
     from homepilot.portal.repository import InviteRepository
 
-console = Console()
-err_console = Console(stderr=True)
+
+console = CliConsole()
+# soft_wrap: a message is one line, whatever its length (a terminal still wraps
+# it on screen). Hard-wrapping at the console width split "other users can
+# read" across lines when the token file's path was long, so a script grepping
+# stderr - or a test - missed the reason.
+err_console = Console(stderr=True, soft_wrap=True)
 
 app = typer.Typer(
     name="hp",
@@ -44,8 +51,10 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
-artifacts_app = typer.Typer(help="Artifact management")
-app.add_typer(artifacts_app, name="artifacts")
+artifacts_app = typer.Typer(help="Changes (artifacts): review, approve, apply, follow")
+app.add_typer(artifacts_app, name="changes")
+# The pre-3.13 name; still works, hidden from help.
+app.add_typer(artifacts_app, name="artifacts", hidden=True)
 
 policy_app = typer.Typer(help="Policy management")
 app.add_typer(policy_app, name="policy")
@@ -59,8 +68,9 @@ app.add_typer(token_app, name="token")
 vault_app = typer.Typer(help="Vault secret management (requires HP_VAULT_PASSPHRASE)")
 app.add_typer(vault_app, name="vault")
 
-inventory_app = typer.Typer(help="Inventory management")
-app.add_typer(inventory_app, name="inventory")
+inventory_app = typer.Typer(help="Hosts (the inventory): list, show, forget")
+app.add_typer(inventory_app, name="hosts")
+app.add_typer(inventory_app, name="inventory", hidden=True)
 
 webhook_app = typer.Typer(help="Webhook management")
 app.add_typer(webhook_app, name="webhook")
@@ -161,7 +171,14 @@ async def _open_cli_db(what: str, db_path: Path | None = None) -> Any:
 
 
 def _server_is_running(settings: Any) -> bool:
-    """Whether a backend holds this data directory (it takes the instance lock)."""
+    """Whether a backend holds this data directory (it takes the instance lock).
+
+    In remote mode the answer is always yes: the server the profile names owns
+    the state, so every command that picks "through the API" or "straight into
+    the database" picks the API - there is no local database to fall back to.
+    """
+    if remote.active_target() is not None:
+        return True
     from homepilot.instance_lock import another_instance_is_running
 
     return bool(another_instance_is_running(settings.data_dir))
@@ -186,7 +203,35 @@ def _refuse_if_server_running(settings: Any, what: str) -> None:
         raise typer.Exit(1)
 
 
+class _NoServerSettings:
+    """What `_get_settings()` gives in remote mode: no server configuration at all.
+
+    Building the server's `Settings` is not a read. It resolves the admin
+    secret and hub token through the LOCAL vault, and when there is no hub
+    token it generates one and writes it, with a vault passphrase, into the
+    local data dir (`~/.hp`). A workstation running `hp status` against a
+    remote server minted and kept server secrets of its own, and printed
+    vault warnings on every command (found on the 3.13.0 dev walk).
+
+    Remote paths pass this object through (`_server_is_running`,
+    `_backend_base_url`, `_ephemeral_token` take a `settings` argument and
+    ignore it in remote mode). A remote path that READS server configuration
+    is a bug, and fails here naming the attribute instead of quietly reaching
+    for this machine's data dir.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(
+            f"remote mode read the server setting {name!r}; a remote command must not "
+            "use this machine's HomePilot configuration"
+        )
+
+
 def _get_settings() -> Any:
+    """The server's settings - on the control-plane host only. In remote mode,
+    `_NoServerSettings`: nothing local is constructed, read or written."""
+    if remote.active_target() is not None:
+        return _NoServerSettings()
     return get_settings()
 
 
@@ -588,14 +633,25 @@ def claim_code() -> None:
 
 
 @app.command()
-def status() -> None:
-    """Show whether a backend holds this data dir, the configured PVE address,
-    whether the vault opens, and artifact counts.
+def status(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON (remote mode)"),
+) -> None:
+    """What needs you on the server, or (on the control-plane host) this host's state.
+
+    Against a server (a profile, or --url): the Overview's "Needs you" lines,
+    machines, agents, alerts, changes waiting, version and update. On the host
+    with no profile: whether a backend holds this data dir, the configured PVE
+    address, whether the vault opens, and artifact counts.
 
     The PVE row is the CONFIGURED address; nothing here connects to it (#704:
     the docstring promised connectivity it never checked). Settings -> Proxmox
     in the web UI runs a real connection test.
     """
+    if remote.active_target() is not None:
+        from homepilot.cli import ops
+
+        ops.remote_status(json_output)
+        return
     settings = _get_settings()
     data_dir = Path(settings.data_dir)
 
@@ -668,10 +724,21 @@ def mcp_serve(
 def artifacts_list(
     status: str | None = typer.Option(None, "--status", help="Filter by status"),
     kind: str | None = typer.Option(None, "--kind", help="Filter by kind"),
+    inbox: bool = typer.Option(False, "--inbox", help="Only what waits: proposed and approved"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
-    """List artifacts in a table."""
+    """List changes in a table (the server's, in remote mode)."""
+    if remote.active_target() is not None:
+        from homepilot.cli import ops
+
+        ops.changes_list(status, kind, inbox, json_output)
+        return
     store = _get_artifact_store()
-    results = store.list(status=status, kind=kind)
+    statuses = ["proposed", "approved"] if inbox else [status]
+    results = [a for one in statuses for a in store.list(status=one, kind=kind)]
+    if json_output:
+        typer.echo(json.dumps(results, default=str))
+        return
 
     table = Table(title="Artifacts")
     table.add_column("ID", style="cyan", no_wrap=True)
@@ -696,8 +763,14 @@ def artifacts_list(
 def artifacts_show(
     id: str = typer.Argument(..., help="Artifact ID"),
     diff: bool = typer.Option(False, "--diff", help="Show git diff for last change"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON (remote mode)"),
 ) -> None:
-    """Render full artifact with rich formatting."""
+    """Render full artifact with rich formatting (the server's copy, in remote mode)."""
+    if remote.active_target() is not None:
+        from homepilot.cli import ops
+
+        ops.changes_show(id, json_output)
+        return
     store = _get_artifact_store()
     try:
         fm, body = store.read(id)
@@ -1089,6 +1162,9 @@ def _run_artifact_task(
 def artifacts_apply(
     id: str = typer.Argument(..., help="Artifact ID"),
     approve: bool = typer.Option(False, "--approve", help="Approve first, then apply"),
+    wait: bool = typer.Option(
+        True, "--wait/--no-wait", help="Follow the run to its outcome (default), or only start it"
+    ),
 ) -> None:
     """Apply an approved artifact (or approve+apply together).
 
@@ -1103,6 +1179,11 @@ def artifacts_apply(
         _lifecycle_transition("approve", id, None)
         console.print(f"[green]Approved: {id}[/green]")
 
+    if not wait:
+        from homepilot.cli import ops
+
+        ops.changes_run(id, "apply", wait=False, past="Applied")
+        return
     _run_artifact_task("POST", f"/artifacts/{id}/apply", {}, "Applied", id)
 
 
@@ -2617,6 +2698,13 @@ async def _ephemeral_token(
     """
     import httpx
 
+    target = remote.active_target()
+    if target is not None:
+        # Remote mode: the profile's own token IS the credential. Nothing is
+        # minted on the server and nothing needs deleting afterwards.
+        yield target.token, None
+        return
+
     token, err = await _mint_token_via_api(
         settings, label, scope, expires_in_seconds=_CLI_TOKEN_TTL_SECONDS
     )
@@ -3154,6 +3242,9 @@ def inventory_list(
     role: str = typer.Option("", "--role", "-r", help="Filter by role"),
     status: str = typer.Option("", "--status", "-s", help="Filter by status"),
     output: str = typer.Option("table", "--output", "-o", help="Output format: table or json"),
+    gone: bool = typer.Option(False, "--gone", help="Only machines Proxmox no longer reports"),
+    running: bool = typer.Option(False, "--running", help="Only machines Proxmox reports running"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON (same as -o json)"),
 ) -> None:
     """List hosts in inventory - from the running backend, or the database when it is stopped."""
     from urllib.parse import urlencode
@@ -3177,6 +3268,10 @@ def inventory_list(
             if status:
                 filt["status"] = status
             hosts: list[dict[str, Any]] = await svc.query_inventory(filter=filt or None)
+            if gone:
+                hosts = [h for h in hosts if h.get("absent_since")]
+            if running:
+                hosts = [h for h in hosts if h.get("pve_status") == "running"]
             return hosts
         finally:
             await db.close()
@@ -3187,6 +3282,8 @@ def inventory_list(
             "limit": 1000,
             **({"role": role} if role else {}),
             **({"status": status} if status else {}),
+            **({"absent": "true"} if gone else {}),
+            **({"pve_status": "running"} if running else {}),
         }
         page = (
             _via_backend(
@@ -3199,8 +3296,9 @@ def inventory_list(
     else:
         hosts = asyncio.run(_list())
 
-    if output == "json":
-        console.print(json.dumps(hosts, default=str))
+    if output == "json" or json_output:
+        # typer.echo, not the console: machine output is never line-wrapped.
+        typer.echo(json.dumps(hosts, default=str))
         return
 
     if not hosts:
@@ -3213,6 +3311,8 @@ def inventory_list(
     table.add_column("Role")
     table.add_column("Status")
     table.add_column("Node")
+    if gone:
+        table.add_column("Gone since")
     for h in hosts:
         table.add_row(
             h.get("hostname", ""),
@@ -3220,6 +3320,7 @@ def inventory_list(
             h.get("role", "") or "—",
             h.get("status", "") or "unknown",
             h.get("node", "") or "—",
+            *([str(h.get("absent_since") or "")] if gone else []),
         )
     console.print(table)
     if truncated:
@@ -3232,6 +3333,7 @@ def inventory_list(
 def inventory_show(
     hostname: str = typer.Argument(..., help="Hostname to look up"),
     output: str = typer.Option("text", "--output", "-o", help="Output format: text or json"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON (same as -o json)"),
 ) -> None:
     """Show details for a specific host."""
 
@@ -3269,8 +3371,8 @@ def inventory_show(
         err_console.print(f"[red]Host '{hostname}' not found in inventory[/red]")
         raise typer.Exit(1)
 
-    if output == "json":
-        console.print(json.dumps(host, default=str))
+    if output == "json" or json_output:
+        typer.echo(json.dumps(host, default=str))
         return
 
     table = Table(show_header=False, box=None)
@@ -3686,15 +3788,36 @@ def webhook_test(
 
 # ── Agent management ──────────────────────────────────────────────────────────
 
-agent_app = typer.Typer(help="Agent hub management")
-app.add_typer(agent_app, name="agent")
+agent_app = typer.Typer(help="Agents: list, upgrade, install, forget, enrolment")
+app.add_typer(agent_app, name="agents")
+app.add_typer(agent_app, name="agent", hidden=True)
 
 
 def _backend_http_client(timeout: float) -> Any:
-    """The HTTP client every CLI-to-backend call goes through (a test seam)."""
+    """The HTTP client every CLI-to-backend call goes through (a test seam).
+
+    In remote mode it verifies TLS against the system trust store plus the
+    profile's ``ca_file``; on loopback there is no TLS to verify."""
     import httpx
 
+    target = remote.active_target()
+    if target is not None:
+        return remote.http_client(target, timeout)
     return httpx.AsyncClient(timeout=timeout)
+
+
+def _backend_base_url(settings: Any) -> str:
+    """The backend this run talks to: the remote target, or this box's loopback."""
+    target = remote.active_target()
+    if target is not None:
+        return target.base()
+    return f"http://127.0.0.1:{getattr(settings, 'daemon_port', 8000)}"
+
+
+def _where() -> str:
+    """How an error names the backend: the remote URL, or "the backend"."""
+    target = remote.active_target()
+    return f"the server at {target.base()}" if target is not None else "the HomePilot backend"
 
 
 class BackendRefusedError(RuntimeError):
@@ -3730,7 +3853,11 @@ def _via_backend(
     """
     from rich.markup import escape
 
-    lead = f"The HomePilot backend is running, so `{what}` goes through its API - "
+    target = remote.active_target()
+    if target is not None:
+        lead = f"`{what}` went to {target.base()} - "
+    else:
+        lead = f"The HomePilot backend is running, so `{what}` goes through its API - "
     try:
         return asyncio.run(_backend_api(method, path, body, scope=scope))
     except BackendRefusedError as exc:
@@ -3738,11 +3865,12 @@ def _via_backend(
             err_console.print(f"[yellow]{lead}and it answered: {escape(not_found)}[/yellow]")
         else:
             err_console.print(
-                f"[red]{lead}and it refused ({exc.status}):[/red] {escape(exc.detail)}"
+                f"[red]{lead}and it refused ({exc.status}):[/red] "
+                f"{escape(remote.redact(exc.detail))}"
             )
         raise typer.Exit(1) from None
     except Exception as exc:
-        err_console.print(f"[red]{lead}and that failed:[/red] {escape(str(exc))}")
+        err_console.print(f"[red]{lead}and that failed:[/red] {escape(remote.redact(str(exc)))}")
         raise typer.Exit(1) from None
 
 
@@ -3788,19 +3916,26 @@ async def _backend_session(scope: str = "admin") -> AsyncIterator[Any]:
                     "dir's api-token). This command works through its API."
                 )
             )
-        port = getattr(settings, "daemon_port", 8000)
+        base = _backend_base_url(settings)
         auth = {"Authorization": f"Bearer {token}"}
+        target = remote.active_target()
+        if target is not None:
+            # Once per run: say on stderr when this CLI is older than the server.
+            await remote.check_version_once(target)
 
         async def call(
             method: str,
             path: str,
-            json_body: dict[str, Any] | None = None,
+            json_body: Any = None,
             timeout: float = 15.0,
+            raw: bool = False,
         ) -> Any:
+            """``raw=True`` returns the httpx response whatever its status (the
+            generated `hp api` layer reports status and body itself)."""
             async with _backend_http_client(timeout) as client:
-                resp = await client.request(
-                    method, f"http://127.0.0.1:{port}{path}", headers=auth, json=json_body
-                )
+                resp = await client.request(method, f"{base}{path}", headers=auth, json=json_body)
+            if raw:
+                return resp
             if resp.status_code >= 400:
                 raise BackendRefusedError(resp.status_code, path, _api_error_text(resp))
             if resp.status_code == 204 or not resp.content:
@@ -4030,7 +4165,7 @@ def agent_revoke(
     async def _revoke() -> bool:
         from homepilot.db.repository import Repository
 
-        settings = get_settings()
+        settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
@@ -4068,6 +4203,7 @@ def agent_revoke(
         raise typer.Exit(1)
 
 
+@agent_app.command("forget")
 @agent_app.command("remove")
 def agent_remove(
     agent_id: str = typer.Argument(..., help="Agent ID to forget entirely"),
@@ -4088,7 +4224,7 @@ def agent_remove(
     async def _remove() -> bool:
         from homepilot.db.repository import Repository
 
-        settings = get_settings()
+        settings = _get_settings()
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
@@ -4237,3 +4373,440 @@ def quota_list() -> None:
             await database.close()
 
     asyncio.run(_run())
+
+
+# ── Remote mode (#remote-cli) ─────────────────────────────────────────────────
+# `hp` as a client of a server elsewhere: profiles in ~/.config/homepilot/
+# client.toml, `--profile/-p` / HP_PROFILE, `--url` / HP_URL + HP_TOKEN. With no
+# target, every command behaves exactly as it did (local mode). See
+# homepilot.cli.remote for the token rules.
+
+# Commands that work on THIS host's files, database or processes and so cannot
+# run against a remote server. Keyed by command path ("group" covers the whole
+# group). Each reason says why and, where the API has the same operation, which
+# command reaches it remotely; tests/test_cli_remote.py checks every `hp api`
+# command named here exists for the real API.
+LOCAL_ONLY: dict[str, str] = {
+    "init": "it creates a new instance on this host: its data directory, vault and database",
+    "claim-code": "it reads the first-run claim code from this host's data directory",
+    "mcp-serve": "it starts a standalone MCP server over this host's data directory",
+    "doc": (
+        "it renders through a local MCP bootstrap over this host's database; remotely use "
+        "`hp api inventory get-host-doc HOST_ID`"
+    ),
+    "export": "it archives this host's data directory",
+    "import": "it restores an archive into this host's data directory",
+    "db": "it works on this host's database file",
+    "vault": "it opens this host's vault files",
+    "artifacts reset-approval": (
+        "it writes this host's database; remotely use `hp api artifacts reset-approval-code ID`"
+    ),
+    "artifacts edit": (
+        "it edits the file in this host's artifact store; remotely use "
+        "`hp api artifacts edit-artifact ID --content ...`"
+    ),
+    "artifacts push": "it runs git on this host's artifact repository",
+    "artifacts pull": "it runs git on this host's artifact repository",
+    "artifacts sync-status": "it runs git on this host's artifact repository",
+    "kb reindex": (
+        "it probes the embedding service with this host's settings and can rebuild the "
+        "index straight from its database; remotely use `hp api kb reindex-kb`"
+    ),
+    "token create": (
+        "its fallback is the direct-database bootstrap mint; remotely use "
+        "`hp api auth admin-create-token --label NAME --scope SCOPE`"
+    ),
+    "token list": (
+        "it uses this host's admin credential on loopback; remotely use `hp api auth list-tokens`"
+    ),
+    "token revoke": (
+        "it uses this host's admin credential on loopback; remotely use "
+        "`hp api auth revoke-token PREFIX`"
+    ),
+    "inventory refresh": (
+        "it can sync straight into this host's database; remotely use "
+        "`hp api inventory refresh-inventory`"
+    ),
+}
+
+# Commands that never resolve a remote target: `login` creates one.
+_NO_TARGET = {"login"}
+
+
+def _refuse_local_only(command: str, shown: str | None = None) -> None:
+    """Exit 2 when ``command`` (or its group) is local-only and this run is remote.
+
+    ``command`` is keyed by the group's canonical name; ``shown`` is what the
+    operator typed (`hp hosts refresh` and `hp inventory refresh` are one command).
+    """
+    target = remote.active_target()
+    if target is None:
+        return
+    group = command.split(" ", 1)[0]
+    reason = LOCAL_ONLY.get(command) or LOCAL_ONLY.get(group)
+    if reason is None:
+        return
+    err_console.print(
+        f"`hp {shown or command}` runs on the control-plane host only: {reason}. "
+        f"This run targets {target.base()}.",
+        markup=False,
+        highlight=False,
+    )
+    raise typer.Exit(2)
+
+
+def _print_version(value: bool) -> None:
+    if value:
+        typer.echo(f"hp {__version__}")
+        raise typer.Exit(0)
+
+
+@app.callback()
+def _root(
+    ctx: typer.Context,
+    profile: str | None = typer.Option(
+        None,
+        "--profile",
+        "-p",
+        help="Talk to the server of this client profile (or HP_PROFILE). See `hp login`.",
+    ),
+    url: str | None = typer.Option(
+        None,
+        "--url",
+        help="Talk to the server at this URL for one run (or HP_URL); token from HP_TOKEN.",
+    ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        is_eager=True,
+        callback=_print_version,
+        help="Print the CLI version and exit.",
+    ),
+) -> None:
+    """Pick this run's target before any command runs."""
+    if ctx.invoked_subcommand in _NO_TARGET:
+        remote.set_active_target(None)
+        return
+    try:
+        remote.set_active_target(remote.resolve_target(profile, url))
+    except remote.RemoteConfigError as exc:
+        err_console.print(str(exc), markup=False, highlight=False)
+        raise typer.Exit(exc.exit_code) from None
+    if ctx.invoked_subcommand:
+        _refuse_local_only(ctx.invoked_subcommand)
+
+
+def _group_guard(group: str) -> Any:
+    def _guard(ctx: typer.Context) -> None:
+        if ctx.invoked_subcommand:
+            sub = ctx.invoked_subcommand
+            _refuse_local_only(f"{group} {sub}", f"{ctx.info_name or group} {sub}")
+
+    return _guard
+
+
+for _group_name, _group_app in (
+    ("artifacts", artifacts_app),
+    ("policy", policy_app),
+    ("kb", kb_app),
+    ("token", token_app),
+    ("vault", vault_app),
+    ("inventory", inventory_app),
+    ("webhook", webhook_app),
+    ("db", db_app),
+    ("invite", invite_app),
+    ("quota", quota_app),
+    ("agent", agent_app),
+):
+    _group_app.callback()(_group_guard(_group_name))
+
+
+def _read_secret_from_stdin_or_prompt(prompt: str) -> str:
+    """A secret from a pipe, or a no-echo prompt on a terminal - never argv."""
+    import getpass
+    import sys
+
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt).strip()
+    return sys.stdin.readline().strip()
+
+
+async def _probe_login(target: remote.Target) -> tuple[str, dict[str, Any]]:
+    """(server version, /auth/me) for a target, or a RuntimeError naming why not."""
+    import httpx
+
+    try:
+        async with remote.http_client(target, 15.0) as client:
+            health = await client.get(f"{target.base()}/health")
+            me = await client.get(f"{target.base()}/auth/me", headers=remote.auth_headers(target))
+    except httpx.ConnectError as exc:
+        text = str(exc)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text:
+            raise RuntimeError(
+                f"{target.base()} presented a certificate this machine does not trust. "
+                "For a self-signed server, pass its CA with --ca-file."
+            ) from None
+        raise RuntimeError(
+            f"Could not reach {target.base()}: {remote.redact(text, target)}"
+        ) from None
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"Could not reach {target.base()}: "
+            f"{remote.redact(str(exc), target) or type(exc).__name__}"
+        ) from None
+    if me.status_code != 200:
+        raise RuntimeError(
+            f"{target.base()} refused this token ({me.status_code}): "
+            f"{remote.redact(_api_error_text(me), target)}"
+        )
+    version = ""
+    with contextlib.suppress(ValueError):
+        version = str(health.json().get("version") or "")
+    return version, dict(me.json())
+
+
+@app.command()
+def login(
+    profile: str = typer.Option("default", "--profile", "-p", help="Profile name to write"),
+    url: str = typer.Option(..., "--url", help="Server URL, e.g. https://homepilot.example.com"),
+    ca_file: str = typer.Option(
+        "", "--ca-file", help="CA certificate to trust for a self-signed server"
+    ),
+    token_file: str = typer.Option(
+        "", "--token-file", help="Where to keep the token (default: in the config dir, 0600)"
+    ),
+    allow_http: bool = typer.Option(
+        False, "--allow-http", help="Allow plain http to a non-loopback server (token in clear)"
+    ),
+    make_default: bool = typer.Option(
+        False, "--default", help="Make this the default profile (the first one always is)"
+    ),
+) -> None:
+    """Save a server profile. The token is read from stdin or a hidden prompt.
+
+    Pipe it in (`hp login --url ... < token-file`) or type it at the prompt; it
+    is never taken from the command line, never echoed, and is checked against
+    the server (GET /auth/me) before anything is written.
+    """
+    try:
+        remote.check_profile_name(profile)
+        checked = remote.check_url(url, allow_http=allow_http)
+    except remote.RemoteConfigError as exc:
+        err_console.print(str(exc), markup=False, highlight=False)
+        raise typer.Exit(exc.exit_code) from None
+    token = _read_secret_from_stdin_or_prompt("API token (input hidden): ")
+    if not token:
+        err_console.print("No token given (pipe it on stdin or type it at the prompt).")
+        raise typer.Exit(2)
+    target = remote.Target(url=checked, token=token, profile=profile, ca_file=ca_file)
+    try:
+        remote.tls_verify(target)
+        version, me = asyncio.run(_probe_login(target))
+    except (RuntimeError, remote.RemoteConfigError) as exc:
+        err_console.print(
+            f"Not saved: {remote.redact(str(exc), target)}", markup=False, highlight=False
+        )
+        raise typer.Exit(1) from None
+    cfg, token_path, became_default = remote.save_login(
+        profile,
+        checked,
+        token,
+        ca_file=ca_file,
+        token_file=token_file,
+        allow_http=allow_http,
+        make_default=make_default,
+    )
+    caps = ", ".join(me.get("capabilities") or []) or str(me.get("scope") or "?")
+    console.print(
+        f"Logged in to {checked} (HomePilot {version or 'unknown version'}) as "
+        f"{me.get('token_label') or '?'} [{caps}].",
+        markup=False,
+        highlight=False,
+    )
+    console.print(
+        f"Profile '{profile}' saved in {cfg}"
+        + (" as the default" if became_default else "")
+        + f"; token in {token_path} (0600).",
+        markup=False,
+        highlight=False,
+    )
+    notice = remote.older_notice(version)
+    if notice:
+        err_console.print(notice, markup=False, highlight=False)
+
+
+@app.command()
+def whoami(
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Which server this run talks to, its version, and the token's label and scope."""
+    target = remote.active_target()
+    settings = _get_settings()
+
+    async def _ask() -> tuple[dict[str, Any], dict[str, Any] | None]:
+        async with _backend_session("read") as call:
+            health = await call("GET", "/health", raw=True)
+            me = await call("GET", "/auth/me") if target is not None else None
+            return (health.json() if health.content else {}), me
+
+    try:
+        health, me = asyncio.run(_ask())
+    except BackendRefusedError as exc:
+        err_console.print(
+            f"{_where()} refused this token ({exc.status}): {remote.redact(exc.detail)}",
+            markup=False,
+            highlight=False,
+        )
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        err_console.print(
+            f"Could not reach {_where()}: {remote.redact(str(exc)) or type(exc).__name__}",
+            markup=False,
+            highlight=False,
+        )
+        raise typer.Exit(1) from None
+    info: dict[str, Any] = {
+        "mode": "remote" if target is not None else "local",
+        "server": _backend_base_url(settings),
+        "profile": target.profile if target is not None else None,
+        "server_version": health.get("version"),
+        "cli_version": __version__,
+    }
+    if me is not None:
+        info.update(
+            token_label=me.get("token_label"),
+            token_prefix=me.get("prefix"),
+            scope=me.get("scope"),
+            capabilities=me.get("capabilities"),
+        )
+    else:
+        info["credential"] = "this host's admin credential (HP_ADMIN_TOKEN or <data dir>/api-token)"
+    if json_output:
+        typer.echo(json.dumps(info))
+        return
+    table = Table(show_header=False, box=None)
+    for key, value in info.items():
+        if value is not None:
+            shown = ", ".join(value) if isinstance(value, list) else str(value)
+            table.add_row(key.replace("_", " "), shown)
+    console.print(table)
+
+
+def _installed_version() -> str:
+    """The homepilot version this interpreter now imports (after an install)."""
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c", "from homepilot import __version__; print(__version__)"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=remote.scrubbed_env(),
+    )
+    return out.stdout.strip()
+
+
+@app.command("self-update")
+def self_update(
+    version: str | None = typer.Option(
+        None, "--version", help="Install this release instead of the server's"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the install command only"),
+) -> None:
+    """Install the release the server runs (uv tool or pipx installs).
+
+    Reads the server's version, then reinstalls this CLI from the matching tag
+    of the public release mirror with the tool that installed it, and checks the
+    version that is installed afterwards.
+    """
+    import sys
+
+    wanted = version
+    if wanted is None:
+        target = remote.active_target()
+        if target is None:
+            err_console.print(
+                "Not connected to a server: name a release with --version X.Y.Z, or log in "
+                "first (`hp login`)."
+            )
+            raise typer.Exit(2)
+        wanted = asyncio.run(remote.server_version(target))
+        if not wanted:
+            err_console.print(f"Could not read the server version from {target.base()}/health.")
+            raise typer.Exit(1)
+        if remote.is_older(wanted, __version__):
+            console.print(
+                f"hp {__version__} is newer than the server ({wanted}); nothing to do. "
+                f"Pass --version {wanted} to match it."
+            )
+            return
+    if remote.release_version(wanted) is None:
+        err_console.print(f"Not a release version: {wanted!r} (expected X.Y.Z).")
+        raise typer.Exit(2)
+    wanted = wanted.lstrip("v")
+    if wanted == __version__:
+        console.print(f"hp is already {wanted}.")
+        return
+    kind = remote.install_kind()
+    if kind is None:
+        err_console.print(
+            f"This hp runs from {sys.prefix}, which is not a `uv tool` or pipx install, so "
+            "it cannot update itself. On the control-plane host the CLI updates with the "
+            "server. To install the client: "
+            f"uv tool install {remote.install_spec(wanted)}",
+            markup=False,
+            highlight=False,
+        )
+        raise typer.Exit(1)
+    tool = "uv" if kind == "uv" else "pipx"
+    executable = shutil.which(tool)
+    if executable is None:
+        err_console.print(f"This hp was installed with {tool}, but {tool} is not on PATH.")
+        raise typer.Exit(1)
+    command = remote.install_command(kind, wanted, executable)
+    if dry_run:
+        typer.echo(" ".join(command))
+        return
+    err_console.print(f"Installing hp {wanted}: {' '.join(command)}", markup=False)
+    result = subprocess.run(command, check=False, env=remote.scrubbed_env())
+    if result.returncode != 0:
+        err_console.print(f"The installer failed (exit {result.returncode}); hp is unchanged.")
+        raise typer.Exit(1)
+    now = _installed_version()
+    if now != wanted:
+        err_console.print(f"The install finished but hp reports {now or 'nothing'}, not {wanted}.")
+        raise typer.Exit(1)
+    console.print(f"hp is now {now}.")
+
+
+@app.command(
+    "api",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+    add_help_option=False,
+)
+def api(ctx: typer.Context) -> None:
+    """Every API operation of the server, generated from its OpenAPI document.
+
+    `hp api --list` lists them; `hp api GROUP OPERATION --help` shows one;
+    `hp api raw METHOD /path` calls any path. JSON out, `--table` for lists.
+    """
+    from homepilot.cli import api_layer
+
+    raise typer.Exit(api_layer.run(list(ctx.args), _backend_session))
+
+
+# The everyday operator commands (hosts, agents, changes, tasks, kb, alerts,
+# channels, guests, power) live in homepilot.cli.ops; registered last so they
+# attach to the groups defined above.
+from homepilot.cli import ops as _ops  # noqa: E402
+
+_ops.register(
+    app,
+    hosts_app=inventory_app,
+    agents_app=agent_app,
+    changes_app=artifacts_app,
+    kb_app=kb_app,
+)
+
+if __name__ == "__main__":
+    app()

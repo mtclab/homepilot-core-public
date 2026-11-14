@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ..common import OPENAPI_DESTRUCTIVE
 from ..config import get_settings
 from ..portal.trust import (
     PortalNotConfiguredError,
@@ -172,7 +173,7 @@ async def my_quota(request: Request) -> Any:
     }
 
 
-@router.post("/vms/{host_id}/power")
+@router.post("/vms/{host_id}/power", openapi_extra=OPENAPI_DESTRUCTIVE)
 async def power(request: Request, host_id: str, body: PowerRequest) -> Any:
     try:
         cn = _client_cn(request)

@@ -18,6 +18,7 @@ from sse_starlette.sse import EventSourceResponse
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import audit_actor, principal_from_token
 from ..client_ip import client_ip as _client_ip
+from ..common import OPENAPI_DESTRUCTIVE
 from ..runtime.blocking import run_blocking
 from ..sse import bus as sse_bus
 from .lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
@@ -527,7 +528,11 @@ async def approve_artifact(
     return {"id": artifact_id, "status": "approved"}
 
 
-@router.post("/{artifact_id}/reject", dependencies=[Depends(require_scope("write"))])
+@router.post(
+    "/{artifact_id}/reject",
+    dependencies=[Depends(require_scope("write"))],
+    openapi_extra=OPENAPI_DESTRUCTIVE,
+)
 async def reject_artifact(
     request: Request,
     artifact_id: str,
@@ -769,7 +774,11 @@ async def recheck_artifact(request: Request, artifact_id: str, token: _TokenDep)
     }
 
 
-@router.post("/{artifact_id}/withdraw", dependencies=[Depends(require_scope("write"))])
+@router.post(
+    "/{artifact_id}/withdraw",
+    dependencies=[Depends(require_scope("write"))],
+    openapi_extra=OPENAPI_DESTRUCTIVE,
+)
 async def withdraw_artifact(
     request: Request,
     artifact_id: str,

@@ -1221,11 +1221,14 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.12.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.13.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
 | `HP_ADMIN_TOKEN` | — | An admin-scope API token for the CLI on the box (`hp token create`, `hp token list/revoke`, `hp agent …`). Falls back to `<data dir>/api-token`, which `hp init` and the browser claim write automatically |
+| `HP_URL` | — | `hp` as a client of a server elsewhere: the server URL for one run (with `HP_TOKEN`). Not read by the server. See [docs/cli.md](cli.md) |
+| `HP_TOKEN` | — | The API token `hp` sends with `HP_URL` (or instead of a profile's token file). For scripts; never pass a token on the command line. Not read by the server |
+| `HP_PROFILE` | — | Which `hp` client profile (`~/.config/homepilot/client.toml`) a run uses. Not read by the server |
 | `HP_ADMIN_SECRET` | — | Admin API auth secret (vault `admin-secret` preferred). One of the two ways to authorise minting; an admin-scope API token is the other, and a claim-installed instance has only the token |
 | `HP_VAULT_PASSPHRASE` | — | Vault encryption passphrase (auto-generated if not set) |
 | `HP_VAULT_PASSPHRASE_FILE` | — | Path to file containing vault passphrase (overrides `HP_VAULT_PASSPHRASE`) |

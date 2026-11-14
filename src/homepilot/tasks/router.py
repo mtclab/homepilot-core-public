@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from ..auth.deps import require_scope
+from ..common import OPENAPI_DESTRUCTIVE
 
 router = APIRouter()
 
@@ -104,7 +105,11 @@ async def perform_task_cancel(
     return cancelled
 
 
-@router.post("/{task_id}/cancel", dependencies=[Depends(require_scope("write"))])
+@router.post(
+    "/{task_id}/cancel",
+    dependencies=[Depends(require_scope("write"))],
+    openapi_extra=OPENAPI_DESTRUCTIVE,
+)
 async def cancel_task(request: Request, task_id: str) -> Any:
     repo = _get_task_repo(request)
     provision_service = getattr(request.app.state, "provision_service", None)

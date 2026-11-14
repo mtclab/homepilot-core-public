@@ -1,6 +1,6 @@
 [project]
 name = "homepilot"
-version = "3.12.0"
+version = "3.13.0"
 description = "AI-first, artifact-backed, MCP-native homelab platform"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
@@ -25,6 +25,11 @@ dependencies = [
     "asyncssh>=2.17",
     "httpx>=0.28",
     "typer>=0.15",
+    # The generated `hp api` layer (homepilot.cli.api_layer) builds its commands
+    # at run time from the server's OpenAPI document with click directly. Typer
+    # vendors its own private click copy since 0.20, so click is declared rather
+    # than borrowed from whatever else happens to pull it in.
+    "click>=8.1",
     "rich>=13.0",
     "pyyaml>=6.0",
     # Bounded to the 2.x line: the code is migrated to the mcp 2.x server API

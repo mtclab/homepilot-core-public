@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+# OpenAPI extension on routes that destroy, forget, revoke, power off, withdraw,
+# reject or cancel. The generated `hp api` layer asks before calling one (as it
+# does for every DELETE); tests/test_destructive_marks.py keeps the set honest.
+OPENAPI_DESTRUCTIVE: dict[str, Any] = {"x-hp-destructive": True}
+
 
 def format_validation_error(exc: Any) -> str:
     """A pydantic ValidationError as text that names fields, never values (#697).

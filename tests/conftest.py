@@ -80,6 +80,26 @@ def _reset_global_rate_limits():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_cli_client_profile(tmp_path_factory: pytest.TempPathFactory, monkeypatch) -> None:
+    """Keep the CLI in LOCAL mode unless a test asks otherwise (#remote-cli).
+
+    `hp` picks a remote target from HP_URL / HP_PROFILE / HP_TOKEN and from
+    ~/.config/homepilot/client.toml. A developer with a real profile (or a gate
+    run in a shell that exported one) would otherwise turn every in-process CLI
+    test into a call to that server. Each test gets empty XDG dirs and none of
+    those variables; tests that exercise remote mode set them themselves.
+    """
+    xdg = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg / "cache"))
+    for name in ("HP_URL", "HP_PROFILE", "HP_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    from homepilot.cli import remote
+
+    remote.set_active_target(None)
+
+
 # ── Invite portal (#442 stage 2) ─────────────────────────────────────────────
 # Named portal_* so no portal test module has to shadow another's fixture; the
 # helpers they build on live in tests/portal_support.py.
