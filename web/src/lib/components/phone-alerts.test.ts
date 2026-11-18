@@ -42,6 +42,7 @@ function bundled(over: Partial<BundledNtfyStatus> = {}): PhoneAlertsStatus {
 			limit: 'This ntfy server runs on the same host as HomePilot. If that host goes down, nothing is left to push.',
 			...over,
 		},
+		bundled_unavailable: null,
 		compose_command: 'docker compose --profile ntfy up -d',
 		ntfy_version: '2.37.2',
 	};
@@ -49,6 +50,7 @@ function bundled(over: Partial<BundledNtfyStatus> = {}): PhoneAlertsStatus {
 
 const FRESH: PhoneAlertsStatus = {
 	bundled: null,
+	bundled_unavailable: null,
 	compose_command: 'docker compose --profile ntfy up -d',
 	ntfy_version: '2.37.2',
 };
@@ -67,6 +69,26 @@ describe('PhoneAlerts', () => {
 		expect(screen.getByText('ntfy.sh')).toBeInTheDocument();
 		expect(m.enableBundledNtfy).not.toHaveBeenCalled();
 		expect(m.chooseNtfySh).not.toHaveBeenCalled();
+	});
+
+	// An install without HP_NTFY_INTERNAL_URL (no shipped compose) answered the
+	// status with a 503 and the page showed only that error - ntfy.sh and an
+	// existing server, which need no bundled service, were unreachable too.
+	it('without an internal ntfy address, still offers the other two ways and says why the bundled one is off', async () => {
+		const reason = 'HP_NTFY_INTERNAL_URL is not set, so HomePilot does not know where the bundled ntfy service answers.';
+		m.getPhoneAlerts.mockResolvedValue({ ...FRESH, bundled_unavailable: reason });
+		render(PhoneAlerts);
+		const bundledRadio = (await screen.findByText("HomePilot's own ntfy server"))
+			.closest('label')!
+			.querySelector('input')!;
+		expect(bundledRadio).toBeDisabled();
+		expect(document.querySelector('[data-bundled-unavailable]')?.textContent).toContain(reason);
+		expect(screen.queryByRole('button', { name: 'Set it up' })).not.toBeInTheDocument();
+		// The way it starts on is usable: the existing-server form is there.
+		expect(screen.getByRole('button', { name: 'Add and send a test' })).toBeInTheDocument();
+		await fireEvent.click(screen.getByText('ntfy.sh'));
+		expect(screen.getByRole('button', { name: 'Use ntfy.sh' })).toBeInTheDocument();
+		expect(m.enableBundledNtfy).not.toHaveBeenCalled();
 	});
 
 	it('choosing the bundled server enables it, then gives the one command while it waits', async () => {

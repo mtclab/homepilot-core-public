@@ -18,6 +18,7 @@ knows what shape it expects.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # The collections the read-only passthrough tool (MCP ``proxmox_api_read``) may
@@ -92,8 +93,22 @@ async def guest_agent_interfaces(proxmox: Any, node: str, vmid: int | str) -> An
     return await proxmox.read(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
 
 
+# ── Endpoint shapes that free a guest's volume (3.14 walk) ──────────────────
+# Not reads: the shapes executor/volume_deletes.py recognises in a
+# proxmox-api-sequence step, so a change that deletes a volume of a guest it
+# also snapshots is refused before it runs. Written here because a PVE path
+# lives in the adapters (#717).
+GUEST_CONFIG_PATH = re.compile(r"/nodes/[^/]+/(qemu|lxc)/([^/?]+)/config/?$")
+GUEST_UNLINK_PATH = re.compile(r"/nodes/[^/]+/qemu/([^/?]+)/unlink/?$")
+GUEST_ITSELF_PATH = re.compile(r"/nodes/[^/]+/(qemu|lxc)/([^/?]+)/?$")
+STORAGE_CONTENT_PATH = re.compile(r"/nodes/[^/]+/storage/[^/]+/content/([^?]+)$")
+
 __all__ = [
+    "GUEST_CONFIG_PATH",
+    "GUEST_ITSELF_PATH",
+    "GUEST_UNLINK_PATH",
     "READ_PASSTHROUGH_PREFIXES",
+    "STORAGE_CONTENT_PATH",
     "cluster_guests",
     "guest_agent_interfaces",
     "guest_config",

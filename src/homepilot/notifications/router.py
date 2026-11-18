@@ -165,15 +165,9 @@ def _phone_alerts(request: Request) -> PhoneAlerts:
     if repo is None:
         raise HTTPException(status_code=503, detail="Phone alerts are not available")
     settings = get_settings()
-    if not settings.ntfy_internal_url:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "HP_NTFY_INTERNAL_URL is not set, so HomePilot does not know where the "
-                "bundled ntfy service answers. The shipped compose files set it "
-                "(http://ntfy); an install without them points it at its ntfy service."
-            ),
-        )
+    # An unset HP_NTFY_INTERNAL_URL refuses only what needs the bundled service
+    # (PhoneAlerts says why); the status still answers, so the page keeps
+    # offering ntfy.sh and an existing server instead of one error.
     made = PhoneAlerts(
         notifier=_notifier(request),
         repo=repo,

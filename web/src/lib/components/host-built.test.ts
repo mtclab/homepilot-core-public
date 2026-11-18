@@ -120,6 +120,18 @@ describe('How it is built (#818)', () => {
 		expect(hidden).toHaveTextContent('Listening sockets: the owning process of 1 socket(s)');
 	});
 
+	it('says a reason that names its subject once, not "Docker: docker:" (3.14 walk)', async () => {
+		const docker = { status: 'not_visible', reason: "docker: not readable - the agent's user cannot open the docker socket" };
+		getHostDescription.mockResolvedValue(view({ description: { ...description, docker } }));
+		render(HostBuilt, { hostId: 'h1', canWrite: true });
+		await screen.findByText('What runs');
+		const hidden = screen.getByRole('heading', { name: 'Not visible to the agent' }).closest('section')!;
+		expect(hidden).toHaveTextContent("Docker: not readable - the agent's user cannot open the docker socket");
+		expect(hidden.textContent).not.toMatch(/docker:\s*docker:/i);
+		// A reason that only contains a colon is left whole.
+		expect(hidden).toHaveTextContent('nftables: not visible to the agent: its user');
+	});
+
 	it('says an agent is too old to describe its host, and where to upgrade it', async () => {
 		getHostDescription.mockResolvedValue(
 			view({ description: null, previous_collected_at: null, changes: [], agent: { connected: true, can_describe: false, version: '3.13.0' } }),

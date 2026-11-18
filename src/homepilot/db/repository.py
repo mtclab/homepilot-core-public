@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -205,6 +206,36 @@ class Repository:
     async def get_user_by_id(self, user_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM users WHERE id = ?", (user_id,))
         return dict(row) if row is not None else None
+
+    async def credential_names_by_id(self, ids: Iterable[str]) -> dict[str, str]:
+        """The name each token or user id is said by: a token's label, a user's display name.
+
+        Journal rows recorded before 3.14.1 by the provision, tailnet-join and
+        agent-install routes carry the caller's internal id (a UUID) as the
+        actor. The words layer (dashboard/wording.py) asks here so no surface
+        ever prints that id; an id that matches nothing is left out and said
+        as a credential that no longer exists.
+        """
+        wanted = sorted({str(i) for i in ids if i})
+        if not wanted:
+            return {}
+        marks = ", ".join("?" for _ in wanted)
+        names: dict[str, str] = {}
+        users = await self.db.fetchall(
+            f"SELECT id, display_name FROM users WHERE id IN ({marks})",  # nosec B608
+            wanted,
+        )
+        for row in users:
+            if row.get("display_name"):
+                names[str(row["id"])] = str(row["display_name"])
+        tokens = await self.db.fetchall(
+            f"SELECT id, label FROM api_tokens WHERE id IN ({marks})",  # nosec B608
+            wanted,
+        )
+        for row in tokens:
+            label = row.get("label") or "a token"
+            names[str(row["id"])] = str(label)
+        return names
 
     async def create_api_token(
         self,

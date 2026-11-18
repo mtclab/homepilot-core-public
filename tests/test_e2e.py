@@ -804,44 +804,51 @@ class TestThePhoneViewport:
 
 
 class TestPhoneAlertsOnTheShippedPage:
-    """#822 on the real built UI and the real server: Monitoring > Channels
-    offers "Get alerts on your phone"; choosing HomePilot's own ntfy server
-    writes its config and tokens and then tells the operator the ONE command
-    that starts the service (nothing listens at the gate server's ntfy
-    address, exactly like an install that has not started the profile yet).
-    No HomePilot ntfy token is ever on the page or in the setup answer. The
-    real-ntfy half of the journey is tests/test_phone_alerts_journey_822.py.
+    """#822 on the real built UI and the real server, as the harness starts it.
 
-    Leaves the shared e2e server as it found it: the test disables again."""
+    Both harnesses - the mirror's e2e workflow and scripts/gate-e2e.sh - start
+    this server WITHOUT HP_NTFY_INTERNAL_URL, like an install that does not use
+    the shipped compose files. There Monitoring > Channels must still offer a
+    way to get alerts on a phone: HomePilot's own server is shown as not
+    available, with the reason, and an existing ntfy server and ntfy.sh can be
+    chosen. 3.14.0's page answered that install with one error and nothing to
+    choose (the mirror's CI found it; the gate script had set the variable).
 
-    def test_choose_bundled_shows_the_command_and_no_token(self, session_auth):
+    Choosing HomePilot's own server - which needs the variable, as the shipped
+    compose sets it - is the fleet server's journey:
+    TestFleetJourneys.test_choose_bundled_shows_the_command_and_no_token.
+    """
+
+    def test_without_the_internal_address_the_other_ways_stay_offered(self, session_auth):
+        from playwright.sync_api import expect
+
         context = session_auth["context"]
+        status = context.request.get(f"{BASE_URL}/admin/notifications/phone")
+        assert status.ok, f"the phone-alert status refused: {status.status} {status.text()}"
+        reason = status.json()["bundled_unavailable"]
+        assert reason, (
+            "this journey expects the harness's server WITHOUT HP_NTFY_INTERNAL_URL "
+            "(the mirror's e2e workflow and scripts/gate-e2e.sh start it so)"
+        )
         page = context.new_page()
-        page.on("dialog", lambda d: d.accept())
         try:
             page.goto(f"{UI}/monitoring/channels", wait_until="networkidle")
             assert page.get_by_role("tab", name="Channels").get_attribute("aria-selected") == "true"
-            page.get_by_text("HomePilot's own ntfy server").click()
-            page.get_by_role("button", name="Set it up").click()
-            command = page.locator("[data-compose-command]")
-            command.wait_for(timeout=15_000)
-            assert command.inner_text().strip() == "docker compose --profile ntfy up -d"
-            assert "Waiting" in page.locator("[data-server-detail]").inner_text()
-            # The channel HomePilot created is listed - by host only.
-            page.get_by_text("Phone (bundled ntfy)").first.wait_for(timeout=10_000)
-
-            html = page.content()
-            assert not re.search(r"tk_[a-z0-9]{29}", html), "an ntfy token is on the page"
-            status = context.request.get(f"{BASE_URL}/admin/notifications/phone")
-            assert status.ok, status.text()
-            assert "tk_" not in status.text()
-        finally:
-            off = context.request.delete(
-                f"{BASE_URL}/admin/notifications/phone/bundled",
-                headers=_csrf_headers(session_auth["csrf"], content_type=False),
+            bundled_choice = page.get_by_role(
+                "radio", name=re.compile("HomePilot's own ntfy server")
             )
+            expect(bundled_choice).to_be_disabled()
+            expect(page.locator("[data-bundled-unavailable]")).to_contain_text(reason)
+            expect(page.get_by_role("button", name="Set it up")).to_have_count(0)
+            # The page starts on a way this install can use...
+            page.get_by_role("radio", name=re.compile("An ntfy server you already run")).check()
+            expect(page.get_by_role("button", name="Add and send a test")).to_be_visible()
+            # ...and ntfy.sh is one click away (not pressed: it would publish).
+            page.get_by_role("radio", name=re.compile(r"^ntfy\.sh")).check()
+            expect(page.locator("[data-ntfysh-warning]")).to_be_visible()
+            expect(page.get_by_role("button", name="Use ntfy.sh")).to_be_enabled()
+        finally:
             page.close()
-        assert off.ok, f"could not disable after the test: {off.status} {off.text()}"
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +905,9 @@ def fleet():
         "HP_PORTAL_TRUSTED_PROXY": "127.0.0.1/32",
         "HP_PORTAL_PROXY_SECRET": _PORTAL_SECRET,
         "PROXMOX_SECRETS": "/nonexistent",
+        # Set as the shipped compose files set it, at an address nothing
+        # listens on: an install that has not started the ntfy profile yet.
+        "HP_NTFY_INTERNAL_URL": "http://127.0.0.1:9",
     }
     log_path = os.path.join(data, "server.log")
     log = open(log_path, "wb")  # noqa: SIM115 - closed in the finally below
@@ -1407,6 +1417,45 @@ class TestFleetJourneys:
             assert errors == []
         finally:
             context.close()
+
+    # -- Monitoring > Channels: phone alerts (#822) -----------------------------
+
+    def test_choose_bundled_shows_the_command_and_no_token(self, fleet, browser):
+        """Choosing HomePilot's own ntfy server writes its config and tokens and
+        then tells the operator the ONE command that starts the service. Here,
+        not on the harness's server: this needs HP_NTFY_INTERNAL_URL, which the
+        fixture sets as the shipped compose does (nothing listens there - an
+        install that has not started the profile yet), and the harness's server
+        runs without it (the mirror's workflow does, so 3.14.0's version of this
+        test passed only in the local gate). No HomePilot ntfy token is ever on
+        the page or in the status. The real-ntfy half of the journey is
+        tests/test_phone_alerts_journey_822.py. Disables again afterwards."""
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/monitoring/channels", wait_until="networkidle")
+            assert page.get_by_role("tab", name="Channels").get_attribute("aria-selected") == "true"
+            page.get_by_text("HomePilot's own ntfy server").click()
+            page.get_by_role("button", name="Set it up").click()
+            command = page.locator("[data-compose-command]")
+            command.wait_for(timeout=15_000)
+            assert command.inner_text().strip() == "docker compose --profile ntfy up -d"
+            assert "Waiting" in page.locator("[data-server-detail]").inner_text()
+            # The channel HomePilot created is listed - by host only.
+            expect(page.get_by_text("Phone (bundled ntfy)").first).to_be_visible(timeout=10_000)
+
+            html = page.content()
+            assert not re.search(r"tk_[a-z0-9]{29}", html), "an ntfy token is on the page"
+            status, body = _fleet_api(fleet, "GET", "/admin/notifications/phone")
+            assert status == 200, body
+            assert body["bundled"] is not None and body["bundled_unavailable"] is None
+            assert "tk_" not in json.dumps(body)
+            assert errors == []
+        finally:
+            off, off_body = _fleet_api(fleet, "DELETE", "/admin/notifications/phone/bundled")
+            context.close()
+        assert off == 200, f"could not disable after the test: {off} {off_body}"
 
     # -- Changes > Inbox (#805) -------------------------------------------------
 

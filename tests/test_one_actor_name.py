@@ -43,6 +43,23 @@ def test_no_second_spelling_of_a_credential_survives_in_the_source():
     assert not offenders, "a credential named outside audit_actor:\n" + "\n".join(offenders)
 
 
+def test_no_route_records_the_internal_user_id_as_the_actor():
+    """3.14 walk: provision, tailnet-join and agent install recorded `token["user_id"]`
+    - the users-table uuid every token shares - so `hp status` said
+    "<uuid> upgraded the agent on ...". The actor is `audit_actor(token)`."""
+    pattern = re.compile(r"""actor\s*=\s*\w+(\.get\(|\[)["']user_id["']""")
+    offenders = [
+        f"{path.relative_to(SRC)}:{no}: {line.strip()}"
+        for path in SRC.rglob("*.py")
+        for no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert not offenders, "an internal user id recorded as the actor:\n" + "\n".join(offenders)
+    # The Principal's name never falls back to that id either.
+    nameless = {"user_id": "5f0c2a1e-7b3d-4c9e-9a41-0d2e6b8f3c17", "prefix": "hp_0123456789ab"}
+    assert "5f0c2a1e" not in audit_actor(nameless)
+
+
 def test_the_helper_is_the_principal_name():
     token = {"label": "ops", "prefix": "hp_0123456789ab", "scope": "admin"}
     assert (

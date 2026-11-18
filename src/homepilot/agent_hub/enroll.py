@@ -61,8 +61,9 @@ _INSTALLER_PATH = "/run/hp-agent-install.sh"
 SNAPSHOT_DIR = "/var/lib/hp-agent/upgrade-snapshot"
 
 # The rollback says so when it kept the credential the hub had already issued to
-# the new agent (restoring the old one would lock the host out).
-_KEPT_TOKEN_MARKER = "hp-agent-rollback: kept agent.token"
+# the new agent (restoring the old one would lock the host out). A line the
+# wrapper echoes, not a secret.
+_KEPT_CREDENTIAL_MARKER = "hp-agent-rollback: kept agent.token"
 
 # install-agent.sh always writes the agent id it resolved to /etc/homepilot/agent.id
 # (it reuses an existing id rather than minting one, so the id is not ours to
@@ -576,7 +577,7 @@ class AgentEnrollService:
         kept = (
             " It kept the credential the hub had already issued to the new agent; "
             "every other file is as it was."
-            if _KEPT_TOKEN_MARKER in (out or "")
+            if _KEPT_CREDENTIAL_MARKER in (out or "")
             else ""
         )
         deadline = time.monotonic() + self.connect_wait_s
@@ -773,7 +774,7 @@ def _rollback_script() -> str:
         "systemctl daemon-reload; "
         # A partial restore keeps the snapshot for the operator and exits non-zero.
         'if [ -z "$fail" ]; then rm -rf "$S"; fi; '
-        f'if [ -n "$keep_token" ]; then echo "{_KEPT_TOKEN_MARKER}"; fi; '
+        f'if [ -n "$keep_token" ]; then echo "{_KEPT_CREDENTIAL_MARKER}"; fi; '
         "else "
         'if [ -f "$I/hp-agent.prev" ]; then mv -f "$I/hp-agent.prev" "$I/hp-agent"; fi; '
         'if [ ! -s "$C/agent.token" ] && [ -s "$C/agent.token.prev" ]; then '

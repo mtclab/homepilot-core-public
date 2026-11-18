@@ -44,12 +44,26 @@ def _table(header: list[str], rows: list[list[Any]]) -> list[str]:
     return [*out, ""]
 
 
+def _reason(sec: dict[str, Any], what: str) -> str:
+    """A section's reason to follow ``"<what>: "`` - without saying ``what`` twice.
+
+    An agent's reason stands alone, so some name their subject ("docker: not
+    readable - ..."); after the renderer's own label that read "Docker: docker:
+    not readable" (3.14 walk). A leading ``<what>:`` (any case) is dropped here.
+    """
+    text = str(sec.get("reason") or sec.get("status") or "unknown")
+    head, colon, rest = text.partition(":")
+    if colon and rest.strip() and head.strip().lower() in {what.lower(), what.lower().split()[0]}:
+        return rest.strip()
+    return text
+
+
 def _status_line(sec: dict[str, Any], what: str) -> list[str]:
     status = sec.get("status")
     if status == "not_installed":
         return [f"No {what} on this host.", ""]
     if status in _HIDDEN:
-        return [f"_{what}: {sec.get('reason') or status}_", ""]
+        return [f"_{what}: {_reason(sec, what)}_", ""]
     return []
 
 
@@ -202,7 +216,7 @@ def _how_exposed(doc: dict[str, Any]) -> list[str]:
             )
             out.append(f"- nftables {t.get('family')} {t.get('name')}: {chains or 'no chains'}")
     else:
-        out.append(f"- nftables: {nft.get('reason') or nft.get('status') or 'unknown'}")
+        out.append(f"- nftables: {_reason(nft, 'nftables')}")
     return [*out, ""]
 
 
@@ -288,7 +302,7 @@ def _not_visible(doc: dict[str, Any]) -> list[str]:
         "time sync": _sec(doc, "time"),
     }
     hidden = [
-        f"- {name}: {sec.get('reason') or sec.get('status')}"
+        f"- {name}: {_reason(sec, name)}"
         for name, sec in parts.items()
         if sec.get("status") in _HIDDEN
     ]

@@ -234,7 +234,7 @@ class ArtifactExecutor:
                 and target_kind in SNAPSHOTTABLE_TARGET_KINDS
                 and kind not in _NEVER_SNAPSHOT_KINDS
             ):
-                snapshot_id = await self._maybe_snapshot(fm, target_data)
+                snapshot_id = await self._maybe_snapshot(fm, target_data, kind, body)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
             logger.exception("Executor failed for %s", artifact_id)
@@ -323,7 +323,7 @@ class ArtifactExecutor:
                 and target_kind in SNAPSHOTTABLE_TARGET_KINDS
                 and kind not in _NEVER_SNAPSHOT_KINDS
             ):
-                snapshot_id = await self._maybe_snapshot(fm, target_data)
+                snapshot_id = await self._maybe_snapshot(fm, target_data, kind, body)
             result = await self._dispatch(kind, fm, body, target_data)
         except Exception as exc:
             logger.exception("Replay failed for %s", artifact_id)
@@ -719,10 +719,25 @@ class ArtifactExecutor:
             warnings=list(result.get("warnings") or []),
         )
 
-    async def _maybe_snapshot(self, fm: dict[str, Any], target: dict[str, Any]) -> str | None:
+    async def _maybe_snapshot(
+        self,
+        fm: dict[str, Any],
+        target: dict[str, Any],
+        kind: ArtifactKind | None = None,
+        body: str = "",
+    ) -> str | None:
         requires_snapshot = fm.get("requires_snapshot") is not False
         if not requires_snapshot:
             return None
+        if kind is not None:
+            # A change proposed before propose refused this (3.14 walk): its own
+            # snapshot would keep the volume it deletes in use. Refused BEFORE the
+            # snapshot, so nothing is changed and nothing is left half done.
+            from homepilot.executor.volume_deletes import snapshot_conflict
+
+            conflict = snapshot_conflict(kind.value, fm, body, target)
+            if conflict:
+                raise ExecutorError(f"Refused, nothing was changed: {conflict}")
         vmid = target.get("vmid")
         node = target.get("node")
         if vmid is None or not node:

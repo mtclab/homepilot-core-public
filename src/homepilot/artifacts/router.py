@@ -339,12 +339,12 @@ async def _policies_for(kb_service: Any, host: str) -> list[dict[str, Any]]:
 
     Selected by what a policy is ABOUT, not by text similarity to the hostname.
     Free-text search got this wrong in both directions, reproduced on dev 3.6.17
-    while reviewing a change to `hp-test-server`:
+    while reviewing a change to `web01`:
 
       * shown - a policy whose target was `dev-ct-db` and whose own text read
         *"This rule is about dev-ct-db only"*, because it happened to name
-        `hp-test-server` in passing. The keyword pass was
-        `content LIKE '%hp-test-server%'`.
+        `web01` in passing. The keyword pass was
+        `content LIKE '%web01%'`.
       * not shown - *"No package installs on any managed machine without a
         snapshot taken first. Applies to every host in the fleet."*, a GLOBAL
         policy, against a plan that installs packages. It never named the host,

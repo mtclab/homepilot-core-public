@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api, type AuditEntry } from '$lib/api';
+	import type { WordedEntry } from '$lib/journalWords';
 	import { notify } from '$lib/stores';
 	import { base } from '$app/paths';
 	import { debounce } from '$lib/debounce';
@@ -179,8 +180,11 @@
 		openId = openId === id ? null : id;
 	}
 	/** The one-line gist of an entry: who/what it touched, without the detail. */
+	// Who is the server's words (a token's label), never an internal id; the
+	// expanded detail keeps the raw record.
 	function summaryOf(e: AuditEntry): string {
-		return [e.user_id, e.target_host, e.target_service].filter(Boolean).join(' · ');
+		const who = (e as WordedEntry).words?.actor ?? e.user_id;
+		return [who, e.target_host, e.target_service].filter(Boolean).join(' · ');
 	}
 
 	/** Rows of the expanded detail, skipping the fields this entry has nothing for. */

@@ -132,7 +132,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Approve a proposed artifact so the executor can apply it. Requires a "
             "human decision: the operator reads the artifact's approval_code from "
-            "the web review screen, `hp artifacts show`, or a proposal "
+            "the web review screen, `hp changes show`, or a proposal "
             "notification, and relays it to you. You cannot approve without it - "
             "the code is never shown over this transport, so a valid code proves a "
             "human approved. Five wrong codes lock approval until an operator "
@@ -614,7 +614,7 @@ async def handle_propose_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     msg = (
         f"Artifact {artifact_id} created with status: "
         f"{fm.get('status', 'unknown')}. "
-        f"Review with: hp artifacts show {artifact_id}"
+        f"Review with: hp changes show {artifact_id}"
     )
     return {
         "id": artifact_id,
@@ -689,7 +689,7 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
         raise ValueError(
             "approve_artifact requires an approval_code a human relays to you — "
             "the assistant cannot approve its own proposal. Ask the operator to "
-            "read the code from the review screen or `hp artifacts show`."
+            "read the code from the review screen or `hp changes show`."
         )
 
     if ctx.get("repo") is None:

@@ -117,7 +117,7 @@ ENROLMENT_WINDOW_CLOSED_ERROR = (
 HOST_HOLDS_CREDENTIAL_ERROR = (
     "enrolment refused: this hostname already holds its own agent credential. "
     "Reconnect with that credential, or ask an operator to revoke it (or enrol "
-    "with a bootstrap token: `hp agent bootstrap` prints the install command)."
+    "with a bootstrap token: `hp agents bootstrap` prints the install command)."
 )
 
 
@@ -490,7 +490,7 @@ class AgentHubServer:
                     "live per-agent credential, so a shared-token register for it is "
                     "not that host's agent. To re-enrol it with a fresh bootstrap "
                     f"token: `hp agents install {hostname}` (a QEMU guest), or run "
-                    "`hp agent bootstrap` and paste the install command it prints on "
+                    "`hp agents bootstrap` and paste the install command it prints on "
                     "the host (the installer moves the old credential aside). Or "
                     "revoke the credential and let the shared token re-enrol it."
                 ),

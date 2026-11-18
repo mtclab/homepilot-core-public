@@ -518,7 +518,7 @@ Artifacts can also be rejected, superseded, or revoked.
 
 ## Editing
 
-Use `hp artifacts edit <id>` to edit artifacts. Manual edits to approved
+Use `hp changes edit <id>` to edit artifacts. Manual edits to approved
 artifacts will be caught by hash verification at apply time.
 
 ## Format

@@ -4,7 +4,7 @@ HomePilot has two audiences for a credential:
 
 * **operator** - a person. The token a human holds is the one the browser claim
   and `hp init` mint: the admin capability (scope ``admin`` or ``all``). The
-  on-box CLI (`hp artifacts approve`), which reads the database directly and is
+  on-box CLI (`hp changes approve`), which reads the database directly and is
   therefore already root-equivalent on the control plane, is an operator too.
 * **assistant** - everything below the admin capability. Settings -> Tokens
   mints assistants ``read,write`` (the MCP ``full`` tier) or ``read_only``, and
@@ -72,7 +72,9 @@ def principal_from_token(token: dict[str, Any]) -> Principal:
     The prefix is the token's public id (it is what revocation is keyed on) and
     is not secret.
     """
-    label = token.get("label") or token.get("display_name") or token.get("user_id") or "api-token"
+    # Never the internal user id: a uuid is no name, and the journal printed it
+    # as the subject of a sentence (3.14 walk). The prefix still tells tokens apart.
+    label = token.get("label") or token.get("display_name") or "api-token"
     name = credential_name(str(label), token.get("prefix"))
     if is_operator_credential(token.get("scope"), token.get("role")):
         return Principal.operator(name)

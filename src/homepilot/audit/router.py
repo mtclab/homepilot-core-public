@@ -5,7 +5,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, Query, Request
 
 from ..auth.deps import require_scope
-from ..dashboard.wording import with_journal_words
+from ..dashboard.wording import worded_journal
 
 router = APIRouter()
 
@@ -54,4 +54,5 @@ async def list_audit(
     )
     # Each row in words (dashboard/wording.py): the console's "What happened",
     # `hp status` and MCP's get_audit_log say the same sentence, never the code.
-    return {"items": with_journal_words(rows), "total": total}
+    # The actor is named too: never an internal id (#844 walk, 3.14.1).
+    return {"items": await worded_journal(repo, rows), "total": total}

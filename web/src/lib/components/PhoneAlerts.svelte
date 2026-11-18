@@ -52,6 +52,8 @@
 		try {
 			status = await getPhoneAlerts();
 			loadError = '';
+			// This install cannot run HomePilot's own server: start on a way it can use.
+			if (status.bundled_unavailable && choice === 'bundled') choice = 'existing';
 			if (status.bundled && !addressDraft) addressDraft = status.bundled.public_url ?? '';
 		} catch (e) {
 			loadError = String(e);
@@ -320,10 +322,15 @@
 		<fieldset class="space-y-2">
 			<legend class="field-label">Where should alerts go?</legend>
 			<label class="flex items-start gap-2 text-xs">
-				<input type="radio" bind:group={choice} value="bundled" />
+				<input type="radio" bind:group={choice} value="bundled" disabled={!!status.bundled_unavailable} />
 				<span><span class="text-ink">HomePilot's own ntfy server</span> (recommended) - runs next to
 					HomePilot, private to your logins.</span>
 			</label>
+			{#if status.bundled_unavailable}
+				<p class="prose-note text-xs text-warn ml-6" data-bundled-unavailable>
+					Not available on this install: {status.bundled_unavailable}
+				</p>
+			{/if}
 			<label class="flex items-start gap-2 text-xs">
 				<input type="radio" bind:group={choice} value="existing" />
 				<span><span class="text-ink">An ntfy server you already run</span> - its topic URL and an

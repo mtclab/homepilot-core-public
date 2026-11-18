@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from ..auth.deps import require_scope
+from ..auth.principal import audit_actor
 from .defaults import MissingProvisioningDefaultError, provisioning_defaults
 from .models import ProvisionRequestIn, TailnetJoinRequest
 from .service import (
@@ -44,7 +45,9 @@ async def provision_guest(
     except MissingProvisioningDefaultError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
-        task_id = await service.start(resolved, actor=token.get("user_id") or "system")
+        # The credential's name (label and prefix), the one spelling every route
+        # records - never the internal user id (3.14 walk: a UUID as the actor).
+        task_id = await service.start(resolved, actor=audit_actor(token))
     except ProvisionConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"task_id": task_id, "status": "pending"}
@@ -89,7 +92,7 @@ async def rejoin_tailnet(
             vmid=vmid,
             hostname=hostname,
             key=body.auth_key,
-            actor=token.get("user_id") or "system",
+            actor=audit_actor(token),
         )
     except TailnetJoinConflictError as exc:
         # 409, not 202: two joins on one guest overwrite each other's staged key

@@ -402,10 +402,13 @@ async def handle_get_host_metrics_series(
     # trivia: a caller that asks for a 10-year window or 10 million points would
     # otherwise get a different (and much more expensive) answer over MCP than
     # over HTTP. Clamped here so both surfaces obey the same ceiling.
+    # The window's bounds are series_answer's (window_problem): the same
+    # sentence the route gives, never a second spelling of the limit.
     raw_hours = arguments.get("hours")
-    hours = 1.0 if raw_hours is None else float(raw_hours)
-    if hours <= 0 or hours > MAX_WINDOW_HOURS:
-        raise ValueError(f"hours must be greater than 0 and at most {MAX_WINDOW_HOURS}")
+    try:
+        hours = 1.0 if raw_hours is None else float(raw_hours)
+    except (TypeError, ValueError):
+        raise ValueError(f"hours must be a number of hours, not {raw_hours!r}") from None
 
     raw_limit = arguments.get("limit")
     limit = MAX_SERIES_POINTS if raw_limit is None else int(raw_limit)

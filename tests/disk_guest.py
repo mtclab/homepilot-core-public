@@ -150,7 +150,20 @@ echo "chattr $*" >> "$S/chattr.log"
 class DiskGuest:
     """The inside of one guest: its disks, fstab, mounts and tools, in files."""
 
-    def __init__(self, root: Path, *, has_xfs: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        has_xfs: bool = True,
+        selinux_confined: bool = False,
+        hidden: tuple[str, ...] = (),
+        missing: tuple[str, ...] = (),
+    ) -> None:
+        """``selinux_confined``: the agent's shell runs as ``virt_qemu_ga_t`` on an
+        enforcing guest (its /proc/self/attr/current and /sys/fs/selinux/enforce).
+        ``hidden``: tools installed in the usual directory (a stat finds them) that
+        the agent's shell cannot find on its PATH. ``missing``: tools neither the
+        PATH nor a stat finds - really absent, or (confined) refused even a stat."""
         self.root = root
         self.state = root / "state"
         self.bin = root / "bin"
@@ -172,6 +185,20 @@ class DiskGuest:
             real = shutil.which(name)
             assert real, f"the test host has no {name}"
             (self.bin / name).symlink_to(real)
+        # The guest's "usual places" for tools (SYSDIRS), and its SELinux facts.
+        self.sysdir = root / "usr" / "bin"
+        self.sysdir.mkdir(parents=True, exist_ok=True)
+        for name in hidden:
+            (self.bin / name).rename(self.sysdir / name)
+        for name in missing:
+            (self.bin / name).unlink()
+        self.self_context = root / "proc-self-attr-current"
+        self.enforce = root / "sys-fs-selinux-enforce"
+        if selinux_confined:
+            self.self_context.write_text("system_u:system_r:virt_qemu_ga_t:s0\x00")
+            self.enforce.write_text("1")
+        else:
+            self.self_context.write_text("unconfined\n")
 
     def add_device(
         self, serial: str, *, fstype: str = "", label: str = "", parts: int = 0, sig: str = ""
@@ -211,6 +238,15 @@ class DiskGuest:
     def run(self, script: str) -> tuple[int, str, str]:
         assert "FSTAB='/etc/fstab'" in script, "the guest script names the real fstab"
         script = script.replace("FSTAB='/etc/fstab'", f"FSTAB='{self.fstab}'")
+        for name, real in (
+            ("SELF_CONTEXT", self.self_context),
+            ("SELINUX_ENFORCE", self.enforce),
+            ("SYSDIRS", self.sysdir),
+        ):
+            assert f"{name}='" in script, f"the guest script names {name}"
+            start = script.index(f"{name}='")
+            end = script.index("'", start + len(name) + 2)
+            script = script[:start] + f"{name}='{real}'" + script[end + 1 :]
         proc = subprocess.run(  # nosec B603 - the script under test, a fixed interpreter
             ["/bin/sh", "-c", script],
             env={"PATH": str(self.bin), "HOME": str(self.root), "LC_ALL": "C"},
@@ -255,7 +291,14 @@ class DiskCluster(FakeCluster):
         self._exec_results: dict[int, dict[str, Any]] = {}
         self._volumes = 0
 
-    def add_vm(self, vmid: int, name: str, *, config: dict[str, Any] | None = None) -> DiskGuest:
+    def add_vm(
+        self,
+        vmid: int,
+        name: str,
+        *,
+        config: dict[str, Any] | None = None,
+        inside: dict[str, Any] | None = None,
+    ) -> DiskGuest:
         base = {
             "agent": "1",
             "scsihw": "virtio-scsi-single",
@@ -267,10 +310,10 @@ class DiskCluster(FakeCluster):
         for key in [k for k, v in base.items() if v is None]:
             del base[key]
         self.add(vmid, name, "running", base)
-        inside = DiskGuest(self.tmp / f"guest-{vmid}")
-        self.guests_inside[vmid] = inside
+        guest = DiskGuest(self.tmp / f"guest-{vmid}", **(inside or {}))
+        self.guests_inside[vmid] = guest
         self.agent_alive[vmid] = True
-        return inside
+        return guest
 
     @property
     def config_writes(self) -> list[tuple[str, dict[str, Any] | None]]:

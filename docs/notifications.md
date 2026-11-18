@@ -16,6 +16,8 @@ startup self-check line `notifications` reports `off`.
 
 **Monitoring -> Channels -> Get alerts on your phone** (admin session) offers
 three ways to get alerts onto a phone. Nothing extra runs until you choose one.
+On an install without `HP_NTFY_INTERNAL_URL` (set by the shipped compose files),
+the first is shown as not available, with that reason; the other two still work.
 
 1. **HomePilot's own ntfy server** (recommended). The release ships an opt-in
    `ntfy` compose service (profile `ntfy`, image pinned by tag and digest, data

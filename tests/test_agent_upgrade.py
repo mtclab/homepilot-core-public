@@ -61,7 +61,7 @@ import pytest_asyncio
 from homepilot.agent_hub.enroll import (
     _AGENT_ID_MARKER,
     _ENV_PATH,
-    _KEPT_TOKEN_MARKER,
+    _KEPT_CREDENTIAL_MARKER,
     AgentEnrollService,
     EnrollPreconditionError,
     _rollback_script,
@@ -314,7 +314,7 @@ class TestTheRollbackRestoresEverything:
         assert changed["hp-agent.service"] != before["hp-agent.service"]
         assert str(host.snapshot) in out
 
-        assert _KEPT_TOKEN_MARKER not in host.roll_back()
+        assert _KEPT_CREDENTIAL_MARKER not in host.roll_back()
 
         assert host.state() == before
         assert not host.snapshot.exists(), "the snapshot (old credentials) outlived the restore"
@@ -356,7 +356,7 @@ class TestTheRollbackRestoresEverything:
 
         out = host.roll_back()
 
-        assert _KEPT_TOKEN_MARKER in out
+        assert _KEPT_CREDENTIAL_MARKER in out
         after = host.state()
         assert after.pop("agent.token")[0] == b"credential-the-hub-issued-the-new-agent"
         before.pop("agent.token")

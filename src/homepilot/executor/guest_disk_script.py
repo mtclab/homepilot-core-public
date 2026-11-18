@@ -54,12 +54,53 @@ fact() { printf 'HP-FACT %s %s\n' "$1" "$2"; }
 refuse() { step "$1" failed "$2"; exit 3; }
 broke() { step "$1" failed "$2"; exit 4; }
 
+# Is this shell the QEMU guest agent confined by SELinux (Fedora/RHEL/Rocky/
+# Alma)? Read with the shell's own `read` - nothing to exec, which a confined
+# agent may not be allowed to do. Confined = our context is virt_qemu_ga_t and
+# SELinux is not permissive (an unreadable enforce file counts as enforcing).
+confined() {
+  ctx=''; enf=''
+  { read -r ctx < "$SELF_CONTEXT"; } 2>/dev/null || true
+  { read -r enf < "$SELINUX_ENFORCE"; } 2>/dev/null || true
+  case "$ctx" in *virt_qemu_ga_t*) [ "$enf" != 0 ];; *) return 1;; esac
+}
+SELINUX_WAY="An operator can widen what the guest agent may do, inside the guest: \
+'setsebool -P virt_qemu_ga_run_unconfined 1' lets it run programs labelled \
+virt_qemu_ga_unconfined_exec_t unconfined, and 'semanage permissive -a virt_qemu_ga_t' \
+stops confining it at all - either lets whoever can reach the guest agent do more, \
+so it is a decision for the guest's owner. HomePilot changes neither"
+# A tool the agent's shell cannot find: really missing, or there and out of
+# the agent's reach? (3.14 walk: a Fedora guest with mount installed was told
+# "the guest has no mount".) A stat of the usual places tells "installed" from
+# "missing"; under SELinux the stat may be refused too, so confinement is said
+# on its own when the file cannot be seen.
+missing() {
+  at=''
+  for d in $SYSDIRS; do
+    if [ -e "$d/$1" ]; then at="$d/$1"; break; fi
+  done
+  if [ -n "$at" ] && confined; then
+    refuse tools "the guest has $at, but SELinux confines the QEMU guest agent \
+(domain virt_qemu_ga_t, enforcing) and the commands it starts may not run it. $SELINUX_WAY"
+  fi
+  if [ -n "$at" ]; then
+    refuse tools "the guest has $at, but the guest agent's shell cannot run it \
+(it is not on the agent's PATH, or not executable)"
+  fi
+  if confined; then
+    refuse tools "the guest agent cannot see $1: SELinux confines it (domain \
+virt_qemu_ga_t, enforcing), so $1 may be installed and out of its reach, or really \
+missing${2:+ ($2)}. $SELINUX_WAY"
+  fi
+  refuse tools "the guest has no $1${2:+ - $2}"
+}
+
 for tool in lsblk blkid wipefs findmnt mount grep; do
-  command -v "$tool" >/dev/null 2>&1 || refuse tools "the guest has no $tool"
+  command -v "$tool" >/dev/null 2>&1 || missing "$tool" ""
 done
 if [ "$MODE" != verify ]; then
   command -v "mkfs.$FSTYPE" >/dev/null 2>&1 || \
-    refuse tools "the guest has no mkfs.$FSTYPE - install its $FSTYPE tools first"
+    missing "mkfs.$FSTYPE" "install its $FSTYPE tools first"
 fi
 [ -f "$FSTAB" ] || refuse tools "the guest has no $FSTAB"
 
@@ -241,6 +282,11 @@ def guest_script(spec: GuestDiskSpec, serial: str, mode: str) -> str:
         f"OPTS={shlex.quote(spec.mount_options)}",
         f"PASSNO={passno}",
         "FSTAB='/etc/fstab'",
+        # Where the SELinux facts and the usual tool directories are (a test
+        # guest points these at files of its own, as it does FSTAB).
+        "SELF_CONTEXT='/proc/self/attr/current'",
+        "SELINUX_ENFORCE='/sys/fs/selinux/enforce'",
+        "SYSDIRS='/usr/sbin /usr/bin /sbin /bin /usr/local/sbin /usr/local/bin'",
     ]
     return "\n".join(header) + _BODY
 

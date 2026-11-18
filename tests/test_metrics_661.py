@@ -229,9 +229,38 @@ class TestTheWindowIsCappedAtRetention:
         assert window_problem(700, 60) is None
         assert window_problem(800, 60) == (
             f"A 800-hour window is longer than one series request may ask for "
-            f"({MAX_WINDOW_HOURS} hours)."
+            f"({MAX_WINDOW_HOURS} hours), so ask for at most {MAX_WINDOW_HOURS} hours."
         )
         assert "kept for 7 days" in (window_problem(169, 7) or "")
+
+    async def test_a_window_over_the_ceiling_is_a_sentence_not_a_validation_list(
+        self, api, retention_days
+    ):
+        """3.14 walk: `hours=721` came back as pydantic's list ("Input should be
+        less than or equal to 720") - the route's Query bound answered before
+        the sentence. Every bound is the one sentence now, route and MCP."""
+        from homepilot.mcp.tools.monitoring_tools import handle_get_host_metrics_series
+        from homepilot.metrics.router import MAX_WINDOW_HOURS
+
+        client, repo = api
+        for days, words in ((7, "kept for 7 days"), (60, f"at most {MAX_WINDOW_HOURS} hours")):
+            retention_days.days = days
+            resp = client.get(
+                f"/monitoring/hosts/web01/series?metric=load.1m&hours={MAX_WINDOW_HOURS + 1}"
+            )
+            assert resp.status_code == 422
+            detail = resp.json()["detail"]
+            assert isinstance(detail, str) and words in detail, detail
+            with pytest.raises(ValueError, match=words):
+                await handle_get_host_metrics_series(
+                    {"host": "web01", "metric": "load.1m", "hours": MAX_WINDOW_HOURS + 1},
+                    {"metrics_repo": repo},
+                )
+        for bad in ("0", "-2", "inf", "nan"):
+            resp = client.get(f"/monitoring/hosts/web01/series?metric=load.1m&hours={bad}")
+            assert resp.status_code == 422, bad
+            detail = resp.json()["detail"]
+            assert isinstance(detail, str) and "greater than 0" in detail, (bad, detail)
 
     async def test_mcp_refuses_the_same_window_with_the_same_sentence(self, api):
         from homepilot.mcp.tools.monitoring_tools import handle_get_host_metrics_series

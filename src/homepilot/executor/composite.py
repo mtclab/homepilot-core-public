@@ -53,7 +53,7 @@ async def execute(
                 # A step that names no artifact did nothing, and a composite made
                 # only of those used to report success having run NOTHING (#642
                 # B9). Propose-time validation refuses this shape, so it can only
-                # arrive through `hp artifacts edit` or a hand edit of the file -
+                # arrive through `hp changes edit` or a hand edit of the file -
                 # neither of which re-validates - which is exactly why the
                 # executor must not treat it as a step that went fine.
                 log_lines.append(f"[{sid}] names no artifact, so nothing was run")

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -511,3 +512,24 @@ class TestTheRecipe:
         md = render_asbuilt("bare", bare)
         assert "No nginx on this host." in md and "No Docker on this host." in md
         json.dumps(md)
+
+    def test_a_reason_that_names_its_subject_is_not_said_twice(self):
+        """3.14 walk: the agent's docker reason stands alone ("docker: not
+        readable - ..."), and after the renderer's label it read "Docker:
+        docker: not readable". Every hidden section, as the note says it."""
+        doc = description()
+        doc["docker"] = {
+            "status": "not_visible",
+            "reason": "docker: not readable - the agent's user cannot open the docker socket",
+        }
+        doc["nginx"] = {"status": "error", "reason": "nginx: the command failed (exit status 1)"}
+        doc["firewall"]["nftables"] = {"status": "error", "reason": "nftables: timed out"}
+        md = render_asbuilt("proxy-1", doc)
+        assert "Docker: not readable - the agent's user cannot open" in md
+        assert "nginx: the command failed" in md and "nftables: timed out" in md
+        # No label anywhere is followed by itself.
+        doubled = re.findall(r"(?i)\b([a-z][a-z ]*?): \1:", md)
+        assert not doubled, doubled
+        # A reason that merely contains a colon is left whole.
+        doc["docker"]["reason"] = "not visible to the agent: its user cannot read this"
+        assert "Docker: not visible to the agent: its user" in render_asbuilt("p", doc)

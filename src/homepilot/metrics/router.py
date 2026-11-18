@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Literal
 
@@ -81,7 +82,15 @@ async def retention_days_in_force() -> int:
 
 
 def window_problem(hours: float, retention_days: int) -> str | None:
-    """Why a series window cannot be answered, in a sentence, or None."""
+    """Why a series window cannot be answered, in a sentence, or None.
+
+    The ONE refusal for a window: the route used to bound ``hours`` in its
+    ``Query`` too, so a window over the outer ceiling was refused with
+    pydantic's list (``Input should be less than or equal to 720``) before this
+    sentence was ever reached (3.14 walk). The route and MCP now leave every
+    bound to this."""
+    if not math.isfinite(hours) or hours <= 0:
+        return f"A {hours:g}-hour window is not a window: ask for a number of hours greater than 0."
     if hours > retention_days * 24:
         return (
             f"A {hours:g}-hour window reaches past what is kept: metric samples are "
@@ -91,7 +100,7 @@ def window_problem(hours: float, retention_days: int) -> str | None:
     if hours > MAX_WINDOW_HOURS:
         return (
             f"A {hours:g}-hour window is longer than one series request may ask for "
-            f"({MAX_WINDOW_HOURS} hours)."
+            f"({MAX_WINDOW_HOURS} hours), so ask for at most {MAX_WINDOW_HOURS} hours."
         )
     return None
 
@@ -207,13 +216,14 @@ async def host_series(
     request: Request,
     hostname: str,
     metric: str = Query(..., min_length=1, max_length=64),
+    # No gt/le here: window_problem is the one refusal, in a sentence (a Query
+    # bound answered first, with pydantic's list - 3.14 walk).
     hours: float = Query(
         1.0,
-        gt=0,
-        le=MAX_WINDOW_HOURS,
         description=(
-            "Window in hours. At most the metric retention in force (default 7 days "
-            "= 168 hours); a longer window is refused with 422."
+            "Window in hours, greater than 0. At most the metric retention in force "
+            f"(default 7 days = 168 hours) and never more than {MAX_WINDOW_HOURS}; a "
+            "longer window is refused with 422 and a sentence saying how long it may be."
         ),
     ),
     limit: int = Query(MAX_SERIES_POINTS, ge=1, le=MAX_SERIES_POINTS),

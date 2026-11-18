@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from ..auth.deps import SCOPE_ENFORCER_ATTR, require_scope
+from ..auth.principal import audit_actor
 from ..common import OPENAPI_DESTRUCTIVE
 from .audit import ActionType, set_audit_caller
 from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
@@ -795,7 +796,8 @@ async def install_agent_on_host(
             host,
             hub_host,
             hub_port,
-            actor=token.get("user_id") or "system",
+            # The credential's name, never the internal user id (3.14 walk).
+            actor=audit_actor(token),
             upgrade=body.upgrade,
         )
     except EnrollPreconditionError as exc:

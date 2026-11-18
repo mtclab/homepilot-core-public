@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import secrets
+import string
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,12 +74,22 @@ CHANNEL_NAME = "Phone (bundled ntfy)"
 # socket, which is root on the host.
 COMPOSE_COMMAND = "docker compose --profile ntfy up -d"
 
+# Why the bundled server cannot be chosen on an install that has not said where
+# its ntfy service answers. Only that one of the three ways needs the address:
+# ntfy.sh and an ntfy server the operator already runs work without it, so the
+# status answer carries this as a reason instead of refusing the whole flow.
+NO_INTERNAL_URL = (
+    "HP_NTFY_INTERNAL_URL is not set, so HomePilot does not know where the bundled "
+    "ntfy service answers. The shipped compose files set it (http://ntfy); an "
+    "install without them points it at its ntfy service."
+)
+
 HTTP_TIMEOUT_SECONDS = 5.0
 # ntfy's own username rule is ^[-_.+@a-zA-Z0-9]+$ (user/util.go). A phone name
 # is narrower: lower case, so "Pixel" and "pixel" cannot be two logins, and short
 # enough to read on the ntfy app's account screen.
 _PHONE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
-_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+_TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 # A phone password is typed on a phone keyboard: 16 characters of [a-z0-9]
 # (~82 bits) in four groups, no symbols to hunt for.
 _PASSWORD_GROUPS = 4
@@ -311,6 +322,10 @@ class PhoneAlerts:
         """Provision the bundled server. Idempotent: a second call rewrites the
         config from the tokens already in the vault instead of minting new ones,
         so a phone or a channel set up earlier keeps working."""
+        if not self.internal_url:
+            # The publisher channel's address IS this URL; without it nothing
+            # could ever be delivered, so nothing is written.
+            raise PhoneAlertsError(f"{NO_INTERNAL_URL} Nothing was written.")
         if self._vault is None:
             raise PhoneAlertsError(
                 "There is no vault on this install, so the ntfy tokens cannot be stored "
@@ -410,6 +425,13 @@ class PhoneAlerts:
         ``/v1/health`` answers for any ntfy; ``/v1/version`` answers only an
         admin - so a 200 there with HomePilot's admin token proves the server
         loaded the config HomePilot wrote, not an older one."""
+        if not self.internal_url:
+            return {
+                "running": False,
+                "configured": False,
+                "version": None,
+                "detail": NO_INTERNAL_URL,
+            }
         try:
             stored = await self._secrets()
         except PhoneAlertsError as exc:
@@ -452,10 +474,14 @@ class PhoneAlerts:
         return {"running": True, "configured": True, "version": found or None, "detail": None}
 
     async def status(self) -> dict[str, Any]:
+        """``bundled_unavailable`` is why the bundled server cannot be chosen on
+        this install (None when it can); the other two ways stay offered."""
         state = await self._state()
+        unavailable = None if self.internal_url else NO_INTERNAL_URL
         if state.get("mode") != "bundled":
             return {
                 "bundled": None,
+                "bundled_unavailable": unavailable,
                 "compose_command": COMPOSE_COMMAND,
                 "ntfy_version": NTFY_VERSION,
             }
@@ -479,6 +505,7 @@ class PhoneAlerts:
                 "phones": phones,
                 "limit": LIMIT_NOTE,
             },
+            "bundled_unavailable": unavailable,
             "compose_command": COMPOSE_COMMAND,
             "ntfy_version": NTFY_VERSION,
         }
@@ -543,6 +570,8 @@ class PhoneAlerts:
     async def _admin(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> httpx.Response:
+        if not self.internal_url:
+            raise PhoneAlertsError(NO_INTERNAL_URL)
         stored = await self._secrets()
         try:
             async with self._client() as client:
@@ -649,6 +678,12 @@ class PhoneAlerts:
     async def remove_phone(self, raw_name: str) -> dict[str, Any]:
         name = self._check_phone_name(raw_name)
         await self._require_bundled()
+        # HomePilot's own list first, as allow_phone does: ntfy answers a DELETE
+        # for a login it does not have with 400, which read as "ntfy refused to
+        # remove the login (HTTP 400)" - a 503 for a typo (3.14 walk). An
+        # unknown name is a 404; a 503 stays for ntfy really failing.
+        if not any(p["name"] == name for p in await self.list_phones()):
+            raise LookupError(name)
         resp = await self._admin("DELETE", "/v1/users", {"username": name})
         if resp.status_code == 404:
             raise LookupError(name)

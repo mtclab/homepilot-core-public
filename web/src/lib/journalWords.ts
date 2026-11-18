@@ -27,6 +27,8 @@ export interface Happening {
 
 /** A journal row in words, as the server sends it (dashboard/wording.py). */
 export interface JournalWords {
+	/** Who did it: "HomePilot", a token's label, never an internal id (absent from an older server). */
+	actor?: string;
 	verb: string;
 	/** The thing acted on - a change id or a host name - shown strong; null for none. */
 	object: string | null;
@@ -44,15 +46,29 @@ const w = (text: string): Part => ({ text });
 /** Words for a row the server sent none for (an older server): never the code. */
 const NO_WORDS: JournalWords = { verb: 'recorded an event', object: null, tail: '', many: null, text: 'recorded an event' };
 
-/** The name a journal actor is said by: "You", or its label without the token prefix. */
-export function actorName(userId: string, me: { token_label?: string; prefix?: string } | null): string {
+// An internal id (a users/api_tokens uuid) - never said as a name (3.14 walk).
+const INTERNAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The name a journal actor is said by: "You" for the viewer's own rows, else
+ * the server's `actor` words (a token's label, never an internal id). An older
+ * server's row without them: its label without the token prefix, and an
+ * internal id as a token that no longer exists.
+ */
+export function actorName(
+	userId: string,
+	me: { token_label?: string; prefix?: string } | null,
+	said?: string,
+): string {
 	const id = userId || 'system';
 	if (me?.token_label) {
 		const full = me.prefix ? `${me.token_label} (${me.prefix})` : me.token_label;
 		if (id === full || id === me.token_label) return 'You';
 	}
+	if (said) return said;
 	if (id === 'system') return 'HomePilot';
-	return id.replace(/\s*\(hp_[A-Za-z0-9]+\)\s*$/, '') || id;
+	const label = id.replace(/\s*\(hp_[A-Za-z0-9]+\)\s*$/, '') || id;
+	return INTERNAL_ID.test(label) ? 'A token that no longer exists' : label;
 }
 
 function hrefOf(e: AuditEntry, base: string): string {
@@ -78,7 +94,7 @@ export function describeJournal(
 			while (j < entries.length && entries[j].action === e.action && entries[j].user_id === e.user_id) j++;
 		}
 		const n = j - i;
-		const who = actorName(e.user_id, me);
+		const who = actorName(e.user_id, me, e.words?.actor);
 		const parts: Part[] =
 			n > 1 && words.many
 				? [w(`${who} ${words.many.replace('{n}', String(n))}`)]

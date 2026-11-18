@@ -54,6 +54,9 @@ take the new compose file (it adds the opt-in `ntfy` service).
 - **ntfy.sh**: HomePilot picks a long random topic and says plainly that alert
   text leaves your network.
 - The first-run checklist gains the optional step "Get alerts on your phone".
+- Removing a phone HomePilot does not list answers 404 "No phone named ..."
+  (it was a 503 "ntfy refused to remove the login (HTTP 400)"); a 503 is kept
+  for ntfy really failing.
 
 ### How a host is built, for the knowledge base (#818)
 
@@ -99,6 +102,9 @@ HomePilot. Now each agent describes its host:
   `.env.*` file, is refused wherever it sits. Compose files are deliberately NOT
   readable: they routinely carry passwords inline; the description reports what
   compose runs from the Docker daemon instead.
+- The tab and the as-built note no longer say a part's name twice ("Docker:
+  docker: not readable"): a reason that starts with the part's own name is shown
+  after the label without it.
 
 ### Percentage alert rules, and a readable week of metrics (#661)
 
@@ -129,6 +135,9 @@ VM and a 4 TB array. And the 7-day chart showed the newest 33 hours of the week.
   says it is showing per-bucket min/avg/max, with the true sample range.
 - **A window past the metric retention is refused** with a sentence instead of
   answered with nothing; the host page offers only ranges inside it.
+- A window over the 720-hour ceiling, or one of 0 hours or less, gets the same
+  kind of sentence over the route and MCP - it was pydantic's validation list
+  ("Input should be less than or equal to 720").
 - Each agent now stores ten series instead of eight: ~13.6 MB per host per week
   measured with realistic identities (the old 77.7 B/row figure came from a
   five-character hostname and was ~66% optimistic).
@@ -163,6 +172,13 @@ spec (example in docs/add-disk.md).
 - The review shows the slot, serial, fstab line and anything that would refuse
   it now (`plan_artifact` answers for `guest-disk` too); drift checks the disk
   is attached, mounted from its label and in fstab.
+- **A confined guest agent is named, not mistaken for a missing tool.** On
+  Fedora/RHEL-family guests qemu-ga runs confined by SELinux (`virt_qemu_ga_t`)
+  and the commands it starts may not see or run `mount`, `mkfs` and friends;
+  the check said "the guest has no mount". It now tells "really missing" from
+  "installed but out of the agent's reach" and names what the guest's owner
+  can do (`virt_qemu_ga_run_unconfined`, `semanage permissive`), saying both
+  widen what the guest agent may do. HomePilot changes neither.
 
 ### The read tier no longer shows command lines (#817)
 
@@ -288,6 +304,11 @@ refusal now names the remedy: `hp agents install HOST` on a QEMU guest, or
   loops, constants and callers; migration SQL; the `tasks` table's CHECK
   constraints - and fails on a code with no words, on words for a code nothing
   writes, and on a journal write whose code cannot be derived.
+- The words name who did it too (`actor`): a token's label, never an internal
+  id. Agent installs and upgrades, guest creation and tailnet joins recorded
+  the caller's user id, so `hp status` read "<uuid> upgraded the agent on ...";
+  they now record the token's name, and rows already recorded that way read as
+  the token's label, or "A token that no longer exists".
 
 ### Proxmox endpoint paths live in the adapters (#717)
 
@@ -331,6 +352,21 @@ refusal now names the remedy: `hp agents install HOST` on a QEMU guest, or
 
 ### Fixes
 
+- **A change that deletes a disk volume is no longer defeated by its own
+  snapshot.** A proxmox-api-sequence that freed a VM's unused disk took the
+  automatic pre-apply snapshot first; the snapshot held the volume, Proxmox
+  refused the delete "volume is still in use (snapshot?)" and the change was
+  left partly applied. Such a change (config `delete` of an `unusedN` key, or a
+  disk key with `force`; a forced `unlink`; destroying the guest; deleting one
+  of its volumes from a storage) is now refused at propose unless it says
+  `requires_snapshot: false`, refused before the snapshot at apply if it was
+  proposed earlier, and a refusal Proxmox still gives says which snapshot holds
+  the volume and what to do.
+- **Hints name the commands `hp --help` lists.** "Review with: hp artifacts
+  show" and 40-odd other messages named the pre-3.13 group names (`hp
+  artifacts`, `hp inventory`, `hp agent`), now hidden aliases; they say `hp
+  changes`, `hp hosts` and `hp agents`. A gate resolves every `hp ...` the
+  product names against the real command tree.
 - **A clean shutdown is no longer killed by Docker (#812).** Each step of the
   shutdown is bounded, and the bounds add up to ~126 s (hub stop, reconcilers,
   seven drains, blocking pools, WAL checkpoint, close). The compose files set no

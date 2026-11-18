@@ -2,7 +2,7 @@
 
 An artifact's approval code is a short, unguessable secret generated when the
 artifact is PROPOSED. A human reads it from an operator surface (the web review
-screen, `hp artifacts show`, or a webhook notification) and relays it to the
+screen, `hp changes show`, or a webhook notification) and relays it to the
 assistant, which passes it to `approve_artifact(artifact_id, approval_code)` over
 MCP. The server verifies it constant-time against the stored code, so a valid
 code is proof a human decided - the assistant cannot fabricate one.

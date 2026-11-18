@@ -222,6 +222,61 @@ class TestEnable:
         assert await alerts._notifier.store.list() == []
 
 
+class TestNoInternalAddress:
+    """An install without HP_NTFY_INTERNAL_URL (no shipped compose file).
+
+    3.14.0's mirror CI ran the server so: the status route answered 503, the
+    page showed only that error, and ntfy.sh and an existing server - which
+    need no bundled service - could not be chosen either. Now only the bundled
+    server's own actions refuse, with the reason; the status says why it is off.
+
+    Teeth: drop ``bundled_unavailable`` and the status test fails (put the
+    router's 503 back and tests/test_e2e.py's TestPhoneAlertsOnTheShippedPage
+    fails on the real server); drop the enable guard and a channel addressed
+    at "/homepilot" plus a tokens-only config are written."""
+
+    def _alerts(self, parts: tuple[Any, Any], tmp_path: Path, vault: Any) -> PhoneAlerts:
+        db, repo = parts
+        return PhoneAlerts(
+            notifier=Notifier(db, vault, retry_delays=()),
+            repo=repo,
+            data_dir=tmp_path / "data",
+            internal_url="",
+        )
+
+    async def test_status_answers_and_says_why_the_bundled_server_is_off(
+        self, parts, tmp_path: Path
+    ) -> None:
+        status = await self._alerts(parts, tmp_path, MemVault()).status()
+        assert status["bundled"] is None
+        assert "HP_NTFY_INTERNAL_URL is not set" in status["bundled_unavailable"]
+        configured = await _phone(parts, tmp_path, MemVault()).status()
+        assert configured["bundled_unavailable"] is None
+
+    async def test_enable_refuses_and_writes_nothing(self, parts, tmp_path: Path) -> None:
+        vault = MemVault()
+        alerts = self._alerts(parts, tmp_path, vault)
+        with pytest.raises(PhoneAlertsError, match="HP_NTFY_INTERNAL_URL is not set"):
+            await alerts.enable()
+        assert not alerts.config_path.exists()
+        assert bundled.VAULT_REF not in vault.secrets
+        assert await alerts._notifier.store.list() == []
+
+    async def test_an_address_removed_later_is_reported_and_disable_still_works(
+        self, parts, tmp_path: Path
+    ) -> None:
+        vault = MemVault()
+        await _phone(parts, tmp_path, vault).enable()
+        alerts = self._alerts(parts, tmp_path, vault)
+        status = await alerts.status()
+        assert "HP_NTFY_INTERNAL_URL is not set" in status["bundled"]["server"]["detail"]
+        with pytest.raises(PhoneAlertsError, match="HP_NTFY_INTERNAL_URL is not set"):
+            await alerts.list_phones()
+        await alerts.disable()
+        assert not alerts.config_path.exists()
+        assert await alerts._notifier.store.list() == []
+
+
 @pytest.mark.asyncio
 async def test_ntfy_sh_picks_a_long_random_topic_and_warns(parts, tmp_path: Path) -> None:
     """Teeth: a short or fixed topic is everyone's topic on a public server."""
@@ -285,3 +340,114 @@ def test_the_phone_routes_are_admin_only() -> None:
     for route in phone:
         names = [getattr(d.dependency, "__qualname__", "") for d in route.dependencies]
         assert any("require_scope" in n for n in names), route.path
+
+
+class FakeNtfyAdmin:
+    """ntfy v2.37.2's admin user API, as far as removing a phone reaches it.
+
+    GET /v1/users lists every login (HomePilot's provisioned ones and the
+    phones); DELETE /v1/users removes one - and for a login it does not have,
+    real ntfy answers 400 (the 3.14 walk's "ntfy refused to remove the login
+    (HTTP 400)"). ``fail_delete`` makes ntfy really fail (a 500)."""
+
+    def __init__(self) -> None:
+        self.users = {
+            "hp-admin": {"role": "admin", "provisioned": True},
+            "hp-publisher": {"role": "user", "provisioned": True},
+            "pixel": {"role": "user", "provisioned": False},
+        }
+        self.deletes: list[str] = []
+        self.fail_delete = False
+
+    def __call__(self, request: Any) -> Any:
+        import json as _json
+
+        import httpx
+
+        if request.url.path == "/v1/users" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "username": name,
+                        **user,
+                        "grants": [{"topic": bundled.TOPIC, "permission": "read-only"}],
+                    }
+                    for name, user in self.users.items()
+                ],
+            )
+        if request.url.path == "/v1/users" and request.method == "DELETE":
+            name = _json.loads(request.content)["username"]
+            self.deletes.append(name)
+            if self.fail_delete:
+                return httpx.Response(500, json={"error": "internal"})
+            if name not in self.users:
+                return httpx.Response(400, json={"code": 40001, "error": "invalid request"})
+            del self.users[name]
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(404)
+
+
+async def test_removing_a_phone_homepilot_does_not_have_is_a_404(parts, tmp_path: Path) -> None:
+    """3.14 walk: DELETE /admin/notifications/phone/phones/<unknown> answered
+    503 "ntfy refused to remove the login (HTTP 400)". Through the real route:
+    an unknown phone is 404 "No phone named ..." and ntfy is never asked; a
+    listed phone is removed (200, journal row); ntfy really failing stays 503.
+
+    Teeth: drop the list check in ``remove_phone`` and the unknown phone is a
+    503 again."""
+    import httpx
+    from fastapi import FastAPI
+
+    from homepilot.auth.deps import require_token
+    from homepilot.notifications.router import router
+
+    db, repo = parts
+    ntfy = FakeNtfyAdmin()
+    notifier = Notifier(db, MemVault(), retry_delays=())
+    alerts = PhoneAlerts(
+        notifier=notifier,
+        repo=repo,
+        data_dir=tmp_path / "data",
+        internal_url="http://ntfy.test",
+        transport=httpx.MockTransport(ntfy),
+    )
+    await alerts.enable()
+    app = FastAPI()
+    app.include_router(router)
+    app.state.notifier = notifier
+    app.state.repo = repo
+    app.state.phone_alerts = alerts
+    app.dependency_overrides[require_token] = lambda: {
+        "scope": "admin",
+        "role": "admin",
+        "label": "owner",
+        "prefix": "hp_owner000001",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://hp"
+    ) as client:
+        unknown = await client.delete("/admin/notifications/phone/phones/ghost")
+        assert unknown.status_code == 404, unknown.text
+        assert unknown.json()["detail"] == "No phone named 'ghost'"
+        assert ntfy.deletes == [], "ntfy was asked to remove a login HomePilot does not list"
+        # HomePilot's own logins are not phones: not removable here either.
+        own = await client.delete("/admin/notifications/phone/phones/hp-publisher")
+        assert own.status_code == 422 and "hp-publisher" in ntfy.users
+
+        ntfy.fail_delete = True
+        failing = await client.delete("/admin/notifications/phone/phones/pixel")
+        assert failing.status_code == 503, failing.text
+        assert "HTTP 500" in failing.json()["detail"]
+
+        ntfy.fail_delete = False
+        removed = await client.delete("/admin/notifications/phone/phones/pixel")
+        assert removed.status_code == 200, removed.text
+        assert removed.json() == {"name": "pixel", "removed": True}
+        assert "pixel" not in ntfy.users
+        again = await client.delete("/admin/notifications/phone/phones/pixel")
+        assert again.status_code == 404 and again.json()["detail"] == "No phone named 'pixel'"
+    rows = await db.fetchall(
+        "SELECT action FROM audit_log WHERE action = 'phone_alerts_phone_removed'"
+    )
+    assert len(rows) == 1, "only the real removal is journalled"

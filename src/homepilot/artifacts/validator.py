@@ -388,6 +388,17 @@ def validate_artifact_content(spec: Mapping[str, Any], body: str) -> dict[str, A
                 "with no rollback point. Drop the claim, or target the guest."
             )
 
+    # A change that deletes a disk volume would be blocked by its OWN pre-apply
+    # snapshot, which keeps that volume in use (3.14 walk: "volume is still in
+    # use (snapshot?)", left partly applied). Refused here, before anything runs.
+    from homepilot.executor.volume_deletes import snapshot_conflict
+
+    conflict = snapshot_conflict(
+        kind.value, {**dict(spec), "mutating": derived["mutating"]}, body, target_data or {}
+    )
+    if conflict:
+        raise LifecycleError(conflict)
+
     # Vault references the platform forbids (#684): its own credentials always,
     # and anything outside HP_ARTIFACT_VAULT_ALLOWLIST when that is set. Checked
     # on the RAW body with the executor's own regex - before the Jinja pass,

@@ -42,6 +42,17 @@ describe('journal words', () => {
 		expect(actorName('admin-secret', ME)).toBe('admin-secret');
 	});
 
+	it('names an internal-id actor by the server\'s words, never the id (3.14 walk)', () => {
+		const id = '5f0c2a1e-7b3d-4c9e-9a41-0d2e6b8f3c17';
+		expect(actorName(id, ME, 'claude')).toBe('claude');
+		// An older server that sent no actor words: still not the id.
+		expect(actorName(id, ME)).toBe('A token that no longer exists');
+		const row = e({ action: 'host_added', user_id: id, target_host: 'nas' });
+		const said = describeJournal([{ ...row, words: { ...row.words!, actor: 'claude' } }], ME);
+		expect(sentence(said[0])).toBe('claude added the host nas');
+		expect(sentence(describeJournal([row], ME)[0])).not.toContain(id);
+	});
+
 	it('says known actions in words, with what they acted on', () => {
 		const out = describeJournal(
 			[

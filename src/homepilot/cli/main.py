@@ -138,8 +138,8 @@ async def _open_cli_db(what: str, db_path: Path | None = None) -> Any:
     Two rules live here, and both are about a command that must NOT proceed.
 
     **The refusal is decided BEFORE anything is opened.** `hp init`,
-    `hp token create|revoke`, `hp invite *`, `hp inventory *`, `hp webhook *`,
-    `hp agent revoke|remove`, `hp kb reindex` and `hp import` all migrate the
+    `hp token create|revoke`, `hp invite *`, `hp hosts *`, `hp webhook *`,
+    `hp agents revoke|remove`, `hp kb reindex` and `hp import` all migrate the
     same file a running server is using, so a CLI could change the schema under
     it (#431). The refusal used to be raised while the caller already held an
     open aiosqlite connection - and a CLI that raises while holding one NEVER
@@ -187,7 +187,7 @@ def _server_is_running(settings: Any) -> bool:
 def _refuse_if_server_running(settings: Any, what: str) -> None:
     """Refuse a schema migration while a backend holds this data directory (#431).
 
-    `hp init`, `hp token create` and `hp agent revoke` each run `run_migrations()`
+    `hp init`, `hp token create` and `hp agents revoke` each run `run_migrations()`
     on the same file a running server is using, so a CLI could migrate the schema
     out from under it. The backend takes an advisory lock for its lifetime; this
     asks whether anyone holds it.
@@ -288,7 +288,7 @@ def _lifecycle_transition(
     """
 
     async def _direct() -> None:
-        async with _lifecycle_with_repo(f"hp artifacts {action}") as lifecycle:
+        async with _lifecycle_with_repo(f"hp changes {action}") as lifecycle:
             if action == "approve":
                 await lifecycle.approve(
                     id, _CLI_OPERATOR, reason=reason, acknowledge_policy=acknowledge_policy
@@ -834,10 +834,10 @@ def artifacts_show(
             Panel(
                 f"[bold]{code}[/bold]\n"
                 "[dim]Relay this to the assistant to approve over MCP, or run "
-                "`hp artifacts approve` here.[/dim]"
+                "`hp changes approve` here.[/dim]"
                 + (
                     "\n[red]LOCKED — too many wrong codes. "
-                    "Run `hp artifacts reset-approval` to unlock.[/red]"
+                    "Run `hp changes reset-approval` to unlock.[/red]"
                     if locked
                     else ""
                 ),
@@ -932,7 +932,7 @@ def artifacts_reset_approval(
 
     After too many wrong codes relayed over MCP, coded approval locks for the
     artifact. This clears the lock; the code itself is unchanged, so you can
-    re-read it with `hp artifacts show` and relay it again."""
+    re-read it with `hp changes show` and relay it again."""
 
     async def _reset(repo: Any) -> bool:
         return bool(await repo.reset_approval_lock(id))
@@ -1051,11 +1051,11 @@ def artifacts_edit(
 async def _edit_directly(id: str, edited: str) -> dict[str, Any]:
     from homepilot.artifacts.edit_router import submit_edit
 
-    async with _lifecycle_with_repo("hp artifacts edit") as lifecycle:
+    async with _lifecycle_with_repo("hp changes edit") as lifecycle:
         return await submit_edit(lifecycle, id, edited, "cli")
 
 
-# How long `hp artifacts apply|replay|revoke` follow a task before saying its
+# How long `hp changes apply|replay|revoke` follow a task before saying its
 # outcome is unknown. Generous on purpose: an apply that provisions a guest or
 # runs a long playbook legitimately takes many minutes, and giving up early is
 # only honest if it is reported as "unknown", which it is.
@@ -1144,7 +1144,7 @@ def _run_artifact_task(
         err_console.print(
             f"[yellow]No answer from the backend while starting the task for "
             f"{artifact_id} ({type(exc).__name__}). The outcome is unknown: check "
-            f"`hp artifacts show {artifact_id}` or the Tasks page.[/yellow]"
+            f"`hp changes show {artifact_id}` or the Tasks page.[/yellow]"
         )
         raise typer.Exit(EXIT_OUTCOME_UNKNOWN) from None
 
@@ -1174,7 +1174,7 @@ def _run_artifact_task(
     )
     err_console.print(
         f"[yellow]The outcome of task {task_id} for {artifact_id} is unknown: {why}. "
-        f"It may still complete - check `hp artifacts show {artifact_id}` or the "
+        f"It may still complete - check `hp changes show {artifact_id}` or the "
         "Tasks page.[/yellow]"
     )
     raise typer.Exit(EXIT_OUTCOME_UNKNOWN)
@@ -2714,7 +2714,7 @@ async def _ephemeral_token(
     Yields ``_mint_token_via_api``'s ``(token, error)``. The delete is made with
     the ADMIN credential that minted the token, not with the token itself: a
     ``write`` token is not allowed to delete tokens, so self-deletion answered
-    403 and every `hp artifacts apply` left a live write credential behind
+    403 and every `hp changes apply` left a live write credential behind
     (#699). A delete that still fails is logged as a warning - the expiry
     bounds the damage, but the operator should know.
     """
@@ -2831,7 +2831,7 @@ def token_create(
     the local DB - anyone who could run `hp` on the box could mint a fleet-root
     credential, and nothing was recorded about who did. Now the token is minted
     through POST /auth/tokens with this box's admin credential, exactly as
-    `hp agent` does its work. The old path survives for the one case that cannot
+    `hp agents` does its work. The old path survives for the one case that cannot
     be authenticated - an instance with no live token to authenticate WITH.
     """
     # Refuse a scope the instance cannot honour BEFORE anything is minted: a
@@ -3280,7 +3280,7 @@ def inventory_list(
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             return []
-        db = await _open_cli_db("hp inventory list", db_path)
+        db = await _open_cli_db("hp hosts list", db_path)
         try:
             repo = Repository(db)
             svc = InventoryService(repo=repo)
@@ -3308,9 +3308,7 @@ def inventory_list(
             **({"pve_status": "running"} if running else {}),
         }
         page = (
-            _via_backend(
-                "hp inventory list", "GET", f"/inventory?{urlencode(params)}", scope="read"
-            )
+            _via_backend("hp hosts list", "GET", f"/inventory?{urlencode(params)}", scope="read")
             or {}
         )
         hosts = list(page.get("items", []))
@@ -3366,7 +3364,7 @@ def inventory_show(
         db_path = Path(settings.data_dir) / "homepilot.db"
         if not db_path.exists():
             return None
-        db = await _open_cli_db("hp inventory show", db_path)
+        db = await _open_cli_db("hp hosts show", db_path)
         try:
             repo = Repository(db)
             host = await repo.get_host_by_hostname(hostname)
@@ -3377,7 +3375,7 @@ def inventory_show(
     if _server_is_running(_get_settings()):
         page = (
             _via_backend(
-                "hp inventory show",
+                "hp hosts show",
                 "GET",
                 f"/inventory?q={quote(hostname)}&limit=1000",
                 scope="read",
@@ -3447,7 +3445,7 @@ def inventory_refresh(
         from homepilot.inventory.service import InventoryService
 
         db_path = Path(settings.data_dir) / "homepilot.db"
-        db = await _open_cli_db("hp inventory refresh", db_path)
+        db = await _open_cli_db("hp hosts refresh", db_path)
         try:
             repo = Repository(db)
 
@@ -3975,10 +3973,10 @@ async def _backend_api(
 ) -> dict[str, Any] | list[Any]:
     """Call the running backend, as an operator would.
 
-    Two families of command need this, for the same reason. `hp agent
+    Two families of command need this, for the same reason. `hp agents
     list|token|bootstrap` used to read `app_state.get_agent_registry()`, a global
     only ever set inside the FastAPI lifespan, so a standalone `hp` process
-    ALWAYS printed "Agent hub not enabled" (#430). `hp artifacts
+    ALWAYS printed "Agent hub not enabled" (#430). `hp changes
     apply|replay|revoke` ran a SECOND apply engine with weaker guarantees for the
     same reason - the real executor, its agent transport, its snapshots and its
     task rows all live in the backend process (#423).
@@ -3988,7 +3986,7 @@ async def _backend_api(
 
     The short-lived admin token is minted through the same admin-secret endpoint
     the other CLI-to-backend commands use, and DELETED again afterwards - a
-    read-only `hp agent list` must not leave a fleet-root credential behind on
+    read-only `hp agents list` must not leave a fleet-root credential behind on
     every invocation.
     """
     async with _backend_session(scope) as call:
@@ -4137,7 +4135,7 @@ def agent_enrolment_window(
 
     While the window is open, the shared fleet token may enrol a host this
     install has never seen. While it is closed, only already-known hosts and
-    one-shot bootstrap tokens (`hp agent bootstrap`) can enrol - a leaked shared
+    one-shot bootstrap tokens (`hp agents bootstrap`) can enrol - a leaked shared
     token cannot grow the fleet behind your back. A brand-new install with no
     agents at all is exempt, so the first zero-touch rollout still needs nothing.
     """
@@ -4192,7 +4190,7 @@ def agent_revoke(
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
             raise typer.Exit(1)
-        db = await _open_cli_db("hp agent revoke", db_path)
+        db = await _open_cli_db("hp agents revoke", db_path)
         try:
             repo = Repository(db)
             return await repo.revoke_agent_credential(agent_id)
@@ -4204,7 +4202,7 @@ def agent_revoke(
         # database write from here never could (#700).
         answer = (
             _via_backend(
-                "hp agent revoke",
+                "hp agents revoke",
                 "POST",
                 f"/agents/{agent_id}/revoke",
                 not_found=f"No active credential to revoke for agent '{agent_id}'",
@@ -4251,7 +4249,7 @@ def agent_remove(
         if not db_path.exists():
             err_console.print(f"[red]Database not found at {db_path}[/red]")
             raise typer.Exit(1)
-        db = await _open_cli_db("hp agent remove", db_path)
+        db = await _open_cli_db("hp agents remove", db_path)
         try:
             repo = Repository(db)
             # Revoke FIRST: if the delete then fails, the credential is already
@@ -4273,7 +4271,7 @@ def agent_remove(
         # The route refuses a CONNECTED agent (409), which the direct path
         # below cannot know about (#700).
         _via_backend(
-            "hp agent remove",
+            "hp agents remove",
             "DELETE",
             f"/agents/{agent_id}",
             not_found=f"No agent '{agent_id}' to forget",
@@ -4459,7 +4457,7 @@ def _refuse_local_only(command: str, shown: str | None = None) -> None:
     """Exit 2 when ``command`` (or its group) is local-only and this run is remote.
 
     ``command`` is keyed by the group's canonical name; ``shown`` is what the
-    operator typed (`hp hosts refresh` and `hp inventory refresh` are one command).
+    operator typed (`hosts refresh` and its hidden alias `inventory refresh` are one command).
     """
     target = remote.active_target()
     if target is None:

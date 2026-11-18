@@ -86,6 +86,18 @@
 			] as [string, Node][]).filter(([, s]) => s && ['not_visible', 'partial', 'error'].includes(s.status))
 		: [];
 
+	// A section's reason after its label, without saying the label twice: an
+	// agent's reason stands alone ("docker: not readable - ..."), so after
+	// "Docker: " it read "Docker: docker: not readable" (3.14 walk).
+	function reasonAfter(s: Node, name: string): string {
+		const text = String(s.reason ?? s.status);
+		const at = text.indexOf(':');
+		const head = at > 0 ? text.slice(0, at).trim().toLowerCase() : '';
+		const rest = at > 0 ? text.slice(at + 1).trim() : '';
+		const label = name.toLowerCase();
+		return rest && (head === label || head === label.split(' ')[0]) ? rest : text;
+	}
+
 	function absent(s: Node, what: string): string {
 		if (!s) return '';
 		if (s.status === 'not_installed') return `No ${what} on this host.`;
@@ -280,7 +292,7 @@
 			<section class="card p-4 space-y-1" aria-labelledby="built-hidden">
 				<h2 class="section-title" id="built-hidden">Not visible to the agent</h2>
 				<ul class="text-sm text-muted space-y-0.5">
-					{#each hidden as [name, s]}<li>{name}: {s.reason ?? s.status}</li>{/each}
+					{#each hidden as [name, s]}<li>{name}: {reasonAfter(s, name)}</li>{/each}
 					{#if (d.truncated ?? []).length}<li>Trimmed to fit: {d.truncated.join('; ')}</li>{/if}
 				</ul>
 			</section>

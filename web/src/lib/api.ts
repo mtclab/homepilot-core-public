@@ -2169,6 +2169,8 @@ export interface BundledNtfyStatus {
 
 export interface PhoneAlertsStatus {
 	bundled: BundledNtfyStatus | null;
+	/** Why HomePilot's own server cannot be chosen here (no internal ntfy address); null when it can. */
+	bundled_unavailable: string | null;
 	compose_command: string;
 	ntfy_version: string;
 }

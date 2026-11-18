@@ -209,13 +209,13 @@ class TestTheBanIsForGuessers:
             reply = await hub.knock("lost-cred", AUTH, agent_id="lost-id")
             assert reply is not None, f"knock {n + 1} was banned: an identity clash is not a guess"
             assert reply.get("error") == HOST_HOLDS_CREDENTIAL_ERROR, reply
-        assert "hp agent bootstrap" in HOST_HOLDS_CREDENTIAL_ERROR
+        assert "hp agents bootstrap" in HOST_HOLDS_CREDENTIAL_ERROR
 
         row = _only((await join_requests.payload(hub.repo))["attempts"], "lost-cred")
         assert row["reason_code"] == "host_holds_credential"
         assert row["attempts"] == MAX_AUTH_FAILURES * 2
         assert "`hp agents install lost-cred`" in row["reason"]
-        assert "`hp agent bootstrap`" in row["reason"]
+        assert "`hp agents bootstrap`" in row["reason"]
 
         bootstrap = await hub.server._token_store.create(minted_by="re-enrol lost-cred")
         ack = await hub.knock("lost-cred", bootstrap, agent_id="lost-id")

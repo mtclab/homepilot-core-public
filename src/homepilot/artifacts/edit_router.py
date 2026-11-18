@@ -1,6 +1,6 @@
 """Editing an artifact through the backend that owns it (#693).
 
-`hp artifacts edit` opened $EDITOR on the store file itself and then asked a
+`hp changes edit` opened $EDITOR on the store file itself and then asked a
 lifecycle with no repository to record the edit. The DB row, the audit log and
 the webhooks never heard of it, and an edit of an APPLIED artifact was saved
 into the file before the lifecycle refused it - the command exited 0 and left a

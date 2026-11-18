@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
 import time
 from pathlib import Path
@@ -31,6 +30,7 @@ import typer
 from rich.table import Table
 
 from homepilot.cli import remote
+from homepilot.dashboard.wording import actor_words
 
 # ── Plumbing ─────────────────────────────────────────────────────────────────
 
@@ -198,14 +198,6 @@ def _needs_you(summary: dict[str, Any], firing: list[dict[str, Any]]) -> list[st
 WHAT_HAPPENED_LIMIT = 8
 
 
-def _actor(user_id: Any) -> str:
-    """A journal actor as the Overview says it: its label without the token prefix."""
-    text = str(user_id or "").strip()
-    if text in ("", "system"):
-        return "HomePilot"
-    return re.sub(r"\s*\(hp_[A-Za-z0-9]+\)\s*$", "", text) or text
-
-
 def _what_happened(rows: list[dict[str, Any]]) -> list[str]:
     """The Overview's "What happened", one line per row, in the server's words."""
     out: list[str] = []
@@ -213,7 +205,11 @@ def _what_happened(rows: list[dict[str, Any]]) -> list[str]:
         if row.get("action") == "login":  # a sign-in is not news about the estate
             continue
         words = row.get("words") or {}
-        out.append(f"{_actor(row.get('user_id'))} {words.get('text') or 'did something'}")
+        # Who, in the server's words too: it names an internal-id actor by its
+        # token's label (3.14 walk printed the uuid). An older server's row
+        # without it is still never the id.
+        who = words.get("actor") or actor_words(row.get("user_id"))
+        out.append(f"{who} {words.get('text') or 'did something'}")
     return out
 
 

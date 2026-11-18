@@ -504,7 +504,11 @@ def _fixture() -> dict[str, Any]:
             "target_host": sample.get("target_host"),
             "details_json": sample.get("details_json"),
         }
-        journal.append({"row": row, "words": wording.journal_words(row)})
+        # Who did it depends on the row's actor, not its code: the web tests
+        # say it from their own rows' user_id (tests/test_journal_actor_names.py
+        # holds the server's actor words), so the fixture carries the rest.
+        words = {k: v for k, v in wording.journal_words(row).items() if k != "actor"}
+        journal.append({"row": row, "words": words})
     runs = [
         {"action": a, "status": st, "target": t, "words": wording.run_words(a, st, t)}
         for a, st, t in SAMPLE_RUNS

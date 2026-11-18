@@ -48,7 +48,7 @@ function host(over: { id: string } & Record<string, unknown>) {
 }
 
 const SERVER = host({
-	id: 'hp-test-server',
+	id: 'web01',
 	proxmox_id: 100,
 	status: 'online',
 	import_state: 'adopted',
@@ -116,7 +116,7 @@ describe('Hosts: the fleet model (lane B1)', () => {
 		await fireEvent.change(screen.getByRole('combobox', { name: 'Filter by env' }), {
 			target: { value: 'dev' },
 		});
-		await waitFor(() => expect(screen.queryByText('hp-test-server')).toBeNull());
+		await waitFor(() => expect(screen.queryByText('web01')).toBeNull());
 		expect(listInventory.mock.calls.at(-1)?.[0].env).toBe('dev');
 		expect(screen.getByText('live-c')).toBeTruthy();
 	});
@@ -134,9 +134,9 @@ describe('Hosts: the fleet model (lane B1)', () => {
 
 	it("marks HomePilot's own host on its row", async () => {
 		render(Hosts);
-		await waitFor(() => expect(screen.getByText('hp-test-server')).toBeTruthy());
+		await waitFor(() => expect(screen.getByText('web01')).toBeTruthy());
 
-		const own = screen.getByText('hp-test-server').closest('tr') as HTMLElement;
+		const own = screen.getByText('web01').closest('tr') as HTMLElement;
 		expect(within(own).getByText('HomePilot')).toBeTruthy();
 		const other = screen.getByText('live-c').closest('tr') as HTMLElement;
 		expect(within(other).queryByText('HomePilot')).toBeNull();

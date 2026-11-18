@@ -122,8 +122,10 @@ async def world(tmp_path: Path):
         await db.close()
 
 
-async def _vm(w: dict[str, Any], **config: Any) -> tuple[str, Any]:
-    inside = w["pve"].add_vm(101, "app-01", config=config or None)
+async def _vm(
+    w: dict[str, Any], *, guest: dict[str, Any] | None = None, **config: Any
+) -> tuple[str, Any]:
+    inside = w["pve"].add_vm(101, "app-01", config=config or None, inside=guest)
     result = await w["svc"].refresh_inventory()
     assert result["complete"], result
     row = await w["repo"].get_host_by_hostname("app-01")
@@ -403,6 +405,64 @@ class TestTheGuards:
         resp = await w["http"].post(f"/inventory/{hid}/disks", json=_form(inside))
         assert resp.status_code == 409
         assert "LABEL=appdata" in resp.json()["detail"]["message"]
+
+    @pytest.mark.parametrize(
+        ("guest", "said", "unsaid"),
+        [
+            ({"missing": ("mount",)}, ["the guest has no mount"], ["SELinux"]),
+            (
+                {"missing": ("mount",), "selinux_confined": True},
+                [
+                    "cannot see mount: SELinux confines it",
+                    "virt_qemu_ga_t",
+                    "setsebool -P virt_qemu_ga_run_unconfined 1",
+                    "HomePilot changes neither",
+                ],
+                ["the guest has no mount"],
+            ),
+            (
+                {"hidden": ("mount",), "selinux_confined": True},
+                [
+                    "/bin/mount, but SELinux confines the QEMU guest agent",
+                    "virt_qemu_ga_run_unconfined",
+                ],
+                ["the guest has no mount"],
+            ),
+            (
+                {"hidden": ("mount",)},
+                ["/bin/mount, but the guest agent's shell cannot run it"],
+                ["the guest has no mount", "SELinux"],
+            ),
+            (
+                {"missing": ("mkfs.ext4",)},
+                ["the guest has no mkfs.ext4 - install its ext4 tools first"],
+                ["SELinux"],
+            ),
+        ],
+        ids=["really-missing", "confined-unseen", "confined-seen", "off-path", "no-mkfs"],
+    )
+    async def test_a_missing_tool_and_a_confined_agent_are_told_apart(
+        self, world, guest, said, unsaid
+    ):
+        """3.14 walk: a Fedora guest with mount installed was refused "inside the
+        guest: the guest has no mount" - qemu-ga runs confined by SELinux
+        (virt_qemu_ga_t) and the commands it starts could not see it. The
+        preflight now says which it is, and what the operator can do about
+        confinement without HomePilot doing it.
+
+        Teeth: drop the ``missing`` classification (back to "the guest has no
+        $tool" for every case) and the confined and off-path cases fail."""
+        w = world
+        hid, inside = await _vm(w, guest=guest)
+        resp = await w["http"].post(f"/inventory/{hid}/disks", json=_form(inside))
+        assert resp.status_code == 409, resp.text
+        message = resp.json()["detail"]["message"]
+        for words in said:
+            assert words in message, message
+        for words in unsaid:
+            assert words not in message, message
+        assert w["pve"].config_writes == [], "a refused preflight changed the VM"
+        assert inside.log("mkfs.ext4") == []
 
     async def test_a_container_cannot_get_a_disk_this_way(self, world):
         w = world

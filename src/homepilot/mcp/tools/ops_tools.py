@@ -390,9 +390,9 @@ async def handle_get_audit_log(arguments: dict[str, Any], ctx: dict[str, Any]) -
     # report "50 of 4000" for a 50-row search.
     total = await repo.count_audit_log(**filters)
     # The same words the console and `hp status` show (dashboard/wording.py).
-    from homepilot.dashboard.wording import with_journal_words
+    from homepilot.dashboard.wording import worded_journal
 
-    return {"items": with_journal_words(items), "total": total}
+    return {"items": await worded_journal(repo, items), "total": total}
 
 
 async def handle_get_selfcheck(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:

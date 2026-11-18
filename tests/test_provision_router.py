@@ -79,7 +79,8 @@ class TestAccepted:
         assert resp.json() == {"task_id": "task-abc", "status": "pending"}
         request = service.start.await_args.args[0]
         assert request.name == "web-01"
-        assert service.start.await_args.kwargs["actor"] == "u1"
+        # The credential's name, never the internal user id (3.14 walk).
+        assert service.start.await_args.kwargs["actor"] == "admin"
 
     def test_defaults_are_applied(self, client: TestClient, service: MagicMock):
         client.post("/guests/provision", json=GOOD_BODY)

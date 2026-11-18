@@ -166,7 +166,7 @@ class ArtifactLifecycle:
             # Mint the approval code AFTER the artifacts row exists. Never logged
             # (it is a human-relay secret); it reaches operators only via the
             # outbound webhook POST below, the review screen for an operator
-            # credential, and `hp artifacts show`. No MCP read, no SSE event and
+            # credential, and `hp changes show`. No MCP read, no SSE event and
             # no non-operator REST read returns it (#681).
             try:
                 from .approval_code import ensure_approval_code
@@ -260,7 +260,7 @@ class ArtifactLifecycle:
             raise ApprovalRefusedError(
                 "Approving needs an approval code a human relays to you, or an "
                 "operator credential. Ask the operator to read the code from the "
-                "review screen or `hp artifacts show`."
+                "review screen or `hp changes show`."
             )
         if self.repo is None:
             raise ApprovalRefusedError("approval-code store unavailable")
@@ -279,7 +279,7 @@ class ArtifactLifecycle:
             raise ApprovalRefusedError(
                 f"Approval for '{id}' is locked after too many wrong codes. "
                 "An operator must reset it from the web UI or "
-                "`hp artifacts reset-approval` before it can be approved with a code."
+                "`hp changes reset-approval` before it can be approved with a code."
             )
         if not verify_code(str(approval_code), str(row["code"])):
             state = await self.repo.record_failed_approval(id, LOCK_THRESHOLD)

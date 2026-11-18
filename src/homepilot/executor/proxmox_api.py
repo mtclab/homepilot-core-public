@@ -18,6 +18,7 @@ from homepilot.executor.jinja_utils import (
 )
 from homepilot.executor.pve_warnings import explain_warning
 from homepilot.executor.skip_if import SkipIfUndecided, make_pve_response_proxy
+from homepilot.executor.volume_deletes import in_use_hint
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +538,10 @@ async def execute(
                     if keys[0]:
                         step_log += f" (re-read: applied {', '.join(keys[0])}"
                         step_log += f"; not applied {', '.join(keys[1])})" if keys[1] else ")"
+            # "volume is still in use (snapshot?)" names no cause an operator
+            # can act on; say which snapshot holds it and what to do (3.14 walk).
+            hint = in_use_hint(str(e))
+            step_log += hint
             if on_error == "halt":
                 elapsed = time.monotonic() - start
                 log_lines.append(step_log)
@@ -545,11 +550,11 @@ async def execute(
                     {
                         "success": False,
                         "execution_log": "\n".join(log_lines),
-                        "failure_reason": f"step {step_id} failed: {e}",
+                        "failure_reason": f"step {step_id} failed: {e}{hint}",
                     },
                     done=done,
                     failed=[str(step_id)],
-                    error=str(e),
+                    error=f"{e}{hint}",
                     not_run=_later(index),
                     warnings=warnings_all,
                     reread=reread,

@@ -22,9 +22,10 @@ no longer produced is still said in words (:func:`_unknown`), never as the code.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 On = Literal["change", "host", "none"]
 
@@ -183,13 +184,60 @@ def _details(entry: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def journal_words(entry: Mapping[str, Any]) -> dict[str, Any]:
-    """One journal row in words: ``{verb, object, tail, many, text}``.
+# An internal id (users.id / api_tokens.id are uuid4 strings). Rows recorded
+# before 3.14.1 by the provision, tailnet-join and agent-install routes carry
+# one as the actor; `hp status` printed it as the subject of the sentence.
+_INTERNAL_ID = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+# A token's public prefix after its label: "claude (hp_1a2b3c4d5e6f7)".
+_PREFIX_SUFFIX = re.compile(r"\s*\(hp_[A-Za-z0-9]+\)\s*$")
+# Who an internal id is said as when no token or user carries it any more.
+GONE_CREDENTIAL = "A token that no longer exists"
+
+
+def actor_words(user_id: Any, names: Mapping[str, str] | None = None) -> str:
+    """WHO did it, as the start of the sentence - never an internal id.
+
+    The system is "HomePilot"; a credential is its label without the token
+    prefix; an internal id is the label of the token (or the name of the user)
+    it belongs to, from ``names`` (:func:`credential_names`), or
+    :data:`GONE_CREDENTIAL` when nothing carries it any more.
+    """
+    known = names or {}
+    text = str(user_id or "").strip()
+    if text in ("", "system"):
+        return "HomePilot"
+    text = _PREFIX_SUFFIX.sub("", text) or text
+    if _INTERNAL_ID.fullmatch(text):
+        return known.get(text) or known.get(text.lower()) or GONE_CREDENTIAL
+    # An id inside a longer actor: name it the same way, mid-sentence.
+    return _INTERNAL_ID.sub(
+        lambda m: known.get(m.group(0)) or known.get(m.group(0).lower()) or GONE_CREDENTIAL.lower(),
+        text,
+    )
+
+
+class _NamesSource(Protocol):
+    async def credential_names_by_id(self, ids: Iterable[str]) -> dict[str, str]: ...
+
+
+async def credential_names(repo: _NamesSource, rows: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """The names of the internal ids that journal rows carry as actors (one query each table)."""
+    ids = {m.group(0) for row in rows for m in _INTERNAL_ID.finditer(str(row.get("user_id") or ""))}
+    return await repo.credential_names_by_id(ids) if ids else {}
+
+
+def journal_words(
+    entry: Mapping[str, Any], names: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """One journal row in words: ``{actor, verb, object, tail, many, text}``.
 
     ``text`` is the whole fragment ("applied web-01's change") for surfaces that
     print a line; ``verb``/``object``/``tail`` are the same words in parts, for
-    the console to set the object in bold. The actor is NOT included: each
-    surface says who ("You", an assistant's label) its own way.
+    the console to set the object in bold. ``actor`` is who did it
+    (:func:`actor_words`) - every surface starts the sentence with it, except
+    that the console says "You" for the viewer's own rows.
     """
     code = str(entry.get("action") or "")
     phrase = JOURNAL.get(code) or _unknown(code)
@@ -210,12 +258,29 @@ def journal_words(entry: Mapping[str, Any]) -> dict[str, Any]:
     else:
         obj = None
     text = verb + (f" {obj}" if obj else "") + tail
-    return {"verb": verb, "object": obj, "tail": tail, "many": phrase.many, "text": text}
+    return {
+        "actor": actor_words(entry.get("user_id"), names),
+        "verb": verb,
+        "object": obj,
+        "tail": tail,
+        "many": phrase.many,
+        "text": text,
+    }
 
 
-def with_journal_words(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def with_journal_words(
+    rows: Iterable[Mapping[str, Any]], names: Mapping[str, str] | None = None
+) -> list[dict[str, Any]]:
     """Journal rows, each with its ``words``. What every surface returns."""
-    return [{**row, "words": journal_words(row)} for row in rows]
+    return [{**row, "words": journal_words(row, names)} for row in rows]
+
+
+async def worded_journal(
+    repo: _NamesSource, rows: Iterable[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """Journal rows in words, their internal-id actors named (/audit and MCP use this)."""
+    listed = list(rows)
+    return with_journal_words(listed, await credential_names(repo, listed))
 
 
 def run_words(action: str, status: str, target: str) -> dict[str, str]:
@@ -228,11 +293,15 @@ def run_words(action: str, status: str, target: str) -> dict[str, str]:
 
 
 __all__ = [
+    "GONE_CREDENTIAL",
     "JOURNAL",
     "RUN_ACTIONS",
     "RUN_STATUSES",
     "Phrase",
+    "actor_words",
+    "credential_names",
     "journal_words",
     "run_words",
     "with_journal_words",
+    "worded_journal",
 ]

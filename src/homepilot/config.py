@@ -479,7 +479,7 @@ class Settings(BaseSettings):
         if _os.environ.get("HP_AUTO_APPLY_MUTATING"):
             logger.warning(
                 "HP_AUTO_APPLY_MUTATING is no longer supported. "
-                "All mutating artifacts require explicit approval via 'hp artifacts approve'."
+                "All mutating artifacts require explicit approval via 'hp changes approve'."
             )
 
         if not self.vault_dir:
