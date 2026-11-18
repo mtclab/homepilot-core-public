@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -149,17 +150,18 @@ def _needs_you(summary: dict[str, Any], firing: list[dict[str, Any]]) -> list[st
     """The Overview's "Needs you", one sentence per thing an operator can act on."""
     lines: list[str] = []
     attention = summary.get("attention") or {}
+    # A run line in the server's words (dashboard/wording.py), never its codes.
     for run in attention.get("failed_runs") or []:
-        where = run.get("hostname") or run.get("artifact_id") or "a host"
+        words = run.get("words") or {}
         lines.append(
-            f"A {run.get('action')} on {where} failed: {run.get('error') or 'no reason recorded'}"
+            f"{words.get('what') or 'A run'} failed: {run.get('error') or 'no reason recorded'}"
             f" - `hp tasks follow {run.get('task_id')}`"
         )
     for run in attention.get("stuck_runs") or []:
-        where = run.get("hostname") or run.get("artifact_id") or "a host"
+        words = run.get("words") or {}
         lines.append(
-            f"A {run.get('action')} on {where} has been {run.get('status')} since "
-            f"{run.get('created_at')} - `hp tasks cancel {run.get('task_id')}`"
+            f"{words.get('what') or 'A run'} is still {words.get('status') or 'not finished'} "
+            f"since {run.get('created_at')} - `hp tasks cancel {run.get('task_id')}`"
         )
     gone = (attention.get("gone") or {}).get("hosts") or []
     if gone:
@@ -191,13 +193,51 @@ def _needs_you(summary: dict[str, Any], firing: list[dict[str, Any]]) -> list[st
     return lines
 
 
+# How many of the latest people/assistant journal rows `hp status` shows - the
+# Overview's "What happened" list is as long.
+WHAT_HAPPENED_LIMIT = 8
+
+
+def _actor(user_id: Any) -> str:
+    """A journal actor as the Overview says it: its label without the token prefix."""
+    text = str(user_id or "").strip()
+    if text in ("", "system"):
+        return "HomePilot"
+    return re.sub(r"\s*\(hp_[A-Za-z0-9]+\)\s*$", "", text) or text
+
+
+def _what_happened(rows: list[dict[str, Any]]) -> list[str]:
+    """The Overview's "What happened", one line per row, in the server's words."""
+    out: list[str] = []
+    for row in rows:
+        if row.get("action") == "login":  # a sign-in is not news about the estate
+            continue
+        words = row.get("words") or {}
+        out.append(f"{_actor(row.get('user_id'))} {words.get('text') or 'did something'}")
+    return out
+
+
 def remote_status(json_output: bool) -> None:
     summary = api("hp status", "GET", "/dashboard/summary", scope="read") or {}
     firing = (api("hp status", "GET", "/monitoring/alerts", scope="read") or {}).get("items", [])
+    journal = api(
+        "hp status",
+        "GET",
+        _query("/audit", actor="people", limit=WHAT_HAPPENED_LIMIT),
+        scope="read",
+    )
     needs = _needs_you(summary, firing)
+    happened = _what_happened(list((journal or {}).get("items", [])))
     target = remote.active_target()
     if json_output:
-        _emit_json({"server": target.base() if target else None, "needs_you": needs, **summary})
+        _emit_json(
+            {
+                "server": target.base() if target else None,
+                "needs_you": needs,
+                "what_happened": happened,
+                **summary,
+            }
+        )
         return
     updates = summary.get("updates") or {}
     agents = summary.get("agents") or {}
@@ -223,6 +263,10 @@ def remote_status(json_output: bool) -> None:
     _print(f"Changes waiting: {waiting}")
     if updates.get("update_available"):
         _print(f"Update available: {updates.get('latest')}")
+    if happened:
+        _print("\nWhat happened:")
+        for line in happened:
+            _print(f"  - {line}")
 
 
 # ── hp hosts ─────────────────────────────────────────────────────────────────
@@ -271,6 +315,72 @@ def hosts_forget(names: list[str], gone: bool, yes: bool, json_output: bool) -> 
             _print(f"Could not forget {f['hostname']}: {f['reason']}", err=True)
     if failed:
         raise typer.Exit(1)
+
+
+def hosts_describe(name: str, refresh: bool, export: bool, json_output: bool) -> None:
+    """How a host is built (#818): the stored description, optionally fresh,
+    optionally exported to the knowledge base as the host's as-built note."""
+    page = api("hp hosts describe", "GET", _query("/inventory", q=name, limit=1000), scope="read")
+    named = [h for h in (page or {}).get("items", []) if h.get("hostname") == name]
+    if not named:
+        _print(f"No host named '{name}' in the inventory.", err=True)
+        raise typer.Exit(1)
+    # The live machine of that name, not a retired row that kept it.
+    host = sorted(named, key=lambda h: h.get("absent_since") is not None)[0]
+    path = f"/inventory/{quote(str(host['id']), safe='')}/description"
+    if refresh:
+        view = api("hp hosts describe --refresh", "POST", path, scope="read")
+    else:
+        view = api("hp hosts describe", "GET", path, scope="read")
+    exported = None
+    if export:
+        exported = api("hp hosts describe --export", "POST", f"{path}/export", scope="write")
+    if json_output:
+        _emit_json({**(view or {}), "export": exported} if export else view)
+        return
+    _print_description(name, view or {})
+    if exported:
+        line = f"As-built note: {exported.get('note_id')}"
+        if exported.get("unchanged"):
+            line += " (unchanged: the description has not changed since the last export)"
+        elif exported.get("superseded"):
+            line += f" (supersedes {exported['superseded']})"
+        _print(line)
+
+
+def _print_description(name: str, view: dict[str, Any]) -> None:
+    from homepilot.inventory.asbuilt import render_asbuilt
+
+    doc = view.get("description")
+    if view.get("last_error"):
+        _print(f"Last attempt failed ({view.get('last_error_at')}): {view['last_error']}", err=True)
+    if not doc:
+        agent = view.get("agent") or {}
+        why = (
+            "its agent is not connected"
+            if not agent.get("connected")
+            else "its agent is too old to describe it: upgrade it"
+            if not agent.get("can_describe")
+            else "collect one with --refresh"
+        )
+        _print(f"No description of {name} yet - {why}.")
+        return
+    changes = view.get("changes") or []
+    if view.get("previous_collected_at"):
+        _print(f"Changes since {view['previous_collected_at']}: {len(changes) or 'none'}")
+        for c in changes:
+            for item in c.get("added") or []:
+                _print(f"  + {c['part']}: {item}")
+            for item in c.get("removed") or []:
+                _print(f"  - {c['part']}: {item}")
+        _print()
+    _print(render_asbuilt(name, doc).rstrip())
+    note = view.get("as_built") or {}
+    if note:
+        _print(
+            f"\nAs-built note in the knowledge base: {note.get('note_id')} "
+            f"({note.get('exported_at')})"
+        )
 
 
 # ── hp agents ────────────────────────────────────────────────────────────────
@@ -345,14 +455,20 @@ def agents_install(name: str) -> None:
 # ── hp changes ───────────────────────────────────────────────────────────────
 
 
-def changes_list(status: str | None, kind: str | None, inbox: bool, json_output: bool) -> None:
+def changes_list(
+    status: str | None,
+    kind: str | None,
+    inbox: bool,
+    json_output: bool,
+    tag: str | None = None,
+) -> None:
     statuses = ["proposed", "approved"] if inbox else [status]
     items: list[dict[str, Any]] = []
     for one in statuses:
         page = api(
             "hp changes list",
             "GET",
-            _query("/artifacts", status=one, kind=kind, limit=1000),
+            _query("/artifacts", status=one, kind=kind, tag=tag, limit=1000),
             scope="read",
         )
         items += list((page or {}).get("items", []))
@@ -362,18 +478,35 @@ def changes_list(status: str | None, kind: str | None, inbox: bool, json_output:
     if not items:
         _print("Nothing waits for you." if inbox else "No changes.")
         return
-    table = _table("ID", "Kind", "Status", "Target", "Intent")
+    table = _table("ID", "Kind", "Status", "Target", "Intent", "Tags")
     for a in items:
         target = a.get("target") or {}
         where = target.get("host") or target.get("hostname") or target.get("kind") or ""
+        tags = a.get("tags")
         table.add_row(
             str(a.get("id", "")),
             str(a.get("kind", "")),
             str(a.get("status", "")),
             str(where),
             str(a.get("intent", "")),
+            ", ".join(str(t) for t in tags) if isinstance(tags, list) else "",
         )
     _cli().console.print(table)
+
+
+def _print_policy_warnings(warnings: list[dict[str, Any]]) -> None:
+    """The structured policy rules a proposed change matches (#506), before approving."""
+    matched = [w for w in warnings if w.get("matched")]
+    for w in matched:
+        _print(
+            f"Policy: {w.get('policy_title') or w.get('policy_id')} ({w.get('rule')}) "
+            f"matches {w.get('artifact_id')}: {'; '.join(w.get('matched') or [])}"
+        )
+    for w in warnings:
+        for error in w.get("errors") or []:
+            _print(f"Policy {w.get('policy_title') or w.get('policy_id')}: {error}")
+    if matched:
+        _print("Approving it needs --acknowledge-policy.")
 
 
 def changes_show(artifact_id: str, json_output: bool) -> None:
@@ -404,6 +537,7 @@ def changes_show(artifact_id: str, json_output: bool) -> None:
         _print(f"Irreversible: {summary['danger']}")
     if data.get("approval_code"):
         _print(f"Approval code: {data['approval_code']}")
+    _print_policy_warnings(data.get("policy_warnings") or [])
     last = data.get("last_task") or {}
     if last:
         _print(f"Last run: {last.get('status')} {last.get('error') or ''}".rstrip())
@@ -429,13 +563,15 @@ def changes_propose(path: str) -> None:
     _print(f"Proposed: {created.get('id')}")
 
 
-def changes_run(artifact_id: str, route: str, wait: bool, past: str) -> None:
+def changes_run(
+    artifact_id: str, route: str, wait: bool, past: str, acknowledge_policy: bool = False
+) -> None:
     started = (
         api(
             f"hp changes {route}",
             "POST",
             f"/artifacts/{quote(artifact_id, safe='')}/{route}",
-            {},
+            {"acknowledge_policy": True} if acknowledge_policy else {},
         )
         or {}
     )
@@ -725,6 +861,20 @@ def register(
         """Forget hosts: names them all first, asks, then removes exactly those."""
         hosts_forget(list(names or []), gone, yes, json_output)
 
+    @hosts_app.command("describe")
+    def _hosts_describe(
+        name: str = typer.Argument(..., help="Hostname"),
+        refresh: bool = typer.Option(
+            False, "--refresh", help="Ask the host's agent for a fresh description first"
+        ),
+        export: bool = typer.Option(
+            False, "--export", help="Record it in the knowledge base as the host's as-built note"
+        ),
+        json_output: bool = _JSON,
+    ) -> None:
+        """How a host is built: what runs, how it is exposed, where its config lives."""
+        hosts_describe(name, refresh, export, json_output)
+
     @agents_app.command("upgrade")
     def _agents_upgrade(
         names: list[str] | None = typer.Argument(None, help="Hosts whose agents to upgrade"),  # noqa: B008
@@ -744,9 +894,20 @@ def register(
     def _changes_approve_and_apply(
         artifact_id: str = typer.Argument(..., help="Change ID"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Follow the run to its outcome"),
+        acknowledge_policy: bool = typer.Option(
+            False,
+            "--acknowledge-policy",
+            help="Approve over the structured policy rules this change matches",
+        ),
     ) -> None:
         """Approve a proposed change and run it, as an operator."""
-        changes_run(artifact_id, "approve-and-apply", wait, "Approved and applied")
+        changes_run(
+            artifact_id,
+            "approve-and-apply",
+            wait,
+            "Approved and applied",
+            acknowledge_policy=acknowledge_policy,
+        )
 
     @changes_app.command("propose")
     def _changes_propose(

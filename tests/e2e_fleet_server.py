@@ -139,6 +139,7 @@ async def _seeded(app: Any) -> Any:
         alice = await repo.get_host_by_hostname("alice-web")
         await repo.update_host(str(alice["id"]), owner="alice")
         await _seed_reused_vmid(app)
+        await _seed_long_task(app)
         print("E2E_FLEET_READY", flush=True)
         yield state
 
@@ -173,6 +174,38 @@ async def _seed_reused_vmid(app: Any) -> None:
     await lifecycle.approve(aid, Principal.operator("owner"))
     pve.guests.pop(150)
     pve.add(150, "alice-db", "running", {"meta": "creation-qemu=9.0.2,ctime=1705000000"})
+
+
+LONG_TASK_TOKEN = "sha256:" + "0123456789abcdef" * 4
+
+
+async def _seed_long_task(app: Any) -> None:
+    """The #829 scene: a failed task whose detail and execution log carry long
+    unbroken tokens (a digest, an API path), as a real Proxmox refusal does.
+    Records > Tasks on a phone must keep them inside the table's own scroller."""
+    import json
+
+    repo = app.state.task_repo
+    task_id = await repo.create_task(None, "provision")
+    await repo.update_task_status(
+        task_id,
+        "failed",
+        error=(
+            "Proxmox refused POST /api2/json/nodes/pve1/qemu/170/clone: "
+            f"unable to create image vm-170-disk-0 from {LONG_TASK_TOKEN}"
+            "/var/lib/vz/template/cache/debian-12-standard_12.7-1_amd64.tar.zst"
+        ),
+        result_json=json.dumps(
+            {
+                "name": "e2e-long-detail-guest-with-a-long-hostname",
+                "vmid": 170,
+                "execution_log": (
+                    "TASK ERROR: clone failed: "
+                    f"{LONG_TASK_TOKEN}{LONG_TASK_TOKEN}/nodes/pve1/storage/local-lvm\n"
+                ),
+            }
+        ),
+    )
 
 
 main.app.router.lifespan_context = _seeded

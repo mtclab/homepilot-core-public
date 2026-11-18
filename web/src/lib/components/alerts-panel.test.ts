@@ -323,7 +323,7 @@ describe('AlertsPanel as the Alerts page', () => {
 		render(AlertsPanel, { props: { page: true } });
 		expect(await screen.findByRole('link', { name: 'Add a channel' })).toHaveAttribute(
 			'href',
-			'/ui/monitoring/rules#notification-channels',
+			'/ui/monitoring/channels',
 		);
 	});
 });

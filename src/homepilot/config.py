@@ -209,6 +209,11 @@ class Settings(BaseSettings):
     # 2026-08-29 an OOM kill corrupted a database mid-write and nothing said so
     # until data was gone. 0 turns the check off.
     db_integrity_interval_seconds: int = 21600
+    # How often every connected, capable agent is asked to describe its host
+    # (#818): the slow schedule behind the on-demand "Collect now". A host is
+    # re-described when its description is older than this. 0 turns the
+    # schedule off; on-demand collection still works.
+    host_description_interval_seconds: int = 86400
     # Loop-stall watchdog (runtime/loop_watchdog.py): when one callback holds the
     # event loop longer than this, the loop thread's stack is logged while it is
     # still stuck, and the stall is counted in the self-check. Every request, the
@@ -259,6 +264,14 @@ class Settings(BaseSettings):
     # operator settings (app_settings), re-read every cycle.
     update_check_enabled: int = 1
     update_check_interval_seconds: int = 86400
+
+    # ── Phone alerts (#822) ──────────────────────────────────────────────────
+    # Where HomePilot reaches the bundled ntfy service (the opt-in `ntfy`
+    # compose profile) to publish and to manage phone logins. Empty by default
+    # (ADR-004 corollary 3): the shipped compose files set it to the service's
+    # name on the compose network, http://ntfy. Phones never use this address;
+    # they use the one the operator gives in Monitoring > Channels.
+    ntfy_internal_url: str = ""
 
     # ── Invite portal (#442 stage 2) ─────────────────────────────────────────
     # The /invite/* pages trust a client-certificate identity ONLY when all

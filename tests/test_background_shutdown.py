@@ -46,14 +46,15 @@ import pytest
 from homepilot.background import drain_tasks
 from homepilot.db.connection import Database
 from homepilot.db.migrations import run_migrations
+from homepilot.main import SHUTDOWN_DB_CLOSE_S, SHUTDOWN_DRAINABLE
+
+# The timeout main.lifespan allows `agent_hub.stop()` - its own named bound
+# since #812, so the budget gate below reads the value the shutdown uses.
+from homepilot.main import SHUTDOWN_HUB_STOP_S as _LIFESPAN_HUB_STOP_BUDGET
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 pytestmark = pytest.mark.asyncio
-
-# The timeout main.lifespan allows `agent_hub.stop()`. Kept here so the budget
-# gate below fails loudly if either side is changed without the other.
-_LIFESPAN_HUB_STOP_BUDGET = 20.0
 
 
 def _assert_handle_is_closed(raw: sqlite3.Connection) -> None:
@@ -351,7 +352,8 @@ class TestTheForcedCloseNeverBlocksTheLoop:
 
         lifespan = (REPO_ROOT / "src/homepilot/main.py").read_text()
         found = re.search(
-            r"wait_for\(\s*state\.database\.close\(\),\s*timeout=([0-9.]+)\s*\)", lifespan
+            r"wait_for\(\s*state\.database\.close\(\),\s*timeout=SHUTDOWN_DB_CLOSE_S\s*\)",
+            lifespan,
         )
         assert found, "main.lifespan no longer guards database.close() the way this gate reads"
         worst_case = (
@@ -359,9 +361,9 @@ class TestTheForcedCloseNeverBlocksTheLoop:
             + Database._HANDLE_CLOSE_SECONDS
             + Database._FORCE_GRACE_SECONDS
         )
-        assert worst_case < float(found.group(1)), (
+        assert worst_case < SHUTDOWN_DB_CLOSE_S, (
             f"Database.close can take {worst_case}s but main.lifespan cancels it at "
-            f"{found.group(1)}s"
+            f"{SHUTDOWN_DB_CLOSE_S}s"
         )
 
 
@@ -591,6 +593,10 @@ class TestDrainingBackgroundWork:
 
         source = inspect.getsource(main_mod.lifespan)
         shutdown = source[source.index("finally:") :]
+        # The drain list is main.SHUTDOWN_DRAINABLE since #812; the shutdown
+        # must still walk it.
+        assert "in SHUTDOWN_DRAINABLE" in shutdown, "the shutdown no longer walks the drain list"
+        drained = {attr for _label, attr in SHUTDOWN_DRAINABLE}
 
         for attr in (
             "task_runner",
@@ -598,7 +604,7 @@ class TestDrainingBackgroundWork:
             "agent_enroll_service",
             "agent_registry",
         ):
-            assert f'"{attr}"' in shutdown, (
+            assert attr in drained, (
                 f"main.lifespan's shutdown never looks up app.state.{attr}, so the "
                 "background jobs it starts are never drained"
             )

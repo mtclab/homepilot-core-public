@@ -24,13 +24,23 @@ START = ">>> agent-identity block"
 END = "<<< end agent-identity block"
 
 
-def _identity_block() -> str:
+def _between(start_marker: str, end_marker: str) -> str:
     text = SCRIPT.read_text()
-    start = text.index(START)
-    end = text.index(END)
-    block = text[text.index("\n", start) + 1 : text.rindex("\n", start, end)]
-    assert "AGENT_ID" in block, "identity block markers no longer wrap the id logic"
-    return block
+    start = text.index(start_marker)
+    end = text.index(end_marker)
+    return text[text.index("\n", start) + 1 : text.rindex("\n", start, end)]
+
+
+def _identity_block() -> str:
+    """The id resolution (run early in the installer, before the binary swap)
+    followed by the identity + env block, both verbatim: together they are what
+    decides and writes the host's agent id."""
+    resolve = _between(">>> agent-id resolve block", "<<< end agent-id resolve block")
+    block = _between(START, END)
+    assert "resolve_agent_id" in resolve and "resolve_agent_id" in block, (
+        "the identity block markers no longer wrap the id logic"
+    )
+    return resolve + "\n" + block
 
 
 def _run(conf_dir: Path, tls_pin: str = "") -> dict[str, str]:
@@ -135,3 +145,39 @@ class TestInstallerHubPin:
         )
         assert proc.returncode != 0
         assert "--tls-pin must be a sha256 fingerprint" in proc.stderr
+
+    @pytest.mark.parametrize("prefix", ["sha256:", ""])
+    def test_installer_refuses_a_valid_pin_with_a_line_smuggled_after_it(
+        self, tmp_path: Path, prefix: str
+    ):
+        """#842: the check matched line by line (grep), so 64 hex characters
+        followed by a newline and VAR=... passed and the whole value was written
+        into agent.env - a second variable line. Matched on the whole value now.
+
+        Revert-check: put the grep check back and this test gets past the pin
+        check (it then stops at the download, which nothing serves)."""
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        (shim / "sudo").write_text('#!/bin/sh\nexec "$@"\n')
+        (shim / "sudo").chmod(0o755)
+        proc = subprocess.run(
+            ["bash", str(SCRIPT)],
+            env={
+                "PATH": f"{shim}:/usr/bin:/bin",
+                "HUB": "hub.example:8443",
+                "TOKEN": "t",
+                "TLS_PIN": prefix + "ab" * 32 + "\nHP_AGENT_PRIVILEGED=true",
+                # Sandbox everything the script touches past the pin check.
+                "CONF_DIR": str(tmp_path / "conf"),
+                "INSTALL_DIR": str(tmp_path / "bin"),
+                "SNAPSHOT_DIR": str(tmp_path / "snapshot"),
+                "UNIT_PATH": str(tmp_path / "unit"),
+                "HP_API": "http://127.0.0.1:9",
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode != 0
+        assert "--tls-pin must be a sha256 fingerprint" in proc.stderr, proc.stderr
+        assert not (tmp_path / "conf" / "agent.env").exists()

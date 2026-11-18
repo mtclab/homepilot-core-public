@@ -188,7 +188,7 @@ class TestThePerVmFenceIsReadBack:
     async def test_a_pre_599_guest_fence_is_corrected_in_place(self) -> None:
         want = fence_rules(desired(), "out")
         legacy = [FOREIGN_VM_RULE, *reversed(want)]
-        cluster = _converged_chains(vm_chains={("elizabeth", 105): list(legacy)})
+        cluster = _converged_chains(vm_chains={("pve-gw", 105): list(legacy)})
 
         the_plan = plan(desired(), await survey(cluster, desired()))
         assert any(s.id.startswith("vm-105-fence") for s in the_plan.steps), (
@@ -196,17 +196,17 @@ class TestThePerVmFenceIsReadBack:
         )
 
         await _apply(cluster)
-        chain = cluster.vm_chains[("elizabeth", 105)]
+        chain = cluster.vm_chains[("pve-gw", 105)]
         assert _owned(chain) == want, "the guest's DNS/DHCP ACCEPTs still sit below its DROPs"
         assert FOREIGN_VM_RULE in chain, "an operator's rule on the guest was removed"
         assert plan(desired(), await survey(cluster, desired())).converged
 
     async def test_a_guest_without_the_fence_is_not_touched(self) -> None:
-        cluster = _converged_chains(vm_chains={("elizabeth", 200): [dict(FOREIGN_VM_RULE)]})
+        cluster = _converged_chains(vm_chains={("pve-gw", 200): [dict(FOREIGN_VM_RULE)]})
         current = await survey(cluster, desired())
         assert current.vm_fences == {}
         assert plan(desired(), current).converged
-        assert cluster.vm_chains[("elizabeth", 200)] == [FOREIGN_VM_RULE]
+        assert cluster.vm_chains[("pve-gw", 200)] == [FOREIGN_VM_RULE]
 
 
 class TestEnforcedIsEarned:
@@ -289,7 +289,7 @@ class TestTheGatewayDelete:
         gw = PveSdnGateway(lib)
 
         with pytest.raises(RuntimeError) as exc:
-            await gw.delete_vnet_firewall_rule(vnet="innkeep", pos=7, expect=expect)
+            await gw.delete_vnet_firewall_rule(vnet="guestnet", pos=7, expect=expect)
         assert "nothing was deleted" in str(exc.value)
         assert lib.store["deletes"] == [], "an operator's rule was deleted"
 
@@ -299,5 +299,5 @@ class TestTheGatewayDelete:
         lib = _Library(at_pos=dict(planned, pos=7, digest="abc"))
         gw = PveSdnGateway(lib)
 
-        await gw.delete_vnet_firewall_rule(vnet="innkeep", pos=7, expect=expect)
+        await gw.delete_vnet_firewall_rule(vnet="guestnet", pos=7, expect=expect)
         assert lib.store["deletes"] == [{"digest": "abc"}]

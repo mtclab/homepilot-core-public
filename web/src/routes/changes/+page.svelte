@@ -88,6 +88,11 @@
 	let loading = true;
 	let error = '';
 	let filterKind = '';
+	// The library (#506): a tag filter asked of the server (`?tag=`), exact
+	// match. `pattern` marks changes worth imitating, so it is always offered;
+	// the other tags are the ones seen on an unfiltered read.
+	let filterTag = '';
+	let knownTags: string[] = ['pattern'];
 	// Searched on the SERVER (#445 A4). The page fetches a capped 1000 rows, so a
 	// filter applied in the browser can only ever search the rows it already
 	// pulled - which is exactly the moment a search stops being useful.
@@ -136,8 +141,17 @@
 		if (initial) loading = true;
 		error = '';
 		try {
-			const res = await api.listArtifacts({ limit: 1000, q: search.trim() || undefined });
+			const res = await api.listArtifacts({
+				limit: 1000,
+				q: search.trim() || undefined,
+				tag: filterTag || undefined,
+			});
 			allItems = res.items;
+			if (!filterTag) {
+				const seen = new Set(res.items.flatMap((a) => a.tags ?? []));
+				seen.delete('pattern');
+				knownTags = ['pattern', ...[...seen].sort()];
+			}
 			applyFilter();
 		} catch (e) {
 			if (initial || allItems.length === 0) error = String(e);
@@ -149,8 +163,9 @@
 	function clearFilters() {
 		activeTab = 'all';
 		filterKind = '';
-		if (search) {
+		if (search || filterTag) {
 			search = '';
+			filterTag = '';
 			loadAll(false);
 			return;
 		}
@@ -335,7 +350,16 @@
 				<option value={k}>{k || 'All kinds'}</option>
 			{/each}
 		</select>
-		{#if search || filterKind || activeTab !== 'all'}
+		<label class="flex items-center gap-2">
+			<span class="sr-only">Filter by tag</span>
+			<select class="input text-xs" data-testid="tag-filter" bind:value={filterTag} on:change={() => loadAll(false)}>
+				<option value="">All tags</option>
+				{#each knownTags as t}
+					<option value={t}>{t === 'pattern' ? 'pattern (the library)' : t}</option>
+				{/each}
+			</select>
+		</label>
+		{#if search || filterKind || filterTag || activeTab !== 'all'}
 			<button class="btn btn-ghost text-xs" on:click={clearFilters}>Clear filters</button>
 		{/if}
 		<span class="text-muted text-xs">{items.length} items</span>

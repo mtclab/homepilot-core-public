@@ -33,6 +33,10 @@ ActionType = Literal[
     # the kind of thing the durable trail exists for.
     "enrolment_window_opened",
     "enrolment_window_closed",
+    # #818: the read-only host description. Audited like a read_file.
+    "describe_host",
+    # #853: the pre-apply rollback snapshot (privileged agents; write path's read).
+    "snapshot_file",
 ]
 ResultType = Literal["success", "blocked", "error"]
 

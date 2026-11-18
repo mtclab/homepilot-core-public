@@ -6,7 +6,7 @@
 	import { onMount } from 'svelte';
 	import { api, type EnrolmentWindow, type HubEndpoint } from '$lib/api';
 	import { notify } from '$lib/stores';
-	import { isValidHubHost } from '$lib/hostValidation';
+	import InstallOneLiner from './InstallOneLiner.svelte';
 	import { base } from '$app/paths';
 
 	export let show: 'bootstrap' | 'hub' | null = null;
@@ -87,30 +87,7 @@
 	function fmtHub(host: string, port: number): string {
 		return `${host}:${port}`;
 	}
-
-	// The one-liner itself is built by the server (lane A3): it knows whether
-	// this control plane can serve the installer and agent binary, so a host
-	// installed by hand gets THIS hub's agent version - not GitHub's latest.
-	function commandFor(d: HubEndpoint | null): string | null {
-		if (!d || !d.install_command || !isValidHubHost(d.hub_host)) return null;
-		return d.install_command;
-	}
 </script>
-
-{#snippet installSource(d: HubEndpoint)}
-	{#if d.install_source === 'control_plane'}
-		<p class="prose-note text-xs" data-testid="install-source">
-			Installs agent {d.install_version} from this HomePilot - the host needs no internet
-			access, and its agent matches this control plane.
-		</p>
-	{:else if d.install_source === 'github'}
-		<p class="text-xs text-warn" data-testid="install-source">
-			This HomePilot cannot serve the agent itself ({d.install_fallback_reason}), so this
-			one-liner fetches release {d.install_version} from GitHub instead. The host needs
-			internet access.
-		</p>
-	{/if}
-{/snippet}
 
 {#if show === 'bootstrap'}
 	<div class="card p-4 space-y-4">
@@ -141,20 +118,7 @@
 					<p class="text-xs text-ok mb-1">Bootstrap token (copy now — shown once):</p>
 					<code class="text-xs text-ink break-all select-all">{bootstrapData.bootstrap_token}</code>
 				</div>
-				{#if commandFor(bootstrapData)}
-					<div class="bg-canvas border border-border-strong rounded p-3 space-y-1">
-						<p class="field-label mb-1">One-liner install (run as root on the host):</p>
-						<code class="text-xs text-ink break-all select-all" data-testid="install-command"
-							>{commandFor(bootstrapData)}</code
-						>
-						{@render installSource(bootstrapData)}
-					</div>
-				{:else}
-					<div class="bg-canvas border border-danger-border rounded p-3">
-						<p class="text-xs text-danger font-semibold mb-1">Install one-liner unavailable</p>
-						<p class="prose-note text-xs">The hub host reported by the server (<code class="text-ink break-all">{bootstrapData.hub_host}</code>) is not a valid hostname or IP. Copying a root <code class="text-ink">curl … | bash</code> with it would be unsafe. Fix <code class="text-ink">HP_HUB_HOST</code> on the server and regenerate.</p>
-					</div>
-				{/if}
+				<InstallOneLiner data={bootstrapData} />
 				<button class="btn btn-ghost text-xs" on:click={generateBootstrap} disabled={generating}>
 					Regenerate
 				</button>
@@ -227,15 +191,11 @@
 				<p class="prose-note text-xs mb-1">Hub: <code class="text-ink">{fmtHub(hubData.hub_host, hubData.hub_port)}</code></p>
 				<code class="text-xs text-ink select-all">{hubData.auth_token}</code>
 			</div>
-			{#if commandFor(hubData)}
-				<div class="bg-canvas border border-border-strong rounded p-3 space-y-1">
-					<p class="field-label mb-1">One-liner install with the shared token:</p>
-					<code class="text-xs text-ink break-all select-all" data-testid="install-command"
-						>{commandFor(hubData)}</code
-					>
-					{@render installSource(hubData)}
-				</div>
-			{/if}
+			<InstallOneLiner
+				data={hubData}
+				label="One-liner install with the shared token:"
+				explainMissing={false}
+			/>
 		{/if}
 	</div>
 {/if}

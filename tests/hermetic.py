@@ -43,6 +43,11 @@ KEEP = frozenset(
         "HP_TEST_URL",
         "HP_TEST_TOKEN",
         "HP_TEST_ADMIN_SECRET",
+        # Where the operator's forbidden patterns are, for the publish-clean
+        # gate (a path to a read-only file outside the tree).
+        "HP_SCRUB_FORBIDDEN",
+        # The real ntfy binary the phone-alert journey runs (#822).
+        "HP_NTFY_BIN",
     }
 )
 

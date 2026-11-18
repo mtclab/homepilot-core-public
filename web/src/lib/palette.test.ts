@@ -114,7 +114,7 @@ describe('palette: pages', () => {
 	it('matches a label first, then a keyword, every word required', () => {
 		const pages = palettePages({ guests: false });
 		expect(matchPages(pages, 'rules')[0].label).toBe('Monitoring > Rules');
-		expect(matchPages(pages, 'ntfy').map((r) => r.label)).toEqual(['Monitoring > Alerts', 'Monitoring > Rules']);
+		expect(matchPages(pages, 'ntfy').map((r) => r.label)).toEqual(['Monitoring > Alerts', 'Monitoring > Channels']);
 		expect(matchPages(pages, 'enrol')[0].href).toBe('/hosts/agents');
 		expect(matchPages(pages, 'drift')[0].href).toBe('/changes/drift');
 		expect(matchPages(pages, 'monitoring alerts').map((r) => r.label)).toEqual(['Monitoring > Alerts']);

@@ -28,6 +28,7 @@ from homepilot.vault.manager import VaultManager
 
 from .ansible import execute as ansible_execute
 from .composite import execute as composite_execute
+from .guest_disk import execute as guest_disk_execute
 from .guest_network import execute as guest_network_execute
 from .guest_power import execute as guest_power_execute
 from .host_provision import execute as host_provision_execute
@@ -93,7 +94,9 @@ SNAPSHOTTABLE_TARGET_KINDS = ("vm", "lxc")
 # says: a power action changes no disk, so a rollback point would only lock the
 # guest and delay the action (#781). Propose refuses `requires_snapshot: true`
 # for them as well.
-_NEVER_SNAPSHOT_KINDS = frozenset({ArtifactKind.GUEST_POWER})
+# A guest-disk change (#824) writes a NEW blank disk and one fstab line it
+# backs up first; a snapshot would lock the guest it hot-plugs into.
+_NEVER_SNAPSHOT_KINDS = frozenset({ArtifactKind.GUEST_POWER, ArtifactKind.GUEST_DISK})
 
 # How long the pre-apply snapshot is followed. A snapshot that saves RAM state
 # writes the guest's whole memory out, which outlasts the general 600 s on a big
@@ -510,7 +513,9 @@ class ArtifactExecutor:
         entry: dict[str, Any] = dict(fm.get("unsettled_task") or {})
         node = str(entry.get("node") or "")
         upid = str(entry.get("upid") or "")
-        action = str(entry.get("action") or "apply")
+        # Only an apply or a replay leaves a task unsettled (_record_unsettled),
+        # and the journal code below is derived from it - so it is one of the two.
+        action = "replay" if entry.get("action") == "replay" else "apply"
         snapshot_id = entry.get("snapshot_id")
         earlier_log = str(entry.get("execution_log") or "")
 
@@ -698,6 +703,8 @@ class ArtifactExecutor:
             )
         elif kind == ArtifactKind.GUEST_POWER:
             result = await guest_power_execute(fm, body, target, self.repo, self.proxmox)
+        elif kind == ArtifactKind.GUEST_DISK:
+            result = await guest_disk_execute(fm, body, target, self.proxmox)
         elif kind == ArtifactKind.KB_NOTE:
             result = await kb_note_execute(fm, body, self.repo)
         else:

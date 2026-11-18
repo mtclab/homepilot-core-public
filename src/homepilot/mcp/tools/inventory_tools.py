@@ -304,20 +304,30 @@ async def handle_get_host(arguments: dict[str, Any], ctx: dict[str, Any]) -> dic
 async def handle_query_inventory(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     repo: Repository = ctx["repo"]
     filter_str = arguments.get("filter")
-    filter_obj = None
+    filter_obj: dict[str, Any] | None = None
     if filter_str:
         try:
-            filter_obj = json.loads(filter_str)
+            parsed = json.loads(filter_str)
         except json.JSONDecodeError:
-            filter_obj = {"hostname": filter_str}
+            parsed = None
+        # A bare name ("web01", or one that happens to parse as JSON, "42") is
+        # a hostname filter.
+        filter_obj = parsed if isinstance(parsed, dict) else {"hostname": filter_str}
 
+    # The hostname filter used to be built and then never applied, so a name
+    # filter returned the whole inventory (#818).
+    hostname = filter_obj.get("hostname") if filter_obj else None
     hosts = await repo.list_hosts(
         managed=filter_obj.get("managed") if filter_obj else None,
         role=filter_obj.get("role") if filter_obj else None,
+        hostname=str(hostname) if hostname is not None else None,
     )
-    services = await repo.list_services(
-        host_id=filter_obj.get("host_id") if filter_obj else None,
-    )
+    host_id = filter_obj.get("host_id") if filter_obj else None
+    if host_id is None and hostname is not None:
+        # The services of the named host(s) only, not every service.
+        services = [s for h in hosts for s in await repo.list_services(host_id=str(h["id"]))]
+    else:
+        services = await repo.list_services(host_id=host_id)
     return {"hosts": hosts, "services": services}
 
 

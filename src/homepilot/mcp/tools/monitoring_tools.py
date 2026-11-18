@@ -10,7 +10,6 @@ system will wake an operator for, which belongs to the mutation wave.
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from homepilot.mcp.tools.host_param import host_arg, host_properties, with_host_warning
@@ -26,8 +25,12 @@ from homepilot.metrics.router import (
     MAX_HISTORY_HOURS,
     MAX_HISTORY_ITEMS,
     MAX_WINDOW_HOURS,
+    RESOLUTION_AUTO,
+    RESOLUTION_RAW,
     alert_history,
     rule_kind_problem,
+    rules_with_coverage,
+    series_answer,
 )
 
 # Named in every description that has to give an example, so a caller is never
@@ -91,7 +94,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "`last_eval_at` from its last evaluation: `hosts_matched: 0` means the rule "
             "is guarding NOTHING - its filter matched no host, or no host reports that "
             "metric - and `last_eval_at: null` means it has not been evaluated yet. "
-            "Read-only - it cannot add, silence or delete a rule."
+            "`hosts_without_metric` (with `hosts_without_metric_names`) counts hosts in "
+            "the rule's filter that report metrics but not this one - an older agent "
+            "that needs upgrading - and `coverage_note` says it in a sentence; relay "
+            "it. Read-only - it cannot add, silence or delete a rule."
         ),
         "inputSchema": {"type": "object", "properties": {}},
         "outputSchema": {
@@ -151,12 +157,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_host_metrics_series",
         "description": (
-            "One host and one metric over a time window, oldest point first. Every "
-            "point returned is a sample the host actually reported - nothing is "
-            f"averaged or thinned. At most {MAX_SERIES_POINTS} points come back; when "
-            "the window holds more, `truncated` is true and the OLDEST points are the "
-            f"ones left out. The window may be up to {MAX_WINDOW_HOURS} hours, and is "
-            "answered only from samples retention has not yet pruned."
+            "One host and one metric over a time window, oldest point first. By "
+            "default (`resolution: raw`) every point returned is a sample the host "
+            f"actually reported - nothing is averaged or thinned. At most "
+            f"{MAX_SERIES_POINTS} points come back; when the window holds more, "
+            "`truncated` is true and the OLDEST points are the ones left out (at the "
+            "60 s default cadence that is about 33 hours). Pass `resolution: auto` for "
+            "a longer window: when it holds more than `limit` samples the WHOLE window "
+            "comes back as fixed-width buckets - the answer then says `resolution: "
+            "bucketed`, `bucket_seconds`, and `aggregation` (each point's `value` is the "
+            "bucket's average, with its `min`, `max` and `count`). Say that you are "
+            "quoting bucket averages when you do. The window may be at most the metric "
+            f"retention in force (default 168 hours; never more than {MAX_WINDOW_HOURS}); "
+            "a longer one is refused, because it could only return nothing beyond it."
         ),
         "inputSchema": {
             "type": "object",
@@ -179,6 +192,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "maximum": MAX_SERIES_POINTS,
                     "description": f"Maximum points to return (max {MAX_SERIES_POINTS})",
                 },
+                "resolution": {
+                    "type": "string",
+                    "enum": [RESOLUTION_RAW, RESOLUTION_AUTO],
+                    "description": (
+                        "raw (default): samples as reported, newest `limit` of them. "
+                        "auto: a window holding more than `limit` samples comes back "
+                        "whole, as min/avg/max buckets."
+                    ),
+                },
             },
             "required": ["host", "metric"],
         },
@@ -191,8 +213,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "points": {"type": "array", "items": {"type": "object"}},
                 "truncated": {"type": "boolean"},
                 "max_points": {"type": "integer"},
+                "resolution": {"type": "string"},
+                "bucket_seconds": {"type": ["integer", "null"]},
+                "aggregation": {"type": ["object", "null"]},
             },
-            "required": ["hostname", "metric", "points", "truncated"],
+            "required": ["hostname", "metric", "points", "truncated", "resolution"],
         },
     },
     # ── Admin tier (MCP<->API parity, wave 3). POST/PATCH/DELETE /monitoring/rules
@@ -346,7 +371,8 @@ def _repo(ctx: dict[str, Any]) -> Any:
 
 
 async def handle_list_alert_rules(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
-    rules = await _repo(ctx).list_rules()
+    repo = _repo(ctx)
+    rules = await rules_with_coverage(repo, await repo.list_rules())
     return {"items": rules, "total": len(rules)}
 
 
@@ -386,19 +412,13 @@ async def handle_get_host_metrics_series(
     if limit < 1 or limit > MAX_SERIES_POINTS:
         raise ValueError(f"limit must be between 1 and {MAX_SERIES_POINTS}")
 
-    since = int(time.time() - hours * 3600)
-    points, truncated = await _repo(ctx).series(hostname, metric, since, limit=limit)
-    return with_host_warning(
-        {
-            "hostname": hostname,
-            "metric": metric,
-            "since": since,
-            "points": points,
-            "truncated": truncated,
-            "max_points": limit,
-        },
-        warning,
+    resolution = str(arguments.get("resolution") or RESOLUTION_RAW)
+    # The same answer GET /monitoring/hosts/{h}/series gives, refusals included:
+    # a window past retention is a ValueError carrying the route's sentence.
+    answer = await series_answer(
+        _repo(ctx), hostname, metric, hours=hours, limit=limit, resolution=resolution
     )
+    return with_host_warning(answer, warning)
 
 
 # ── Admin-tier handlers (wave 3). Call the SAME MetricsRepository methods the

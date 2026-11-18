@@ -235,6 +235,53 @@ def test_apply_no_wait_starts_and_hands_back_the_task(ws: Workstation, tmp_path:
     assert _power_state(ws, "batch-1") == "running"
 
 
+def test_the_library_tag_and_the_acknowledged_policy(fresh: Workstation, tmp_path: Path) -> None:
+    """#506 from the operator's terminal: a change tagged `pattern` is found by
+    `hp changes list --tag`, and a structured policy rule it matches is shown by
+    `hp changes show` and must be acknowledged to approve - never a refusal of
+    the proposal itself.
+
+    Teeth: drop the tag filter in ArtifactStore.list -> the untagged change is
+    listed; drop the acknowledgement check in ArtifactLifecycle.approve -> the
+    plain approve succeeds.
+    """
+    policy = (
+        "# No starting batch guests by API\n\nStart them from the console.\n\n"
+        "```policy-rule\nforbid:\n  - kind: proxmox-api-sequence\n    verb: POST\n"
+        "    path: /nodes/*/qemu/*/status/start\n```\n"
+    )
+    fresh.ok("kb", "add", "-", "--kind", "policy", "--target", "batch-1", stdin=policy)
+
+    spec = json.loads(_start_spec(tmp_path, "batch-1", 141).read_text())
+    spec["tags"] = ["pattern"]
+    tagged_path = tmp_path / "tagged.json"
+    tagged_path.write_text(json.dumps(spec))
+    tagged = _propose(fresh, tagged_path)  # proposed: a policy never refuses a draft
+    plain = _propose(fresh, _start_spec(tmp_path, "batch-2", 142))
+
+    library = {c["id"] for c in fresh.json("changes", "list", "--tag", "pattern")}
+    assert library == {tagged}
+    assert plain in {c["id"] for c in fresh.json("changes", "list")}
+    assert "pattern" in fresh.ok("changes", "list", "--tag", "pattern").stdout
+
+    shown = fresh.ok("changes", "show", tagged).stdout
+    assert "No starting batch guests by API" in shown
+    assert "POST /nodes/pve1/qemu/141/status/start" in shown
+    assert "--acknowledge-policy" in shown
+
+    refused = fresh.hp("changes", "approve", tagged)
+    assert refused.returncode == 1
+    assert "acknowledge" in refused.stderr and "No starting batch guests" in refused.stderr
+    assert fresh.json("changes", "show", tagged)["frontmatter"]["status"] == "proposed"
+    # A change the rule does not match approves as before (another host).
+    fresh.ok("changes", "approve", plain)
+
+    fresh.ok("changes", "approve", tagged, "--acknowledge-policy")
+    approved = fresh.json("changes", "show", tagged)["frontmatter"]
+    assert approved["status"] == "approved"
+    assert approved["approved_by"]["policy_acknowledged"], approved["approved_by"]
+
+
 def test_tasks_cancel_asks_first(ws: Workstation) -> None:
     refused = ws.hp("tasks", "cancel", "no-such-task")
     assert refused.returncode == 1 and "Pass --yes" in refused.stderr
@@ -307,6 +354,18 @@ def test_power_guards_and_outcome(fresh: Workstation) -> None:
     assert unavailable.returncode == 1 and "Cannot start forge-dev" in unavailable.stderr
     usage = fresh.hp("power", "atlas", "explode")
     assert usage.returncode == 2
+
+    # `hp status` says what just happened in the server's words (3.14), the
+    # same sentence the Overview shows - never the journal code.
+    status = fresh.ok("status").stdout
+    happened = status.split("What happened:", 1)[1]
+    assert "cli-journey shut down atlas" in happened
+    assert "cli-journey started forge-dev" in happened
+    assert "approved 2026-" in happened  # the fleet's seeded approval, by its change id
+    for code in ("guest_shutdown", "guest_start", "approve "):
+        assert code not in status
+    lines = fresh.json("status")["what_happened"]
+    assert any(line.endswith("shut down atlas") for line in lines), lines
 
 
 # ── hp agents ────────────────────────────────────────────────────────────────

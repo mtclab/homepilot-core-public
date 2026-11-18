@@ -11,8 +11,9 @@ module answers the other half: which privileges the write token holds. PVE's
 `GET /access/permissions`, asked AS the token, returns its effective
 privileges per path - a read, so a probe may make it.
 
-Per the owner mandate recorded in ``pve_sdn`` (HomePilot does not re-implement
-Proxmox endpoints), the call goes through the estate's ``proxmox_mcp`` library:
+This is an adapter module, one of the places a PVE path may be named (#717,
+the rule recorded in ``pve_sdn``). The call goes through the estate's
+``proxmox_mcp`` library:
 its ``MultiClient`` is built by the same ``multi_client_from`` factory, and the
 read is made on the library's ELEVATED (write) client. The library's own
 ``check_permissions`` formats a string from the MONITOR token, which is neither

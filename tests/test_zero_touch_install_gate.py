@@ -46,7 +46,7 @@ pytestmark = pytest.mark.asyncio
 
 # The ONLY two things an operator is asked for.
 PVE_HOST = "pve.example.com"
-PVE_TOKEN = "admin@pam!gate=00000000-1111-2222-3333-444444444444"  # pragma: allowlist secret
+PVE_TOKEN = "automation@pve!gate=00000000-1111-2222-3333-444444444444"  # pragma: allowlist secret
 
 
 @pytest.fixture

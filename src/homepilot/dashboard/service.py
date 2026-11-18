@@ -313,7 +313,16 @@ async def build_summary(repo: Any) -> dict[str, Any]:
     #
     # The steps are the actual path from an empty install to a managed change:
     # something in inventory -> adopt it -> give it an agent -> apply a change.
+    # "Get alerts on your phone" (#822) is OFFERED, not required (owner
+    # decision 2026-11-18: opt-in): `optional` steps never hold `complete`
+    # back. Done is read from the channels' own delivery record - a channel
+    # that has delivered at least once - not from "a channel exists".
     applied_artifacts = artifacts_by_status.get("applied", 0)
+    delivered = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM notification_channels "
+        "WHERE enabled = 1 AND last_ok_at IS NOT NULL"
+    )
+    phone_heard = bool(delivered and delivered["n"])
     onboarding_steps = [
         {
             "key": "inventory",
@@ -335,6 +344,17 @@ async def build_summary(repo: Any) -> dict[str, Any]:
             "detail": "The agent is how a change reaches the host, and how metrics come back.",
             "href": "/agents",
             "done": agents_connected > 0,
+        },
+        {
+            "key": "phone",
+            "title": "Get alerts on your phone",
+            "detail": (
+                "Optional. HomePilot can run its own ntfy server, use one you run, or ntfy.sh; "
+                "a test push proves it."
+            ),
+            "href": "/monitoring/channels",
+            "done": phone_heard,
+            "optional": True,
         },
         {
             "key": "artifact",
@@ -367,7 +387,7 @@ async def build_summary(repo: Any) -> dict[str, Any]:
         "updates": updates,
         "onboarding": {
             "steps": onboarding_steps,
-            "complete": all(step["done"] for step in onboarding_steps),
+            "complete": all(step["done"] for step in onboarding_steps if not step.get("optional")),
         },
         "inventory": {
             "total": hosts_total,

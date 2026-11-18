@@ -69,6 +69,7 @@ class ArtifactKind(StrEnum):
     HOST_PROVISION = "host-provision"
     GUEST_NETWORK = "guest-network"
     GUEST_POWER = "guest-power"
+    GUEST_DISK = "guest-disk"
     KB_NOTE = "kb-note"
 
 

@@ -34,6 +34,17 @@ A recorded block turns that phase's report (setup, call or teardown) into a
 failure naming the callback, its duration and its loop thread. Blocks recorded
 outside any test phase fail the session.
 
+**A starved box is not a block (#810).** The clock is wall time, so a callback
+the OS simply did not schedule looks exactly like one that blocked. Each loop
+thread's run-queue wait (``/proc/<pid>/task/<tid>/schedstat``: time spent
+runnable but waiting for a CPU) is read when the sampler first sees a callback
+running and again when it ends. When the callback's time NOT spent waiting for
+a CPU still fits the budget, the overrun is the machine's, not the code's: it is
+reported as ``INCONCLUSIVE: starved (...)`` in the session summary, with the
+numbers and the CPU pressure (PSI), instead of failing the test. Anything else
+past the budget - including a real block on a starved box, whose own time still
+exceeds the budget - fails as before. The budget is never raised.
+
 ``ALLOWLIST`` holds node ids allowed to block. It starts empty and should stay
 that way: an entry is a known freeze, written down.
 """
@@ -112,7 +123,11 @@ def _take() -> list[str]:
 # budget, WHILE it runs, so a report names the blocking line - a handle's repr
 # after the fact only names the task that woke up - and so the block can be
 # attributed to the coroutine that made it.
-_running: dict[int, tuple[float, object]] = {}
+_running: dict[int, tuple[float, object, int]] = {}
+# Run-queue wait (ns) of a callback's thread when the sampler first saw it
+# running: the start of the window its starvation is measured over (#810).
+_wait_at_start: dict[object, int] = {}
+_inconclusive: list[str] = []
 # Seconds spent in garbage collection, per thread. A collection pauses the
 # whole interpreter wherever it happens to trigger; it is not the callback
 # blocking, so it is taken out of the callback's time.
@@ -138,7 +153,11 @@ def _sample_forever() -> None:
         time.sleep(_SAMPLE_EVERY_S)
         now = time.perf_counter()
         frames = None
-        for tid, (start, token) in list(_running.items()):
+        for tid, (start, token, native_id) in list(_running.items()):
+            if token not in _wait_at_start:
+                wait = runqueue_wait_ns(native_id)
+                if wait is not None:
+                    _wait_at_start[token] = wait
             if now - start <= BUDGET_S / 2 or token in _samples:
                 continue
             frames = frames or sys._current_frames()
@@ -146,6 +165,44 @@ def _sample_forever() -> None:
             if frame is not None:
                 stack = traceback.format_list(traceback.extract_stack(frame)[-20:])
                 _samples[token] = ("".join(stack), _blocking_coroutine(frame))
+
+
+def runqueue_wait_ns(native_id: int) -> int | None:
+    """How long this thread has spent runnable but waiting for a CPU, in ns.
+
+    The second field of the kernel's per-thread schedstat. None where it is not
+    available (not Linux, schedstats compiled out), which judges nothing as
+    starved: without evidence, an overrun is a block.
+    """
+    try:
+        with open(f"/proc/self/task/{native_id}/schedstat", encoding="ascii") as f:
+            return int(f.read().split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cpu_pressure() -> str:
+    """The box's CPU pressure right now (PSI ``some``), for the report."""
+    try:
+        with open("/proc/pressure/cpu", encoding="ascii") as f:
+            some = f.readline().split()
+    except OSError:
+        return "CPU PSI unavailable"
+    fields = dict(part.split("=", 1) for part in some[1:] if "=" in part)
+    return f"CPU PSI some avg10={fields.get('avg10', '?')} avg60={fields.get('avg60', '?')}"
+
+
+def starved(elapsed_s: float, budget_s: float, runqueue_wait_s: float | None) -> bool:
+    """Whether an over-budget callback is explained by CPU starvation (#810).
+
+    Only when the time it spent NOT waiting for a CPU still fits the budget: then
+    the code ran no longer than allowed and the machine supplied the rest. A real
+    block on a starved box keeps its own time over the budget and stays a block.
+    No reading, no verdict of starvation.
+    """
+    if runqueue_wait_s is None:
+        return False
+    return elapsed_s - runqueue_wait_s <= budget_s
 
 
 def _test_owned(path: str) -> bool:
@@ -172,7 +229,7 @@ def _timed_run(self: asyncio.Handle) -> None:
     gc_before = getattr(_gc, "total", 0.0)
     start = time.perf_counter()
     previous = _running.get(tid)
-    _running[tid] = (start, token)
+    _running[tid] = (start, token, threading.get_native_id())
     try:
         _original_run(self)
     finally:
@@ -182,21 +239,45 @@ def _timed_run(self: asyncio.Handle) -> None:
         else:
             _running[tid] = previous
         sample = _samples.pop(token, None)
+        wait_at_start = _wait_at_start.pop(token, None)
+        budget = BUDGET_S if sample else UNSAMPLED_BUDGET_S
         if (
-            elapsed > (BUDGET_S if sample else UNSAMPLED_BUDGET_S)
+            elapsed > budget
             and not (sample and _test_owned(sample[1]))
             and not threading.current_thread().name.startswith(_CONTAINMENT_THREAD_PREFIXES)
             and not _in_out_of_process_item
         ):
-            _record(
-                f"event loop blocked {elapsed * 1000:.0f} ms (budget {BUDGET_S * 1000:.0f} ms) "
-                f"in thread {threading.current_thread().name!r} by {self!r}"
-                + (
-                    f"; blocking coroutine in {sample[1] or '?'}; stack while blocked:\n{sample[0]}"
-                    if sample
-                    else "; no stack could be sampled (the GIL was held throughout)"
-                )
+            wait_now = runqueue_wait_ns(threading.get_native_id())
+            waited = (
+                (wait_now - wait_at_start) / 1e9
+                if wait_now is not None and wait_at_start is not None
+                else None
             )
+            if starved(elapsed, budget, waited):
+                assert waited is not None
+                _inconclusive.append(
+                    f"INCONCLUSIVE: starved (callback {elapsed * 1000:.0f} ms, of which "
+                    f"{waited * 1000:.0f} ms runnable but waiting for a CPU; "
+                    f"{(elapsed - waited) * 1000:.0f} ms of its own against the "
+                    f"{budget * 1000:.0f} ms budget; {cpu_pressure()}) "
+                    f"in thread {threading.current_thread().name!r} by {self!r}"
+                )
+            else:
+                _record(
+                    f"event loop blocked {elapsed * 1000:.0f} ms (budget {BUDGET_S * 1000:.0f} ms) "
+                    f"in thread {threading.current_thread().name!r} by {self!r}"
+                    + (
+                        f"; blocking coroutine in {sample[1] or '?'}; "
+                        f"stack while blocked:\n{sample[0]}"
+                        if sample
+                        else "; no stack could be sampled (the GIL was held throughout)"
+                    )
+                    + (
+                        f"; {waited * 1000:.0f} ms of it waiting for a CPU ({cpu_pressure()})"
+                        if waited
+                        else ""
+                    )
+                )
 
 
 # Frames that belong to the blocking primitive itself, skipped to find WHO
@@ -292,6 +373,17 @@ _STRAY_KEY = pytest.StashKey[list[str]]()
 
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    if _inconclusive:
+        # Not a pass for those windows and not a product defect: the box did not
+        # run the loop. Said with the evidence, never silently absorbed (#810).
+        terminalreporter.write_line(
+            f"Loop-block detector: {len(_inconclusive)} over-budget callback(s) NOT judged - "
+            "the loop thread was waiting for a CPU, not blocking (tests/loop_block_detector.py):",
+            yellow=True,
+            bold=True,
+        )
+        for message in _inconclusive:
+            terminalreporter.write_line(message, yellow=True)
     stray = config.stash.get(_STRAY_KEY, [])
     if stray:
         terminalreporter.write_line(

@@ -87,6 +87,7 @@ echo "gate-e2e: starting the server from this tree on $BASE_URL (isolated HOME a
         HP_DATA_DIR="$WORK/data" HP_ARTIFACTS_DIR="$WORK/data/artifacts" \
         HP_SECRET_KEY=gate-e2e-secret HP_VAULT_PASSPHRASE=gate-e2e-pass \
         HP_ADMIN_SECRET="$ADMIN_SECRET" HP_UPDATE_CHECK_ENABLED=0 \
+        HP_NTFY_INTERNAL_URL=http://127.0.0.1:9 \
         HP_PORT="$PORT" HP_AGENT_HUB_HOST=127.0.0.1 HP_AGENT_HUB_PORT="$HUB_PORT" \
         "$VENV_BIN/uvicorn" homepilot.main:app --host 127.0.0.1 --port "$PORT"
 ) >"$WORK/server.log" 2>&1 &

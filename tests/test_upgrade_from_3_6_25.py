@@ -48,9 +48,10 @@ SCHEMA_3_7_0 = 36
 # * 40 - the `withdraw` task action (#797): ``tasks`` rebuilt, rows kept
 # * 41 - one live ``hosts`` row per VMID and per node (duplicates retired)
 # * 42 - put-off Overview lines (quiet Overview, 3.12): ``attention_snoozes``
+# * 43 - how each host is built (#818): ``host_descriptions``
 # tests/test_upgrade_from_3_7_0.py drives a 3.7.0 database with real rows
 # through both.
-SCHEMA_LATEST = 42
+SCHEMA_LATEST = 43
 
 
 async def _version(db: Database) -> int:
@@ -125,6 +126,8 @@ class TestADatabaseFrom3625UpgradesInOneStart:
             "protected",
         } <= await _columns(db_3_6_25, "hosts")
         assert "host_addresses" in await _tables(db_3_6_25)
+        # 43: the host-description table exists, and an upgrade describes nothing.
+        assert await db_3_6_25.fetchall("SELECT * FROM host_descriptions") == []
 
         tables = await _tables(db_3_6_25)
         assert {"alert_events", "notification_channels", "enrolment_attempts"} <= tables

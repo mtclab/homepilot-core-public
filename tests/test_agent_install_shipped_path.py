@@ -27,6 +27,8 @@ Teeth (each proven by reverting the fix):
     ``test_the_panel_one_liner_installs_the_agent`` fails (curl 22, no binary);
   * build the command as ``curl ... | bash -s -- ...`` again ->
     ``test_a_refused_download_fails_the_command`` fails (exit status 0).
+  * drop the sha256 check from ``dist.install_command`` ->
+    ``test_a_tampered_installer_is_refused_and_nothing_runs`` fails (it runs).
 """
 
 from __future__ import annotations
@@ -206,4 +208,32 @@ def test_a_refused_download_fails_the_command(minted: dict, tmp_path: Path):
     assert proc.returncode != 0, "a refused download reported success"
     assert "401" in proc.stderr, proc.stderr[-1500:]
     assert INSTALL_FAILED_MESSAGE in proc.stderr
+    assert not landed.exists()
+
+
+def test_a_tampered_installer_is_refused_and_nothing_runs(
+    backend: tuple[str, Path], minted: dict, tmp_path: Path
+):
+    """#843: the one-liner carries the sha256 of the installer the control plane
+    serves and checks it before bash runs it. The installer file is changed
+    after the command was minted - what anything rewriting the plain-http
+    response on the LAN does - and the command must refuse it, say why, and run
+    none of it."""
+    from homepilot.agent_hub.dist import INSTALLER_MISMATCH_MESSAGE
+
+    _api, data = backend
+    assert minted["installer_sha256"] and minted["installer_sha256"] in minted["install_command"]
+    served = data / "agent-dist" / "install-agent.sh"
+    genuine = served.read_text()
+    ran = tmp_path / "tampered-installer-ran"
+    served.write_text(f'#!/bin/sh\ntouch "{ran}"\n' + genuine)
+    try:
+        proc, landed = _run(minted["install_command"], tmp_path)
+    finally:
+        served.write_text(genuine)
+
+    assert proc.returncode != 0, "a tampered installer was accepted"
+    assert INSTALLER_MISMATCH_MESSAGE in proc.stderr, proc.stderr[-1500:]
+    assert INSTALL_FAILED_MESSAGE in proc.stderr
+    assert not ran.exists(), "the tampered installer RAN"
     assert not landed.exists()

@@ -60,6 +60,8 @@ from homepilot.agent_hub.audit import AuditLog
 from homepilot.agent_hub.registry import AgentRegistry
 from homepilot.agent_hub.server import (
     ENROLMENT_WINDOW_CLOSED_ERROR,
+    GENERIC_AUTH_ERROR,
+    HOST_HOLDS_CREDENTIAL_ERROR,
     MAX_AUTH_FAILURES,
     AgentHubServer,
     _encode,
@@ -191,6 +193,53 @@ class TestTheBanIsForGuessers:
             assert reply is not None and reply.get("error") == "invalid auth_token", reply
         assert await hub.knock("guesser", WRONG) is None, (
             "a peer that failed MAX_AUTH_FAILURES credential checks was not banned"
+        )
+
+    async def test_an_identity_clash_is_never_banned_and_names_the_remedy(self, hub: _Hub):
+        """#789 (owner decision 2026-11-18): a real agent that lost its
+        credential presents the genuine shared token for a hostname that still
+        holds one. Twice the ban threshold of those refusals, and every one is
+        ANSWERED with the plain refusal naming the remedy - then the remedy it
+        names (a bootstrap token) lets the host in on the very next knock.
+
+        Revert-check: drop DENY_HOST_HOLDS_CREDENTIAL from the ban-exempt set
+        and the 6th knock is a silent hang-up."""
+        await hub.repo.set_agent_credential("lost-id", "lost-cred", hash_token("its-own-token"))
+        for n in range(MAX_AUTH_FAILURES * 2):
+            reply = await hub.knock("lost-cred", AUTH, agent_id="lost-id")
+            assert reply is not None, f"knock {n + 1} was banned: an identity clash is not a guess"
+            assert reply.get("error") == HOST_HOLDS_CREDENTIAL_ERROR, reply
+        assert "hp agent bootstrap" in HOST_HOLDS_CREDENTIAL_ERROR
+
+        row = _only((await join_requests.payload(hub.repo))["attempts"], "lost-cred")
+        assert row["reason_code"] == "host_holds_credential"
+        assert row["attempts"] == MAX_AUTH_FAILURES * 2
+        assert "`hp agents install lost-cred`" in row["reason"]
+        assert "`hp agent bootstrap`" in row["reason"]
+
+        bootstrap = await hub.server._token_store.create(minted_by="re-enrol lost-cred")
+        ack = await hub.knock("lost-cred", bootstrap, agent_id="lost-id")
+        assert ack is not None and ack.get("action") == "register_ack", ack
+
+    async def test_a_genuine_credential_under_another_hostname_is_never_banned(self, hub: _Hub):
+        """The other identity clash: a host's own per-agent credential, presented
+        under a different hostname (a renamed host). Refused - the credential is
+        bound to its host - but not counted as a guess."""
+        await hub.repo.set_agent_credential("renamed-id", "old-name", hash_token("renamed-token"))
+        for n in range(MAX_AUTH_FAILURES * 2):
+            reply = await hub.knock("new-name", "renamed-token", agent_id="renamed-id")
+            assert reply is not None, f"knock {n + 1} was banned"
+            assert reply.get("error") == GENERIC_AUTH_ERROR, reply
+
+    async def test_identity_clashes_do_not_launder_a_guessing_streak(self, hub: _Hub):
+        """Interleaved identity clashes neither reset nor pad the guess count."""
+        await hub.repo.set_agent_credential("clash-id", "clash-host", hash_token("own"))
+        for _ in range(MAX_AUTH_FAILURES - 1):
+            assert await hub.knock("clash-host", WRONG) is not None
+            assert await hub.knock("clash-host", AUTH, agent_id="clash-id") is not None
+        assert await hub.knock("clash-host", WRONG) is not None  # the 5th bad one
+        assert await hub.knock("clash-host", AUTH, agent_id="clash-id") is None, (
+            "five wrong tokens from one peer were not banned"
         )
 
     async def test_window_refusals_do_not_launder_a_guessing_streak(self, hub: _Hub):
@@ -427,6 +476,20 @@ class TestTheReadApi:
         assert len(pending) == 1
         assert pending[0]["minted_by"] and "admin" in pending[0]["minted_by"]
         assert token not in resp.text
+
+    async def test_a_re_enrol_token_says_which_host_it_was_minted_for(self, hub: _Hub, api):
+        """#789: Re-enrol mints for the host on the line, and the pending list
+        says so. A label, not a bind - the hub accepts a bootstrap token from
+        any host - so a hostname a peer claimed is only cleaned, never refused."""
+        client, admin, reader = api
+        minted = await client.post(
+            "/agents/bootstrap", json={"hostname": "nas-01\x1b[2J"}, headers=_bearer(admin)
+        )
+        assert minted.status_code == 200, minted.text
+        resp = await client.get("/agents/enrolment-requests", headers=_bearer(reader))
+        (pending,) = resp.json()["pending_tokens"]
+        assert pending["minted_by"].startswith("re-enrol of nas-01[2J, by ")
+        assert "\x1b" not in pending["minted_by"]
 
 
 # ── The journey, on the shipped path ─────────────────────────────────────────

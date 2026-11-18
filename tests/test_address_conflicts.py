@@ -266,7 +266,7 @@ class TestWhatMustNotClash:
         repo, pve, svc = world
         pve.add(101, "lan-10", "running", qemu_static("192.0.2.10", "BC:24:11:00:00:01"))
         pve.add(
-            102, "vnet-10", "running", qemu_static("192.0.2.10", "BC:24:11:00:00:02", "innkeep")
+            102, "vnet-10", "running", qemu_static("192.0.2.10", "BC:24:11:00:00:02", "guestnet")
         )
         pve.add(103, "vlan-10", "running", qemu_static("192.0.2.10", "BC:24:11:00:00:03", LAN, 20))
         await _sync(svc)

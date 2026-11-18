@@ -33,9 +33,14 @@
 	import AttentionItem from '$lib/components/AttentionItem.svelte';
 	import AlertsPanel from '$lib/components/AlertsPanel.svelte';
 	import HostNetwork from '$lib/components/HostNetwork.svelte';
+	import HostBuilt from '$lib/components/HostBuilt.svelte';
 	import GuestPower from '$lib/components/GuestPower.svelte';
+	import GuestAddDisk from '$lib/components/GuestAddDisk.svelte';
 	import TabBar from '$lib/components/TabBar.svelte';
 	import { formatMetricValue, metricLabel } from '$lib/sparkline';
+	// #661: a window too long for raw samples is asked for as `auto` buckets.
+	import { getHostSeriesResolved } from '$lib/api';
+	import { bucketExtremes, bucketedSeriesNote } from '$lib/sparkline';
 	import { queryTabs, activeQueryTab } from '$lib/tabs';
 	import { HOST_TABS, hostTabFromHash } from '$lib/hostTabs';
 	import Icon from '$lib/components/Icon.svelte';
@@ -46,6 +51,11 @@
 	let doc: HostDoc | null = null;
 	let latest: LatestMetric[] = [];
 	let series: Record<string, MetricPoint[]> = {};
+	// #661: when a window is bucketed, the true sample range per metric and the
+	// bucket width (null = every point is a raw sample).
+	let seriesExtremes: Record<string, { min: number; max: number } | null> = {};
+	let seriesBucketSeconds: number | null = null;
+	let retentionHours = 168;
 	let activity: AuditEntry[] = [];
 	/** Artifact ids the drift checker currently says disagree with reality. */
 	let driftedIds: Set<string> = new Set();
@@ -101,6 +111,13 @@
 		{ label: '24h', hours: 24 },
 		{ label: '7d', hours: 168 },
 	];
+	// The raw cap: 2000 points (MAX_SERIES_POINTS) at the agent's 60 s cadence is
+	// ~33 hours. A longer window asks for `auto` - otherwise the 7d chart was the
+	// newest 33 hours of the week, drawn as if it were the week (#661).
+	const RAW_CAP_HOURS = (2000 * 60) / 3600;
+	// A window past the retention in force is refused by the API, so it is not offered.
+	$: ranges = RANGES.filter((r) => r.hours <= retentionHours);
+	$: bucketNote = bucketedSeriesNote(seriesBucketSeconds);
 
 	async function load() {
 		loading = true;
@@ -157,23 +174,40 @@
 	async function loadMetrics() {
 		if (!host?.agent_id || !host.hostname) return;
 		try {
+			// Additive: an unreadable config keeps the default 7-day horizon.
+			retentionHours = await api
+				.getUiConfig()
+				.then((c) => c.metrics_retention_days * 24)
+				.catch(() => retentionHours);
 			const latestRes = await api.getHostLatest(host.hostname);
 			latest = latestRes.metrics;
 			metricsError = '';
 			const wanted = latest.map((m) => m.metric);
+			const resolution = hours > RAW_CAP_HOURS ? 'auto' : 'raw';
 			const results = await Promise.allSettled(
-				wanted.map((m) => api.getHostSeries(host!.hostname, m, hours))
+				wanted.map((m) => getHostSeriesResolved(host!.hostname, m, hours, resolution))
 			);
 			const next: Record<string, MetricPoint[]> = {};
+			const extremes: Record<string, { min: number; max: number } | null> = {};
+			let bucketSeconds: number | null = null;
 			results.forEach((r, i) => {
-				if (r.status === 'fulfilled') next[wanted[i]] = r.value.points;
+				if (r.status !== 'fulfilled') return;
+				next[wanted[i]] = r.value.points;
+				if (r.value.resolution === 'bucketed') {
+					extremes[wanted[i]] = bucketExtremes(r.value.points);
+					bucketSeconds = Math.max(bucketSeconds ?? 0, r.value.bucket_seconds ?? 0) || null;
+				}
 			});
 			series = next;
+			seriesExtremes = extremes;
+			seriesBucketSeconds = bucketSeconds;
 		} catch (e) {
 			// A fetch error must not take down the identity header - but it is
 			// also not "the agent has not reported yet" (#701).
 			latest = [];
 			series = {};
+			seriesExtremes = {};
+			seriesBucketSeconds = null;
 			metricsError = reason(e);
 		}
 	}
@@ -591,6 +625,11 @@
 				{#if canAdmin && (host.host_type === 'qemu' || host.host_type === 'lxc') && !host.is_template && !host.absent_since}
 					<GuestPower hostId={host.id} />
 				{/if}
+				<!-- Add a disk (#824): proposes ONE change - attach, format, mount -
+				     that runs only once approved. VMs only (the guest agent formats it). -->
+				{#if canWrite && host.host_type === 'qemu' && !host.is_template && !host.absent_since}
+					<GuestAddDisk hostId={host.id} />
+				{/if}
 				<!-- ── Facts: ONE definition-list pattern, left-anchored ──────────── -->
 				<div class="card p-4">
 					<dl class="grid gap-x-8 gap-y-1.5 text-sm" style="grid-template-columns: max-content 1fr;">
@@ -732,6 +771,9 @@
 			{:else if activeTab === 'network'}
 				<!-- ── Network: every address, its source and age, and its clashes ── -->
 				<HostNetwork hostId={id} />
+			{:else if activeTab === 'built'}
+				<!-- ── How it is built: the agent's host description (#818) ───────── -->
+				<HostBuilt hostId={id} {canWrite} />
 			{:else if activeTab === 'metrics'}
 				<!-- ── Metrics ─────────────────────────────────────────────────────── -->
 				<div class="card p-4 space-y-3">
@@ -739,7 +781,7 @@
 						<h2 class="section-title">Metrics</h2>
 						{#if latest.length}
 							<div class="flex gap-1">
-								{#each RANGES as r (r.hours)}
+								{#each ranges as r (r.hours)}
 									<button
 										class="btn text-xs {hours === r.hours ? 'btn-primary' : 'btn-ghost'}"
 										on:click={() => setRange(r.hours)}>{r.label}</button>
@@ -767,13 +809,16 @@
 								<div class="flex items-center gap-3">
 									<span class="text-muted text-xs w-24 shrink-0">{metricLabel(m.metric)}</span>
 									{#if series[m.metric]?.length}
-										<Sparkline points={series[m.metric]} metric={m.metric} showLabel={false} width={150} height={30} />
+										<Sparkline points={series[m.metric]} metric={m.metric} showLabel={false} width={150} height={30} extremes={seriesExtremes[m.metric] ?? null} />
 									{:else}
 										<span class="text-ink text-xs num-inline">{formatMetricValue(m.metric, m.value)}</span>
 									{/if}
 								</div>
 							{/each}
 						</div>
+						{#if bucketNote}
+							<p class="prose-note text-xs" data-series-bucketed>{bucketNote}</p>
+						{/if}
 					{/if}
 				</div>
 			{:else if activeTab === 'changes'}

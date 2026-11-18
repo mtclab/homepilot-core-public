@@ -96,26 +96,101 @@ def _clean_text(value: str, limit: int) -> str:
 # start a paragraph.
 _ACTION_LEAD_RE = re.compile(r"^\*\*\s*(upgrade|operator action)\b[^*]*[:.]\s*\*\*", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
-_ACTION_HEADING_RE = re.compile(r"upgrad|operator action", re.IGNORECASE)
+# Which headings hold operator instructions. A heading IS an instruction heading
+# when, once leading emoji/punctuation are dropped, it
+#   * starts with "Operator action(s)", "Upgrade note(s)", "Upgrade
+#     instructions", "Upgrading" or "Before you upgrade" (a qualifier may follow:
+#     "Operator actions (agents profile)", "Upgrade notes - read first"), or
+#   * says "before upgrading" / "before you upgrade" anywhere ("Required reading
+#     before upgrading").
+# Not a heading that merely contains the word: "Upgrade agent keeps the host's
+# grant (#841)" is a feature, and lifting it told operators to do a changelog
+# entry (3.14 release check).
+_ACTION_HEADING_RE = re.compile(
+    r"^(operator actions?|upgrade notes?|upgrade instructions|upgrading|before you upgrade)"
+    r"(?![\w-])"
+    r"|\bbefore (you )?upgrad(e|ing)\b",
+    re.IGNORECASE,
+)
+_HEADING_LEAD_RE = re.compile(r"^[^\w]+")
+_LIST_ITEM_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.*)$")
 _NOTHING_TO_DO_RE = re.compile(r"^(-\s*)?none\.?$", re.IGNORECASE)
 
 
+def is_action_heading(text: str) -> bool:
+    """Does this heading introduce operator instructions (see _ACTION_HEADING_RE)?"""
+    return bool(_ACTION_HEADING_RE.search(_HEADING_LEAD_RE.sub("", text.strip())))
+
+
+def _section_items(lines: list[str]) -> list[str]:
+    """An instruction section's items: one per top-level list item, prose as one.
+
+    A top-level list item (``- ``, ``* ``, ``1. `` at the start of the line) is
+    one action, its wrapped and indented continuation lines joined to it. Text
+    that is not in a list item - a section written as plain prose, over one
+    paragraph or several - is ONE action. The 3.14 notes have five bullets;
+    joining the whole section into one item cut it at 500 characters and lost
+    the compose and n8n steps.
+    """
+    items: list[list[str]] = []
+    prose: list[str] | None = None
+    current: list[str] | None = None
+    for raw in lines:
+        if not raw.strip():
+            current = None  # a blank line ends a list item; prose runs on
+            continue
+        item = _LIST_ITEM_RE.match(raw)
+        if item and raw[:1] not in (" ", "\t"):
+            current = [item.group(2).strip()]
+            items.append(current)
+        elif current is not None and (raw[:1] in (" ", "\t") or not item):
+            current.append(raw.strip())
+        else:
+            if prose is None:
+                prose = []
+                items.append(prose)
+            prose.append(raw.strip())
+    return [" ".join(i) for i in items]
+
+
+def _limit(actions: list[str]) -> list[str]:
+    """At most MAX_ACTIONS, and when more were found the last one says so."""
+    if len(actions) <= MAX_ACTIONS:
+        return actions
+    more = len(actions) - (MAX_ACTIONS - 1)
+    return [
+        *actions[: MAX_ACTIONS - 1],
+        f"{more} more operator actions are in the release notes - read them before upgrading.",
+    ]
+
+
 def operator_actions(body: str | None) -> list[str]:
-    """The upgrade instructions a release's notes carry, as plain-text items."""
+    """The upgrade instructions a release's notes carry, as plain-text items.
+
+    Two sources, both CHANGELOG conventions (docs/CHANGELOG.md):
+
+    * a section under an instruction heading (:func:`is_action_heading`), up to
+      the next heading of the same or a higher level - each top-level list
+      item one action, prose one action (:func:`_section_items`); a section
+      that only says "None." is no action;
+    * outside such sections, a paragraph led by a bold ``**Upgrade...:**`` or
+      ``**Operator action...:**`` label.
+
+    Each action is cut at MAX_ACTION_CHARS (ending "..." when cut); past
+    MAX_ACTIONS the last item says how many more are in the notes.
+    """
     if not body:
         return []
     lines = str(body).replace("\r\n", "\n").split("\n")
     actions: list[str] = []
 
-    # Sections headed as upgrade notes: everything up to the next heading of the
-    # same or a higher level is one item.
     section_level = 0
     section: list[str] = []
     paragraph: list[str] = []
 
     def flush_section() -> None:
-        if section:
-            text = _clean_text(" ".join(section), MAX_ACTION_CHARS)
+        for item in _section_items(section):
+            text = _clean_text(item, MAX_ACTION_CHARS)
             # "### Operator actions" + "None." is how a release says there is
             # nothing to do; lifted, it became an update notice telling the
             # operator to do "None.".
@@ -138,12 +213,11 @@ def operator_actions(body: str | None) -> list[str]:
                 flush_section()
                 section_level = 0
             flush_paragraph()
-            if not section_level and _ACTION_HEADING_RE.search(heading.group(2)):
+            if not section_level and is_action_heading(heading.group(2)):
                 section_level = level
             continue
         if section_level:
-            if raw.strip():
-                section.append(raw.strip())
+            section.append(raw.rstrip())
             continue
         if raw.strip():
             paragraph.append(raw.strip())
@@ -151,7 +225,7 @@ def operator_actions(body: str | None) -> list[str]:
             flush_paragraph()
     flush_section()
     flush_paragraph()
-    return actions[:MAX_ACTIONS]
+    return _limit(actions)
 
 
 def _notes_url(value: Any) -> str:

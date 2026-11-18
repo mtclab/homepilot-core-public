@@ -4,11 +4,28 @@
 	// to the alerts it produces. Firing alerts also show where the operator
 	// looks: Overview and the affected host.
 	import { onMount, tick } from 'svelte';
-	import { api, type AlertComparison, type AlertRule } from '$lib/api';
+	import { api, type AlertComparison, type AlertRule, type AlertRuleCoverage } from '$lib/api';
 	import { notify } from '$lib/stores';
 	import { metricLabel } from '$lib/sparkline';
 
-	const RULE_METRICS = ['load.1m', 'load.5m', 'load.15m', 'memory.free_gb', 'disk.free_gb'];
+	// The ratios first (#661): "disk over 90%" is the rule most people come here
+	// to write, and only a ratio means the same thing on every host.
+	const RULE_METRICS = [
+		'disk.used_pct',
+		'memory.used_pct',
+		'load.1m_per_core',
+		'load.1m',
+		'load.5m',
+		'load.15m',
+		'memory.free_gb',
+		'disk.free_gb'
+	];
+
+	/** The server's sentence naming hosts this rule cannot see yet - an older
+	 *  agent that does not report its metric (#661) - or null. */
+	function coverageNote(r: AlertRule): string | null {
+		return (r as AlertRule & Partial<AlertRuleCoverage>).coverage_note ?? null;
+	}
 	// Not a metric: picking it makes a `nodata` rule (#660) - an enrolled host
 	// that has reported nothing for the duration. It takes no threshold.
 	const NODATA = '__nodata';
@@ -171,7 +188,10 @@
 		every host, <span class="font-mono">web-*</span> every host whose name
 		starts that way, and a bare name is one machine. The Hosts column says how
 		many the rule matched when it was last evaluated - if that is zero, it is
-		enabled and watching nothing.
+		enabled and watching nothing. For "disk over 90% full" on every host, pick
+		<em>Disk used</em>, <em>above</em>, <span class="font-mono">90</span>: the
+		percentages mean the same on a small VM and a big array. Hosts whose agent
+		is too old to report a metric are named under the rule.
 	</p>
 
 	<div class="flex flex-wrap items-end gap-2">
@@ -301,6 +321,9 @@
 									watching {r.hosts_matched}
 									{r.hosts_matched === 1 ? 'host' : 'hosts'}
 								</span>
+							{/if}
+							{#if coverageNote(r)}
+								<span class="block font-sans text-warn text-xs" data-rule-missing-metric>{coverageNote(r)}</span>
 							{/if}
 						</td>
 						<td>

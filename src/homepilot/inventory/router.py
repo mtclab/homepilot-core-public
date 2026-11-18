@@ -813,6 +813,128 @@ async def power_host(
     return result.as_dict()
 
 
+class AddDiskRequest(BaseModel):
+    """The "Add a disk" form (#824). Checked again, in full, by the change's spec."""
+
+    storage: str = Field(max_length=200)
+    size_gib: int
+    filesystem: Literal["ext4", "xfs"] = "ext4"
+    mount_point: str = Field(max_length=200)
+    label: str = Field(max_length=32)
+    mount_options: str | None = Field(default=None, max_length=200)
+    bus: Literal["scsi", "virtio"] = "scsi"
+    ssd: bool = False
+    reason: str = Field(default="", max_length=120)
+
+
+def _disk_service(request: Request) -> Any:
+    from .disks import DiskService
+
+    svc = _get_service(request)
+    return DiskService(svc.repo, svc.proxmox)
+
+
+@router.get("/{host_id}/disks", dependencies=[Depends(require_scope("read"))])
+async def get_disk_options(request: Request, host_id: str) -> dict[str, Any]:
+    """What adding a disk to this VM can use: storages, next slot, hotplug, agent.
+
+    A read: nothing is sent to the guest.
+    """
+    from .disks import DiskRefusedError
+
+    try:
+        result: dict[str, Any] = await _disk_service(request).describe(host_id)
+    except DiskRefusedError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail()) from e
+    return result
+
+
+@router.post("/{host_id}/disks", dependencies=[Depends(require_scope("write"))])
+async def propose_disk(
+    request: Request, host_id: str, body: AddDiskRequest, token: dict[str, Any] = _principal
+) -> Any:
+    """PROPOSE adding a disk (#824): one guest-disk change that attaches, formats
+    and mounts it once approved. Nothing is attached here; what the apply would
+    refuse is refused now (4xx with a ``code`` and the reason)."""
+    import secrets
+
+    from .disks import DiskRefusedError
+
+    lifecycle = getattr(request.app.state, "artifact_lifecycle", None)
+    if lifecycle is None:
+        raise HTTPException(status_code=503, detail="the change store is not available")
+    produced_by = {
+        "session": f"web-{secrets.token_hex(4)}",
+        "agent": "web",
+        "user": audit_actor(token),
+    }
+    inputs = body.model_dump(exclude={"reason"})
+    try:
+        return await _disk_service(request).propose(
+            host_id, inputs, lifecycle=lifecycle, produced_by=produced_by, reason=body.reason
+        )
+    except DiskRefusedError as e:
+        return JSONResponse(status_code=e.status, content={"detail": e.detail()})
+
+
+def _descriptions(request: Request) -> Any:
+    from .description import HostDescriptionService
+
+    svc = getattr(request.app.state, "host_descriptions", None)
+    if svc is None:
+        svc = HostDescriptionService(request.app.state.repo, _resolve_agent_adapter(request))
+    return svc
+
+
+@router.get("/{host_id}/description", dependencies=[Depends(require_scope("read"))])
+async def get_host_description(request: Request, host_id: str) -> dict[str, Any]:
+    """How this host is built (#818): the latest stored host description, what
+    changed since the one before it, the last failure and the as-built export.
+    ``description`` is null until the host's agent has described it."""
+    from .description import DescriptionError
+
+    svc = _descriptions(request)
+    try:
+        result: dict[str, Any] = await svc.view(await svc.host(host_id=host_id))
+    except DescriptionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+    return result
+
+
+@router.post("/{host_id}/description", dependencies=[Depends(require_scope("read"))])
+async def collect_host_description(request: Request, host_id: str) -> dict[str, Any]:
+    """Ask the host's agent to describe the host now, store it, return it.
+
+    A READ: the agent runs its fixed read-only collectors and nothing on the
+    host changes - the same tier as reading a file on the host. A request within
+    30 seconds of the last collection answers with that one.
+    """
+    from .description import DescriptionError
+
+    svc = _descriptions(request)
+    try:
+        result: dict[str, Any] = await svc.collect(await svc.host(host_id=host_id))
+    except DescriptionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+    return result
+
+
+@router.post("/{host_id}/description/export", dependencies=[Depends(require_scope("write"))])
+async def export_host_asbuilt(request: Request, host_id: str) -> dict[str, Any]:
+    """Record the latest description as this host's KB "as-built" note - a
+    rebuild recipe - superseding the host's previous as-built note."""
+    from .description import DescriptionError
+
+    svc = _descriptions(request)
+    try:
+        result: dict[str, Any] = await svc.export_asbuilt(
+            await svc.host(host_id=host_id), getattr(request.app.state, "kb_service", None)
+        )
+    except DescriptionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+    return result
+
+
 @router.post("/enrich", dependencies=[Depends(require_scope("write"))])
 async def enrich_inventory(request: Request) -> dict[str, Any]:
     svc = _get_service(request)

@@ -82,6 +82,7 @@ def _agent() -> AsyncMock:
     agent.exec = AsyncMock(return_value=(0, "done", ""))
     agent.exec_readonly = AsyncMock(return_value=(1, "", ""))
     agent.read_file = AsyncMock(side_effect=FileNotFoundError("absent"))
+    agent.snapshot_file = AsyncMock(side_effect=FileNotFoundError("absent"))
     return agent
 
 

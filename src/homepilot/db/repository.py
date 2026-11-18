@@ -933,6 +933,7 @@ class Repository:
         env: str | None = None,
         is_template: bool | None = None,
         absent: bool | None = None,
+        hostname: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(limit, 1000)
         offset = max(offset, 0)
@@ -947,6 +948,7 @@ class Repository:
             env=env,
             is_template=is_template,
             absent=absent,
+            hostname=hostname,
         )
         params.extend([limit, offset])
         rows = await self.db.fetchall(f"SELECT * FROM hosts{where} LIMIT ? OFFSET ?", params)
@@ -965,6 +967,7 @@ class Repository:
         env: str | None = None,
         is_template: bool | None = None,
         absent: bool | None = None,
+        hostname: str | None = None,
     ) -> tuple[str, list[Any]]:
         """The filter clauses, in ONE place, for both the list and the count.
 
@@ -998,6 +1001,10 @@ class Repository:
         if is_template is not None:
             clauses.append("is_template = ?")
             params.append(int(is_template))
+        if hostname is not None:
+            # Exact, unlike `q`: "this machine", not "machines like this" (#818).
+            clauses.append("hostname = ?")
+            params.append(hostname)
         if absent is not None:
             # Gone from Proxmox, or not (the Overview's "Review" door, 3.12).
             clauses.append("absent_since IS NOT NULL" if absent else "absent_since IS NULL")
@@ -1350,6 +1357,10 @@ class Repository:
         # Its addresses (lane B2): a forgotten machine must not go on "holding"
         # an address and raising a clash nobody can open.
         await self.db.execute("DELETE FROM host_addresses WHERE host_id = ?", (host_id,))
+        # Its host description (#818): how a forgotten machine was built is not
+        # a fact about the estate any more. An as-built note it exported to the
+        # KB stays - that is the record a rebuild would start from.
+        await self.db.execute("DELETE FROM host_descriptions WHERE host_id = ?", (host_id,))
         # The as-found observation note is keyed `introspect:<host_id>` in its
         # SOURCE (its target is the hostname), so that is what identifies it -
         # matching on the hostname alone would take out unrelated notes about a
@@ -2484,5 +2495,89 @@ class Repository:
                SET status = ?, attempts = ?, last_attempt_at = ?
                WHERE id = ?""",
             (status, attempts, ts, delivery_id),
+        )
+        await self.db.conn.commit()
+
+    # ── Host descriptions (#818) ─────────────────────────────────────────────
+
+    async def get_live_host_by_hostname(self, hostname: str) -> dict[str, Any] | None:
+        """The host row named ``hostname``, preferring the live one.
+
+        Rows of machines Proxmox stopped reporting keep their names
+        (``absent_since`` is set), so a plain lookup by name could answer with a
+        retired row while the live machine of that name sits beside it. Among
+        live rows, the one an agent is linked to wins.
+        """
+        row = await self.db.fetchone(
+            "SELECT * FROM hosts WHERE hostname = ? "
+            "ORDER BY (absent_since IS NULL) DESC, (agent_id IS NOT NULL) DESC, "
+            "updated_at DESC LIMIT 1",
+            (hostname,),
+        )
+        return dict(row) if row is not None else None
+
+    async def get_host_by_agent_id(self, agent_id: str) -> dict[str, Any] | None:
+        """The host row an agent's registration linked it to."""
+        row = await self.db.fetchone("SELECT * FROM hosts WHERE agent_id = ?", (agent_id,))
+        return dict(row) if row is not None else None
+
+    async def get_host_description(self, host_id: str) -> dict[str, Any] | None:
+        row = await self.db.fetchone(
+            "SELECT * FROM host_descriptions WHERE host_id = ?", (host_id,)
+        )
+        return dict(row) if row is not None else None
+
+    async def list_host_descriptions(self) -> list[dict[str, Any]]:
+        """host_id, hostname and timestamps of every stored description (no bodies)."""
+        rows = await self.db.fetchall(
+            "SELECT host_id, hostname, collected_at, received_at, last_error_at "
+            "FROM host_descriptions"
+        )
+        return [dict(r) for r in rows]
+
+    async def save_host_description(
+        self, host_id: str, hostname: str, schema: str, collected_at: str, description_json: str
+    ) -> None:
+        """Store a new description; the one it replaces becomes the previous one.
+
+        One statement, so the latest/previous shift cannot half-happen. A
+        successful collection also clears the last error.
+        """
+        await self.db.execute(
+            """INSERT INTO host_descriptions
+               (host_id, hostname, schema, collected_at, received_at, description_json)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(host_id) DO UPDATE SET
+                 previous_json = host_descriptions.description_json,
+                 previous_collected_at = host_descriptions.collected_at,
+                 hostname = excluded.hostname,
+                 schema = excluded.schema,
+                 collected_at = excluded.collected_at,
+                 received_at = excluded.received_at,
+                 description_json = excluded.description_json,
+                 last_error = NULL,
+                 last_error_at = NULL""",
+            (host_id, hostname, schema, collected_at, now(), description_json),
+        )
+        await self.db.conn.commit()
+
+    async def record_host_description_error(self, host_id: str, hostname: str, error: str) -> None:
+        """Why the last attempt to describe a host failed; the stored
+        description (if any) is kept."""
+        await self.db.execute(
+            """INSERT INTO host_descriptions (host_id, hostname, last_error, last_error_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(host_id) DO UPDATE SET
+                 last_error = excluded.last_error,
+                 last_error_at = excluded.last_error_at""",
+            (host_id, hostname, error[:500], now()),
+        )
+        await self.db.conn.commit()
+
+    async def set_host_asbuilt_note(self, host_id: str, note_id: str) -> None:
+        await self.db.execute(
+            "UPDATE host_descriptions SET asbuilt_note_id = ?, asbuilt_exported_at = ? "
+            "WHERE host_id = ?",
+            (note_id, now(), host_id),
         )
         await self.db.conn.commit()

@@ -85,12 +85,15 @@ async def test_drain_with_nothing_running_is_a_no_op(db, tmp_path: Path):
 
 
 def test_the_lifespan_drains_the_kb_service_before_the_database_closes() -> None:
+    from homepilot.main import SHUTDOWN_DRAINABLE
+
     src = (REPO / "src" / "homepilot" / "main.py").read_text()
-    drain_list = src.index("drainable = (")
-    entry = src.find('("kb service", getattr(app.state, "kb_service", None))', drain_list)
-    close = src.index("state.database.close()", drain_list)
-    assert entry != -1, "the KB service is not in the lifespan's drain list"
-    assert entry < close, "the KB service must be drained BEFORE the database closes"
+    drain_loop = src.index("for label, attr in SHUTDOWN_DRAINABLE:")
+    close = src.index("state.database.close()", drain_loop)
+    assert ("kb service", "kb_service") in SHUTDOWN_DRAINABLE, (
+        "the KB service is not in the lifespan's drain list"
+    )
+    assert drain_loop < close, "the KB service must be drained BEFORE the database closes"
 
 
 def test_a_thread_killed_by_an_exception_fails_the_run() -> None:

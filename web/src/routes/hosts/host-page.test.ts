@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // $lib/api and never sees the mock.
 import { setPage } from '../../lib/test-mocks';
 import HostPage from './[id]/+page.svelte';
-import { api } from '$lib/api';
+import { api, getHostSeriesResolved } from '$lib/api';
 import { HOST_TABS } from '$lib/hostTabs';
 
 /**
@@ -29,7 +29,8 @@ import { HOST_TABS } from '$lib/hostTabs';
 const getHost = api.getHost as ReturnType<typeof vi.fn>;
 const getHostDoc = api.getHostDoc as ReturnType<typeof vi.fn>;
 const getHostLatest = api.getHostLatest as ReturnType<typeof vi.fn>;
-const getHostSeries = api.getHostSeries as ReturnType<typeof vi.fn>;
+const getHostSeries = getHostSeriesResolved as ReturnType<typeof vi.fn>;
+const getUiConfig = api.getUiConfig as ReturnType<typeof vi.fn>;
 const listAudit = api.listAudit as ReturnType<typeof vi.fn>;
 
 // Shaped exactly like the live instance that produced the complaint: nested
@@ -95,7 +96,13 @@ describe('Host page (#514 S2)', () => {
 				{ ts: 1787499000, value: 1.1 },
 				{ ts: 1787500000, value: 0.53 },
 			],
+			truncated: false,
+			max_points: 2000,
+			resolution: 'raw',
+			bucket_seconds: null,
+			aggregation: null,
 		});
+		getUiConfig.mockResolvedValue({ metrics_retention_days: 7 });
 		listAudit.mockResolvedValue({
 			items: [
 				{ id: 1, timestamp: '2026-08-23T12:00:00Z', user_id: 'ui', source: 'ui', action: 'host_adopted', artifact_id: null, target_host: 'llm', target_service: null, command: null, exit_code: null },
@@ -324,5 +331,87 @@ describe('Host page attention zone', () => {
 		await waitFor(() => expect(screen.getByRole('heading', { name: 'llm' })).toBeTruthy());
 		expect(screen.getByText(/Nothing needs you/i)).toBeTruthy();
 		expect(screen.queryByText(/cannot say whether this host/i)).toBeNull();
+	});
+});
+
+/**
+ * A readable week (#661). Raw samples stop at 2000 points - about 33 hours at
+ * the 60 s cadence - so the 7d chart used to be the newest 33 hours of the week
+ * drawn as if it were the week. A longer window now asks for `auto` and the
+ * page SAYS the line is per-bucket averages with the true min/max beside it.
+ *
+ * Teeth: always ask for `raw` and the 7d test fails; drop the note and the
+ * "says so" assertion fails; offer every range regardless of retention and the
+ * 3-day test fails.
+ */
+describe('Host page metric windows (#661)', () => {
+	afterEach(() => cleanup());
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		at('metrics');
+		getHost.mockResolvedValue(HOST);
+		getHostDoc.mockResolvedValue({ target: 'llm', hosts: [HOST], services: [], kb_entries: [], artifact_history: [] });
+		getHostLatest.mockResolvedValue({ hostname: 'llm', metrics: [{ metric: 'disk.used_pct', ts: 1787500000, value: 91 }] });
+		listAudit.mockResolvedValue({ items: [], total: 0 });
+		getUiConfig.mockResolvedValue({ metrics_retention_days: 7 });
+		getHostSeries.mockImplementation((_h: string, metric: string, hours: number, resolution: string) =>
+			Promise.resolve(
+				resolution === 'auto'
+					? {
+							hostname: 'llm',
+							metric,
+							since: 0,
+							points: [
+								{ ts: 1787400000, value: 50, min: 12, max: 60, count: 10 },
+								{ ts: 1787400600, value: 70, min: 65, max: 97, count: 10 },
+							],
+							truncated: false,
+							max_points: 2000,
+							resolution: 'bucketed',
+							bucket_seconds: 600,
+							aggregation: { value: 'avg', also: ['min', 'max', 'count'] },
+						}
+					: {
+							hostname: 'llm',
+							metric,
+							since: 0,
+							points: [{ ts: 1787500000, value: 91 }, { ts: 1787500060, value: 92 }],
+							truncated: hours > 33,
+							max_points: 2000,
+							resolution: 'raw',
+							bucket_seconds: null,
+							aggregation: null,
+						}
+			)
+		);
+	});
+
+	it('a short window is raw samples and carries no caveat', async () => {
+		render(HostPage);
+		await waitFor(() => expect(getHostSeries).toHaveBeenCalledWith('llm', 'disk.used_pct', 1, 'raw'));
+		expect(document.querySelector('[data-series-bucketed]')).toBeNull();
+	});
+
+	it('the 7-day window asks for buckets and says it is showing per-bucket min/avg/max', async () => {
+		render(HostPage);
+		const week = await screen.findByRole('button', { name: '7d' });
+		week.click();
+		await waitFor(() => expect(getHostSeries).toHaveBeenCalledWith('llm', 'disk.used_pct', 168, 'auto'));
+		const note = await waitFor(() => {
+			const el = document.querySelector('[data-series-bucketed]');
+			expect(el).not.toBeNull();
+			return el as HTMLElement;
+		});
+		expect(note.textContent).toContain('per-bucket min/avg/max over 10-minute buckets');
+		// The range beside the line is the true sample range, not the averages'.
+		expect(screen.getByText('12% – 97%')).toBeTruthy();
+	});
+
+	it('does not offer a window past the retention in force', async () => {
+		getUiConfig.mockResolvedValue({ metrics_retention_days: 3 });
+		render(HostPage);
+		await screen.findByRole('button', { name: '24h' });
+		expect(screen.queryByRole('button', { name: '7d' })).toBeNull();
 	});
 });

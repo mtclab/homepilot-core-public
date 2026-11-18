@@ -201,6 +201,30 @@ class TestAuthRedirect:
         current = page.url.lower()
         assert "/login" in current, f"Expected redirect to /login, got {page.url}"
 
+    @pytest.mark.parametrize(
+        ("deep_link", "landing"),
+        [
+            # A deep link lands on its exact path, query AND fragment (#807).
+            ("/ui/hosts/agents?q=web01#join", "/ui/hosts/agents?q=web01#join"),
+            # A pre-move bookmark's fragment is what its redirect reads; without
+            # it the legacy-anchor redirect never fired after a login.
+            ("/ui/settings#alerts", "/ui/monitoring/rules"),
+        ],
+    )
+    def test_a_logged_out_deep_link_keeps_its_fragment_through_login(
+        self, page, deep_link, landing
+    ):
+        page.goto(BASE_URL + deep_link, wait_until="networkidle")
+        page.wait_for_url(lambda url: urlsplit(url).path == "/ui/login", timeout=10000)
+        page.locator("input#login-token").fill(TOKEN)
+        page.locator("input#login-token").press("Enter")
+        try:
+            page.wait_for_url(lambda url: _landed(url) == landing, timeout=15000)
+        except PlaywrightTimeoutError:
+            pytest.fail(
+                f"{deep_link} logged out -> after login {_landed(page.url)} (wanted {landing})"
+            )
+
     def test_settings_page_has_token_input(self, page):
         page.goto(UI + "/settings", wait_until="networkidle")
         assert page.locator("input#login-token").count() > 0
@@ -779,6 +803,47 @@ class TestThePhoneViewport:
             page.close()
 
 
+class TestPhoneAlertsOnTheShippedPage:
+    """#822 on the real built UI and the real server: Monitoring > Channels
+    offers "Get alerts on your phone"; choosing HomePilot's own ntfy server
+    writes its config and tokens and then tells the operator the ONE command
+    that starts the service (nothing listens at the gate server's ntfy
+    address, exactly like an install that has not started the profile yet).
+    No HomePilot ntfy token is ever on the page or in the setup answer. The
+    real-ntfy half of the journey is tests/test_phone_alerts_journey_822.py.
+
+    Leaves the shared e2e server as it found it: the test disables again."""
+
+    def test_choose_bundled_shows_the_command_and_no_token(self, session_auth):
+        context = session_auth["context"]
+        page = context.new_page()
+        page.on("dialog", lambda d: d.accept())
+        try:
+            page.goto(f"{UI}/monitoring/channels", wait_until="networkidle")
+            assert page.get_by_role("tab", name="Channels").get_attribute("aria-selected") == "true"
+            page.get_by_text("HomePilot's own ntfy server").click()
+            page.get_by_role("button", name="Set it up").click()
+            command = page.locator("[data-compose-command]")
+            command.wait_for(timeout=15_000)
+            assert command.inner_text().strip() == "docker compose --profile ntfy up -d"
+            assert "Waiting" in page.locator("[data-server-detail]").inner_text()
+            # The channel HomePilot created is listed - by host only.
+            page.get_by_text("Phone (bundled ntfy)").first.wait_for(timeout=10_000)
+
+            html = page.content()
+            assert not re.search(r"tk_[a-z0-9]{29}", html), "an ntfy token is on the page"
+            status = context.request.get(f"{BASE_URL}/admin/notifications/phone")
+            assert status.ok, status.text()
+            assert "tk_" not in status.text()
+        finally:
+            off = context.request.delete(
+                f"{BASE_URL}/admin/notifications/phone/bundled",
+                headers=_csrf_headers(session_auth["csrf"], content_type=False),
+            )
+            page.close()
+        assert off.ok, f"could not disable after the test: {off.status} {off.text()}"
+
+
 # ---------------------------------------------------------------------------
 # 3.10.0 journeys that need guests: the e2e fleet server
 # ---------------------------------------------------------------------------
@@ -957,7 +1022,36 @@ def _no_sideways_scroll(page) -> None:
         "Math.max(document.documentElement.scrollWidth - document.documentElement.clientWidth,"
         " ...Array.from(document.querySelectorAll('main')).map(m => m.scrollWidth - m.clientWidth))"
     )
-    assert overflow <= 1, f"the page scrolls sideways by {overflow}px"
+    if overflow > 1:
+        # Name what reaches past the viewport, outside any scroller that clips
+        # it (#829: an sr-only label escaping a static scroller, not the table).
+        culprits = page.evaluate(
+            """() => {
+                const vw = document.documentElement.clientWidth;
+                // Clipped by a scroller on its CONTAINING-BLOCK chain only: an
+                // absolute element skips static ancestors, a fixed one all.
+                const clipped = e => {
+                    let pos = getComputedStyle(e).position;
+                    for (let a = e.parentElement; a; a = a.parentElement) {
+                        const cs = getComputedStyle(a);
+                        if (pos === 'fixed' || (pos === 'absolute' && cs.position === 'static')) {
+                            continue;
+                        }
+                        if (cs.overflowX !== 'visible') {
+                            return a.getBoundingClientRect().right <= vw + 1;
+                        }
+                        pos = cs.position;
+                    }
+                    return false;
+                };
+                return Array.from(document.querySelectorAll('body *'))
+                    .filter(e => e.getBoundingClientRect().right > vw + 1 && !clipped(e))
+                    .slice(0, 8)
+                    .map(e => `${e.tagName.toLowerCase()}.${String(e.className).trim()
+                        .replace(/\\s+/g, '.')} right=${Math.round(e.getBoundingClientRect().right)}`);
+            }"""
+        )
+        pytest.fail(f"the page scrolls sideways by {overflow}px; past the edge: {culprits}")
 
 
 def _start_spec(name: str, vmid: int) -> dict:
@@ -1569,6 +1663,249 @@ class TestFleetJourneys:
             acts_box = gone.locator(".attn-acts").bounding_box()
             assert acts_box["y"] >= text_box["y"] + text_box["height"] - 1, (text_box, acts_box)
             expect(page.get_by_label("Running machines")).to_be_visible()
+            _no_sideways_scroll(page)
+            assert errors == []
+        finally:
+            context.close()
+
+
+# ---------------------------------------------------------------------------
+# Re-enrol a refused host (#789)
+# ---------------------------------------------------------------------------
+
+
+def _knock_with_a_dead_credential(host: str, port: int, hostname: str, tls: bool) -> dict:
+    """One register on the real hub with a credential it cannot accept - the
+    state of an agent that lost its own credential. Returns the hub's reply."""
+    import socket
+    import ssl
+    import struct
+
+    raw = socket.create_connection((host, port), timeout=10)
+    sock: socket.socket = raw
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # a refusal is the point; nothing secret is sent
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    try:
+        payload = json.dumps(
+            {
+                "action": "register",
+                "auth_token": "e2e-a-credential-the-hub-never-issued",  # pragma: allowlist secret
+                "agent_id": f"id-{hostname}",
+                "hostname": hostname,
+                "request_id": "reg-e2e-reenrol",
+            }
+        ).encode()
+        sock.sendall(struct.pack("!I", len(payload)) + payload)
+        header = sock.recv(4)
+        size = struct.unpack("!I", header)[0]
+        body = b""
+        while len(body) < size:
+            chunk = sock.recv(size - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return json.loads(body.decode())
+    finally:
+        sock.close()
+
+
+class TestReEnrolARefusedHost:
+    """#789: a host the hub refuses is fixed from its own line in Hosts > Agents.
+
+    The journey on the shipped path: a real register on the real hub is refused
+    (the credential it holds is not one the hub issued), the refusal is listed
+    under Waiting to join, and Re-enrol on that line mints a single-use
+    bootstrap token and shows the server-built install one-liner for it - the
+    same command Enroll agent shows, which the hub accepts whatever credential
+    the host held before.
+    """
+
+    HOST = "e2e-reenrol-box"
+
+    def test_re_enrol_shows_the_install_line_for_a_fresh_token(self, auth_page):
+        from playwright.sync_api import expect
+
+        # Where the hub listens, as the console's own enrol panel learns it.
+        boot = auth_page.request.post(f"{BASE_URL}/agents/bootstrap", headers=_bearer())
+        assert boot.ok, boot.text()
+        hub = boot.json()
+        host = hub["hub_host"] or urlsplit(BASE_URL).hostname
+        reply = _knock_with_a_dead_credential(
+            str(host), int(hub["hub_port"]), self.HOST, bool(hub.get("hub_tls"))
+        )
+        assert reply.get("action") != "register_ack", reply
+
+        before = auth_page.request.get(f"{BASE_URL}/agents/enrolment-requests", headers=_bearer())
+        tokens_before = len(before.json()["pending_tokens"])
+
+        auth_page.goto(f"{UI}/hosts/agents", wait_until="networkidle")
+        row = auth_page.get_by_test_id("refused-host").filter(has_text=self.HOST)
+        expect(row).to_be_visible(timeout=15000)
+        # Not a QEMU guest HomePilot can reinstall into: no Install again here.
+        expect(row.get_by_role("button", name="Install again")).to_have_count(0)
+        row.get_by_role("button", name="Re-enrol").click()
+
+        command = row.get_by_test_id("install-command")
+        expect(command).to_be_visible(timeout=15000)
+        text = command.inner_text()
+        assert re.search(r"--token hpbat_\S+", text), text
+        assert f"--hub {host}:{hub['hub_port']}" in text, text
+        expect(row).to_contain_text(f"Run this on {self.HOST} as root")
+        # A real token was minted for it: one more is pending than before.
+        after = auth_page.request.get(f"{BASE_URL}/agents/enrolment-requests", headers=_bearer())
+        assert len(after.json()["pending_tokens"]) == tokens_before + 1
+
+
+class TestEveryRouteOnAPhone:
+    """The console at 390 px, route by route (#829), on a fleet server of its
+    OWN: the `fleet` fixture is class-scoped, so this class gets its own process
+    and its own per-IP rate window. Walking every route loads each in full; run
+    on the fleet TestFleetJourneys drives, the walk landed on the login page in
+    a full run (passing alone) - consistent with that class's journeys and the
+    walk sharing one 300/min authenticated budget, where a 429 on /auth/me reads
+    as no session. The limit is the product's and stays as it is."""
+
+    def test_records_tasks_with_a_long_detail_stays_on_a_phone(self, fleet, browser):
+        """#829: at 390 px Records > Tasks made the page ~870 px wide. Not the
+        table (its card scrolls) but the Row-actions header's sr-only label,
+        position:absolute under a static scroller, so never clipped by it. The
+        fleet seeds a failed task with a long digest in its detail and its log
+        (tests/e2e_fleet_server.py), as a real Proxmox refusal reads."""
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser, width=390, height=844)
+        try:
+            page.goto(f"{fleet['base']}/ui/records/tasks")
+            row = page.locator("tr", has_text="e2e-long-detail-guest")
+            expect(row).to_contain_text("sha256:0123456789abcdef", timeout=15000)
+            _no_sideways_scroll(page)
+            # The execution log opens in a full-width row under the task.
+            row.get_by_role("button", name="Log").click()
+            expect(page.locator("pre.code-block")).to_contain_text("TASK ERROR")
+            _no_sideways_scroll(page)
+            assert errors == []
+        finally:
+            context.close()
+
+    def test_no_console_route_scrolls_sideways_on_a_phone(self, fleet, browser):
+        """Every console route at 390 px (#829: Records had never been in the
+        phone checks), on the fleet server so the lists hold real rows."""
+        from playwright.sync_api import expect
+
+        context, page, errors = _fleet_page(fleet, browser, width=390, height=844)
+        wide: list[str] = []
+        try:
+            for route in TestUIPages.ROUTES:
+                page.goto(f"{fleet['base']}/ui/{route}", wait_until="networkidle")
+                expect(page.locator("h1").first).to_be_visible()
+                try:
+                    _no_sideways_scroll(page)
+                except pytest.fail.Exception as exc:
+                    wide.append(f"/ui/{route}: {exc}")
+            assert not wide, "\n".join(wide)
+            assert errors == []
+        finally:
+            context.close()
+
+
+# ---------------------------------------------------------------------------
+# The library tag and the policy acknowledgement, in the console (#506)
+# ---------------------------------------------------------------------------
+
+_POLICY_RULE = (
+    "# No starting batch guests by API\n\nStart them from the console.\n\n"
+    "```policy-rule\nforbid:\n  - kind: proxmox-api-sequence\n    verb: POST\n"
+    "    path: /nodes/*/qemu/*/status/start\n```\n"
+)
+
+
+class TestLibraryAndPolicyInTheConsole:
+    """#506 on the built UI and the real backend (over the suite's fake Proxmox).
+
+    The Changes list filters on the `pattern` tag on the server; a change a
+    structured policy rule matches cannot be approved until the operator ticks
+    the acknowledgement on its page, and the approval then records it.
+    """
+
+    def test_the_tag_filter_and_the_acknowledged_approval(self, fleet, browser):
+        from playwright.sync_api import expect
+
+        status, made = _fleet_api(
+            fleet, "POST", "/kb/notes",
+            {"kind": "policy", "target": "batch-1", "content": _POLICY_RULE},
+        )  # fmt: skip
+        assert status == 200 and made["indexed"], made
+        tagged_spec = {**_start_spec("batch-1", 141), "tags": ["pattern"]}
+        status, tagged = _fleet_api(fleet, "POST", "/artifacts", tagged_spec)
+        assert status == 200, tagged  # a policy never refuses a proposal
+        status, plain = _fleet_api(fleet, "POST", "/artifacts", _start_spec("batch-2", 142))
+        assert status == 200, plain
+
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/changes")
+            expect(page.get_by_text("Start batch-2")).to_be_visible(timeout=15000)
+            page.get_by_test_id("tag-filter").select_option("pattern")
+            expect(page.get_by_text("Start batch-2")).to_have_count(0, timeout=15000)
+            expect(page.get_by_text("Start batch-1")).to_be_visible()
+
+            page.goto(f"{fleet['base']}/ui/changes/{tagged['id']}")
+            warning = page.get_by_test_id("policy-warnings")
+            expect(warning).to_contain_text("No starting batch guests by API", timeout=15000)
+            expect(warning).to_contain_text("POST /nodes/pve1/qemu/141/status/start")
+            approve = page.get_by_role("button", name="Approve only")
+            expect(approve).to_be_disabled()
+            page.get_by_test_id("policy-ack").get_by_role("checkbox").check()
+            expect(approve).to_be_enabled()
+            approve.click()
+            expect(page.get_by_test_id("policy-warnings")).to_have_count(0, timeout=15000)
+            assert errors == []
+        finally:
+            context.close()
+
+        status, detail = _fleet_api(fleet, "GET", f"/artifacts/{tagged['id']}")
+        assert detail["frontmatter"]["status"] == "approved", detail["frontmatter"]
+        assert detail["frontmatter"]["approved_by"]["policy_acknowledged"]
+        # The other change, which no rule matches, still approves without asking.
+        status, body = _fleet_api(fleet, "POST", f"/artifacts/{plain['id']}/approve", {})
+        assert status == 200, body
+
+
+class TestHowItIsBuilt:
+    """#818 on the built UI and the real backend: a host's "How it is built" tab.
+
+    The fleet server has no agents, so the journey is the one an operator meets
+    on a host whose agent is not connected: the tab says so instead of showing
+    an empty description, "Collect now" answers with the hub's reason, and that
+    reason is what the server then stores as the host's last attempt.
+    """
+
+    def test_the_tab_explains_a_missing_agent_and_records_the_refusal(self, fleet, browser):
+        from playwright.sync_api import expect
+
+        host = _fleet_host(fleet, "relay")
+        context, page, errors = _fleet_page(fleet, browser)
+        try:
+            page.goto(f"{fleet['base']}/ui/hosts/{host['id']}?tab=built")
+            expect(page.get_by_role("tab", name="How it is built")).to_have_attribute(
+                "aria-selected", "true"
+            )
+            expect(
+                page.get_by_text("No description yet: this host's agent is not connected.")
+            ).to_be_visible(timeout=15000)
+            page.get_by_role("button", name="Collect now").click()
+            # The reason is the backend's: "no agent connected for relay" with a
+            # hub, or "no agent to ask" on a server whose hub is not running.
+            alert = page.get_by_role("alert")
+            expect(alert).to_contain_text("no agent", timeout=15000)
+            shown = alert.inner_text()
+            status, body = _fleet_api(fleet, "GET", f"/inventory/{host['id']}/description")
+            assert status == 200, body
+            assert body["description"] is None
+            assert body["last_error"] and body["last_error"] in shown
             _no_sideways_scroll(page)
             assert errors == []
         finally:

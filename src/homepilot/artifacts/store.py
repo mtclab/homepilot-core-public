@@ -117,6 +117,11 @@ def _artifact_matches(fm: dict[str, Any], needle: str) -> bool:
     return False
 
 
+def _tags_of(fm: dict[str, Any]) -> list[str]:
+    tags = fm.get("tags")
+    return [str(t) for t in tags] if isinstance(tags, list) else []
+
+
 class ArtifactStore:
     """The artifacts git repository. Every method is SYNCHRONOUS and blocks.
 
@@ -405,9 +410,17 @@ class ArtifactStore:
         return fm, body
 
     def list(
-        self, status: str | None = None, kind: str | None = None, q: str | None = None
+        self,
+        status: str | None = None,
+        kind: str | None = None,
+        q: str | None = None,
+        tag: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Artifacts, optionally narrowed by status/kind and by free text.
+        """Artifacts, optionally narrowed by status/kind, an exact tag and free text.
+
+        ``tag`` keeps only artifacts whose ``tags`` list holds exactly that tag
+        - the library convention (#506): ``tags: ["pattern"]`` marks a change
+        worth imitating.
 
         ``q`` matches the frontmatter an operator would recognise an artifact by -
         its id, its intent, its kind, its target and its tags - case-insensitively.
@@ -433,6 +446,8 @@ class ArtifactStore:
                     if status is not None and fm.get("status") != status:
                         continue
                     if kind is not None and fm.get("kind") != kind:
+                        continue
+                    if tag is not None and tag not in _tags_of(fm):
                         continue
                     if needle and not _artifact_matches(fm, needle):
                         continue

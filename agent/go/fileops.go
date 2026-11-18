@@ -186,7 +186,19 @@ func readFile(path string) (string, error) {
 		}
 		return "", err
 	}
-	return string(data), nil
+	content := string(data)
+	// A unit file or drop-in leaves the host with its Environment= values (and
+	// the other secret-bearing settings) redacted, on every agent (#853). The
+	// path as given counts as well as the resolved one: a unit symlinked into
+	// /etc/systemd/system from elsewhere is still a unit.
+	if isUnitShaped(filepath.Clean(path)) || isUnitShaped(resolved) {
+		content, _ = redactUnitText(content)
+		if len(content) > maxPayloadBytes {
+			return "", fmt.Errorf("file is %d bytes after redaction; the agent hub accepts at most %d per reply: %s",
+				len(content), maxPayloadBytes, path)
+		}
+	}
+	return content, nil
 }
 
 func writeFile(path, content string) error {

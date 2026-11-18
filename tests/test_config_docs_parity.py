@@ -68,6 +68,9 @@ SRC = REPO_ROOT / "src"
 EXTERNAL_ENV: dict[str, tuple[Path, ...]] = {
     "HP_IMAGE_TAG": COMPOSE_FILES,
     "HP_DAEMON_PORT": COMPOSE_FILES,
+    # The opt-in ntfy service's published address and port (#822).
+    "HP_NTFY_BIND": COMPOSE_FILES,
+    "HP_NTFY_PORT": COMPOSE_FILES,
     "HP_AGENT_TLS_INSECURE": (REPO_ROOT / "agent" / "go" / "config.go",),
 }
 

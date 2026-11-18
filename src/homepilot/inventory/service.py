@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from homepilot.adapters import pve_reads
 from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.db.repository import Repository
 from homepilot.db.utils import escape_like
@@ -396,7 +397,7 @@ class InventoryService:
         if self.proxmox is None:
             return None
         try:
-            result = await self.proxmox.read(f"/nodes/{node_name}/{guest_type}/{vmid}/config")
+            result = await pve_reads.guest_config(self.proxmox, node_name, guest_type, vmid)
             data = result.get("data", result)
             if isinstance(data, dict):
                 return data
@@ -415,7 +416,7 @@ class InventoryService:
         if self.proxmox is None:
             return None
         try:
-            result = await self.proxmox.read(f"/nodes/{node_name}/network")
+            result = await pve_reads.node_network(self.proxmox, node_name)
             ifaces = result.get("data", result)
             return ifaces if isinstance(ifaces, list) else None
         except (httpx.HTTPError, ConnectionError, OSError) as exc:
@@ -473,7 +474,7 @@ class InventoryService:
             return None
         try:
             return await asyncio.wait_for(
-                self.proxmox.read(f"/nodes/{node_name}/qemu/{vmid}/agent/network-get-interfaces"),
+                pve_reads.guest_agent_interfaces(self.proxmox, node_name, vmid),
                 timeout=timeout,
             )
         except (
@@ -491,7 +492,7 @@ class InventoryService:
         if self.proxmox is None:
             return {}, False
         try:
-            result = await self.proxmox.read("/cluster/resources", {"type": "vm"})
+            result = await pve_reads.cluster_guests(self.proxmox)
         except Exception as exc:
             # Logged and carried on: the facts it holds are additive.
             logger.warning("Could not read /cluster/resources for guest facts: %s", exc)
@@ -613,7 +614,7 @@ class InventoryService:
             # failure here costs those facts for one cycle and nothing else -
             # it is not a listing the absent sweep depends on.
             resources, resources_read = await self._cluster_guest_resources()
-            nodes = await self.proxmox.read("/nodes")
+            nodes = await pve_reads.nodes(self.proxmox)
             node_list = nodes.get("data", nodes)
             if not isinstance(node_list, list):
                 # An answer we cannot read is not "a cluster with no nodes".
@@ -689,7 +690,7 @@ class InventoryService:
 
                 for guest_type in ("qemu", "lxc"):
                     try:
-                        guests = await self.proxmox.read(f"/nodes/{node_name}/{guest_type}")
+                        guests = await pve_reads.node_guests(self.proxmox, node_name, guest_type)
                         guest_list = guests.get("data", guests)
                         if not isinstance(guest_list, list):
                             guest_list = []

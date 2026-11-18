@@ -183,10 +183,11 @@ class ProxmoxClient:
         """This client's own connection details, for building a sibling client.
 
         The guest-network work talks to PVE through the estate's
-        ``proxmox_mcp`` library rather than through this class (which gains no
-        new endpoint knowledge, by owner mandate), and that library needs the
-        same host and the same tokens. Handing them over here is what keeps
-        ONE configuration surface instead of two.
+        ``proxmox_mcp`` library (``pve_sdn``) rather than through this class,
+        and that library needs the same host and the same tokens. (Endpoint
+        paths may live in this class and the other adapter modules only - #717.)
+        Handing them over here is what keeps ONE configuration surface instead
+        of two.
 
         Carries live secrets: never log it, never put it in a response, never
         serialise it. It exists to be passed to a client constructor.

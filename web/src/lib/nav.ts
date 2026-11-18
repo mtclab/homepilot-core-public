@@ -1,5 +1,13 @@
 import { writable } from 'svelte/store';
 
+// The address a login redirect returns to: path, query AND fragment (#807).
+// The fragment never reaches the server, so this is the only place a deep
+// link's `#anchor` (and the legacy-anchor redirects that read it) survives the
+// login. Every redirect to the login page builds its `returnTo` here.
+export function returnAddress(url: { pathname: string; search: string; hash: string }): string {
+	return url.pathname + url.search + url.hash;
+}
+
 // Same-origin guard for `returnTo` redirects. An attacker-supplied `returnTo`
 // must never send the user off-origin (open redirect) and must never reach
 // SvelteKit's `goto` as a full/off-app URL — `goto` throws on those, which made
@@ -24,8 +32,11 @@ export function safeReturnTo(
 	if (!value.startsWith('/')) return fallback;
 	if (value.startsWith('//') || value.startsWith('/\\')) return fallback;
 
-	// Must stay within the app's base path.
-	if (value !== base && !value.startsWith(base + '/')) return fallback;
+	// Must stay within the app's base path. Judged on the PATH alone, so the
+	// base itself with a query or a `#fragment` (`/ui#x`, #807) is in-app too;
+	// whatever follows `?` or `#` cannot change the origin.
+	const path = value.split(/[?#]/, 1)[0];
+	if (path !== base && !path.startsWith(base + '/')) return fallback;
 
 	return value;
 }

@@ -148,7 +148,7 @@
 						{testing ? 'Sending...' : 'Send test'}
 					</button>
 				{:else}
-					<a class="text-accent text-xs" href="{base}/monitoring/rules#notification-channels">Add a channel</a>
+					<a class="text-accent text-xs" href="{base}/monitoring/channels">Add a channel</a>
 				{/if}
 			{/if}
 		</div>

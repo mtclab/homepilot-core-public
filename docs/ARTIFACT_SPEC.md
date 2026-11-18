@@ -86,7 +86,7 @@ YAML. Keys are stable; do not rename without a version bump.
 | Field | Type | Notes |
 |---|---|---|
 | `id` | string | Matches the filename basename |
-| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `host-provision`, `guest-network`, `guest-power`, `kb-note` |
+| `kind` | enum | One of: `ansible-playbook`, `proxmox-api-sequence`, `http-sequence`, `composite`, `shell-script`, `host-provision`, `guest-network`, `guest-power`, `guest-disk`, `kb-note` |
 | `intent` | string | One-line human description, ≤ 200 chars |
 | `status` | enum | One of: `proposed`, `approved`, `rejected`, `applied`, `failed`, `superseded`, `revoked`, `withdrawn` |
 | `mutating` | bool | `true` for all kinds except `kb-note` |
@@ -119,7 +119,7 @@ YAML. Keys are stable; do not rename without a version bump.
 
 | Field | Type | Notes |
 |---|---|---|
-| `tags` | list[str] | Free-form, e.g. `["security", "auth"]` |
+| `tags` | list[str] | Short slugs (lowercase letters, digits, `-`; 1-32 chars; at most 10, no repeats), e.g. `["pattern", "nginx"]`. Refused at propose otherwise. `pattern` is the library convention (§5.6.1). |
 | `rollback` | bool | `true` if a rollback section exists in the body |
 | `replay_safe` | bool | Defaults to `true`. `false` per **D3** means the artifact cannot be replayed *at all*; to redo the operation, revoke and produce a fresh artifact. Agent must explain in the body why an artifact is not replay-safe. |
 | `requires_snapshot` | bool | Defaults to `true` for `mutating: true` against VM/LXC targets, `false` otherwise. Override only when snapshotting is impossible or dangerous (e.g. snapshotting the running PVE node itself). Setting it `true` on any other `target.kind` is **refused at propose**: only a vm or an lxc can be snapshotted, so the claim could not be honoured, and an ignored `requires_snapshot: true` reads on the review screen as a rollback point that does not exist. A required snapshot the executor cannot address (no vmid, no node) aborts the apply rather than being skipped. |
@@ -611,6 +611,51 @@ note_kind: note | policy | decision
    search will find it, so it must not return success with the word "indexed".
 5. No external side effects.
 
+#### 5.6.1 The library, and structured policy rules (#506)
+
+**The library is the store plus one convention.** A change worth imitating is
+tagged `pattern` (`tags: ["pattern"]`). `query_artifacts` with
+`{"tag": "pattern"}`, `GET /artifacts?tag=pattern` and
+`hp changes list --tag pattern` list exactly the artifacts carrying that tag;
+`get_artifact` returns one with its body and execution log, which is what an
+assistant imitates. There is no separate catalog to keep in sync.
+
+**A policy may carry a machine-readable rule.** A `policy` note stays free text,
+shown beside the plan on the review screen. It MAY also hold a `policy-rule`
+block, the only part HomePilot checks:
+
+````markdown
+```policy-rule
+forbid:
+  - kind: proxmox-api-sequence   # an artifact kind
+    verb: DELETE                 # an operation's verb
+    path: /nodes/*/qemu/*        # a glob over the operation's path
+```
+````
+
+- `forbid` is one entry or a list. Each entry names at least one of `kind`,
+  `verb`, `path` and matches a change when every field it names matches.
+- The operations a rule sees, by kind: `proxmox-api-sequence` and
+  `http-sequence` steps as `METHOD /path` (target-rendered, query dropped);
+  `host-provision` as `install <package>`, `write <config path>` and
+  `<state> <service>` (e.g. `started nginx`); a `composite` as each step
+  artifact's own operations, against that step's target's policies; any other
+  kind has none, so only `kind` can match it.
+- Which policies apply is the review screen's rule: those whose target is the
+  change's host, and global ones (no target, or `global`).
+- A block that does not parse is reported (`errors` in `policy_warnings`) and
+  checks nothing until it is fixed.
+
+**A match is a warning acknowledged at APPROVE, never a refusal at propose.**
+`GET /artifacts/{id}`, `get_artifact` and the plan carry `policy_warnings` while
+the change is `proposed`, and the review screen shows them. Approving a matching
+change without `acknowledge_policy: true` (API body, MCP `approve_artifact`,
+`hp changes approve --acknowledge-policy`, also on `approve-and-apply`) is
+answered 409 `policy_acknowledgement_required` with the matches; the change
+stays `proposed`. With it, the approval goes through and
+`approved_by.policy_acknowledged` (and the journal's approve row) records which
+policies were acknowledged.
+
 **Indexed on propose.** `propose` writes a kb-note `applied` without running the
 executor, so nothing indexed it: `propose_artifact` answered `applied` for a note
 `get_kb_doc` could not find. The lifecycle indexes every kb-note as it proposes
@@ -734,6 +779,65 @@ outcome unknown (`unsettled_task`, #774).
 Changes) on a `guest-power` proposal, as on most kinds (see §7).
 
 **Drift:** none - a power action is a moment, not a state.
+
+---
+
+### 5.9 `kind: guest-disk`
+
+Add a disk to one running QEMU VM and take it into use, as ONE change (#824;
+operator guide: [docs/add-disk.md](add-disk.md)). Proposed by the host page's
+"Add a disk" form (`POST /api/inventory/{host_id}/disks`), the `add_guest_disk`
+MCP tool, or a hand-written spec; the first two run every live check before
+they propose.
+
+**Body structure** (`render_guest_disk_body` writes it):
+
+````markdown
+## Add a 50 GiB disk to app-01 at /srv/data
+<the steps in words>
+
+## Spec
+
+```yaml guest-disk-spec
+storage: fast-pool          # a storage with `images` content; a /dev path is refused
+size_gib: 50                # 1-65536
+filesystem: ext4            # ext4 (default) | xfs
+mount_point: /srv/data      # absolute, normalised, not / or a system tree
+label: appdata              # ext4 <= 16, xfs <= 12 chars
+mount_options: defaults,nofail,discard   # must include nofail
+bus: scsi                   # scsi (default) | virtio
+ssd: true                   # attach discard=on (+ssd=1 on scsi)
+serial: hp0123456789ab      # optional; derived from the id when absent
+```
+````
+
+**Frontmatter rules, refused at propose:** `target.kind: vm` with `target.host`;
+`idempotence: via-precheck`; `requires_snapshot: false` (it writes a new blank
+disk and one fstab line it backs up; a snapshot would lock the guest); no
+rollback (HomePilot never detaches a disk). A physical disk is refused with the
+`qm set` command root runs on the node.
+
+**Executor:** reads the VM's current config and pending changes, its status,
+the node's storages and - read-only, through the guest agent - the guest's
+side; any blocker (stopped, locked, no `disk` in `hotplug`, no answering agent,
+storage missing/inactive/too small, no free slot, mount point not empty, label
+or mount point already in fstab, missing tools) refuses the run with nothing
+changed. Then: `POST .../config {<slot>: <storage>:<GiB>,serial=<serial>...}`,
+the task followed, the CURRENT config re-read (a disk Proxmox only queued as
+pending is "partly applied", never success). Then the guest script as root via
+`agent/exec`: find the disk by serial, refuse a non-blank one, mkfs with the
+label, empty immutable mount point, fstab backup + one line, `mount
+<mount_point>`, findmnt check. Each step reports done / skipped / failed, so a
+re-run skips what is there and a failure names the steps done and not run.
+
+**Outcome:** success when the guest's own check ends verified. Attach done and
+the guest part failed = `failed` with `partial_apply` (#796), its `remedy`
+naming retry (re-approve and apply) and detach (the operator's own step).
+
+**Drift:** in spec = a disk with the serial in the current config, the guest
+sees it mounted at the mount point with the label and type, and fstab carries
+the line (a read-only run of the same script); unknown when the guest cannot be
+asked.
 
 ---
 

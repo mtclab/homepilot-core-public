@@ -4,7 +4,8 @@
     "agent/go/readonly_policy_test.go (the agent) and tests/test_readonly_policy.py",
     "(the adapter's exec_readonly and the MCP read_file_on_guest check).",
     "refuse_everywhere: refused by the MCP read tier AND by the agent in every mode, privileged included.",
-    "refuse_read_tier: refused by the MCP read tier and the unprivileged agent (a privileged agent may run them for an admin).",
+    "refuse_read_tier: refused by the MCP read tier and the unprivileged agent; a privileged agent runs them for an admin",
+    "(readonly_policy_test.go holds that). #817: every form that prints a process's command line lives here or in refuse_everywhere.",
     "agent_only: the unprivileged agent runs them; the MCP read tier does not offer them.",
     "Add to this file whenever a new verb or path class is found: both layers pick it up."
   ],
@@ -12,17 +13,20 @@
     "allow": [
       "hostname", "uptime", "uname -a", "free -m", "df -h", "df -h /",
       "ls", "ls -la /var/log", "ls /etc /var", "ls -lh /opt/homepilot",
-      "ps", "ps aux", "ps auxf", "ps auxww", "ps -ef", "ps -e", "ps -eF", "ps -eo pid,comm,%cpu",
-      "ps -p 1", "ps -u root", "ps --forest", "ps aux --sort=-%mem",
+      "ps -eo pid,user,comm,etime,pcpu,pmem", "ps -eo pid,comm,%cpu", "ps -Ao pid,ppid,comm,stat",
+      "ps -o pid,comm -p 1", "ps -p 1,2 -o pid,comm,etime", "ps -u root -o pid,comm", "ps -C nginx -o pid,comm,etime",
+      "ps -eHo pid,comm", "ps -e -o pid,comm --forest", "ps -eo pid,comm,pmem --sort=-%mem", "ps -eo pid,comm --no-headers",
       "ip addr", "ip a", "ip addr show", "ip -4 addr show dev eth0", "ip link", "ip link show eth0",
       "ip route", "ip r", "ip route show table all", "ip route get 192.0.2.53", "ip neigh", "ip neigh show",
       "ip -s link", "ip -br addr", "ip -j route show", "ip rule list",
       "ss -tln", "ss -tlnp", "ss -s", "ss -tan state established", "ss -tn dst 192.0.2.1",
-      "systemctl status nginx", "systemctl status nginx.service", "systemctl is-active nginx",
-      "systemctl is-enabled nginx.service", "systemctl is-failed nginx", "systemctl status getty@tty1.service",
+      "systemctl is-active nginx", "systemctl is-enabled nginx.service", "systemctl is-failed nginx",
+      "systemctl is-active getty@tty1.service", "systemctl show nginx -p ActiveState,SubState,MainPID",
+      "systemctl show nginx.service --property=NRestarts --value", "systemctl show getty@tty1.service -p ActiveState",
       "journalctl", "journalctl -u nginx", "journalctl -u nginx -n 50", "journalctl -xeu nginx",
       "journalctl --since=today --no-pager", "journalctl -b", "journalctl -b -1", "journalctl -n100",
-      "journalctl -p err -b", "journalctl -S -1h", "journalctl -k", "journalctl -o json -n 20",
+      "journalctl -p err -b", "journalctl -S -1h", "journalctl -k", "journalctl -o short-iso -n 20",
+      "journalctl -u nginx -o cat", "journalctl --output=short-precise", "journalctl -ocat", "journalctl -xo with-unit",
       "dpkg -l", "dpkg -l nginx", "dpkg -s nginx", "dpkg -S /usr/bin/ls", "dpkg -L nginx",
       "cat /etc/os-release", "cat /etc/hostname", "cat /var/log/syslog", "cat /proc/meminfo",
       "cat /etc/homepilot/some-artifact.conf", "cat /etc/systemd/system/foo.service",
@@ -31,7 +35,13 @@
     "agent_only": ["docker ps", "docker images", "docker version"],
     "refuse_read_tier": [
       "systemctl daemon-reload", "systemctl restart nginx", "systemctl stop nginx",
-      "systemctl enable nginx", "mkdir -p /opt/homepilot/x", "docker pull nginx"
+      "systemctl enable nginx", "mkdir -p /opt/homepilot/x", "docker pull nginx",
+      "ps", "ps aux", "ps auxf", "ps auxww", "ps axww", "ps -ef", "ps -e", "ps -eF", "ps -eLf", "ps -A",
+      "ps -p 1", "ps -u root", "ps --forest", "ps aux --sort=-%mem", "ps -eo pid,args", "ps -eo pid,cmd",
+      "ps -o command -p 1", "ps -eo comm,args", "ps -eo pid,comm -o args", "ps -e -o comm=args",
+      "ps -fp 1", "ps -fu root", "ps -eo pid,comm -f", "ps -eo pid,comm ww", "ps -eo pid,comm,environ",
+      "systemctl status", "systemctl status nginx", "systemctl status nginx.service",
+      "systemctl status getty@tty1.service"
     ],
     "refuse_everywhere": [
       "", "rm -rf /tmp/x", "bash -c id", "sh -c id", "curl http://example.com",
@@ -51,6 +61,19 @@
       "journalctl -f", "journalctl -xef", "journalctl -D /root", "journalctl --file=/root/x.journal",
       "journalctl --directory=/root", "journalctl -b --flush",
       "ps e", "ps auxe", "ps eww", "ps aux e", "ps axe", "ps -auxe", "ps -xe", "ps -aux", "ps -ey",
+      "ps -eo pid,comm e", "ps -eo pid,comm -O args",
+      "ps -eo pid,comm --format=args", "ps -eo pid,comm --cols=999 ww",
+      "pgrep -a sleep", "pgrep -af token", "pgrep -l sleep", "pkill sleep", "top -b -n 1", "htop",
+      "cat /proc/1/cmdline", "cat /proc/self/cmdline", "cat /proc/1/task/1/cmdline", "cat /proc/1/environ",
+      "cat /proc/1/task/1/environ", "cat /var/lib/hp-agent/upgrade-snapshot/agent.env",
+      "systemctl show nginx", "systemctl show", "systemctl show nginx -p ExecStart",
+      "systemctl show nginx -p Environment", "systemctl show nginx -p Description",
+      "systemctl show nginx -p ActiveState,ExecStart", "systemctl show -p ActiveState nginx",
+      "systemctl list-units", "systemctl cat nginx", "systemctl status nginx --lines=0 -l",
+      "journalctl -o json", "journalctl -ojson", "journalctl -o json-pretty", "journalctl -o verbose",
+      "journalctl -o export", "journalctl --output=json", "journalctl --output=verbose", "journalctl --output json",
+      "journalctl -xo json", "journalctl -u nginx -o verbose", "journalctl -F _CMDLINE",
+      "journalctl --field=_CMDLINE", "journalctl --output-fields=_CMDLINE -o json", "journalctl _CMDLINE=x",
       "dpkg -i x.deb", "dpkg --purge nginx", "dpkg -l --purge nginx", "dpkg -r nginx",
       "cat /etc/homepilot/agent.env", "cat /etc/homepilot/agent.token", "cat /opt/homepilot/.env",
       "cat /etc/shadow", "cat /etc/ssh/ssh_host_ed25519_key", "cat /etc/pve/priv/token.cfg",
@@ -66,7 +89,10 @@
       "/etc/systemd/system/foo.service", "/etc/systemd/journald.conf", "/usr/lib/systemd/system/ssh.service",
       "/etc/homepilot/some-artifact.conf", "/opt/homepilot/config.yaml", "/opt/homepilot/bootstrap.sh",
       "/tmp/homepilot/staged.txt", "/etc/nginx/nginx.conf", "/etc/docker/daemon.json",
-      "/proc/meminfo", "/proc/cpuinfo", "/etc/apt/sources.list"
+      "/proc/meminfo", "/proc/cpuinfo", "/etc/apt/sources.list",
+      "/etc/nginx/conf.d/site.conf", "/etc/nginx/sites-enabled/default", "/etc/nginx/ssl/site.crt",
+      "/etc/letsencrypt/renewal/example.org.conf", "/etc/ufw/ufw.conf", "/etc/ufw/user.rules",
+      "/var/lib/update-notifier/updates-available", "/run/reboot-required"
     ],
     "refuse": [
       "/etc/ssh/ssh_host_ed25519_key", "/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_ecdsa_key",
@@ -78,12 +104,166 @@
       "/etc/homepilot/agent.env", "/etc/homepilot/agent.token",
       "/etc/shadow", "/etc/gshadow", "/etc/shadow-", "/etc/gshadow-",
       "/root", "/root/.bashrc", "/root/.ssh/id_rsa", "/proc/1/environ", "/proc/self/environ", "/proc/1/cmdline",
+      "/proc/self/cmdline", "/proc/1/task/1/cmdline", "/proc/1/task/1/environ",
+      "/var/lib/hp-agent/upgrade-snapshot/agent.env", "/var/lib/hp-agent/upgrade-snapshot/agent.token",
       "/etc/passwd", "/etc/sudoers", "/etc/ssl/private/server.key", "/etc/ssl/certs/server.pem",
       "/etc/nginx/ssl/site.key", "/etc/nginx/.htpasswd", "/etc/docker/key.json",
       "/etc/systemd/system/../../shadow", "/var/log/../../etc/shadow", "relative/path", "",
       "/srv/app/config.yml", "/usr/local/bin/tool", "/sys/class/net/eth0/address", "/home/user/notes.txt",
       "/etc/credstore/db-password",
-      "/var/log/id_ecdsa", "/var/log/id_dsa", "/etc/homepilot/id_ecdsa_sk"
+      "/var/log/id_ecdsa", "/var/log/id_dsa", "/etc/homepilot/id_ecdsa_sk",
+      "/etc/letsencrypt/live/example.org/privkey.pem", "/etc/letsencrypt/live/example.org/cert.pem",
+      "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory/abc/private_key.json",
+      "/etc/letsencrypt/renewal/cloudflare.credentials.ini", "/etc/letsencrypt/renewal/../live/x/privkey.pem",
+      "/etc/nginx/api-token.conf", "/etc/nginx/conf.d/Secrets.conf", "/etc/nginx/conf.d/app.env",
+      "/etc/nginx/.env.production", "/etc/nginx/passwords", "/etc/ufw/backup.env",
+      "/opt/app/docker-compose.yml", "/opt/app/compose.yaml", "/opt/app/.env",
+      "/var/lib/update-notifier/other-file"
+    ]
+  },
+  "unit_redaction": {
+    "_doc": [
+      "#853: the unit-file rewrite, run by agent/go/unitfiles_test.go and tests/test_readonly_policy.py.",
+      "shaped / not_shaped: the agent's isUnitShaped (lexical). cases: [name, in, out, values replaced];",
+      "both layers also assert the rewrite is a fixed point (redacting out again changes nothing)."
+    ],
+    "shaped": [
+      "/etc/systemd/system/app.service",
+      "/etc/systemd/system/app.service.d/override.conf",
+      "/etc/systemd/system.conf",
+      "/etc/systemd/network/wg0.netdev",
+      "/run/systemd/system/x.service",
+      "/usr/lib/systemd/system/ssh.service",
+      "/lib/systemd/system/ssh.service",
+      "/usr/local/lib/systemd/system/y.service",
+      "/opt/homepilot/app/app.service",
+      "/opt/homepilot/app/app.service.d/10-env.conf",
+      "/opt/homepilot/x.timer"
+    ],
+    "not_shaped": [
+      "/etc/nginx/nginx.conf",
+      "/etc/nginx/conf.d/site.conf",
+      "/var/log/syslog",
+      "/opt/homepilot/app/settings",
+      "/etc/systemdx/a.conf",
+      "/opt/homepilot/service",
+      "/opt/homepilot/app.d/x.conf"
+    ],
+    "cases": [
+      [
+        "one variable",
+        "[Service]\nEnvironment=TOKEN=value1\nExecStart=/usr/bin/app\n",
+        "[Service]\nEnvironment=TOKEN=<redacted>\nExecStart=/usr/bin/app\n",
+        1
+      ],
+      [
+        "several unquoted",
+        "Environment=A=1 B=2",
+        "Environment=A=<redacted> B=<redacted>",
+        2
+      ],
+      [
+        "quoted words keep their quote",
+        "Environment=\"A=1\" \"B=two words\" 'C=x y'",
+        "Environment=\"A=<redacted>\" \"B=<redacted>\" 'C=<redacted>'",
+        3
+      ],
+      [
+        "quotes inside a word",
+        "Environment=FOO=\"a b\" BAR='c d' BAZ=e\\ f",
+        "Environment=FOO=<redacted> BAR=<redacted> BAZ=<redacted>",
+        3
+      ],
+      [
+        "escaped quote inside double quotes",
+        "Environment=\"A=x\\\" y\" B=2",
+        "Environment=\"A=<redacted>\" B=<redacted>",
+        2
+      ],
+      [
+        "line continuation",
+        "Environment=A=1 \\\n  B=2\nExecStart=/bin/true\n",
+        "Environment=A=<redacted> B=<redacted>\nExecStart=/bin/true\n",
+        2
+      ],
+      [
+        "comment inside a continuation",
+        "Environment=A=1 \\\n# a note\n  B=2\n",
+        "Environment=A=<redacted> B=<redacted>\n",
+        2
+      ],
+      [
+        "continuation running into the end",
+        "Environment=A=1 \\",
+        "Environment=A=<redacted>",
+        1
+      ],
+      [
+        "spacing and case",
+        "  environment = X=1\n",
+        "  environment =X=<redacted>\n",
+        1
+      ],
+      [
+        "no valid name: the whole word goes",
+        "Environment=1BAD=x =y novalue",
+        "Environment=<redacted> <redacted> <redacted>",
+        3
+      ],
+      [
+        "empty resets stay",
+        "Environment=\nSetCredential=\nPrivateKey=\n",
+        "Environment=\nSetCredential=\nPrivateKey=\n",
+        0
+      ],
+      [
+        "commented-out assignment",
+        "#Environment=TOKEN=old\n; Environment=X=y\n# a note = fine\n",
+        "#Environment=TOKEN=<redacted>\n; Environment=X=<redacted>\n# a note = fine\n",
+        2
+      ],
+      [
+        "manager defaults",
+        "[Manager]\nDefaultEnvironment=HTTP_PROXY=http://proxy.example.com:3128\nManagerEnvironment=X=1\n",
+        "[Manager]\nDefaultEnvironment=HTTP_PROXY=<redacted>\nManagerEnvironment=X=<redacted>\n",
+        2
+      ],
+      [
+        "credentials keep their id",
+        "SetCredential=api:value1\nSetCredentialEncrypted=db: QmFzZTY0\nSetCredential=bad id:x\n",
+        "SetCredential=api:<redacted>\nSetCredentialEncrypted=db:<redacted>\nSetCredential=<redacted>\n",
+        3
+      ],
+      [
+        "wireguard netdev",
+        "[WireGuard]\nPrivateKey=AAAA=\nListenPort=51820\n[WireGuardPeer]\nPresharedKey=BBBB=\nPublicKey=CCCC=\n",
+        "[WireGuard]\nPrivateKey=<redacted>\nListenPort=51820\n[WireGuardPeer]\nPresharedKey=<redacted>\nPublicKey=CCCC=\n",
+        2
+      ],
+      [
+        "crlf",
+        "Environment=A=1\r\nUser=app\r\n",
+        "Environment=A=<redacted>\nUser=app\r\n",
+        1
+      ],
+      [
+        "another key's continuation is kept, a commented secret in it is not",
+        "Description=a long \\\n#Environment=T=old\n  description\n",
+        "Description=a long \\\n#Environment=T=<redacted>\n  description\n",
+        1
+      ],
+      [
+        "nothing to redact",
+        "[Unit]\nDescription=web\nAfter=network.target\n",
+        "[Unit]\nDescription=web\nAfter=network.target\n",
+        0
+      ],
+      ["exec keeps the program, loses the arguments", "ExecStart=/usr/bin/app --token=x --port 80\n", "ExecStart=/usr/bin/app <arguments redacted>\n", 1],
+      ["exec prefix characters stay", "ExecStartPre=-+/usr/bin/prep --key=x\nExecStop=@/usr/bin/app app-stop now\nExecStopPost=|/bin/echo done\n", "ExecStartPre=-+/usr/bin/prep <arguments redacted>\nExecStop=@/usr/bin/app <arguments redacted>\nExecStopPost=|/bin/echo <arguments redacted>\n", 3],
+      ["a bare program and a reset are kept", "ExecReload=/bin/kill\nExecStart=\nExecStart=  /usr/bin/app  \n", "ExecReload=/bin/kill\nExecStart=\nExecStart=  /usr/bin/app  \n", 0],
+      ["a quoted program keeps its quotes", "ExecStart=\"/opt/my app/run\" --x\nExecStartPost='/opt/b' y\n", "ExecStart=\"/opt/my app/run\" <arguments redacted>\nExecStartPost=\"/opt/b\" <arguments redacted>\n", 2],
+      ["exec continuation", "ExecStart=/usr/bin/app \\\n  --token=x \\\n# note\n  --more\n", "ExecStart=/usr/bin/app <arguments redacted>\n", 1],
+      ["commented-out exec and any case", "#ExecStart=/usr/bin/old --token=x\nexeccondition=/bin/test -f /x\nExecReload = /bin/kill -HUP $MAINPID\n", "#ExecStart=/usr/bin/old <arguments redacted>\nexeccondition=/bin/test <arguments redacted>\nExecReload =/bin/kill <arguments redacted>\n", 3]
     ]
   }
 }

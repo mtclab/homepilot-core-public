@@ -9,7 +9,9 @@ plumbing note), seven separate "gone" lines, and no way to put a line off.
 So the rules that need the whole task table, the hub registry or the snooze
 table live here, and BOTH surfaces read them from ``build_summary``: the
 console's Overview and an assistant's ``get_dashboard_summary`` cannot disagree
-about what needs the operator. Wording and layout stay in the web.
+about what needs the operator. Layout stays in the web; the words for a run's
+action and status come from ``dashboard/wording.py`` (the ``words`` on each
+run line), so the console, ``hp status`` and MCP say the same sentence.
 
 Each line this module returns carries a stable ``key`` and a ``severity``; a
 line an operator put off ("Not now, 7 days") is moved to ``put_off`` while its
@@ -24,6 +26,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+from .wording import run_words
 
 # A failed run is news for a day. Past that it is still in Records, but it is
 # no longer something the operator is asked about on the first screen.
@@ -189,7 +193,15 @@ def _settled(
 
 def _run_line(task: dict[str, Any], key: str, severity: str) -> dict[str, Any]:
     host = _task_host(task)
+    # What the run acted on: its change, its host, or - neither known - the task
+    # by the short id the task list shows (web/src/lib/taskStatus.ts shortTaskId).
+    target = (
+        task.get("artifact_id") or host.get("hostname") or f"task {str(task['id']).split('-')[0]}"
+    )
     return {
+        # What the line says (dashboard/wording.py) - every surface shows these
+        # words, never `action`/`status`, which stay for links and filters.
+        "words": run_words(str(task["action"]), str(task["status"]), str(target)),
         "key": key,
         "severity": severity,
         "task_id": task["id"],

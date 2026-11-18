@@ -173,6 +173,8 @@ vi.mock('$lib/api', async () => {
 			ignoreHost: vi.fn(),
 			enrichInventory: vi.fn(),
 			getHostLatest: vi.fn().mockResolvedValue({ hostname: '', metrics: [] }),
+			// The host page sizes its chart ranges by the retention in force (#661).
+			getUiConfig: vi.fn().mockResolvedValue({ metrics_retention_days: 7 }),
 			listAudit: vi.fn().mockResolvedValue({ items: [], total: 0 }),
 			// Overview's "recent movement" + attention zones and Records → Tasks
 			// read the task list (#549 F2/F5). Empty by default so every OTHER
@@ -266,11 +268,45 @@ vi.mock('$lib/api', async () => {
 			hostId
 				? `${base}/hosts/${encodeURIComponent(hostId)}?tab=metrics`
 				: `${base}/inventory?q=${encodeURIComponent(hostname)}`,
+		// #824: module-level like hostMetricsUrl.
+		getDiskOptions: vi.fn().mockRejectedValue(new Error('no disk options in tests')),
+		proposeDisk: vi.fn(),
+		planDiskChange: vi.fn().mockRejectedValue(new Error('no plan in tests')),
+		// #818: module-level like the disk helpers.
+		getHostDescription: vi.fn().mockRejectedValue(new Error('no description in tests')),
+		collectHostDescription: vi.fn(),
+		exportHostAsBuilt: vi.fn(),
+		// #822: module-level like the host-description helpers. Not set up by
+		// default: the phone flow offers its three choices.
+		getPhoneAlerts: vi.fn().mockResolvedValue({
+			bundled: null,
+			compose_command: 'docker compose --profile ntfy up -d',
+			ntfy_version: '2.37.2',
+		}),
+		enableBundledNtfy: vi.fn(),
+		disableBundledNtfy: vi.fn(),
+		setBundledNtfyPublicUrl: vi.fn(),
+		addPhone: vi.fn(),
+		allowPhone: vi.fn(),
+		removePhone: vi.fn(),
+		chooseNtfySh: vi.fn(),
 		setToken: vi.fn((t: string) => _tokenStore.set(t)),
 		getToken: vi.fn(() => ''),
 		hasCookieSession: vi.fn(() => false),
 		refreshSession: vi.fn().mockResolvedValue(null),
 		refreshSessionResult: vi.fn().mockResolvedValue({ me: null, failure: 'rejected' }),
+		// #661: module-level like hostMetricsUrl - the host page's chart fetch.
+		getHostSeriesResolved: vi.fn().mockResolvedValue({
+			hostname: '',
+			metric: '',
+			since: 0,
+			points: [],
+			truncated: false,
+			max_points: 2000,
+			resolution: 'raw',
+			bucket_seconds: null,
+			aggregation: null,
+		}),
 	};
 });
 

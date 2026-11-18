@@ -219,6 +219,12 @@ class Notifier:
         # and a delivery collected mid-flight is an alert nobody gets (#431).
         self._in_flight: set[asyncio.Task[Any]] = set()
 
+    @property
+    def vault(self) -> Any:
+        """The vault channels keep their URLs in (phone alerts keep the bundled
+        ntfy server's tokens there too, #822)."""
+        return self._vault
+
     # ── Configuration ────────────────────────────────────────────────────────
     async def create_channel(
         self, *, kind: str, name: str, url: str, token: str | None

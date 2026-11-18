@@ -9,6 +9,9 @@ import (
 	"syscall"
 )
 
+// agentCapabilities are the optional actions this agent answers.
+var agentCapabilities = []string{"describe_host", "snapshot_file"}
+
 // collectSystemInfo mirrors hp_agent.system_info.collect_system_info.
 func collectSystemInfo() map[string]any {
 	host, _ := os.Hostname()
@@ -26,6 +29,9 @@ func collectSystemInfo() map[string]any {
 		"disk":          diskInfo(),
 		"memory":        memInfo(),
 		"load":          loadInfo(),
+		// What this build can be asked beyond the base protocol (#818), so the
+		// hub can tell "upgrade the agent" apart from "the agent did not answer".
+		"capabilities": agentCapabilities,
 	}
 	return info
 }
@@ -51,10 +57,14 @@ func diskInfo() map[string]float64 {
 	}
 	total := float64(st.Blocks) * float64(st.Bsize)
 	free := float64(st.Bavail) * float64(st.Bsize)
-	return map[string]float64{
+	out := map[string]float64{
 		"total_gb": round2(total / 1e9),
 		"free_gb":  round2(free / 1e9),
 	}
+	if pct, ok := diskUsedPct(uint64(st.Blocks), uint64(st.Bfree), uint64(st.Bavail)); ok {
+		out["used_pct"] = pct
+	}
+	return out
 }
 
 func memInfo() map[string]float64 {
@@ -82,10 +92,14 @@ func memInfo() map[string]float64 {
 	}
 	totalKB := vals["MemTotal"]
 	freeKB := vals["MemAvailable"]
-	return map[string]float64{
+	out := map[string]float64{
 		"total_gb": round2(float64(totalKB) / 1e6),
 		"free_gb":  round2(float64(freeKB) / 1e6),
 	}
+	if pct, ok := memUsedPct(totalKB, freeKB); ok {
+		out["used_pct"] = pct
+	}
+	return out
 }
 
 func loadInfo() map[string]float64 {
@@ -101,9 +115,17 @@ func loadInfo() map[string]float64 {
 		v, _ := strconv.ParseFloat(s, 64)
 		return round2(v)
 	}
-	return map[string]float64{
+	out := map[string]float64{
 		"load_1m":  parse(fields[0]),
 		"load_5m":  parse(fields[1]),
 		"load_15m": parse(fields[2]),
 	}
+	// Divided BEFORE rounding: the per-core value of a small load on a big host
+	// would otherwise be rounded twice.
+	if raw, err := strconv.ParseFloat(fields[0], 64); err == nil {
+		if perCore, ok := loadPerCore(raw, runtime.NumCPU()); ok {
+			out["load_1m_per_core"] = perCore
+		}
+	}
+	return out
 }

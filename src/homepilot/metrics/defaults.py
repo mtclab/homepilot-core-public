@@ -16,9 +16,13 @@ decision must pick a safe default and proceed, not refuse to start."*
 
 ## Why these two, and why they are floors rather than percentages
 
-Both are ABSOLUTE floors, and that is the whole design. A percentage default
-("90% full") would need a ratio metric the agent does not emit, and would be
-wrong in opposite directions on a 20 GB VM and a 4 TB array. A floor cannot be
+Both are ABSOLUTE floors, and that is the whole design. Since #661 the agent
+does emit ratios (``disk.used_pct``, ``memory.used_pct``), so an operator can
+write "90% full" - and that is exactly where it belongs: as a DEFAULT a
+percentage means very different things by size (10% free is 2 GB on a 20 GB VM
+and 400 GB on a 4 TB array, which nobody needs paging for), an agent older than
+#661 does not report it at all, and seeding it would add a rule to existing
+installs this module promises to leave alone. A floor cannot be
 wrong: under a gigabyte free on ``/`` breaks package installs, logging and
 journald on any Linux host, and under 200 MB available memory means the OOM
 killer is the next thing to happen. The cost of a floor is that it is LATE on a

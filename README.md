@@ -350,9 +350,9 @@ exposition endpoint and these routes are authenticated.
 
 | Method | Path | Scope | Description |
 |---|---|---|---|
-| GET | `/monitoring/hosts/{hostname}/series?metric=&hours=` | read | One series over a window, oldest point first (at most 2000 points; `truncated` says when older points were left out) |
+| GET | `/monitoring/hosts/{hostname}/series?metric=&hours=&resolution=` | read | One series over a window, oldest point first. `raw` (default): at most 2000 samples, `truncated` says when older ones were left out. `auto`: a longer window comes back whole as min/avg/max buckets, named in the answer (`resolution`, `bucket_seconds`, `aggregation`). A window past the metric retention is refused |
 | GET | `/monitoring/hosts/{hostname}/latest` | read | Newest value of every metric this host reports |
-| GET | `/monitoring/rules` | read | List alert rules |
+| GET | `/monitoring/rules` | read | List alert rules, each with `hosts_matched` and the hosts in its filter that do not report its metric yet (`hosts_without_metric`, `coverage_note`) |
 | POST | `/monitoring/rules` | admin | Create an alert rule (`metric`, `comparison`, `threshold`, `for_seconds`, `host_filter`) |
 | PATCH | `/monitoring/rules/{rule_id}` | admin | Silence (`{"enabled": false}`) or re-enable a rule without losing it |
 | DELETE | `/monitoring/rules/{rule_id}` | admin | Delete an alert rule and its state |
@@ -362,10 +362,13 @@ A rule fires only when its condition holds for the whole `for_seconds` span, so 
 single spike never pages anyone, and it emits `alert_firing` / `alert_resolved`
 through the existing SSE + webhook event machinery. `host_filter` is a glob
 (`*`, `web-*`, or one hostname) and `metric` must be one the agent actually
-reports (`cpu.count`, `disk.total_gb`, `disk.free_gb`, `memory.total_gb`,
-`memory.free_gb`, `load.1m`, `load.5m`, `load.15m`) — anything else is accepted
-and never matches, so each rule reports `hosts_matched` from its last
-evaluation. A fresh install is seeded with two rules (disk under 1 GB free,
+reports (`disk.total_gb`, `disk.free_gb`, `disk.used_pct`, `memory.total_gb`,
+`memory.free_gb`, `memory.used_pct`, `load.1m`, `load.5m`, `load.15m`,
+`load.1m_per_core`) — anything else is accepted and never matches, so each rule
+reports `hosts_matched` from its last evaluation. "Disk over 90% full" on every
+host is `{"metric": "disk.used_pct", "comparison": "gt", "threshold": 90}`; a
+host whose agent is too old to report a ratio is named in the rule's
+`coverage_note` until it is upgraded. A fresh install is seeded with two rules (disk under 1 GB free,
 available memory under 200 MB, both for ten minutes on every host); delete them
 if you want your own and they will not come back.
 
@@ -427,6 +430,8 @@ hp hosts list                 # list hosts and services
 hp hosts show <host>          # show host detail
 hp hosts forget <host...>     # forget hosts (--gone: every machine Proxmox no longer reports);
                               #   names them all and asks first unless --yes
+hp hosts describe <host>      # how the host is built (--refresh: ask its agent now;
+                              #   --export: record it as the host's as-built KB note)
 hp drift                      # detect drift across all applied artifacts
 hp doc <topic>                # look up environment documentation
 hp export                     # export DB + artifacts as tarball (NO secrets - cannot restore a host)

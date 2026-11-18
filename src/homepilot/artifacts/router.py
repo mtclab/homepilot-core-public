@@ -23,6 +23,7 @@ from ..runtime.blocking import run_blocking
 from ..sse import bus as sse_bus
 from .lifecycle import ArtifactLifecycle, ConflictError, LifecycleError
 from .models import ApprovalRefusedError, ArtifactBusyError
+from .policy_rules import PolicyAcknowledgementRequiredError, policy_warnings
 from .store import ArtifactStore, GitOperationError
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,26 @@ class ApproveBody(BaseModel):
             "an operator (admin) credential (#681)."
         ),
     )
+    acknowledge_policy: bool = Field(
+        default=False,
+        description=(
+            "Approve over the structured policy rules this change matches (#506). "
+            "Without it, an approval of a matching change is answered 409 with the "
+            "matches in `policy_warnings`; the change itself is untouched."
+        ),
+    )
+
+
+def _policy_refusal(exc: PolicyAcknowledgementRequiredError) -> HTTPException:
+    """409: approvable, once the approver acknowledges what the policies say."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "policy_acknowledgement_required",
+            "message": str(exc),
+            "policy_warnings": exc.warnings,
+        },
+    )
 
 
 class ReasonBody(BaseModel):
@@ -102,10 +123,13 @@ async def list_artifacts(
     status: str | None = Query(None),
     kind: str | None = Query(None),
     q: str | None = Query(None, description="Free text over id, intent, kind, target, tags"),
+    tag: str | None = Query(
+        None, description='Only artifacts carrying exactly this tag (e.g. "pattern")'
+    ),
     limit: int = Query(100, ge=1, le=1000),
 ) -> dict[str, Any]:
     store = _get_store(request)
-    items = await run_blocking("io", store.list, status=status, kind=kind, q=q)
+    items = await run_blocking("io", store.list, status=status, kind=kind, q=q, tag=tag)
     return {"items": items[:limit], "total": len(items)}
 
 
@@ -201,6 +225,16 @@ async def get_artifact(request: Request, artifact_id: str, token: _TokenDep) -> 
         # How the last run ended - the outcome the Changes page states in plain
         # words, partial applies (#796) and PVE warnings included.
         "last_task": await last_task_outcome(task_repo, artifact_id),
+        # The structured policy rules a proposed change matches (#506): shown
+        # before approving, and acknowledged to approve. Empty once it has left
+        # PROPOSED - the question was answered at approval.
+        "policy_warnings": (
+            await policy_warnings(
+                artifact_id, store, getattr(request.app.state, "kb_service", None)
+            )
+            if fm.get("status") == "proposed"
+            else []
+        ),
     }
 
 
@@ -338,7 +372,12 @@ async def _policies_for(kb_service: Any, host: str) -> list[dict[str, Any]]:
 
 
 async def build_artifact_plan(
-    artifact_id: str, *, store: ArtifactStore, agent: Any, kb_service: Any
+    artifact_id: str,
+    *,
+    store: ArtifactStore,
+    agent: Any,
+    kb_service: Any,
+    proxmox: Any = None,
 ) -> dict[str, Any]:
     """What applying this artifact would actually change on the host (#445 A1).
 
@@ -362,6 +401,8 @@ async def build_artifact_plan(
         raise ArtifactActionError(404, f"Artifact not found: {artifact_id}") from None
 
     kind = str(fm.get("kind", ""))
+    if kind == "guest-disk":
+        return await _guest_disk_plan(artifact_id, fm, body, store, proxmox, kb_service)
     if kind != "host-provision":
         # Said plainly rather than returning an empty plan: an empty plan reads
         # as "nothing will change", which for an unsupported kind is a lie.
@@ -398,6 +439,7 @@ async def build_artifact_plan(
         raise ArtifactActionError(502, f"Could not inspect {host}: {exc}") from exc
 
     changes = [item for item in items if item["changes"]]
+    policies = await _policies_for(kb_service, host)
     return {
         "artifact_id": artifact_id,
         "host": host,
@@ -410,12 +452,59 @@ async def build_artifact_plan(
         # rules for a machine are the half the plan cannot supply. Best-effort:
         # a KB that is down must not block an approval screen from showing what
         # will change.
-        "policies": await _policies_for(kb_service, host),
+        "policies": policies,
+        # The structured rules among them this change matches (#506): approving
+        # it needs them acknowledged. Same answer as GET /artifacts/{id}.
+        "policy_warnings": await policy_warnings(
+            artifact_id, store, kb_service, known={host: policies}
+        ),
         "summary": (
             f"{len(changes)} of {len(items)} item(s) would change on {host}"
             if changes
             else f"{host} already matches this spec; applying would change nothing"
         ),
+    }
+
+
+async def _guest_disk_plan(
+    artifact_id: str,
+    fm: dict[str, Any],
+    body: str,
+    store: ArtifactStore,
+    proxmox: Any,
+    kb_service: Any,
+) -> dict[str, Any]:
+    """The plan of an added disk (#824): the slot it will take, from the guest's
+    CURRENT config, and every step, with what would refuse it now. Read-only:
+    Proxmox reads and a read-only run of the change's guest script."""
+    from ..executor import guest_disk
+
+    target = fm.get("target", {}) or {}
+    host = str(target.get("host") or "")
+    if proxmox is None:
+        raise ArtifactActionError(
+            503, "No Proxmox is configured, so the guest cannot be inspected."
+        )
+    try:
+        got = await guest_disk.plan(proxmox, fm, body)
+    except ValueError as exc:
+        raise ArtifactActionError(400, f"Invalid guest-disk spec: {exc}") from exc
+    except Exception as exc:  # a failed read must not read as "nothing to do"
+        raise ArtifactActionError(502, f"Could not inspect {host}: {exc}") from exc
+    policies = await _policies_for(kb_service, host)
+    return {
+        "artifact_id": artifact_id,
+        "host": host,
+        "kind": "guest-disk",
+        "items": got["items"],
+        "change_count": len(got["changes"]),
+        "in_spec": not got["changes"] and not got["disk"]["blockers"],
+        "policies": policies,
+        "policy_warnings": await policy_warnings(
+            artifact_id, store, kb_service, known={host: policies}
+        ),
+        "summary": got["summary"],
+        "disk": got["disk"],
     }
 
 
@@ -471,6 +560,14 @@ def _plan_agent(request: Request) -> Any:
     return getattr(executor, "agent", None) if executor is not None else None
 
 
+def _plan_proxmox(request: Request) -> Any:
+    executor = getattr(request.app.state, "artifact_executor", None)
+    if executor is not None and getattr(executor, "proxmox", None) is not None:
+        return executor.proxmox
+    inventory = getattr(request.app.state, "inventory_service", None)
+    return getattr(inventory, "proxmox", None)
+
+
 @router.post("/{artifact_id}/plan", dependencies=[Depends(require_scope("read"))])
 async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
     try:
@@ -479,6 +576,7 @@ async def plan_artifact(request: Request, artifact_id: str) -> dict[str, Any]:
             store=_get_store(request),
             agent=_plan_agent(request),
             kb_service=getattr(request.app.state, "kb_service", None),
+            proxmox=_plan_proxmox(request),
         )
     except ArtifactActionError as e:
         raise HTTPException(status_code=e.status, detail=e.detail) from e
@@ -513,7 +611,10 @@ async def approve_artifact(
             principal_from_token(token),
             body.reason,
             approval_code=body.approval_code,
+            acknowledge_policy=body.acknowledge_policy,
         )
+    except PolicyAcknowledgementRequiredError as e:
+        raise _policy_refusal(e) from e
     except ApprovalRefusedError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ConflictError as e:
@@ -652,7 +753,14 @@ async def approve_and_apply_artifact(
     lifecycle = _get_lifecycle(request)
     body = body or ApproveBody()
     try:
-        await lifecycle.approve(artifact_id, principal_from_token(token), body.reason)
+        await lifecycle.approve(
+            artifact_id,
+            principal_from_token(token),
+            body.reason,
+            acknowledge_policy=body.acknowledge_policy,
+        )
+    except PolicyAcknowledgementRequiredError as e:
+        raise _policy_refusal(e) from e
     except ApprovalRefusedError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except (ConflictError, LifecycleError) as e:

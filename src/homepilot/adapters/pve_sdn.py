@@ -1,11 +1,20 @@
 """The ONE place HomePilot names a PVE SDN or firewall endpoint (#553).
 
-Owner mandate, 2026-08-26: HomePilot does not re-implement Proxmox endpoints.
-The estate's own library - `homepilot-proxmox-mcp` (repo mtclab/proxmox-mcp,
-public mirror mtclab/proxmox-mcp-public, importable as ``proxmox_mcp``) -
-already covers SDN zones, vnets, subnets, the SDN apply and the per-VM
-firewall, so this module DELEGATES to it and HomePilot's own ``ProxmoxClient``
-gains no new endpoint knowledge at all.
+The rule (owner decision 2026-11-18, #717, amending the mandate of
+2026-08-26): a Proxmox endpoint path lives ONLY in the adapter modules -
+``adapters/proxmox.py`` (``ProxmoxClient``), ``adapters/pve_reads.py`` (the
+named reads over it), this module, ``adapters/pve_access.py`` and
+``adapters/pve_firewall_guard.py``. Direct calls through ``ProxmoxClient`` are
+accepted; a path literal anywhere else fails the build
+(``tests/test_pve_paths_only_in_adapters.py``). The 2026-08-26 mandate - that
+ProxmoxClient gain no new endpoint knowledge and everything go through
+``proxmox_mcp`` - was not followed in practice (create_vm, wait_for_task,
+agent_run and a dozen more were added after it) and is retired.
+
+For SDN and firewall this module still DELEGATES to the estate's own library,
+`homepilot-proxmox-mcp` (repo mtclab/proxmox-mcp, public mirror
+mtclab/proxmox-mcp-public, importable as ``proxmox_mcp``), which covers SDN
+zones, vnets, subnets, the SDN apply and the per-VM firewall.
 
 Two shapes come out of that library and the difference decides how each call is
 made here:

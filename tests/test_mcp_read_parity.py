@@ -127,6 +127,10 @@ ROUTE_TO_TOOL: dict[str, str] = {
     "/inventory/{host_id}/network": "get_host",
     # Guest power state + pending changes (lane B3, #781); read-only.
     "/inventory/{host_id}/power": "get_guest_power",
+    # What adding a disk can use (#824); read-only.
+    "/inventory/{host_id}/disks": "get_guest_disks",
+    # How the host is built (#818): the stored host description; read-only.
+    "/inventory/{host_id}/description": "describe_host",
     # KB
     "/kb": "list_kb",
     "/kb/search": "search_kb",
@@ -147,6 +151,17 @@ ROUTE_TO_TOOL: dict[str, str] = {
 }
 
 EXCLUDED_GET_ROUTES: dict[str, str] = {
+    # ── Phone alerts setup (#822). ───────────────────────────────────────────
+    "/admin/notifications/phone": (
+        "the console's 'Get alerts on your phone' setup state (is the bundled ntfy "
+        "up, the address phones use); the channel it creates - where alerts go and "
+        "whether it delivers - is read by list_notification_channels"
+    ),
+    "/admin/notifications/phone/phones": (
+        "the phone logins on the bundled ntfy server, read live from ntfy's admin API "
+        "with HomePilot's admin token; who may read the operator's alerts is a "
+        "console matter like the channels' own creation"
+    ),
     # ── Who a change is for, read live (#813). ───────────────────────────────
     "/artifacts/{artifact_id}/target": (
         "the live read behind the Inbox card and the typed confirm dialog; an "
@@ -285,6 +300,13 @@ MUTATION_ROUTE_TO_TOOL: dict[tuple[str, str], str] = {
     # Inventory
     ("POST", "/inventory"): "add_host",
     ("POST", "/inventory/{host_id}/adopt"): "adopt_host",
+    # Proposes a guest-disk change (#824); attaches nothing. API write = full.
+    ("POST", "/inventory/{host_id}/disks"): "add_guest_disk",
+    # #818: a fresh description is an API `read` POST (the agent runs read-only
+    # collectors), so describe_host(refresh=true) answers it at read_only; the
+    # export writes a KB note, API `write`, so its tool is `full`.
+    ("POST", "/inventory/{host_id}/description"): "describe_host",
+    ("POST", "/inventory/{host_id}/description/export"): "export_host_asbuilt",
     ("POST", "/inventory/{host_id}/ignore"): "ignore_host",
     ("PATCH", "/inventory/{host_id}"): "update_host",
     ("DELETE", "/inventory/{host_id}"): "delete_host",
@@ -439,6 +461,33 @@ EXCLUDED_MUTATION_ROUTES: dict[tuple[str, str], str] = {
         "disabling a channel silences what wakes the operator for an alert; an "
         "operator action at the console, like deleting a webhook"
     ),
+    # ── Phone alerts (#822): mint or revoke who can read the alerts. ──
+    ("POST", "/admin/notifications/phone/bundled"): (
+        "provisions the bundled ntfy server and mints its tokens; an operator act at "
+        "the console that decides where alerts go, like creating a channel"
+    ),
+    ("DELETE", "/admin/notifications/phone/bundled"): (
+        "removes the bundled server's channel and tokens - silences what wakes the "
+        "operator, like deleting a channel"
+    ),
+    ("PUT", "/admin/notifications/phone/bundled/public-url"): (
+        "records the address phones use; console setup of the bundled server"
+    ),
+    ("POST", "/admin/notifications/phone/phones"): (
+        "mints a phone login and returns its password once - a minted credential "
+        "never travels over MCP"
+    ),
+    ("POST", "/admin/notifications/phone/phones/{name}/allow"): (
+        "grants a login read access to the operator's alerts; who may read them is a "
+        "console decision"
+    ),
+    ("DELETE", "/admin/notifications/phone/phones/{name}"): (
+        "removes a phone login - silences a phone, like deleting a channel"
+    ),
+    ("POST", "/admin/notifications/phone/ntfy-sh"): (
+        "creates a channel on the public ntfy.sh and returns its topic URL once - the "
+        "topic is the credential there, and it would land in the transcript"
+    ),
     ("DELETE", "/admin/notifications/channels/{channel_id}"): (
         "deleting a channel silences what wakes the operator for an alert; an "
         "operator action at the console, like deleting a webhook"
@@ -541,8 +590,11 @@ class TestMutationParityGate:
     # - plan_artifact / preview_artifact: their POST routes are API `read`-scoped
     #   and change no host, so read_only is their EXACT tier (they compute a
     #   plan/diff only) - not really an exemption, just a read tool on a POST.
+    # - describe_host (#818): POST /inventory/{host_id}/description is API
+    #   `read`; the agent runs fixed read-only collectors and only HomePilot's
+    #   own copy of the description is written - read_only is its exact tier.
     _READ_CLASSIFIED_WRITE_TOOLS = frozenset(
-        {"refresh_inventory", "plan_artifact", "preview_artifact"}
+        {"refresh_inventory", "plan_artifact", "preview_artifact", "describe_host"}
     )
 
     async def test_every_mapped_mutator_is_actually_mutating(self) -> None:
@@ -1162,6 +1214,7 @@ class TestTheToolAndTheRouteDescribeTheSameEstate:
             "inventory",
             "adopt",
             "agent",
+            "phone",
             "artifact",
         ]
 

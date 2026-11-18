@@ -74,6 +74,11 @@ class _StallStats:
 
 
 class LoopStallWatchdog:
+    # The tick never exceeds this, so stop()'s thread join (2 * tick + 1) is
+    # bounded by MAX_STOP_JOIN_S - a step of the shutdown's worst case (#812).
+    MAX_TICK_S = 1.0
+    MAX_STOP_JOIN_S = 2 * MAX_TICK_S + 1
+
     def __init__(self, threshold_ms: int) -> None:
         if threshold_ms <= 0:
             raise ValueError("threshold_ms must be positive; 0 disables the watchdog upstream")
@@ -81,7 +86,7 @@ class LoopStallWatchdog:
         self._threshold = threshold_ms / 1000.0
         # Half the threshold, kept within [50 ms, 1 s]: often enough to catch a
         # stall while it is still happening, rare enough to cost nothing idle.
-        self._tick = min(1.0, max(0.05, self._threshold / 2))
+        self._tick = min(self.MAX_TICK_S, max(0.05, self._threshold / 2))
         self._beat = time.monotonic()
         self._loop_thread_id: int | None = None
         self._task: asyncio.Task[None] | None = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -87,6 +88,46 @@ def validate_guest_power_spec(spec: Mapping[str, Any], body: str) -> None:
         raise LifecycleError(
             "a guest-power artifact sets requires_snapshot: false - a power action changes "
             "no disk, and a snapshot first would only lock the guest"
+        )
+
+
+def validate_guest_disk_spec(spec: Mapping[str, Any], body: str) -> None:
+    """A guest-disk change: add a disk to one running VM and take it into use (#824).
+
+    QEMU only (the in-guest part runs through the QEMU guest agent), never a
+    snapshot first (the change writes a NEW blank disk and one fstab line it
+    backs up; a snapshot would lock the guest and fails outright on storage that
+    cannot snapshot), `via-precheck` because every step looks before it acts,
+    and no rollback - HomePilot never detaches a disk by itself.
+    """
+    from .guest_disk import RawDiskError, parse_guest_disk_spec
+
+    target = spec.get("target") or {}
+    try:
+        parse_guest_disk_spec(body, dict(target))
+    except RawDiskError as exc:
+        raise LifecycleError(str(exc)) from exc
+    except ValueError as exc:
+        raise LifecycleError(str(exc)) from exc
+    if target.get("kind") != "vm":
+        raise LifecycleError(
+            "a guest-disk change targets a VM (target.kind: vm): the in-guest part runs "
+            "through the QEMU guest agent, which a container does not have"
+        )
+    if not target.get("host"):
+        raise LifecycleError(
+            "a guest-disk change must name the guest (target.host): the apply checks that "
+            "the machine at that VMID is still the one named before it sends anything"
+        )
+    if spec.get("idempotence") != "via-precheck":
+        raise LifecycleError(
+            "a guest-disk change is idempotence: via-precheck - every step checks before "
+            "it acts, so a retry after a partial run continues where it stopped"
+        )
+    if spec.get("requires_snapshot") is not False:
+        raise LifecycleError(
+            "a guest-disk change sets requires_snapshot: false - it writes a new blank "
+            "disk and one fstab line it backs up first; a snapshot would only lock the guest"
         )
 
 
@@ -201,6 +242,32 @@ def _check_vault_references(kind: ArtifactKind | str, body: str) -> None:
         raise LifecycleError(str(exc)) from None
 
 
+# Tags are the library convention (#506): `tags: ["pattern"]` marks a change
+# worth imitating, and `query_artifacts`, `GET /artifacts?tag=` and
+# `hp changes list --tag` filter on an exact tag. Short slugs, so a tag is
+# something you can type and match - not a sentence.
+TAG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+MAX_TAGS = 10
+
+
+def validate_tags(tags: Any) -> None:
+    """Refuse a `tags` value that is not a short list of unique lowercase slugs."""
+    if tags is None:
+        return
+    if not isinstance(tags, list):
+        raise LifecycleError('tags must be a list of short slugs, e.g. ["pattern"]')
+    if len(tags) > MAX_TAGS:
+        raise LifecycleError(f"at most {MAX_TAGS} tags; got {len(tags)}")
+    for tag in tags:
+        if not isinstance(tag, str) or not TAG_PATTERN.match(tag):
+            raise LifecycleError(
+                f"tag {tag!r} is not a short slug: lowercase letters, digits and '-', "
+                "1-32 characters, starting with a letter or digit"
+            )
+    if len(set(tags)) != len(tags):
+        raise LifecycleError("tags must not repeat")
+
+
 def validate_artifact_content(spec: Mapping[str, Any], body: str) -> dict[str, Any]:
     """Every check on WHAT an artifact says - the one pipeline propose and edit share.
 
@@ -223,6 +290,7 @@ def validate_artifact_content(spec: Mapping[str, Any], body: str) -> dict[str, A
         kind = ArtifactKind(kind_str)
     except ValueError as e:
         raise LifecycleError(f"Invalid kind: {kind_str}") from e
+    validate_tags(spec.get("tags"))
 
     if not body:
         raise LifecycleError("Body must not be empty")
@@ -268,6 +336,9 @@ def validate_artifact_content(spec: Mapping[str, Any], body: str) -> dict[str, A
 
     if kind == ArtifactKind.GUEST_POWER:
         validate_guest_power_spec(spec, body)
+
+    if kind == ArtifactKind.GUEST_DISK:
+        validate_guest_disk_spec(spec, body)
 
     derived: dict[str, Any] = {"kind": kind, "mutating": kind != ArtifactKind.KB_NOTE}
 

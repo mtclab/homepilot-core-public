@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 from mcp.types import TextContent
 
+from homepilot.adapters import pve_reads
 from homepilot.adapters.agent import AgentAdapter
 from homepilot.adapters.proxmox import ProxmoxClient
 from homepilot.adapters.readonly_policy import read_path_refusal
@@ -19,15 +20,9 @@ from homepilot.vault import VaultManager
 
 logger = logging.getLogger(__name__)
 
-_proxmox_read_prefixes = (
-    "/nodes/",
-    "/storage/",
-    "/access/",
-    "/cluster/",
-    "/pools/",
-    "/version",
-    "/api2/json/version",
-)
+# The path scope of the read-only passthrough lives with the other PVE paths,
+# in the adapters (#717).
+_proxmox_read_prefixes = pve_reads.READ_PASSTHROUGH_PREFIXES
 
 
 # Path segments the read-tier passthrough never forwards, wherever they sit.
@@ -158,7 +153,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Default-deny: logs (/var/log), systemd unit files, a few identity files "
             "(os-release, hostname, hosts, resolv.conf, /proc/meminfo...) and what "
             "HomePilot wrote (/etc/homepilot, /opt/homepilot, ...). Keys, shadow "
-            "files, PVE/HomePilot credentials and /root are always refused."
+            "files, PVE/HomePilot credentials and /root are always refused. Unit "
+            "files and drop-ins come back with Environment= values redacted "
+            "(NAME=<redacted>) and Exec*= lines without their arguments, and a "
+            "file a unit loads via EnvironmentFile= or "
+            "LoadCredential= is refused."
         ),
         "inputSchema": {
             "type": "object",
@@ -178,9 +177,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Execute an allowlisted read-only command on a guest via the connected "
             "hp-agent (agent hub). "
             "Positive-only allowlist shared with the agent: hostname, uptime, uname, "
-            "free, df, ls, ps (no 'e' environment flag), ip <object> [show|list|get], "
-            "ss (no -K/-D/-F/-N), systemctl status|is-active|is-enabled|is-failed, "
-            "journalctl with read flags only (no -f, no flush/rotate/vacuum), "
+            "free, df, ls, ps with an explicit name-only column list (e.g. "
+            "ps -eo pid,user,comm,etime,pcpu,pmem; never command lines: no aux, -f, "
+            "-o args), ip <object> [show|list|get], ss (no -K/-D/-F/-N), "
+            "systemctl is-active|is-enabled|is-failed or show UNIT -p ActiveState,SubState,"
+            "MainPID,... (no status: it prints command lines), "
+            "journalctl with read flags only (no -f, no flush/rotate/vacuum, -o short "
+            "family or cat only), "
             "dpkg -l|-s|-S|-L, cat of a path read_file_on_guest would serve. "
             "For file reading, use read_file_on_guest instead (logs access)."
         ),

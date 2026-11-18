@@ -12,6 +12,8 @@
 	import Icon from '$lib/components/Icon.svelte';
 	import ChangeOutcome from '$lib/components/ChangeOutcome.svelte';
 	import ChangeSummary from '$lib/components/ChangeSummary.svelte';
+	import DiskPlan from '$lib/components/DiskPlan.svelte';
+	import PolicyWarnings, { type PolicyWarning } from '$lib/components/PolicyWarnings.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import { liveConfirm, runningLine, type LiveConfirm } from '$lib/changes';
 
@@ -36,6 +38,8 @@
 		destructive?: boolean;
 		typed?: boolean;
 		consequence?: string;
+		/** An approval: held until a matching policy is acknowledged (#506). */
+		approves?: boolean;
 	};
 	let confirmAction: Action | null = null;
 	// For a typed confirm: the guest as read live when the dialog opened (#813).
@@ -49,6 +53,12 @@
 	$: canApprove = isAdmin($sessionStore?.capabilities);
 	$: status = detail?.frontmatter.status ?? '';
 	$: hasActiveTask = detail?.active_task !== null && detail?.active_task !== undefined;
+	// The structured policy rules a proposed change matches (#506), from the same read.
+	$: policyWarnings = ((detail as { policy_warnings?: PolicyWarning[] } | null)?.policy_warnings ?? []);
+	// A matching rule must be acknowledged to approve: the checkbox in
+	// <PolicyWarnings>, sent as `acknowledge_policy` with the approval.
+	$: ackRequired = policyWarnings.some((w) => w.matched.length > 0);
+	let policyAck = false;
 
 	const STATUS_CLASSES: Record<string, string> = {
 		proposed: 'badge-proposed',
@@ -102,12 +112,13 @@
 									label: 'Approve and apply',
 									cls: 'btn-primary',
 									fn: doApproveAndApply,
+									approves: true,
 									...runGuard(),
 								},
-								{ label: 'Approve only', cls: 'btn-ghost', fn: doApprove },
+								{ label: 'Approve only', cls: 'btn-ghost', fn: doApprove, approves: true },
 							]
 						: canApprove
-							? [{ label: 'Approve', cls: 'btn-success', fn: doApprove }]
+							? [{ label: 'Approve', cls: 'btn-success', fn: doApprove, approves: true }]
 							: []),
 					{ label: 'Reject', cls: 'btn-danger', fn: doReject, destructive: true },
 				];
@@ -163,7 +174,7 @@
 	async function doApprove() {
 		working = true;
 		try {
-			await api.approveArtifact(id);
+			await api.approveArtifact(id, { acknowledgePolicy: ackRequired && policyAck });
 			notify('Approved');
 			await load();
 		} catch (e) {
@@ -215,7 +226,7 @@
 	async function doApproveAndApply() {
 		working = true;
 		try {
-			const res = await api.approveAndApplyArtifact(id);
+			const res = await api.approveAndApplyArtifact(id, { acknowledgePolicy: ackRequired && policyAck });
 			notify('Approved and started');
 			startPolling(res.task_id);
 			await load();
@@ -386,6 +397,9 @@
 				</p>
 			{/if}
 			<ChangeSummary summary={detail.summary} />
+			{#if detail.frontmatter.kind === 'guest-disk' && ['proposed', 'approved', 'failed'].includes(status)}
+				<DiskPlan artifactId={id} />
+			{/if}
 		</div>
 
 		<div class="card space-y-3">
@@ -447,6 +461,7 @@
 		{/if}
 
 		{#if status === 'proposed'}
+			<PolicyWarnings warnings={policyWarnings} changeId={detail.frontmatter.id} canAcknowledge={canApprove} bind:acknowledged={policyAck} />
 			<ApprovalCodePanel
 				code={detail.approval_code}
 				locked={detail.approval_locked ?? false}
@@ -461,7 +476,8 @@
 				{#each getActions() as action}
 					<button
 						class="btn {action.cls} text-xs"
-						disabled={working || hasActiveTask}
+						disabled={working || hasActiveTask || (action.approves && ackRequired && !policyAck)}
+						title={action.approves && ackRequired && !policyAck ? 'Acknowledge the policy above first' : undefined}
 						on:click={() => handleAction(action)}
 					>{action.label}</button>
 				{/each}

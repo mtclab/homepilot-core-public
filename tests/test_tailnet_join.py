@@ -639,7 +639,7 @@ class TestSilenceIsNotACause:
             monkeypatch,
             AsyncMock(side_effect=ProxmoxError("GET", "/nodes/n/qemu/116/status/current", 500, "")),
         )
-        detail = await svc._why_no_agent("elizabeth", 116)
+        detail = await svc._why_no_agent("pve-gw", 116)
 
         assert "no longer exists" in detail
         # And it must NOT send them to the template, which is the wrong turn.
@@ -649,7 +649,7 @@ class TestSilenceIsNotACause:
         from unittest.mock import AsyncMock
 
         svc = self._service(None, AsyncMock(return_value={"data": {"status": "stopped"}}))
-        detail = await svc._why_no_agent("elizabeth", 116)
+        detail = await svc._why_no_agent("pve-gw", 116)
 
         assert "stopped" in detail
         assert "qemu-guest-agent installed" not in detail
@@ -660,7 +660,7 @@ class TestSilenceIsNotACause:
         from unittest.mock import AsyncMock
 
         svc = self._service(None, AsyncMock(return_value={"data": {"status": "running"}}))
-        detail = await svc._why_no_agent("elizabeth", 116)
+        detail = await svc._why_no_agent("pve-gw", 116)
 
         assert "qemu-guest-agent installed" in detail
 
@@ -669,7 +669,7 @@ class TestSilenceIsNotACause:
         from unittest.mock import AsyncMock
 
         svc = self._service(None, AsyncMock(side_effect=RuntimeError("connection reset")))
-        detail = await svc._why_no_agent("elizabeth", 116)
+        detail = await svc._why_no_agent("pve-gw", 116)
 
         assert "could not be" in detail
         assert "no longer exists" not in detail

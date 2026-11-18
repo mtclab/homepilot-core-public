@@ -9,8 +9,8 @@ func TestAllowlistUnprivileged(t *testing.T) {
 	a := Allowlist{privileged: false}
 	allowed := []string{
 		"hostname", "uname -a", "df -h", "free -m", "uptime",
-		"ls -la /var/log", "ps aux", "cat /var/log/syslog",
-		"cat /etc/os-release", "docker ps", "systemctl status nginx.service",
+		"ls -la /var/log", "ps -eo pid,user,comm", "cat /var/log/syslog",
+		"cat /etc/os-release", "docker ps", "systemctl is-active nginx.service",
 	}
 	for _, c := range allowed {
 		if ok, reason := a.IsAllowed(c); !ok {
@@ -26,6 +26,8 @@ func TestAllowlistUnprivileged(t *testing.T) {
 		"systemctl restart nginx", // privileged-only verb
 		"apt-get install -y vim", // privileged-only
 		"sudo systemctl restart nginx", // sudo w/o privileged
+		"ps aux",                       // command lines: privileged only (#817)
+		"systemctl status nginx",       // command lines: privileged only (#817)
 	}
 	for _, c := range blocked {
 		if ok, _ := a.IsAllowed(c); ok {

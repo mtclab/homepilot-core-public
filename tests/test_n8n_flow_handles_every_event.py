@@ -128,16 +128,34 @@ def test_the_fallback_is_honest_not_an_artifact(flow):
     assert "Artifact" not in text
 
 
-def test_every_formatter_feeds_notifiers_that_read_its_content_and_respond(flow):
+def test_every_formatter_feeds_notifiers_that_read_its_content_and_respond(flow, tmp_path):
+    """Every notifier on a formatter's chain posts the formatter's message.
+
+    The chain is Format -> Notify Matrix -> Notify Telegram -> Respond OK, and a
+    node's `$json` is its PREVIOUS node's output: after Matrix that is the Matrix
+    API's response (n8n@2.35.3 Matrix.node.ts returns `responseData`), so a
+    Telegram node reading `$json.content` sent nothing (#840). Each notifier's
+    text is rendered here the way n8n renders it - `$json` = the previous node's
+    output, `$('Node')` = that node's output - and must equal the content.
+    """
+    from tests.test_n8n_morning_briefing import _render
+
     nodes = _nodes(flow)
-    formatters = [n for n in flow["nodes"] if n["type"] == "n8n-nodes-base.set"]
-    assert formatters
+    cases = []
+    sets = [n for n in flow["nodes"] if n["type"] == "n8n-nodes-base.set"]
+    # Every Set node formats an event, except the one holding where notifiers
+    # post (#787: the Matrix room and Telegram chat, set once after import).
+    formatters = [n for n in sets if n["name"] != "Notification Targets"]
+    assert len(formatters) == len(sets) - 1 and formatters
     for fmt in formatters:
         assert "content" not in fmt["parameters"], (
             f"{fmt['name']}: `content` is not a Set-node parameter, it is silently dropped"
         )
         _content(fmt)
         # Walk the chain to the response; every notifier on it reads $json.content.
+        content = f"message from {fmt['name']}"
+        outputs = {fmt["name"]: {"content": content}}
+        previous = outputs[fmt["name"]]
         seen, current = [], fmt["name"]
         while current != "Respond OK":
             nxt = _targets(flow, current, 0)
@@ -147,8 +165,22 @@ def test_every_formatter_feeds_notifiers_that_read_its_content_and_respond(flow)
             seen.append(current)
             if current != "Respond OK":
                 text = nodes[current]["parameters"].get("text")
-                assert text == "={{ $json.content }}", f"{current} sends {text!r}"
+                cases.append(
+                    (current, content, {"value": text, "json": previous, "nodes": dict(outputs)})
+                )
+                # What a notifier outputs: its chat API's response, not the text.
+                previous = outputs[current] = {"event_id": "$stand-in", "ok": True}
         assert len(seen) >= 2, f"{fmt['name']} notifies nobody"
+    rendered = _render(tmp_path, [case for _name, _content, case in cases])
+    wrong = [
+        f"{name} posts {got!r} instead of {content!r}"
+        for (name, content, _case), got in zip(cases, rendered, strict=True)
+        if got != content
+    ]
+    assert not wrong, "\n".join(wrong)
+    # Both chats, for every formatter.
+    kinds = {nodes[name]["type"] for name, _c, _case in cases}
+    assert kinds == {"n8n-nodes-base.matrix", "n8n-nodes-base.telegram"}, kinds
 
 
 def test_no_dangling_connections(flow):

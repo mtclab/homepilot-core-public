@@ -1,6 +1,7 @@
 import { get, writable } from 'svelte/store';
 import { base } from '$app/paths';
 import { getApiBase } from './apiBase';
+import { returnAddress } from './nav';
 
 // A failed request carries its HTTP status and a human-readable message —
 // never the raw `401: {"detail":...}` JSON the API returns. `.detail` keeps
@@ -93,7 +94,8 @@ function handleUnauthorized(path: string): void {
 	const loginPath = `${base}/login`;
 	if (window.location.pathname === loginPath || _redirectingToLogin) return;
 	_redirectingToLogin = true;
-	const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+	// The fragment too (#807): see returnAddress.
+	const returnTo = encodeURIComponent(returnAddress(window.location));
 	window.location.assign(`${loginPath}?returnTo=${returnTo}`);
 }
 
@@ -268,6 +270,8 @@ export interface PartialApply {
 	step_reread?: string;
 	keys_applied?: string[];
 	keys_not_applied?: string[];
+	/** What the operator can do next (a guest-disk change, #824). */
+	remedy?: string;
 }
 
 /** The artifact's latest task, its result parsed (no raw execution log). */
@@ -370,6 +374,9 @@ export interface InstallCommand {
 	install_source: 'control_plane' | 'github' | null;
 	install_version: string | null;
 	install_fallback_reason: string | null;
+	// The installer's sha256 the command checks before running it (#843); null
+	// for the GitHub fallback, which TLS vouches for.
+	installer_sha256?: string | null;
 }
 
 export interface HubEndpoint extends InstallCommand {
@@ -841,7 +848,7 @@ export interface ArtifactProposal {
 
 /** One thing the plan checked on the host, with what is there now. */
 export interface ArtifactPlanItem {
-	kind: 'package' | 'service' | 'config';
+	kind: 'package' | 'service' | 'config' | 'disk' | 'filesystem' | 'fstab' | 'mount';
 	id: string;
 	name: string;
 	desired: string;
@@ -1288,7 +1295,8 @@ export interface ProxmoxConfigIn {
 
 export const api = {
 	// --- Artifacts ---
-	listArtifacts(params: { status?: string; kind?: string; q?: string; limit?: number } = {}) {
+	// `tag`: only artifacts carrying exactly this tag - `pattern` is the library (#506).
+	listArtifacts(params: { status?: string; kind?: string; q?: string; tag?: string; limit?: number } = {}) {
 		return req<{ items: Artifact[]; total: number }>('/artifacts' + qs(params));
 	},
 	getArtifact(id: string) {
@@ -1321,10 +1329,12 @@ export const api = {
 	// authenticated credential and ignores any name a client claims (#681).
 	// Approving here needs an operator (admin) session; the approval code is for
 	// relaying to the assistant, not for this screen.
-	approveArtifact(id: string) {
+	// `acknowledgePolicy`: approve over the structured policy rules the change
+	// matches (#506) - the operator ticked that they read `policy_warnings`.
+	approveArtifact(id: string, opts: { acknowledgePolicy?: boolean } = {}) {
 		return req<{ id: string; status: string }>(`/artifacts/${id}/approve`, {
 			method: 'POST',
-			body: JSON.stringify({}),
+			body: JSON.stringify(opts.acknowledgePolicy ? { acknowledge_policy: true } : {}),
 		});
 	},
 	resetApprovalCode(id: string) {
@@ -1352,10 +1362,13 @@ export const api = {
 	 * The owner's one tap: approve, then apply (#781; every kind since 3.10 except
 	 * composite and replay_safe:false, which keep two steps). Admin session.
 	 */
-	approveAndApplyArtifact(id: string) {
+	approveAndApplyArtifact(id: string, opts: { acknowledgePolicy?: boolean } = {}) {
 		return req<{ task_id: string; artifact_id: string; status: string; action: string }>(
 			`/artifacts/${id}/approve-and-apply`,
-			{ method: 'POST', body: JSON.stringify({}) },
+			{
+				method: 'POST',
+				body: JSON.stringify(opts.acknowledgePolicy ? { acknowledge_policy: true } : {}),
+			},
 		);
 	},
 	/** Who the change is for and who is at its VMIDs now (#813). A read. */
@@ -1609,9 +1622,12 @@ export const api = {
 			method: 'DELETE',
 		});
 	},
-	getBootstrapToken() {
+	// `hostname`: the host the token is minted for (Re-enrol, #789) - recorded
+	// with the token so the pending list says whose it is. A label, not a bind.
+	getBootstrapToken(hostname?: string) {
 		return req<HubEndpoint & { bootstrap_token: string }>('/agents/bootstrap', {
 			method: 'POST',
+			...(hostname ? { body: JSON.stringify({ hostname }) } : {}),
 		});
 	},
 	// Who is knocking and being refused, and bootstrap tokens not yet used.
@@ -1922,4 +1938,305 @@ export function hostMetricsUrl(base: string, hostname: string, hostId?: string):
 	if (!hostname) return '';
 	// No id in hand: land on the filtered fleet list (S4 renames it to Hosts).
 	return `${base}/inventory?q=${encodeURIComponent(hostname)}`;
+}
+
+// ── Add a disk to a VM (#824) ────────────────────────────────────────────────
+// Module-level (not on `api`) so this lane only appends to the file.
+
+export interface DiskStorage {
+	storage: string;
+	type: string | null;
+	active: boolean;
+	shared: boolean;
+	avail: number | null;
+	total: number | null;
+}
+
+/** What the "Add a disk" form can use, read from Proxmox. Sends nothing. */
+export interface DiskOptions {
+	host_id: string;
+	hostname: string;
+	vmid: number;
+	node: string;
+	status: string;
+	hotplug_disk: boolean;
+	agent_enabled: boolean;
+	agent_answers: boolean;
+	next_slot: { scsi: string | null; virtio: string | null };
+	storages: DiskStorage[];
+	filesystems: string[];
+	label_max: Record<string, number>;
+	size_gib: { min: number; max: number };
+	default_mount_options: string;
+	ssd_mount_options: string;
+	/** Why a proposal would be refused now; empty when it would go through. */
+	blockers: string[];
+}
+
+export interface DiskRequest {
+	storage: string;
+	size_gib: number;
+	filesystem: 'ext4' | 'xfs';
+	mount_point: string;
+	label: string;
+	mount_options?: string;
+	bus?: 'scsi' | 'virtio';
+	ssd: boolean;
+	reason?: string;
+}
+
+/** A proposed guest-disk change: nothing is attached until it is approved. */
+export interface DiskProposal {
+	id: string;
+	status: 'proposed';
+	kind: 'guest-disk';
+	intent: string;
+	slot: string;
+	serial: string;
+	attached: false;
+	message: string;
+}
+
+/** The `disk` part of a guest-disk change's plan. */
+export interface DiskPlan {
+	slot: string | null;
+	bus: string;
+	storage: string;
+	size_gib: number;
+	filesystem: string;
+	label: string;
+	mount_point: string;
+	mount_options: string;
+	serial: string;
+	fstab_line: string;
+	hotplug_disk: boolean;
+	agent: boolean;
+	guest_steps: string[];
+	blockers: string[];
+}
+
+export function getDiskOptions(hostId: string): Promise<DiskOptions> {
+	return req<DiskOptions>(`/inventory/${encodeURIComponent(hostId)}/disks`);
+}
+
+/** PROPOSE adding a disk; a refusal (4xx) carries `{code, message}` in `ApiError.info`. */
+export function proposeDisk(hostId: string, data: DiskRequest): Promise<DiskProposal> {
+	return req<DiskProposal>(`/inventory/${encodeURIComponent(hostId)}/disks`, {
+		method: 'POST',
+		body: JSON.stringify(data),
+	});
+}
+
+/** A guest-disk change's plan, with its `disk` part (POST /artifacts/{id}/plan). */
+export function planDiskChange(id: string): Promise<ArtifactPlan & { disk?: DiskPlan }> {
+	return req<ArtifactPlan & { disk?: DiskPlan }>(`/artifacts/${encodeURIComponent(id)}/plan`, {
+		method: 'POST',
+	});
+}
+
+// ── How a host is built (#818) ───────────────────────────────────────────────
+
+/**
+ * The stored host description and its context (GET /inventory/{id}/description).
+ * `description` is the agent's document (schema hp.host-description/1) or null
+ * until the host's agent has described it; its parts are read loosely by the
+ * Host page because the agent may add parts before the UI names them.
+ */
+export interface HostDescriptionView {
+	host_id: string;
+	hostname: string | null;
+	description: Record<string, unknown> | null;
+	collected_at: string | null;
+	received_at: string | null;
+	previous_collected_at: string | null;
+	changes: { part: string; added: string[]; removed: string[] }[];
+	last_error: string | null;
+	last_error_at: string | null;
+	as_built: { note_id: string; exported_at: string | null } | null;
+	agent: { connected: boolean; can_describe: boolean; version?: string | null };
+}
+
+/** The answer of an as-built export. */
+export interface AsBuiltExport {
+	note_id: string;
+	superseded: string | null;
+	unchanged: boolean;
+	indexed: boolean;
+	doc_id: number | null;
+}
+
+export function getHostDescription(hostId: string): Promise<HostDescriptionView> {
+	return req<HostDescriptionView>(`/inventory/${encodeURIComponent(hostId)}/description`);
+}
+
+/** Ask the host's agent for a fresh description (read-only on the host). */
+export function collectHostDescription(hostId: string): Promise<HostDescriptionView> {
+	return req<HostDescriptionView>(`/inventory/${encodeURIComponent(hostId)}/description`, {
+		method: 'POST',
+	});
+}
+
+/** Record the latest description as the host's as-built KB note. */
+export function exportHostAsBuilt(hostId: string): Promise<AsBuiltExport> {
+	return req<AsBuiltExport>(`/inventory/${encodeURIComponent(hostId)}/description/export`, {
+		method: 'POST',
+	});
+}
+
+// --- Metrics: a readable week, and who a rule cannot see (#661) ---
+
+/** `raw` (default): samples as reported, newest `max_points` of them. `auto`:
+ *  a window holding more than that comes back WHOLE as min/avg/max buckets. */
+export type SeriesResolution = 'raw' | 'auto';
+
+/** One bucket of a `resolution: bucketed` answer. `value` is the bucket's
+ *  average; `min`/`max` are what that average hides; `count` how many samples. */
+export interface MetricBucket extends MetricPoint {
+	min: number;
+	max: number;
+	count: number;
+}
+
+/** A series answer that names what it is. `resolution` is what was RETURNED:
+ *  `bucketed` only when the caller asked for `auto` and the window held more
+ *  than `max_points` samples; `bucket_seconds`/`aggregation` say how. */
+export interface ResolvedMetricSeries extends MetricSeries {
+	resolution: 'raw' | 'bucketed';
+	bucket_seconds: number | null;
+	aggregation: { value: 'avg'; also: string[] } | null;
+	points: (MetricPoint & Partial<MetricBucket>)[];
+}
+
+/** One host + metric over a window, asking for `resolution`. A window past
+ *  the metric retention in force is refused (422) with a sentence. */
+export function getHostSeriesResolved(
+	hostname: string,
+	metric: string,
+	hours: number,
+	resolution: SeriesResolution
+): Promise<ResolvedMetricSeries> {
+	return req<ResolvedMetricSeries>(
+		`/monitoring/hosts/${encodeURIComponent(hostname)}/series` + qs({ metric, hours, resolution })
+	);
+}
+
+/** What GET /monitoring/rules adds to a threshold rule, read at request time:
+ *  hosts in its filter that report metrics but not this one (an older agent),
+ *  and the sentence to show. All null on a `nodata` rule. */
+export interface AlertRuleCoverage {
+	hosts_without_metric: number | null;
+	hosts_without_metric_names: string[] | null;
+	coverage_note: string | null;
+}
+
+// ── Phone alerts (#822) ─────────────────────────────────────────────────────
+// The guided "Get alerts on your phone" flow in Monitoring > Channels. No
+// answer here carries HomePilot's own ntfy tokens; two carry a credential once
+// because the phone must be given it - a new phone's password, and the ntfy.sh
+// topic URL - and neither is ever readable again.
+
+/** The first-run checklist's optional steps (#822): offered, never required. */
+export interface OnboardingStep {
+	optional?: boolean;
+}
+
+export interface BundledNtfyServer {
+	running: boolean;
+	/** True only when ntfy answers HomePilot's admin token: it runs OUR config. */
+	configured: boolean;
+	version: string | null;
+	detail: string | null;
+}
+
+export interface PhoneLogin {
+	name: string;
+	/** May read HomePilot's topic. False for a login made before adoption. */
+	can_read: boolean;
+}
+
+export interface BundledNtfyStatus {
+	enabled_at: string | null;
+	channel_id: number | null;
+	topic: string;
+	server: BundledNtfyServer;
+	public_url: string | null;
+	public_url_ok_at: string | null;
+	subscribe_link: string | null;
+	phones: PhoneLogin[];
+	/** The honest limit, worded by the server. */
+	limit: string;
+}
+
+export interface PhoneAlertsStatus {
+	bundled: BundledNtfyStatus | null;
+	compose_command: string;
+	ntfy_version: string;
+}
+
+export interface PublicUrlCheck {
+	public_url: string;
+	ok: boolean;
+	detail: string;
+	subscribe_link: string;
+}
+
+/** A new phone login. `password` is in this answer and nowhere else, ever. */
+export interface NewPhone {
+	name: string;
+	username: string;
+	password: string;
+	topic: string;
+	server_url: string | null;
+	subscribe_link: string | null;
+}
+
+export interface NtfyShChannel {
+	channel: NotificationChannel;
+	/** The topic URL - the only credential on ntfy.sh. Shown once. */
+	topic_url: string;
+	subscribe_link: string;
+	warning: string;
+}
+
+export function getPhoneAlerts(): Promise<PhoneAlertsStatus> {
+	return req<PhoneAlertsStatus>('/admin/notifications/phone');
+}
+
+export function enableBundledNtfy(): Promise<PhoneAlertsStatus> {
+	return req<PhoneAlertsStatus>('/admin/notifications/phone/bundled', { method: 'POST' });
+}
+
+export function disableBundledNtfy(): Promise<PhoneAlertsStatus> {
+	return req<PhoneAlertsStatus>('/admin/notifications/phone/bundled', { method: 'DELETE' });
+}
+
+export function setBundledNtfyPublicUrl(url: string): Promise<PublicUrlCheck> {
+	return req<PublicUrlCheck>('/admin/notifications/phone/bundled/public-url', {
+		method: 'PUT',
+		body: JSON.stringify({ url }),
+	});
+}
+
+export function addPhone(name: string): Promise<NewPhone> {
+	return req<NewPhone>('/admin/notifications/phone/phones', {
+		method: 'POST',
+		body: JSON.stringify({ name }),
+	});
+}
+
+export function allowPhone(name: string): Promise<PhoneLogin> {
+	return req<PhoneLogin>(`/admin/notifications/phone/phones/${encodeURIComponent(name)}/allow`, {
+		method: 'POST',
+	});
+}
+
+export function removePhone(name: string): Promise<{ name: string; removed: boolean }> {
+	return req<{ name: string; removed: boolean }>(
+		`/admin/notifications/phone/phones/${encodeURIComponent(name)}`,
+		{ method: 'DELETE' },
+	);
+}
+
+export function chooseNtfySh(): Promise<NtfyShChannel> {
+	return req<NtfyShChannel>('/admin/notifications/phone/ntfy-sh', { method: 'POST' });
 }

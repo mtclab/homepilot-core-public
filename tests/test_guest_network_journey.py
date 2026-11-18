@@ -57,7 +57,7 @@ The subnet a friend's machine lives on.
 
 ```yaml guest-network-spec
 zone: guest
-vnet: innkeep
+vnet: guestnet
 subnet_cidr: 198.51.100.0/24
 gateway: 198.51.100.1
 snat: 1
@@ -75,7 +75,7 @@ def _spec(artifact_id: str = "2026-08-26-guest-network-a1b2c3", body: str = BODY
         "kind": ArtifactKind.GUEST_NETWORK.value,
         "intent": "Build the guest subnet 198.51.100.0/24, fenced off the operator LAN",
         "body": body,
-        "target": {"kind": "network", "network": "innkeep"},
+        "target": {"kind": "network", "network": "guestnet"},
         "idempotence": "via-precheck",
         "produced_by": {"session": "s1", "agent": "fable", "user": "olli"},
     }

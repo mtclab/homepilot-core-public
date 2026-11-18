@@ -57,7 +57,7 @@ pytestmark = pytest.mark.asyncio
 def desired(**overrides: Any) -> DesiredGuestNetwork:
     payload: dict[str, Any] = {
         "zone": "guest",
-        "vnet": "innkeep",
+        "vnet": "guestnet",
         "subnet_cidr": "198.51.100.0/24",
         "gateway": "198.51.100.1",
         "snat": True,
@@ -88,7 +88,7 @@ class FakeCluster:
         nftables: int | None = 0,
         services: list[dict[str, Any]] | None = None,
         fail_on: str | None = None,
-        failure: str = "dnsmasq is not installed on node elizabeth",
+        failure: str = "dnsmasq is not installed on node pve-gw",
     ) -> None:
         self.zones = zones or []
         self.vnets = vnets or []
@@ -113,7 +113,7 @@ class FakeCluster:
 
     # reads
     async def list_nodes(self) -> list[dict[str, Any]]:
-        return [{"node": "elizabeth", "status": "online"}]
+        return [{"node": "pve-gw", "status": "online"}]
 
     async def list_zones(self) -> list[dict[str, Any]]:
         return list(self.zones)
@@ -206,7 +206,7 @@ def converged_cluster() -> FakeCluster:
     want = desired()
     return FakeCluster(
         zones=[{"zone": "guest", "type": "simple", "dhcp": "dnsmasq", "ipam": "pve"}],
-        vnets=[{"vnet": "innkeep", "zone": "guest"}],
+        vnets=[{"vnet": "guestnet", "zone": "guest"}],
         subnets=[
             {
                 "cidr": "198.51.100.0/24",
@@ -299,7 +299,7 @@ class TestThePlan:
             "ipam": "pve",
         }
         assert by_id["create-subnet"].params == {
-            "vnet": "innkeep",
+            "vnet": "guestnet",
             "subnet": "198.51.100.0/24",
             "type": "subnet",
             "gateway": "198.51.100.1",
@@ -325,7 +325,7 @@ class TestThePlan:
         """Zone and vnet exist; the subnet and the firewall do not."""
         cluster = FakeCluster(
             zones=[{"zone": "guest", "type": "simple", "dhcp": "dnsmasq", "ipam": "pve"}],
-            vnets=[{"vnet": "innkeep", "zone": "guest"}],
+            vnets=[{"vnet": "guestnet", "zone": "guest"}],
         )
         result = plan(desired(), await survey(cluster, desired()))
         ids = [s.id for s in result.steps]
@@ -388,7 +388,7 @@ class TestThePlan:
     async def test_a_vnet_in_another_zone_is_a_blocker(self) -> None:
         cluster = FakeCluster(
             zones=[{"zone": "guest", "type": "simple", "dhcp": "dnsmasq", "ipam": "pve"}],
-            vnets=[{"vnet": "innkeep", "zone": "elsewhere"}],
+            vnets=[{"vnet": "guestnet", "zone": "elsewhere"}],
         )
         result = plan(desired(), await survey(cluster, desired()))
         assert result.blockers and "Moving a vnet between zones" in result.blockers[0]
@@ -452,7 +452,7 @@ class TestTheSurvey:
 
             setattr(Unreadable, broken, Unreadable._boom)
             current = await survey(
-                Unreadable(vnets=[{"vnet": "innkeep", "zone": "guest"}]), desired()
+                Unreadable(vnets=[{"vnet": "guestnet", "zone": "guest"}]), desired()
             )
             the_plan = plan(desired(), current)
 
@@ -604,7 +604,7 @@ class TestTheExecution:
         await execute(cluster, plan(desired(), await survey(cluster, desired())).steps)
         by_op = dict(cluster.calls)
         assert by_op["set_vnet_firewall_options"] == {
-            "vnet": "innkeep",
+            "vnet": "guestnet",
             "enable": 1,
             "policy_forward": "ACCEPT",
         }
@@ -629,8 +629,8 @@ class TestTheExecution:
         steps = plan(desired(), await survey(cluster, desired())).steps
         result = await execute(cluster, steps)
         assert result["success"] is False
-        assert "dnsmasq is not installed on node elizabeth" in result["failure_reason"]
-        assert "dnsmasq is not installed on node elizabeth" in result["execution_log"]
+        assert "dnsmasq is not installed on node pve-gw" in result["failure_reason"]
+        assert "dnsmasq is not installed on node pve-gw" in result["execution_log"]
 
     async def test_steps_after_a_failure_are_not_attempted(self) -> None:
         cluster = FakeCluster(fail_on="create_vnet")
@@ -716,7 +716,7 @@ def parked_pending_cluster() -> FakeCluster:
         ],
         vnets=[
             {
-                "vnet": "innkeep",
+                "vnet": "guestnet",
                 "state": "new",
                 "pending": {"zone": "guest", "alias": "HomePilot guest network"},
             }
@@ -727,7 +727,7 @@ def parked_pending_cluster() -> FakeCluster:
                 "id": "guest-198.51.100.0-24",
                 "cidr": "198.51.100.0/24",
                 "zone": "guest",
-                "vnet": "innkeep",
+                "vnet": "guestnet",
                 "type": "subnet",
                 "state": "new",
                 "dhcp-range": [],
@@ -804,7 +804,7 @@ class TestRealizationIsHonestNotDriftManufactured:
 
     async def test_a_converged_sdn_config_plans_nothing_regardless_of_node_bridges(self) -> None:
         # A cluster whose SDN config matches desired plans nothing - realization
-        # is NOT a plan input (no false drift on the elizabeth-style omission).
+        # is NOT a plan input (no false drift on the pve-gw-style omission).
         current = await survey(converged_cluster(), desired())
         result = plan(desired(), current)
         assert result.steps == ()

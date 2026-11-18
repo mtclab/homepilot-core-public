@@ -23,6 +23,9 @@ class TestReadPathAllowlist:
 
     def test_path_outside_allowlist_rejected(self):
         with pytest.raises(ValueError, match="not under an allowed read prefix"):
+            _check_guest_read_path("/srv/app/notes.txt")
+        # A credential-named file is refused as DENIED, wherever it sits (#818).
+        with pytest.raises(ValueError, match="is denied"):
             _check_guest_read_path("/srv/app/secret.txt")
 
     def test_parent_traversal_rejected(self):

@@ -643,3 +643,55 @@ class TestHomePilotsOwnDestroys:
         names = await _names(w["repo"])
         assert names["stray-1"] is True
         assert "keeper" not in names
+
+
+class TestEveryLineIsWords:
+    """3.14: the Overview, `hp status` and MCP read the server's words, never codes.
+
+    Teeth: drop ``words`` from ``attention._run_line`` -> the run-line test; drop
+    ``with_journal_words`` from the audit route or the MCP handler -> the
+    journal test (the two surfaces must carry identical words).
+    """
+
+    async def test_run_lines_carry_their_words(self, world):
+        db, repo = world["db"], world["repo"]
+        host_id = await _host(repo, "relay")
+        await db.execute(
+            "INSERT INTO tasks (id, artifact_id, action, status, result_json, created_at) "
+            "VALUES ('t-inst', NULL, 'install_agent', 'failed', ?, ?)",
+            (json.dumps({"host_id": host_id, "hostname": "relay"}), _ts(-timedelta(hours=1))),
+        )
+        await db.conn.commit()
+        await _task(db, "t-long", "dns-zone", "pending", timedelta(minutes=90))
+        attention = await _attention(world["app"])
+        assert attention["failed_runs"][0]["words"]["what"] == "Installing the agent on relay"
+        stuck = attention["stuck_runs"][0]["words"]
+        assert stuck == {"what": "Applying dns-zone", "status": "waiting to start"}
+
+    async def test_the_journal_says_the_same_words_to_the_console_and_the_assistant(self, world):
+        from homepilot.mcp.tools.ops_tools import handle_get_audit_log
+
+        repo = world["repo"]
+        await repo.log_audit(
+            user_id="claude (hp_1a2b3c4d5e6f7)",
+            source="api",
+            action="apply_refused",
+            artifact_id="2026-11-18-shell-web01-abc123",
+        )
+        await repo.log_audit(
+            user_id="owner (hp_owner000001)",
+            source="api",
+            action="guest_power_refused",
+            target_host="atlas",
+        )
+        status, console = await _call(world["app"], "GET", "/audit?actor=people")
+        assert status == 200, console
+        assistant = await handle_get_audit_log({"actor": "people"}, {"repo": repo})
+        said = [row["words"]["text"] for row in console["items"]]
+        assert said == [
+            "tried a power action on atlas - refused",
+            "tried to apply 2026-11-18-shell-web01-abc123 - stopped: the machine had changed",
+        ]
+        assert [row["words"] for row in assistant["items"]] == [
+            row["words"] for row in console["items"]
+        ]

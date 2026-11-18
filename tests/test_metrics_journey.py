@@ -395,6 +395,97 @@ class TestAHostThatGoesDarkReachesAPhone:
             await _shutdown(state, proc)
 
 
+@_needs_go
+class TestAPercentageRuleOnTheShippedAgent:
+    """#661 on the shipped path: the REAL agent binary reports the ratios (and
+    no longer ``cpu.count``), the hub stores them, and a fleet-wide percentage
+    rule fires on the host that breaches it and on no other - while a host
+    running an older agent (no ratio) is named, not silently skipped.
+
+    Teeth: take the ratio adds out of systemInfoToSamples and the stored-metric
+    assertion fails; put cpu.count back and the retired-metric assertion fails;
+    make rules_with_coverage pass rules through and the coverage assertion fails.
+    """
+
+    async def test_disk_used_pct_reaches_a_rule_that_fires_on_the_right_host_only(
+        self, agent_binary: str, hp_dir: str, tmp_path: Path
+    ):
+        state, settings = await _hub_on(hp_dir)
+        proc = None
+        try:
+            pin = "sha256:" + state.agent_hub.cert_fingerprint
+            proc = _spawn_agent(agent_binary, tmp_path / "host-pct", settings, pin)
+
+            ratios = {"disk.used_pct", "memory.used_pct", "load.1m_per_core"}
+            deadline = asyncio.get_running_loop().time() + 40
+            rows: list[dict[str, Any]] = []
+            while asyncio.get_running_loop().time() < deadline:
+                rows = await state.database.fetchall(
+                    "SELECT hostname, metric, ts, value FROM metrics ORDER BY ts"
+                )
+                if ratios <= {r["metric"] for r in rows}:
+                    break
+                await asyncio.sleep(0.2)
+            stored = {r["metric"] for r in rows}
+            assert ratios <= stored, f"the agent reported only {sorted(stored)}"
+            assert "cpu.count" not in stored, "the agent still samples cpu.count"
+
+            hostname = rows[0]["hostname"]
+            newest = {r["metric"]: r for r in rows}  # ordered by ts: last wins
+            used = float(newest["disk.used_pct"]["value"])
+            assert 0 < used <= 100, used
+            mem = float(newest["memory.used_pct"]["value"])
+            total, free = (float(newest[k]["value"]) for k in ("memory.total_gb", "memory.free_gb"))
+            assert abs(mem - 100 * (total - free) / total) < 1.5, (mem, total, free)
+            per_core = float(newest["load.1m_per_core"]["value"])
+            cores = len(os.sched_getaffinity(0))
+            assert abs(per_core - float(newest["load.1m"]["value"]) / cores) < 0.02 + 0.01 * cores
+
+            # Two other hosts, reporting NOW: one well under the threshold on a
+            # current agent, one on an agent from before #661 (no ratio at all).
+            now = int(time.time())
+            await state.metrics_repo.insert_samples(
+                "peer-low",
+                "agent-peer",
+                [("disk.used_pct", now, 0.0), ("disk.free_gb", now, 900.0)],
+            )
+            await state.metrics_repo.insert_samples(
+                "peer-old", "agent-old", [("disk.free_gb", now, 3.0), ("cpu.count", now, 2.0)]
+            )
+
+            client = _series_client(state)
+            # Just under what the real host reports, so only it breaches.
+            threshold = round(used / 2, 2)
+            rule = client.post(
+                "/monitoring/rules",
+                json={
+                    "name": "Disk filling up",
+                    "metric": "disk.used_pct",
+                    "comparison": "gt",
+                    "threshold": threshold,
+                    "for_seconds": 0,
+                },
+            )
+            assert rule.status_code == 201, rule.text
+
+            from homepilot.metrics.alerts import AlertEvaluator
+
+            result = await AlertEvaluator(state.metrics_repo, repo=state.repo).run()
+            firing = client.get("/monitoring/alerts").json()["items"]
+            fired_on = sorted(a["hostname"] for a in firing if a["metric"] == "disk.used_pct")
+            assert fired_on == [hostname], (fired_on, result.details)
+
+            listed = client.get("/monitoring/rules").json()["items"]
+            mine = next(r for r in listed if r["id"] == rule.json()["id"])
+            assert mine["hosts_matched"] == 2, mine
+            assert mine["hosts_without_metric_names"] == ["peer-old"], mine
+            assert mine["coverage_note"].startswith(
+                "1 host does not report disk.used_pct yet - upgrade its agent (peer-old)"
+            ), mine["coverage_note"]
+        finally:
+            await _shutdown(state, proc)
+
+
 def test_ui_series_fixture_stays_in_sync_with_the_api_contract():
     """The fixture is a contract, so it may not drift into something the API
     could never return (a missing key, a point without a timestamp)."""
@@ -406,7 +497,12 @@ def test_ui_series_fixture_stays_in_sync_with_the_api_contract():
         "points",
         "truncated",
         "max_points",
+        # #661: every answer names what it is; the fixture is the raw shape.
+        "resolution",
+        "bucket_seconds",
+        "aggregation",
     }
+    assert fixture["resolution"] == "raw"
     assert fixture["points"], "an empty fixture would draw nothing and prove nothing"
     for point in fixture["points"]:
         assert set(point) == {"ts", "value"}

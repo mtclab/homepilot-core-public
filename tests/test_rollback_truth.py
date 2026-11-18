@@ -298,6 +298,8 @@ class TestHostProvisionActuallyReverses:
             agent.write_config = AsyncMock(return_value={"changed": True})
             agent.exec_readonly = AsyncMock(return_value=(0, "0600", ""))
             agent.read_file = AsyncMock(return_value="old = 1\n")
+            # The capture reads through the write path's snapshot (#853).
+            agent.snapshot_file = AsyncMock(return_value="old = 1\n")
 
             artifact_id = "2026-08-21-hp-reverse"
             await lifecycle.propose(

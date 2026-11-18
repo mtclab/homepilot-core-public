@@ -20,7 +20,12 @@ class MetricsPruner(Reconciler):
     deciding whether downsampling earns its complexity. Retention is therefore
     the ONLY thing bounding the table, which is why it runs on a schedule rather
     than at ingest - an instance whose agents all went quiet still has to shed
-    its old data."""
+    its old data.
+
+    The week was measured (#661): storage was comfortable, reading was not, so
+    the answer is a query-time downsample (``resolution=auto`` on the series
+    API), still not a rollup tier. Retention also bounds the window a series
+    request may ask for."""
 
     def __init__(
         self,

@@ -12,6 +12,84 @@ A fresh install has no channel, so (2) reaches nobody until one is added. The
 Overview says so in words ("no notification channel is set up"), and the
 startup self-check line `notifications` reports `off`.
 
+## Phone alerts: the bundled ntfy server
+
+**Monitoring -> Channels -> Get alerts on your phone** (admin session) offers
+three ways to get alerts onto a phone. Nothing extra runs until you choose one.
+
+1. **HomePilot's own ntfy server** (recommended). The release ships an opt-in
+   `ntfy` compose service (profile `ntfy`, image pinned by tag and digest, data
+   in `<data dir>/ntfy/`, published on one address of the control plane's host
+   only). Choosing it makes HomePilot:
+   * generate two ntfy access tokens - a *publisher* (write-only on the
+     `homepilot` topic) and an *admin* (manages phone logins) - and keep both in
+     the vault. Neither is ever shown, logged or put in an environment;
+   * write ntfy's config (`<data dir>/ntfy/server.yml`): anonymous access
+     `deny-all`, no signup, no web app, no attachments, the two accounts and
+     their tokens declared in it;
+   * create its own notification channel for the publisher.
+
+   Start the service **once** on the control plane's host:
+
+   ```bash
+   docker compose --profile ntfy up -d   # or COMPOSE_PROFILES=ntfy in .env
+   ```
+
+   The service waits for HomePilot's config, and restarts or stops ntfy by
+   itself whenever that file changes or goes away - this command is the only
+   one. The page shows when the server is up with HomePilot's config.
+   (`deploy/control-plane` layout: enable it in the page first - the service
+   mounts `ntfy/` of the `hp-data` volume as a subpath, Docker Engine >= 26,
+   and that directory must exist when the container is created.)
+
+   Then:
+   * **The address your phone will use.** HomePilot cannot make a DNS name or
+     a public proxy appear. Give the address the phone reaches the server at -
+     a LAN/VPN address, or a public name behind a reverse proxy
+     (`deploy/ntfy/nginx-ntfy.conf` is the reference vhost: websocket headers,
+     long timeouts, the admin API blocked). HomePilot checks it answers as this
+     server - an ntfy that refuses anonymous readers - before it calls the setup
+     done. It never sends a token to that address.
+   * **Add a phone.** A name, and HomePilot creates a read-only login for it
+     through ntfy's admin API. The password is shown **once**, on that screen;
+     HomePilot keeps no copy. In the ntfy app: add the login under Settings ->
+     Manage users (server address, name, password), then scan the code or open
+     the link to subscribe. Lost the password? Remove the phone and add it
+     again.
+   * **Send a test push**, and watch the phone.
+
+   **The honest limit:** this server runs on the same host as HomePilot. If that
+   host goes down, nothing is left to push "this host is down". The channel
+   says so, and offers a second channel that does not depend on this host.
+
+   *Disable* removes the channel, the config and the tokens; ntfy's own database
+   (the phone logins) stays in `<data dir>/ntfy/`, so enabling again keeps the
+   phones - with new tokens.
+
+2. **An ntfy server you already run** - its topic URL and an access token, the
+   form below.
+
+3. **ntfy.sh** - the public server. HomePilot picks a long random topic and
+   shows its link once. Alert text (host names, rule names, values) leaves your
+   network, and anyone who learns the topic can read it.
+
+### Adopting an ntfy you already run next to HomePilot
+
+If you built an ntfy server by hand beside HomePilot, either keep it (choice 2)
+or move it under HomePilot:
+
+1. Stop your own ntfy container.
+2. Copy its database files (`user.db`, and `cache.db` if you want its message
+   history) into `<data dir>/ntfy/` (`./data/hp/ntfy/` on the root compose).
+3. Choose **HomePilot's own ntfy server** and start the profile. HomePilot's
+   config replaces yours - `deny-all`, its own two accounts. Your existing
+   logins survive; the phone list shows them, and **Allow** gives one read
+   access to HomePilot's topic.
+4. Delete the old channel that pointed at your hand-built server.
+
+Anything your old config set (a public `base-url`, upstream iOS push, other
+topics' access) is not carried over; HomePilot's config is the whole config.
+
 ## Add an ntfy channel
 
 [ntfy](https://ntfy.sh) pushes a message to a phone app for a *topic*. You can
@@ -19,8 +97,8 @@ run your own ntfy server on your network, or use a public one.
 
 1. In the ntfy app, subscribe to a topic. Pick a long, unguessable name: on
    most servers anyone who knows the topic can read it. The topic URL looks
-   like `https://ntfy.example.com/CHANGE_ME_matrix_room_alias-7f3a`.
-2. In HomePilot: **Settings -> Monitoring -> Notification channels** (admin
+   like `https://ntfy.example.com/hp-alerts-7f3a`.
+2. In HomePilot: **Monitoring -> Channels -> Notification channels** (admin
    session). Give the channel a name, paste the topic URL, and an access token
    if the topic is protected (`tk_...`; sent as `Authorization: Bearer`).
 3. Press **Send test**. The phone should buzz with "HomePilot test
@@ -132,3 +210,29 @@ Release check.
 `n8n/artifact-notification.json` (workflow "HomePilot Event Notifications")
 remains an optional router to Matrix and Telegram for every event, alerts
 and `update_available` included. ntfy needs no n8n.
+
+Setting it up (n8n 2.x, the `agents` compose profile):
+
+1. Import `n8n/artifact-notification.json`.
+2. **Compute Signature** node: create a credential of type *Crypto* (name it
+   "HomePilot webhook secret") and put HomePilot's webhook signing secret in its
+   **Hmac Secret** field - the value of `HP_EVENTS_WEBHOOK_SECRET`, or the vault's
+   `webhook-secret`. Credentials are stored encrypted in n8n's database.
+3. **Notification Targets** node: set `matrixRoomId` (e.g. `!room:example.com`)
+   and `telegramChatId`. Every Matrix and Telegram node reads them from here.
+4. Give the Matrix and Telegram nodes their n8n credentials, and activate the
+   workflow. Point HomePilot's events webhook at its production URL
+   (`.../webhook/homepilot-artifacts`) and send `hp webhook test`.
+
+The flow checks `X-Webhook-Signature` - HMAC-SHA256 over the raw request body -
+in constant time and answers 403 to an unsigned, tampered or wrongly signed
+event, and to every event while the credential is missing. It reads nothing from
+n8n's environment: keep `N8N_BLOCK_ENV_ACCESS_IN_NODE` at its default (blocked),
+because that environment holds HomePilot's MCP tokens.
+
+`n8n/morning-briefing.json` (workflow "HomePilot Morning Briefing") posts the
+knowledge base's `summary` hits to the same chats at 08:00. After importing it:
+fill its own **Notification Targets** node (`hpBaseUrl`, e.g.
+`https://homepilot.example.com`, plus `matrixRoomId` and `telegramChatId`), and
+give **Fetch KB Summary** a *Header Auth* credential ("HomePilot API token":
+name `Authorization`, value `Bearer hp_...` - a read-scope token).

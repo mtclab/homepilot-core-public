@@ -104,6 +104,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+_installer_digest: tuple[tuple[str, int, int], str] | None = None
+
+
+def installer_sha256() -> str | None:
+    """The sha256 of the installer this control plane serves, or None without one.
+
+    The one-liner and the zero-touch install carry it and refuse to run a
+    downloaded installer that does not match (#843): the installer is fetched
+    over plain http when the hub runs without TLS and runs as root, and until
+    this nothing checked it (only the binary it fetches was checked). Cached by
+    path, size and mtime, so a mint does not re-read the file every time.
+    """
+    global _installer_digest
+    try:
+        path = installer()
+    except DistUnavailableError:
+        return None
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if _installer_digest is None or _installer_digest[0] != key:
+        _installer_digest = (key, sha256(path))
+    return _installer_digest[1]
+
+
+# Said when the downloaded installer is not the one the control plane vouched for.
+INSTALLER_MISMATCH_MESSAGE = (
+    "the downloaded install-agent.sh does not match the sha256 HomePilot gave for it - "
+    "refusing to run it (something changed it on the way)"
+)
+
+
 def manifest() -> dict[str, dict[str, object]]:
     """What this image can serve, with sizes and digests.
 
@@ -216,11 +247,15 @@ def install_command(
         ]
         run = ["--hp-api", api, *flags]
         source, reason, version_note = "control_plane", None, control_version
+        digest = installer_sha256()
     else:
         tag = f"v{control_version.lstrip('v')}"
         fetch = ["curl", "-fsSL", f"{PUBLIC_RELEASES}/download/{tag}/{INSTALLER_NAME}"]
         run = ["--version", tag, *flags]
         source, reason, version_note = "github", why_not, tag
+        # Fetched over https from the public mirror, whose TLS vouches for it;
+        # this control plane has no copy whose digest it could state.
+        digest = None
     # Downloaded to a file and run from it, never `curl ... | bash`: in a pipe
     # the shell reports bash's status, and bash given nothing (curl refused,
     # 401) exits 0 - the 3.7.0-rc2 dev walk printed one curl error, returned
@@ -231,9 +266,18 @@ def install_command(
     # line after `||` says so in words, and a root shell the operator pasted
     # into stays open. The token is in curl's and the installer's argv exactly
     # as before.
+    #
+    # The installer's sha256 is checked BEFORE bash runs it (#843): a file that
+    # does not match is refused with a plain sentence and nothing runs.
+    verify = ""
+    if digest:
+        verify = (
+            f"{{ printf '%s  %s\\n' {digest} \"$f\" | sha256sum -c - >/dev/null 2>&1 "
+            f"|| {{ echo {shlex.quote(INSTALLER_MISMATCH_MESSAGE)} >&2; false; }}; }} && "
+        )
     command = (
         f'( f="$(mktemp)" && trap \'rm -f "$f"\' EXIT && '
-        f'{shlex.join(fetch)} -o "$f" && bash "$f" {shlex.join(run)} ) '
+        f'{shlex.join(fetch)} -o "$f" && {verify}bash "$f" {shlex.join(run)} ) '
         f"|| {{ echo {shlex.quote(INSTALL_FAILED_MESSAGE)} >&2; false; }}"
     )
     return {
@@ -241,4 +285,7 @@ def install_command(
         "install_source": source,
         "install_version": version_note,
         "install_fallback_reason": reason,
+        # The digest the command checks the installer against (None: no check,
+        # the GitHub fallback). Shown so an operator can compare it by hand.
+        "installer_sha256": digest,
     }

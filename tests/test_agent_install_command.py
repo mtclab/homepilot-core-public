@@ -113,7 +113,13 @@ def _argv(command: str) -> tuple[list[str], list[str]]:
     ``( f=... && trap ... && curl ... -o "$f" && bash "$f" ARGS ) || {...}``."""
     inner = command[command.index("( ") + 2 : command.rindex(" ) || ")]
     steps = inner.split(" && ")
-    fetch, run = shlex.split(steps[2]), shlex.split(steps[3])
+    fetch, run = shlex.split(steps[2]), shlex.split(steps[-1])
+    if len(steps) == 5:
+        # Served by this control plane: the installer's sha256 is checked
+        # before bash runs it (#843), against the digest of what is served.
+        digest = dist.installer_sha256()
+        assert digest and steps[3].startswith(f"{{ printf '%s  %s\\n' {digest} \"$f\""), steps[3]
+        assert "sha256sum -c -" in steps[3], steps[3]
     assert fetch[-2:] == ["-o", "$f"] and run[:2] == ["bash", "$f"], command
     return fetch[:-2], run[2:]
 

@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from homepilot.adapters import pve_reads
 from homepilot.adapters.proxmox import ProxmoxClient, ProxmoxError, ProxmoxTaskStillRunningError
 from homepilot.executor.jinja_utils import (
     InterpolationError,
@@ -583,7 +584,7 @@ async def execute(
 
 async def _pick_cluster_node(proxmox: ProxmoxClient) -> str | None:
     try:
-        nodes = await proxmox.read("/nodes")
+        nodes = await pve_reads.nodes(proxmox)
         data = nodes.get("data", nodes)
         if isinstance(data, list):
             # `status == "online" or n.get("node")` made the status test DEAD:

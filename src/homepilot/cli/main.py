@@ -255,10 +255,17 @@ async def _lifecycle_with_repo(what: str) -> AsyncIterator[ArtifactLifecycle]:
     goes through the API instead.
     """
     from homepilot.db.repository import Repository
+    from homepilot.kb.service import KBService
 
     database = await _open_cli_db(what)
     try:
-        yield ArtifactLifecycle(_get_artifact_store(), repository=Repository(database))
+        repo = Repository(database)
+        store = _get_artifact_store()
+        lifecycle = ArtifactLifecycle(store, repository=repo)
+        # The policies a change is approved against (#506) live in the KB: the
+        # on-box CLI meets the same acknowledgement the API does.
+        lifecycle._kb_service = KBService(repo=repo, store=store, lifecycle=lifecycle)
+        yield lifecycle
     finally:
         await database.close()
 
@@ -269,7 +276,9 @@ async def _lifecycle_with_repo(what: str) -> AsyncIterator[ArtifactLifecycle]:
 _CLI_OPERATOR = Principal.operator("cli")
 
 
-def _lifecycle_transition(action: str, id: str, reason: str | None) -> None:
+def _lifecycle_transition(
+    action: str, id: str, reason: str | None, acknowledge_policy: bool = False
+) -> None:
     """Approve or reject through whoever owns the lifecycle right now (#693).
 
     With the backend running it is a request to its API - the same route the UI
@@ -281,7 +290,9 @@ def _lifecycle_transition(action: str, id: str, reason: str | None) -> None:
     async def _direct() -> None:
         async with _lifecycle_with_repo(f"hp artifacts {action}") as lifecycle:
             if action == "approve":
-                await lifecycle.approve(id, _CLI_OPERATOR, reason=reason)
+                await lifecycle.approve(
+                    id, _CLI_OPERATOR, reason=reason, acknowledge_policy=acknowledge_policy
+                )
             else:
                 await lifecycle.reject(id, _CLI_OPERATOR.name, reason=reason)
 
@@ -294,6 +305,8 @@ def _lifecycle_transition(action: str, id: str, reason: str | None) -> None:
             body: dict[str, Any] = {}
             if reason:
                 body["reason"] = reason
+            if acknowledge_policy:
+                body["acknowledge_policy"] = True
             scope = "admin" if action == "approve" else "write"
             asyncio.run(_backend_api("POST", f"/artifacts/{id}/{action}", body, scope=scope))
         else:
@@ -725,17 +738,20 @@ def artifacts_list(
     status: str | None = typer.Option(None, "--status", help="Filter by status"),
     kind: str | None = typer.Option(None, "--kind", help="Filter by kind"),
     inbox: bool = typer.Option(False, "--inbox", help="Only what waits: proposed and approved"),
+    tag: str | None = typer.Option(
+        None, "--tag", help="Only changes carrying this tag, e.g. --tag pattern (the library)"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ) -> None:
     """List changes in a table (the server's, in remote mode)."""
     if remote.active_target() is not None:
         from homepilot.cli import ops
 
-        ops.changes_list(status, kind, inbox, json_output)
+        ops.changes_list(status, kind, inbox, json_output, tag=tag)
         return
     store = _get_artifact_store()
     statuses = ["proposed", "approved"] if inbox else [status]
-    results = [a for one in statuses for a in store.list(status=one, kind=kind)]
+    results = [a for one in statuses for a in store.list(status=one, kind=kind, tag=tag)]
     if json_output:
         typer.echo(json.dumps(results, default=str))
         return
@@ -895,10 +911,16 @@ def _print_git_diff(artifacts_dir: str, rel_path: str) -> None:
 def artifacts_approve(
     id: str = typer.Argument(..., help="Artifact ID"),
     reason: list[str] | None = typer.Option(None, "--reason", help="Approval reason"),  # noqa: B008
+    acknowledge_policy: bool = typer.Option(
+        False,
+        "--acknowledge-policy",
+        help="Approve over the structured policy rules this change matches (shown by "
+        "`hp changes show` and by the refusal without this flag)",
+    ),
 ) -> None:
     """Approve a proposed artifact."""
     reason_str = " ".join(reason) if reason else None
-    _lifecycle_transition("approve", id, reason_str)
+    _lifecycle_transition("approve", id, reason_str, acknowledge_policy=acknowledge_policy)
     console.print(f"[green]Approved: {id}[/green]")
 
 
