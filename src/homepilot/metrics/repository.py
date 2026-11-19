@@ -28,16 +28,31 @@ MAX_METRIC_NAME_LEN = 64
 # anything else can never fire, and every surface that offers an EXAMPLE metric
 # must take it from here. `agent/go/metrics.go` is the source of truth and
 # tests/test_metrics_vocabulary.py fails if the two drift.
+#
+# The three ratios (#661) are what makes a fleet-wide rule expressible: "disk
+# over 90%" is ``disk.used_pct gt 90``, where ``disk.free_gb lt N`` meant the
+# same gigabytes on a 20 GB VM and a 4 TB array. The agent computes them at
+# measurement time; there is no rule language that divides one series by
+# another, and none is needed.
 AGENT_METRICS: tuple[str, ...] = (
-    "cpu.count",
     "disk.total_gb",
     "disk.free_gb",
+    "disk.used_pct",
     "memory.total_gb",
     "memory.free_gb",
+    "memory.used_pct",
     "load.1m",
     "load.5m",
     "load.15m",
+    "load.1m_per_core",
 )
+
+# Metrics an agent BEFORE the current one emits and the current one does not.
+# The hub keeps accepting them (it stores whatever validates, and an old agent
+# keeps sending them until it is upgraded), and stored history stays readable,
+# but no surface offers them for a new rule. ``cpu.count`` is a constant that
+# lives in ``system_info``; sampling it once a minute was 12.5% of a real table.
+RETIRED_AGENT_METRICS: tuple[str, ...] = ("cpu.count",)
 
 VALID_COMPARISONS = ("gt", "gte", "lt", "lte")
 
@@ -141,6 +156,54 @@ class MetricsRepository:
             rows = rows[:limit]
         points = [{"ts": int(r["ts"]), "value": float(r["value"])} for r in reversed(rows)]
         return points, truncated
+
+    async def series_count(self, hostname: str, metric: str, since_ts: int) -> int:
+        """How many samples one series holds from ``since_ts`` on - a range count
+        over the primary key prefix, so it reads the index, not the values."""
+        row = await self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM metrics WHERE hostname = ? AND metric = ? AND ts >= ?",
+            (hostname, metric, since_ts),
+        )
+        return int(row["n"]) if row else 0
+
+    async def series_buckets(
+        self, hostname: str, metric: str, since_ts: int, bucket_seconds: int
+    ) -> list[dict[str, Any]]:
+        """One series from ``since_ts`` on, as fixed-width buckets, oldest first.
+
+        Each bucket is ``{ts, value, min, max, count}``: ``ts`` is the bucket's
+        start (aligned to a multiple of ``bucket_seconds`` since the epoch, so
+        the same window asked twice buckets the same way), ``value`` is the AVERAGE
+        of the samples in it, ``min``/``max`` the extremes and ``count`` how many
+        samples it summarises. A bucket the host reported nothing in is absent,
+        not a zero. Every row of the window is read; nothing is skipped."""
+        if bucket_seconds < 1:
+            raise ValueError("bucket_seconds must be at least 1")
+        rows = await self.db.fetchall(
+            "SELECT (ts / ?) * ? AS bucket, AVG(value) AS avg_v, MIN(value) AS min_v, "
+            "MAX(value) AS max_v, COUNT(*) AS n FROM metrics "
+            "WHERE hostname = ? AND metric = ? AND ts >= ? GROUP BY bucket ORDER BY bucket",
+            (bucket_seconds, bucket_seconds, hostname, metric, since_ts),
+        )
+        return [
+            {
+                "ts": int(r["bucket"]),
+                "value": float(r["avg_v"]),
+                "min": float(r["min_v"]),
+                "max": float(r["max_v"]),
+                "count": int(r["n"]),
+            }
+            for r in rows
+        ]
+
+    async def hosts_reporting_any(self, since_ts: int) -> list[str]:
+        """Hosts that reported ANY metric at or after ``since_ts``. Served by
+        idx_metrics_ts, so it reads only the recent tail of the table."""
+        rows = await self.db.fetchall(
+            "SELECT DISTINCT hostname FROM metrics WHERE ts >= ? ORDER BY hostname",
+            (since_ts,),
+        )
+        return [str(r["hostname"]) for r in rows]
 
     async def latest(self, hostname: str) -> list[dict[str, Any]]:
         """The newest value of every metric this host has reported.

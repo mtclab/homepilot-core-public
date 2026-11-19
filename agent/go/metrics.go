@@ -48,28 +48,88 @@ func asWireSamples(samples []metricSample) []map[string]any {
 
 // systemInfoToSamples reshapes one collectSystemInfo() snapshot into samples.
 // Metric names are the storage keys; keep them stable.
+//
+// `cpu.count` is deliberately NOT sampled (#661): it is a constant that changes
+// only when the machine is resized, it was 12.5% of a real metrics table, and no
+// threshold rule can use it. It still travels in system_info on every register,
+// which is where the Agents view reads it from. The hub keeps accepting it from
+// agents that predate this.
+//
+// The three ratios exist so a fleet-wide rule can say "90% full" (#661): an
+// absolute floor means the same number of gigabytes on a 20 GB VM and a 4 TB
+// array. They are computed HERE, at measurement time, from the unrounded values
+// the host reported (see diskUsedPct, memUsedPct, loadPerCore) - not by a rule
+// dividing one stored series by another. A ratio whose denominator is zero is
+// left out rather than reported as 0.
 func systemInfoToSamples(sys map[string]any, now int64) []metricSample {
-	out := make([]metricSample, 0, 8)
+	out := make([]metricSample, 0, 10)
 	add := func(key string, v float64) {
 		out = append(out, metricSample{Metric: key, Value: v, Clock: now})
-	}
-	if cc, ok := sys["cpu_count"].(int); ok {
-		add("cpu.count", float64(cc))
 	}
 	if disk, ok := sys["disk"].(map[string]float64); ok && len(disk) > 0 {
 		add("disk.total_gb", disk["total_gb"])
 		add("disk.free_gb", disk["free_gb"])
+		if pct, ok := disk["used_pct"]; ok {
+			add("disk.used_pct", pct)
+		}
 	}
 	if mem, ok := sys["memory"].(map[string]float64); ok && len(mem) > 0 {
 		add("memory.total_gb", mem["total_gb"])
 		add("memory.free_gb", mem["free_gb"])
+		if pct, ok := mem["used_pct"]; ok {
+			add("memory.used_pct", pct)
+		}
 	}
 	if load, ok := sys["load"].(map[string]float64); ok && len(load) > 0 {
 		add("load.1m", load["load_1m"])
 		add("load.5m", load["load_5m"])
 		add("load.15m", load["load_15m"])
+		if perCore, ok := load["load_1m_per_core"]; ok {
+			add("load.1m_per_core", perCore)
+		}
 	}
 	return out
+}
+
+// diskUsedPct is the root filesystem's use as `df` reports it: used blocks over
+// the blocks an unprivileged writer could ever have (used + available). Blocks
+// reserved for root count as neither, so a disk `df` calls 100% full - the point
+// at which an ordinary service can no longer write - reads 100 here too.
+// ok is false when there is nothing to divide by (an empty or pseudo
+// filesystem): no sample is better than a made-up 0.
+func diskUsedPct(blocks, bfree, bavail uint64) (float64, bool) {
+	if bfree > blocks {
+		return 0, false
+	}
+	used := blocks - bfree
+	denom := used + bavail
+	if denom == 0 {
+		return 0, false
+	}
+	return round2(100 * float64(used) / float64(denom)), true
+}
+
+// memUsedPct is the share of memory that is NOT available for new work:
+// 100 * (MemTotal - MemAvailable) / MemTotal, the same MemAvailable that
+// memory.free_gb reports. ok is false without a MemTotal.
+func memUsedPct(totalKB, availKB int64) (float64, bool) {
+	if totalKB <= 0 || availKB < 0 {
+		return 0, false
+	}
+	if availKB > totalKB {
+		availKB = totalKB
+	}
+	return round2(100 * float64(totalKB-availKB) / float64(totalKB)), true
+}
+
+// loadPerCore is the 1-minute load average divided by the CPUs this process can
+// see, so `> 1` means "more runnable work than cores" on a 2-core VM and a
+// 64-core host alike. ok is false without a CPU count.
+func loadPerCore(load1 float64, cpus int) (float64, bool) {
+	if cpus <= 0 || load1 < 0 {
+		return 0, false
+	}
+	return round2(load1 / float64(cpus)), true
 }
 
 // metricBuffer is a bounded FIFO of samples awaiting delivery. It survives

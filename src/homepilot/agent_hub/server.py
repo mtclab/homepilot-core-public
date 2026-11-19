@@ -117,7 +117,7 @@ ENROLMENT_WINDOW_CLOSED_ERROR = (
 HOST_HOLDS_CREDENTIAL_ERROR = (
     "enrolment refused: this hostname already holds its own agent credential. "
     "Reconnect with that credential, or ask an operator to revoke it (or enrol "
-    "with a bootstrap token)."
+    "with a bootstrap token: `hp agents bootstrap` prints the install command)."
 )
 
 
@@ -130,13 +130,19 @@ DENY_HOSTNAME_MISMATCH = "hostname_mismatch"
 DENY_WINDOW_CLOSED = "window_closed"
 DENY_HOST_HOLDS_CREDENTIAL = "host_holds_credential"
 
-# Refusals of a token the hub ACCEPTED as genuine, turned away only because no
-# enrolment window is open. The peer ban exists to blunt token GUESSING; a peer
-# holding the real shared token is not guessing, and counting its refusals made
-# an honest agent installed while the window was shut spend a third of its time
-# banned (refuse x5 -> 60 s ban -> refuse), so the window it was waiting for
-# could open and the agent still not get in for another minute.
-VALID_TOKEN_REFUSALS = frozenset({DENY_WINDOW_CLOSED})
+# Refusals of a token the hub ACCEPTED as genuine, turned away for a reason other
+# than the token: no enrolment window is open, or an identity clash - the shared
+# token for a hostname that holds its own credential (#683), or a host's genuine
+# per-agent credential presented under another hostname. The peer ban exists to
+# blunt token GUESSING; a peer holding a real token is not guessing. Counting
+# window refusals made an honest agent installed while the window was shut spend
+# a third of its time banned (refuse x5 -> 60 s ban -> refuse). Counting
+# identity clashes locked a real agent that had lost its credential out for
+# good: every restart was refused, each refusal fed the ban, and the plain
+# refusal naming the remedy was replaced by a silent hang-up (#789; owner
+# decision 2026-11-18). A wrong, forged, expired or revoked token still counts.
+IDENTITY_CLASH_REFUSALS = frozenset({DENY_HOST_HOLDS_CREDENTIAL, DENY_HOSTNAME_MISMATCH})
+VALID_TOKEN_REFUSALS = frozenset({DENY_WINDOW_CLOSED}) | IDENTITY_CLASH_REFUSALS
 
 
 @dataclass
@@ -158,7 +164,8 @@ class Denial:
     @property
     def counts_toward_ban(self) -> bool:
         """Whether this refusal is a failed credential, i.e. what the peer ban
-        is for. A valid token refused for want of a window is not."""
+        is for. A valid token refused for want of a window, or for an identity
+        clash, is not."""
         return self.code not in VALID_TOKEN_REFUSALS
 
 
@@ -481,8 +488,11 @@ class AgentHubServer:
                 reason=(
                     f"shared-token enrolment refused: host {hostname} already holds a "
                     "live per-agent credential, so a shared-token register for it is "
-                    "not that host's agent. Revoke the credential to re-enrol the "
-                    "host, or use a bootstrap token."
+                    "not that host's agent. To re-enrol it with a fresh bootstrap "
+                    f"token: `hp agents install {hostname}` (a QEMU guest), or run "
+                    "`hp agents bootstrap` and paste the install command it prints on "
+                    "the host (the installer moves the old credential aside). Or "
+                    "revoke the credential and let the shared token re-enrol it."
                 ),
                 wire_error=HOST_HOLDS_CREDENTIAL_ERROR,
                 code=DENY_HOST_HOLDS_CREDENTIAL,

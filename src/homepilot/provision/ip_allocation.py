@@ -35,6 +35,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from homepilot.adapters import pve_reads
+
 from .guest_network import DesiredGuestNetwork
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,7 @@ INFRA_HOST_FLOOR = 10
 # carry no IPv4 claim and are skipped rather than mis-parsed.
 _IPV4_CIDR_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})$")
 
-# A guest NIC line: `virtio=AA:BB:...,bridge=innkeep,firewall=1`.
+# A guest NIC line: `virtio=AA:BB:...,bridge=guestnet,firewall=1`.
 _NET_KEY_RE = re.compile(r"^net(\d+)$")
 _IPCONFIG_KEY_RE = re.compile(r"^ipconfig(\d+)$")
 
@@ -93,7 +95,7 @@ def address_in(value: Any) -> ipaddress.IPv4Address | None:
 
     Handles both spellings a guest config uses: a qemu guest's ``ipconfigN``
     (``ip=198.51.100.5/24,gw=...``) and an LXC guest's ``netN``
-    (``name=eth0,bridge=innkeep,ip=198.51.100.5/24``). ``ip=dhcp``, ``manual``
+    (``name=eth0,bridge=guestnet,ip=198.51.100.5/24``). ``ip=dhcp``, ``manual``
     and the IPv6 forms claim no IPv4 address and come back None.
     """
     raw = _kv(value).get("ip", "")
@@ -144,7 +146,7 @@ async def claimed_addresses(proxmox: Any, vnet: str) -> set[ipaddress.IPv4Addres
             "addresses are already in use; nothing was provisioned"
         )
     try:
-        listing = await proxmox.read("/cluster/resources", {"type": "vm"})
+        listing = await pve_reads.cluster_guests(proxmox)
     except Exception as exc:
         raise AddressAllocationError(
             f"could not list the cluster's guests to see which addresses are taken: {exc}"

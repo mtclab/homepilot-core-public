@@ -1062,6 +1062,7 @@ class KBService:
         kind: str,
         content: str,
         supersedes: list[str] | None = None,
+        intent: str | None = None,
     ) -> str:
         from datetime import datetime
 
@@ -1088,7 +1089,9 @@ class KBService:
         spec: dict[str, Any] = {
             "id": artifact_id,
             "kind": "kb-note",
-            "intent": content[:200],
+            # A caller may title the note (#818's as-built export); otherwise
+            # the content's opening is the title, as it always was.
+            "intent": (intent or content)[:200],
             "note_kind": kind,
             "target": target
             if isinstance(target, dict)

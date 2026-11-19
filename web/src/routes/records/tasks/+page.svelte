@@ -222,7 +222,11 @@
 				<h2 class="section-title" id="task-group-{group.key}">
 					{group.label} <span class="text-muted font-normal num-inline">({group.items.length})</span>
 				</h2>
-				<div class="card overflow-x-auto">
+				<!-- `relative` (#829): the Row-actions header's sr-only label is
+				     position:absolute, so with a static scroller its containing block
+				     was OUTSIDE it - not clipped by the scroller, it sat at the wide
+				     table's far edge and widened the whole page on a phone. -->
+				<div class="card overflow-x-auto relative">
 					<table class="data-table text-xs">
 						<thead>
 							<tr>

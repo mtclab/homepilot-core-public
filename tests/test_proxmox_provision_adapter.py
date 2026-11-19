@@ -312,33 +312,33 @@ class TestSnapshotGuestType:
 
     RESOURCES: ClassVar[dict] = {
         "data": [
-            {"vmid": 9001, "type": "qemu", "node": "elizabeth"},
-            {"vmid": 9002, "type": "lxc", "node": "elizabeth"},
+            {"vmid": 9001, "type": "qemu", "node": "pve-gw"},
+            {"vmid": 9002, "type": "lxc", "node": "pve-gw"},
         ]
     }
 
     async def test_stated_vm_kind_snapshots_the_qemu_collection(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
-            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+            qemu = mock.post(f"{API}/nodes/pve-gw/qemu/9001/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9001/snapshot").mock(
+            lxc = mock.post(f"{API}/nodes/pve-gw/lxc/9001/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            await client.snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+            await client.snapshot("pve-gw", 9001, "hp-pre-x", guest_type="vm")
 
         assert qemu.called
         assert not lxc.called
 
     async def test_stated_lxc_kind_snapshots_the_lxc_collection(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
-            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9002/snapshot").mock(
+            qemu = mock.post(f"{API}/nodes/pve-gw/qemu/9002/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9002/snapshot").mock(
+            lxc = mock.post(f"{API}/nodes/pve-gw/lxc/9002/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            await client.snapshot("elizabeth", 9002, "hp-pre-x", guest_type="lxc")
+            await client.snapshot("pve-gw", 9002, "hp-pre-x", guest_type="lxc")
 
         assert lxc.called
         assert not qemu.called
@@ -348,13 +348,13 @@ class TestSnapshotGuestType:
             mock.get(f"{API}/cluster/resources").mock(
                 return_value=Response(200, json=self.RESOURCES)
             )
-            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+            qemu = mock.post(f"{API}/nodes/pve-gw/qemu/9001/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/9001/snapshot").mock(
+            lxc = mock.post(f"{API}/nodes/pve-gw/lxc/9001/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            await client.snapshot("elizabeth", 9001, "hp-pre-x")
+            await client.snapshot("pve-gw", 9001, "hp-pre-x")
 
         assert qemu.called
         assert not lxc.called
@@ -364,14 +364,14 @@ class TestSnapshotGuestType:
             mock.get(f"{API}/cluster/resources").mock(
                 return_value=Response(200, json=self.RESOURCES)
             )
-            qemu = mock.post(f"{API}/nodes/elizabeth/qemu/4242/snapshot").mock(
+            qemu = mock.post(f"{API}/nodes/pve-gw/qemu/4242/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
-            lxc = mock.post(f"{API}/nodes/elizabeth/lxc/4242/snapshot").mock(
+            lxc = mock.post(f"{API}/nodes/pve-gw/lxc/4242/snapshot").mock(
                 return_value=Response(200, json={"data": "UPID:snap"})
             )
             with pytest.raises(ProxmoxError) as excinfo:
-                await client.snapshot("elizabeth", 4242, "hp-pre-x")
+                await client.snapshot("pve-gw", 4242, "hp-pre-x")
 
         assert "4242" in str(excinfo.value)
         assert not qemu.called
@@ -379,27 +379,27 @@ class TestSnapshotGuestType:
 
     async def test_401_names_the_path_status_and_the_write_token(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
-            mock.post(f"{API}/nodes/elizabeth/qemu/9001/snapshot").mock(
+            mock.post(f"{API}/nodes/pve-gw/qemu/9001/snapshot").mock(
                 return_value=Response(401, json={"errors": "permission denied"})
             )
             with pytest.raises(ProxmoxError) as excinfo:
-                await client.snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+                await client.snapshot("pve-gw", 9001, "hp-pre-x", guest_type="vm")
 
         message = str(excinfo.value)
-        assert "nodes/elizabeth/qemu/9001/snapshot" in message
+        assert "nodes/pve-gw/qemu/9001/snapshot" in message
         assert "401" in message
         assert "write token" in message
         assert "qemu" in message
 
     async def test_delete_snapshot_uses_the_stated_collection(self, client: ProxmoxClient):
         with respx.mock(assert_all_called=False) as mock:
-            qemu = mock.delete(f"{API}/nodes/elizabeth/qemu/9001/snapshot/hp-pre-x").mock(
+            qemu = mock.delete(f"{API}/nodes/pve-gw/qemu/9001/snapshot/hp-pre-x").mock(
                 return_value=Response(200, json={"data": None})
             )
-            lxc = mock.delete(f"{API}/nodes/elizabeth/lxc/9001/snapshot/hp-pre-x").mock(
+            lxc = mock.delete(f"{API}/nodes/pve-gw/lxc/9001/snapshot/hp-pre-x").mock(
                 return_value=Response(200, json={"data": None})
             )
-            await client.delete_snapshot("elizabeth", 9001, "hp-pre-x", guest_type="vm")
+            await client.delete_snapshot("pve-gw", 9001, "hp-pre-x", guest_type="vm")
 
         assert qemu.called
         assert not lxc.called

@@ -7,7 +7,7 @@ Two things went wrong when a second process touched a live install:
   `docker compose up` therefore **killed the first backend's in-flight work** -
   an apply that was halfway through a host was reported as failed while it
   carried on running;
-* `hp agent revoke`, `hp init` and `hp token create` each call `run_migrations()`
+* `hp agents revoke`, `hp init` and `hp token create` each call `run_migrations()`
   on the same file, so a CLI could migrate the schema under a running server.
 
 Both are the same missing fact: nothing knew whether another process was already

@@ -389,7 +389,10 @@ async def handle_get_audit_log(arguments: dict[str, Any], ctx: dict[str, Any]) -
     # The same filters feed the count: a total that ignored the search would
     # report "50 of 4000" for a 50-row search.
     total = await repo.count_audit_log(**filters)
-    return {"items": items, "total": total}
+    # The same words the console and `hp status` show (dashboard/wording.py).
+    from homepilot.dashboard.wording import worded_journal
+
+    return {"items": await worded_journal(repo, items), "total": total}
 
 
 async def handle_get_selfcheck(arguments: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:

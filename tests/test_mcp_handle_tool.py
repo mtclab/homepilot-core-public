@@ -70,7 +70,7 @@ class TestQueryInventoryStructured:
     @pytest.mark.asyncio
     async def test_filter_json_passed_through(self, ctx):
         await call("query_inventory", {"filter": '{"role": "guest"}'}, ctx)
-        ctx["repo"].list_hosts.assert_called_once_with(managed=None, role="guest")
+        ctx["repo"].list_hosts.assert_called_once_with(managed=None, role="guest", hostname=None)
 
 
 class TestRefreshInventoryStructured:

@@ -367,8 +367,8 @@ Three tiers:
 
 | Tier | Commands | Requirement |
 |------|----------|-------------|
-| Safe | `ls`, `cat`, `ps`, `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl status/is-active/is-enabled/daemon-reload`, `journalctl`, `dpkg -l`, `docker ps/images/inspect/logs/stats/version/info` | Always allowed |
-| Privileged | `docker pull/compose/run/stop/rm/restart`, `systemctl start/stop/restart/enable/disable`, `mkdir`, `chmod`, `cp`, `mv`, `bash /opt/homepilot/*.sh` | Requires `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit |
+| Safe | `ls`, `cat`, `ps -o <name-only columns>` (process names, never command lines, #817), `hostname`, `uname`, `df`, `free`, `uptime`, `ip addr`, `ss`, `systemctl is-active/is-enabled/is-failed`, `systemctl show UNIT -p <state properties>`, `journalctl` (short/cat output), `dpkg -l`, `docker ps/images/inspect/logs/stats/version/info` | Always allowed |
+| Privileged | `docker pull/compose/run/stop/rm/restart`, `systemctl start/stop/restart/enable/disable/daemon-reload/status`, full `ps` listings (`ps aux`, `-ef`, `-o args`), `mkdir`, `chmod`, `cp`, `mv`, `bash /opt/homepilot/*.sh` | Requires `HP_AGENT_PRIVILEGED=true` **and** a root systemd unit |
 | Package management | `apt`/`apt-get install/update/upgrade` | Additionally requires `HP_AGENT_ALLOW_PACKAGE_INSTALL=true` (the unit must drop `ProtectSystem`) |
 
 `sudo` is not allowlisted in any tier: a privileged agent is already root, and an
@@ -391,7 +391,7 @@ must never produce one.
 
 ### File access
 
-**Reads**: default-deny under the one read-only policy shared byte-for-byte by the agent and the control plane (`agent/go/readonly_policy.json` = `src/homepilot/adapters/readonly_policy.json`, #682/#691): logs, unit files, a few identity files and the write prefixes are readable; private keys (`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `*.key`, `*.pem`, ...), shadow files, PVE and HomePilot credentials, `/root`, process environments and dotfile credential stores are denied even under an allowed prefix. `HP_AGENT_READ_PREFIXES` replaces the agent's read prefixes; the deny rules still apply.
+**Reads**: default-deny under the one read-only policy shared byte-for-byte by the agent and the control plane (`agent/go/readonly_policy.json` = `src/homepilot/adapters/readonly_policy.json`, #682/#691): logs, unit files, a few identity files, the web server (`/etc/nginx`), certbot renewal (`/etc/letsencrypt/renewal`) and ufw (`/etc/ufw`) configuration, update-notifier's pending-updates file and the write prefixes are readable (#818); private keys (`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, `*.key`, `*.pem`, ...), shadow files, PVE and HomePilot credentials, `/root`, process environments and dotfile credential stores are denied even under an allowed prefix, as is any file whose name says `secret`, `token`, `passw` or `credential` and every `*.env`/`.env.*` file (#818). Unit files and drop-ins are served with their `Environment=` (and `SetCredential=`, WireGuard key) values redacted in the agent, and any file a unit names in `EnvironmentFile=`/`LoadCredential=`/`PrivateKeyFile=` is refused (#853). `HP_AGENT_READ_PREFIXES` replaces the agent's read prefixes; the deny rules still apply.
 
 **Write prefixes** (`HP_AGENT_WRITE_PREFIXES`, privileged default): `/etc/homepilot/`, `/opt/homepilot/`, `/tmp/homepilot/`, `/etc/systemd/system/`, `/etc/docker/`, `/etc/nginx/`. An unprivileged install grants only HomePilot's own three directories.
 
@@ -415,10 +415,17 @@ configures; monitoring is part of the product.
 
 | Metric | Description |
 |--------|-------------|
-| `cpu.count` | CPU core count |
 | `disk.total_gb` / `disk.free_gb` | Root filesystem size and free space |
+| `disk.used_pct` | Root filesystem use as `df` counts it: used / (used + available) |
 | `memory.total_gb` / `memory.free_gb` | Total and available memory |
+| `memory.used_pct` | 100 x (MemTotal - MemAvailable) / MemTotal |
 | `load.1m` / `load.5m` / `load.15m` | Load averages |
+| `load.1m_per_core` | 1-minute load divided by the CPUs the agent sees |
+
+The three ratios (#661) are computed by the agent when it measures, from the
+unrounded values; a ratio whose denominator is zero is not sent. `cpu.count` is
+no longer sampled - it is a constant, carried in `system_info` on every
+register - and the hub still accepts it from agents that predate this.
 
 **Delivery.** Samples are buffered on the agent while the hub is unreachable
 (`HP_AGENT_METRICS_BUFFER`, default 1440 samples) and flushed on reconnect. A
@@ -436,12 +443,17 @@ which is why the Agents view used to show an empty state and a frozen heartbeat.
 ("this host, this metric, this window") is a range scan over the key prefix, and
 that key doubles as the dedupe identity for a re-sent batch. `idx_metrics_ts`
 serves the retention pruner, which deletes raw samples older than
-`HP_METRICS_RETENTION_DAYS` (default 7). There are deliberately no rollups.
+`HP_METRICS_RETENTION_DAYS` (default 7). Measured with realistic identities, a
+row costs ~135 bytes (~13.6 MB per host per week at ten series); the pressure is
+on reading, not storing. There are deliberately no rollups: a window longer than
+the 2000-point raw cap is read with `resolution=auto`, which buckets the raw
+rows into min/avg/max at query time and names the bucket width in the answer
+(#661). A series window longer than the retention in force is refused.
 
 **Alerting.** A rule is `(host filter, metric, comparison, threshold,
 for_seconds)` and fires only when the condition held for that whole span, so a
 single spike cannot page anyone. The host filter is a **glob** — `*`, `web-*`,
-or a bare hostname. The metric must be one of the eight above: any other name is
+or a bare hostname. The metric must be one of the ten above: any other name is
 stored as a rule and then never matches anything, which is why every rule
 carries `hosts_matched` and `last_eval_at` from its last evaluation, and why
 `hosts_matched: 0` is surfaced in the console and counted on the Overview. Two

@@ -1527,6 +1527,36 @@ MIGRATION_CHAIN: tuple[Migration, ...] = (
         )""",
         ],
     ),
+    Migration(
+        43,
+        [
+            # How each host is built (#818): the agent's host description, the
+            # LATEST and the one before it, so "what changed" is answerable
+            # without a history table. One row per inventory host. A row can
+            # hold only an error (an agent too old to describe its host, or one
+            # that did not answer), so the description columns are nullable.
+            # `asbuilt_note_id` is the KB note the last export wrote - the one
+            # the next export supersedes.
+            #
+            # No `REFERENCES hosts(id)`, for the reason host_addresses gives:
+            # a future hosts rebuild would cascade into this table.
+            # `Repository.delete_host` removes the row explicitly instead.
+            """CREATE TABLE IF NOT EXISTS host_descriptions (
+            host_id               TEXT PRIMARY KEY NOT NULL,
+            hostname              TEXT NOT NULL,
+            schema                TEXT,
+            collected_at          TEXT,
+            received_at           TEXT,
+            description_json      TEXT,
+            previous_json         TEXT,
+            previous_collected_at TEXT,
+            last_error            TEXT,
+            last_error_at         TEXT,
+            asbuilt_note_id       TEXT,
+            asbuilt_exported_at   TEXT
+        )""",
+        ],
+    ),
 )
 
 

@@ -11,15 +11,17 @@ services:
   # chown on a fresh host and changes nothing on an existing one. It uses the
   # backend's own image, so the uid is the image's, never a guessed number.
   hp-data-init:
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.13.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.14.0}
     build:
       context: .
       dockerfile: Dockerfile
     user: "0:0"
+    # The `ntfy/` subdirectory is the opt-in phone-alert server's (#822): made
+    # here, before anything mounts it, so Docker never creates it root:root.
     entrypoint:
       - sh
       - -c
-      - find /home/homepilot/.hp \( ! -user homepilot -o ! -group homepilot \) -exec chown -h homepilot:homepilot {} +
+      - mkdir -p /home/homepilot/.hp/ntfy && find /home/homepilot/.hp \( ! -user homepilot -o ! -group homepilot \) -exec chown -h homepilot:homepilot {} +
     volumes:
       - ./data/hp:/home/homepilot/.hp
     network_mode: none
@@ -30,7 +32,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.13.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.14.0}
     build:
       context: .
       dockerfile: Dockerfile
@@ -52,13 +54,77 @@ services:
       HP_AGENT_HUB_ENABLED: ${HP_AGENT_HUB_ENABLED:-true}
       HP_AGENT_HUB_PORT: "8443"
       HP_AGENT_HUB_AUTH_TOKEN: ${HP_AGENT_HUB_AUTH_TOKEN:-}
+      # Where the opt-in ntfy service answers on the compose network (#822).
+      HP_NTFY_INTERNAL_URL: ${HP_NTFY_INTERNAL_URL:-http://ntfy}
     restart: unless-stopped
+    # A clean shutdown normally takes about a second, but each of its steps is
+    # bounded and their sum is ~126 s (main.shutdown_worst_case_s: hub stop,
+    # reconcilers, seven drains, pools, WAL checkpoint, close). Docker's default
+    # 10 s would SIGKILL one that legitimately needs longer - a git push in
+    # flight, a slow disk - mid-drain (#812). tests/test_compose_stop_grace.py.
+    stop_grace_period: 150s
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 10s
+    networks:
+      - homepilot
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  Phone alerts: the bundled ntfy server (#822) - OPT-IN
+  # ═══════════════════════════════════════════════════════════════════════
+  # Nothing here runs unless you start the profile once:
+  #     docker compose --profile ntfy up -d
+  # (or put COMPOSE_PROFILES=ntfy in .env so a plain `up -d` includes it).
+  # HomePilot provisions it from Monitoring > Channels > "Get alerts on your
+  # phone": it writes ./data/hp/ntfy/server.yml (deny-all, its own tokens, no
+  # signup, no attachments) and makes phone logins over ntfy's admin API. Until
+  # that file exists the service waits; when it changes or disappears the
+  # service restarts or stops ntfy by itself - no command after the first.
+  #
+  # Pinned by tag AND digest (the spike that verified this release:
+  # docs/spikes/ntfy-bundle.md). Bound to one address of this host only:
+  # 127.0.0.1 unless HP_NTFY_BIND names the control plane's LAN address, which
+  # the reference vhost (deploy/ntfy/nginx-ntfy.conf) on another box needs.
+  ntfy:
+    image: binwiederhier/ntfy:v2.37.2@sha256:1875ddcf815c8a3c981d6d78c67a93452d0abba79b1ab9520b1f5f5238902bd7
+    profiles: ["ntfy"]
+    container_name: homepilot-ntfy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cfg="$${NTFY_HP_CONFIG:-/var/lib/ntfy/server.yml}"
+        pid=""
+        trap 'if [ -n "$$pid" ]; then kill -TERM "$$pid" 2>/dev/null; wait "$$pid"; fi; exit 0' TERM INT
+        while :; do
+          if [ ! -f "$$cfg" ]; then sleep 5; continue; fi
+          sum="$$(sha256sum "$$cfg")"
+          ntfy serve --config "$$cfg" &
+          pid=$$!
+          while kill -0 "$$pid" 2>/dev/null && [ "$$(sha256sum "$$cfg" 2>/dev/null)" = "$$sum" ]; do sleep 5; done
+          kill -TERM "$$pid" 2>/dev/null
+          wait "$$pid"
+          pid=""
+          sleep 1
+        done
+    ports:
+      - "${HP_NTFY_BIND:-127.0.0.1}:${HP_NTFY_PORT:-2586}:80"
+    volumes:
+      - ./data/hp/ntfy:/var/lib/ntfy
+    depends_on:
+      hp-data-init:
+        condition: service_completed_successfully
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/v1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     networks:
       - homepilot
 
@@ -93,6 +159,11 @@ services:
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
       MATRIX_ROOM_ID: ${MATRIX_ROOM_ID:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+      # Deliberately NOT here (#787): N8N_BLOCK_ENV_ACCESS_IN_NODE stays at n8n
+      # 2.x's default (blocked), because this environment holds HP_MCP_TOKEN_RW.
+      # The shipped flows (n8n/*.json) read their secrets from n8n credentials
+      # and their HomePilot URL / Matrix room / Telegram chat from their
+      # "Notification Targets" node - n8n's own store, never this env.
     volumes:
       - n8n-data:/home/node/.n8n
     depends_on:

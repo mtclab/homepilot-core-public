@@ -4,6 +4,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from homepilot.adapters.agent import AgentTooOldError
+from homepilot.adapters.readonly_policy import redact_unit_text, unit_read_is_redacted
 from homepilot.artifacts.models import (
     HostProvisionSpec,
     ServiceState,
@@ -196,7 +198,25 @@ async def capture_pre_state(
     for cfg in spec.config_files:
         entry: dict[str, Any] = {"kind": "config", "name": cfg.path}
         try:
-            entry["prior_content"] = await agent.read_file(host, cfg.path)
+            prior = await _read_prior(agent, host, cfg.path)
+            if unit_read_is_redacted(prior):
+                # Only an agent without snapshot_file gets here: its read tier
+                # never sends a unit file's Environment= values or Exec*=
+                # arguments (#853), so what came back holds placeholders, and
+                # writing it back on revoke would replace the service's real
+                # command lines and environment with them. Unknown, not
+                # restorable - upgrading the agent makes it restorable.
+                entry["prior_content"] = None
+                entry["prior_mode"] = None
+                entry["existed"] = None
+                entry["read_error"] = (
+                    "the agent redacts this unit file's Environment= values and Exec "
+                    "arguments, so the bytes that were there cannot be put back "
+                    "(upgrade the agent: a current one snapshots them for rollback)"
+                )
+                captured.append(entry)
+                continue
+            entry["prior_content"] = prior
             entry["existed"] = True
             rc, mode_out, _ = await agent.exec_readonly(host, f"stat -c %a {cfg.path}")
             entry["prior_mode"] = mode_out.strip() if rc == 0 else None
@@ -218,6 +238,20 @@ async def capture_pre_state(
         captured.append(entry)
 
     return captured
+
+
+async def _read_prior(agent: AgentAdapter, host: str, path: str) -> str:
+    """The bytes a config write is about to replace, for the rollback (#853).
+
+    Through the agent's snapshot_file - the write path's own read - so a unit
+    file comes back as it is, not as the read tier shows it (Environment=
+    values and Exec*= arguments redacted). An agent too old to have it is read
+    through read_file, and capture_pre_state then refuses a redacted answer.
+    """
+    try:
+        return await agent.snapshot_file(host, path)
+    except AgentTooOldError:
+        return await agent.read_file(host, path)
 
 
 # The agent answers a genuinely missing file with this exact phrase
@@ -417,6 +451,17 @@ async def probe(
             # "absent" and "different" are different problems to an operator:
             # one is a first write, the other overwrites bytes already there.
             observed = "matches" if matches else "differs"
+            if not matches and unit_read_is_redacted(on_host):
+                # The agent redacts a unit file's Environment= values (#853), so
+                # the desired content is compared redacted the same way: every
+                # other byte is checked, those values cannot be.
+                matches = on_host == redact_unit_text(cfg.content)[0]
+                observed = (
+                    "matches (Environment= values, Exec arguments and credentials "
+                    "are redacted by the agent and not compared)"
+                    if matches
+                    else "differs"
+                )
         except Exception as exc:
             matches = False
             if _read_says_absent(exc):

@@ -8,7 +8,8 @@
 	// why is it not here?" gets its answer - and, for a host that only needs the
 	// window, its one-click fix.
 	import { onMount, createEventDispatcher } from 'svelte';
-	import { api, type EnrolmentRequests } from '$lib/api';
+	import { api, type EnrolmentRequests, type HubEndpoint } from '$lib/api';
+	import InstallOneLiner from './InstallOneLiner.svelte';
 	import { notify } from '$lib/stores';
 	import { timeAgo } from '$lib/relativeTime';
 
@@ -69,6 +70,27 @@
 			notify(e instanceof Error ? e.message : String(e), 'err');
 		} finally {
 			installing = { ...installing, [hostId]: false };
+		}
+	}
+
+	// Re-enrol a refused host that is not a QEMU guest HomePilot can reinstall
+	// into (#789): mint a single-use bootstrap token and hand over the install
+	// one-liner for it - the same server-built command Enroll agent shows. Run on
+	// the host, it moves any old credential aside and enrols with the new token,
+	// which the hub accepts whatever the host held before; no window is opened.
+	// Keyed by hostname + peer: one open one-liner per refused line.
+	let reenrol: Record<string, HubEndpoint & { bootstrap_token: string }> = {};
+	let minting: Record<string, boolean> = {};
+
+	async function reEnrol(key: string, hostname: string) {
+		minting = { ...minting, [key]: true };
+		try {
+			reenrol = { ...reenrol, [key]: await api.getBootstrapToken(hostname || undefined) };
+			await load();
+		} catch (e) {
+			notify('Failed to make a bootstrap token: ' + String(e), 'err');
+		} finally {
+			minting = { ...minting, [key]: false };
 		}
 	}
 
@@ -159,6 +181,24 @@
 									on:click={() => a.install_host_id && installAgain(a.install_host_id, a.hostname)}>
 									{installing[a.install_host_id] ? 'Installing…' : 'Install again'}
 								</button>
+							{:else if canWrite}
+								{@const key = a.hostname + '|' + a.peer}
+								{#if reenrol[key]}
+									<div class="space-y-1 pt-1" data-testid="re-enrol">
+										<p class="prose-note text-xs">
+											Run this on {a.hostname || 'the host'} as root. It enrols with a single-use
+											token that expires in a day; the line goes once the host has joined.
+										</p>
+										<InstallOneLiner data={reenrol[key]} />
+									</div>
+								{:else}
+									<button class="btn btn-ghost text-xs" data-testid="re-enrol-button"
+										title="Make a single-use bootstrap token and show the install one-liner for it. Run on the host, it enrols afresh whatever credential the host held before. No enrolment window is opened."
+										disabled={minting[key]}
+										on:click={() => reEnrol(key, a.hostname)}>
+										{minting[key] ? 'Making a token…' : 'Re-enrol'}
+									</button>
+								{/if}
 							{/if}
 						</li>
 					{/each}
@@ -166,7 +206,7 @@
 				<p class="prose-note text-xs">
 					An open window would not let these in - each line says why. A host you do mean to add
 					joins by re-running the install with a fresh bootstrap token: Install again where the
-					line offers it, or the install one-liner on the host.
+					line offers it, otherwise Re-enrol and run the one-liner it shows on the host.
 				</p>
 			</div>
 		{/if}

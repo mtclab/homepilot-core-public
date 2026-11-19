@@ -124,7 +124,8 @@ class TestTheRouteStartsAJoin:
         assert kwargs["node"] == "pve1"
         assert kwargs["hostname"] == "web-01"
         assert kwargs["key"] == KEY
-        assert kwargs["actor"] == "u1"
+        # The credential's name, never the internal user id (3.14 walk).
+        assert kwargs["actor"] == "api-token"
 
     def test_a_second_join_on_the_same_guest_is_409_not_202(
         self, client: TestClient, service: MagicMock

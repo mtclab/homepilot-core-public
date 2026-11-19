@@ -162,7 +162,7 @@ describe('Hosts tab bar', () => {
 });
 
 describe('Monitoring tab bar', () => {
-	it('has Alerts then Rules, at their URLs, under one page title', () => {
+	it('has Alerts, Rules then Channels, at their URLs, under one page title', () => {
 		at('/ui/monitoring/alerts');
 		render(MonitoringLayout);
 		expect(screen.getByRole('heading', { level: 1, name: 'Monitoring' })).toBeInTheDocument();
@@ -170,6 +170,7 @@ describe('Monitoring tab bar', () => {
 			[
 				['Alerts', '/ui/monitoring/alerts'],
 				['Rules', '/ui/monitoring/rules'],
+				['Channels', '/ui/monitoring/channels'],
 			],
 		);
 	});
@@ -177,6 +178,7 @@ describe('Monitoring tab bar', () => {
 	for (const [path, label] of [
 		['/ui/monitoring/alerts', 'Alerts'],
 		['/ui/monitoring/rules', 'Rules'],
+		['/ui/monitoring/channels', 'Channels'],
 	] as Array<[string, string]>) {
 		it(`${path} marks "${label}" current`, () => {
 			at(path);

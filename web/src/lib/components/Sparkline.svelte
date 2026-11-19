@@ -11,9 +11,14 @@
 	export let height = 30;
 	export let color = 'var(--chart-1)';
 	export let showLabel = true;
+	// The true lowest/highest sample when `points` are bucket averages (#661):
+	// the range beside the line must not be the range of the averages.
+	export let extremes: { min: number; max: number } | null = null;
 
 	$: shape = sparklineShape(points, width, height);
 	$: label = metricLabel(metric);
+	$: low = extremes ? extremes.min : shape?.min;
+	$: high = extremes ? extremes.max : shape?.max;
 </script>
 
 <div class="flex items-center gap-3">
@@ -35,7 +40,7 @@
 		</svg>
 		<span class="num text-ink text-xs tabular-nums">{formatMetricValue(metric, shape.last)}</span>
 		<span class="text-muted text-[11px] tabular-nums">
-			{formatMetricValue(metric, shape.min)} – {formatMetricValue(metric, shape.max)}
+			{formatMetricValue(metric, low ?? shape.min)} – {formatMetricValue(metric, high ?? shape.max)}
 		</span>
 	{:else}
 		<span class="prose-note text-xs">No samples in this window.</span>

@@ -163,7 +163,7 @@ class ApplyReconciler(Reconciler):
         try:
             result = await self.executor.apply(artifact_id, approved_by)
         except (ExecutorError, TamperError) as exc:
-            await self._log_audit(
+            await self._audit_auto_apply(
                 artifact_id=artifact_id,
                 approved_by=approved_by,
                 action="apply_failed",
@@ -199,7 +199,7 @@ class ApplyReconciler(Reconciler):
             warnings=list(result.warnings),
         )
 
-    async def _log_audit(
+    async def _audit_auto_apply(
         self,
         artifact_id: str,
         approved_by: str,

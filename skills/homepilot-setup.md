@@ -251,11 +251,11 @@ homepilot-core-public/
 ├── docker-compose.yml          # Core + agent services
 ├── docker-compose.agent.yml     # LLM overlay (optional GPU/CPU)
 ├── .env                         # Config (no secrets)
+├── n8n/                         # the shipped n8n flows (docs/notifications.md)
 ├── data/
 │   └── hp/                      # DB, vault, artifacts, git backup
 ├── agent/
 │   ├── go/                      # hp-agent binary source (Go)
-│   ├── n8n/workflows/           # 7 bundled workflows
 │   ├── searxng/settings.yml    # Search engine config
 │   └── radicale/config          # CalDAV config
 └── scripts/

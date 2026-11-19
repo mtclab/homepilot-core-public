@@ -43,6 +43,8 @@ from typing import Any
 
 import yaml
 
+from homepilot.adapters import pve_reads
+
 from .models import ArtifactKind
 
 logger = logging.getLogger(__name__)
@@ -239,7 +241,7 @@ async def _vmid_is_free(proxmox: Any, vmid: int) -> bool:
     """PVE's own answer, from its live VMID list: ``/cluster/nextid?vmid=N``
     answers N when N is free and refuses ("already exists") when it is taken."""
     try:
-        await proxmox.read("/cluster/nextid", query={"vmid": vmid})
+        await pve_reads.vmid_free(proxmox, vmid)
         return True
     except Exception as exc:  # only "already exists" means taken
         if "already exists" in str(getattr(exc, "body", exc)).lower():
@@ -249,7 +251,7 @@ async def _vmid_is_free(proxmox: Any, vmid: int) -> bool:
 
 async def _node_names(proxmox: Any) -> list[str]:
     try:
-        resp = await proxmox.read("/nodes")
+        resp = await pve_reads.nodes(proxmox)
     except Exception as exc:  # cannot search the cluster: who is there is not known
         raise TargetUnreadableError(f"could not list the cluster's nodes ({exc})") from exc
     rows = resp.get("data", resp) if isinstance(resp, dict) else resp
@@ -284,7 +286,7 @@ async def read_live(
     if not vmids:
         return {}
     try:
-        resp = await proxmox.read("/cluster/resources", query={"type": "vm"})
+        resp = await pve_reads.cluster_guests(proxmox)
     except Exception as exc:  # any failure: who is there is not known
         raise TargetUnreadableError(f"could not list the cluster's guests ({exc})") from exc
     rows = resp.get("data", resp) if isinstance(resp, dict) else resp

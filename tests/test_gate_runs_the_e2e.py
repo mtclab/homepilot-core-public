@@ -48,6 +48,33 @@ def test_the_script_fails_a_run_that_skipped() -> None:
     assert 'fail "tests were skipped' in SCRIPT
 
 
+def test_the_server_gets_no_setting_the_mirror_workflow_does_not_give_it() -> None:
+    """3.14.0: the script also set HP_NTFY_INTERNAL_URL, the mirror's e2e
+    workflow does not, and a phone-alert test that needed it passed here and
+    timed out only in the mirror. The server's HP_* settings are the workflow's
+    three plus isolation only (where it keeps its data, which ports, no update
+    call). A test that needs another setting starts its own server.
+
+    Teeth: put HP_NTFY_INTERNAL_URL (or any other setting) back in the
+    script's `env -i` block and this fails."""
+    block = SCRIPT.split("exec env -i", 1)[1].split("homepilot.main:app", 1)[0]
+    passed = set(re.findall(r"\b(HP_[A-Z0-9_]+)=", block))
+    workflow = {"HP_SECRET_KEY", "HP_VAULT_PASSPHRASE", "HP_ADMIN_SECRET"}
+    isolation = {
+        "HP_DATA_DIR",
+        "HP_ARTIFACTS_DIR",
+        "HP_UPDATE_CHECK_ENABLED",
+        "HP_PORT",
+        "HP_AGENT_HUB_HOST",
+        "HP_AGENT_HUB_PORT",
+    }
+    assert workflow <= passed, f"the workflow's settings are missing: {workflow - passed}"
+    assert passed <= workflow | isolation, (
+        f"gate-e2e gives the server {sorted(passed - workflow - isolation)}, which the "
+        "mirror's e2e workflow does not set; a test that needs it passes only here"
+    )
+
+
 def test_the_script_holds_the_sigterm_stop() -> None:
     assert "kill -TERM" in SCRIPT
     assert 'stop_server || fail "the server ignored SIGTERM' in SCRIPT

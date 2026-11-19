@@ -41,9 +41,9 @@ HP_GO_BIN := $(shell command -v $(GO_BIN) 2>/dev/null)
 GOCACHE ?= $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/homepilot-gate/go-build
 GO_ENV := GOCACHE=$(GOCACHE)
 
-.PHONY: gate gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-image gate-security gate-mirror schema-lock
+.PHONY: gate gate-box gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-image gate-security gate-mirror schema-lock
 
-gate: gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-security gate-mirror
+gate: gate-box gate-lock gate-py gate-web gate-go gate-go-race gate-e2e gate-security gate-mirror
 
 # The suite in the public mirror's file tree (the scrub's deletions + PROVENANCE).
 # The mirror's CI runs the same tests; a test that reads a file the scrub removes
@@ -63,6 +63,13 @@ gate-mirror:
 		$(VENV)/python scripts/mirror_tree_check.py; \
 	fi
 	@echo "gate: all sub-gates passed"
+
+# Advisory, first (#810): says plainly when the box is loaded (CPU PSI or load
+# per core over a threshold), because the loop-block detector's wall-clock
+# evidence is weaker there. It warns and never refuses; the detector itself
+# reports a starved window as INCONCLUSIVE rather than as a block.
+gate-box:
+	$(VENV)/python scripts/check_quiet_box.py
 
 # The venv must BE uv.lock before anything is tested in it (3.10.0). The 3.9.0
 # gate passed in a venv that had drifted to newer fastapi/pydantic/starlette;

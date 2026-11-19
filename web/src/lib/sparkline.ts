@@ -76,12 +76,30 @@ const METRIC_LABELS: Record<string, string> = {
 	'cpu.count': 'CPU cores',
 	'disk.total_gb': 'Disk total',
 	'disk.free_gb': 'Disk free',
+	'disk.used_pct': 'Disk used',
 	'memory.total_gb': 'Memory total',
 	'memory.free_gb': 'Memory free',
+	'memory.used_pct': 'Memory used',
 	'load.1m': 'Load 1m',
 	'load.5m': 'Load 5m',
 	'load.15m': 'Load 15m',
+	'load.1m_per_core': 'Load 1m per core',
 };
+
+/** The sentence under a chart drawn from a `bucketed` series answer (#661):
+ *  each point is a bucket's AVERAGE, and the range beside it is the bucket
+ *  extremes - a chart that silently averaged would hide the spike an operator
+ *  opened it to find. Empty for a raw answer, which needs no caveat. */
+export function bucketedSeriesNote(bucketSeconds: number | null | undefined): string {
+	if (!bucketSeconds) return '';
+	const width =
+		bucketSeconds % 3600 === 0
+			? `${bucketSeconds / 3600}-hour`
+			: bucketSeconds % 60 === 0
+				? `${bucketSeconds / 60}-minute`
+				: `${bucketSeconds}-second`;
+	return `Showing per-bucket min/avg/max over ${width} buckets: the line is each bucket's average, the range is the lowest and highest sample in the window.`;
+}
 
 export function metricLabel(metric: string): string {
 	return METRIC_LABELS[metric] ?? metric;
@@ -99,4 +117,18 @@ export function formatMetricValue(metric: string, value: number): string {
 	const unit = metricUnit(metric);
 	const digits = Number.isInteger(value) ? 0 : 2;
 	return `${value.toFixed(digits)}${unit}`;
+}
+
+/** The true lowest and highest sample behind a bucketed series - the min of
+ *  the bucket minimums and the max of the bucket maximums, NOT the range of
+ *  the averages the line is drawn from. null when the points carry no
+ *  extremes (a raw series, whose own values already are the samples). */
+export function bucketExtremes(
+	points: (MetricPoint & { min?: number; max?: number })[]
+): { min: number; max: number } | null {
+	if (!points.length || points.some((p) => p.min === undefined || p.max === undefined)) return null;
+	return {
+		min: Math.min(...points.map((p) => p.min as number)),
+		max: Math.max(...points.map((p) => p.max as number)),
+	};
 }

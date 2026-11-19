@@ -167,6 +167,8 @@ async def verify_artifact(
             return await _verify_host_provision(artifact_id, fm, body, executor)
         elif kind == ArtifactKind.GUEST_NETWORK:
             return await _verify_guest_network(artifact_id, fm, body, executor)
+        elif kind == ArtifactKind.GUEST_DISK:
+            return await _verify_guest_disk(artifact_id, fm, body, executor)
         elif kind == ArtifactKind.GUEST_POWER:
             # A power action is a moment, not a state: the guest being stopped
             # tomorrow is not drift from yesterday's start (#781).
@@ -665,6 +667,47 @@ async def _verify_host_provision(
         artifact_id=artifact_id,
         state=state,
         verification_log=(result["log"] or "all items in desired state")[:2000],
+        details=details,
+    )
+
+
+async def _verify_guest_disk(
+    artifact_id: str,
+    fm: dict[str, Any],
+    body: str,
+    executor: Any,
+) -> VerifyResult:
+    """Drift for an added disk (#824): attached, mounted from its label, in fstab.
+
+    Proxmox says whether the disk with the change's serial is still attached;
+    inside the guest a READ-ONLY run of the change's own script (``verify``
+    mode: lsblk, blkid -p, findmnt, grep fstab) says whether it is mounted at
+    the mount point from the right label and fstab still carries the line. A
+    guest that cannot be asked is UNKNOWN, never green.
+    """
+    from homepilot.executor.guest_disk import drift
+
+    proxmox = getattr(executor, "proxmox", None)
+    if proxmox is None:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log="no Proxmox client: the disk could not be checked",
+            details={"reason": "no_proxmox"},
+        )
+    try:
+        state, words, details = await drift(proxmox, fm, body)
+    except (*_PROBE_FAILED, TimeoutError, RuntimeError, ValueError) as exc:
+        return VerifyResult(
+            artifact_id=artifact_id,
+            state=DriftState.UNKNOWN,
+            verification_log=f"the disk could not be checked: {exc}"[:2000],
+            details={"reason": "check_failed"},
+        )
+    return VerifyResult(
+        artifact_id=artifact_id,
+        state=DriftState(state),
+        verification_log=f"guest-disk: {words}",
         details=details,
     )
 

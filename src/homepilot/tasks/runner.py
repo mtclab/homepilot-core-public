@@ -202,7 +202,7 @@ class TaskRunner:
         """Re-apply an already-applied artifact, through the ONE engine (#423).
 
         Replay used to exist only on the CLI, where it called a second, weaker
-        apply path - so `hp artifacts replay` bypassed the `replay_safe: false`
+        apply path - so `hp changes replay` bypassed the `replay_safe: false`
         and replay-only guards that `ArtifactExecutor.replay` enforces and
         ARTIFACT_SPEC promises. Those guards live in the executor, so the fix is
         to have exactly one way in.

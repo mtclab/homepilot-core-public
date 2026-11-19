@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import '../lib/test-mocks';
 import Overview from './+page.svelte';
 import { api, sessionStore } from '$lib/api';
+import { journalWordsFor, runWordsFor } from '$lib/wordingFixture';
 
 /**
  * Overview zone 1 — "needs attention" (#549 F2).
@@ -71,7 +72,10 @@ function attention(over: Record<string, unknown> = {}) {
 /** A task as the server's attention line for it (failed: critical; stuck: warning). */
 function run(t: Record<string, unknown>, kind: 'task' | 'stuck' = 'task') {
 	const host = t.result_json ? JSON.parse(String(t.result_json)) : {};
+	// The words the server attaches (dashboard/wording.py, via the generated fixture).
+	const target = String(t.artifact_id ?? host.hostname ?? `task ${String(t.id).split('-')[0]}`);
 	return {
+		words: runWordsFor(String(t.action), String(t.status), target),
 		key: `${kind}:${t.id}`,
 		severity: kind === 'task' ? 'critical' : 'warning',
 		task_id: t.id,
@@ -168,7 +172,7 @@ describe('Overview: needs attention', () => {
 
 		// 2. The failed task — the door is the CHANGE it failed to apply, which is
 		//    where the operator can read the plan and try again.
-		const failed = zone.getByRole('link', { name: /apply nginx-conf failed/i });
+		const failed = zone.getByRole('link', { name: /Applying nginx-conf failed/ });
 		expect(failed).toHaveAttribute('href', '/ui/changes/nginx-conf');
 		expect(failed.textContent).toContain('nginx -t refused');
 
@@ -301,7 +305,7 @@ describe('Overview: needs attention', () => {
 		const zone = within(await attentionZone());
 
 		// No artifact to fix, so the door is the task list itself.
-		expect(zone.getByRole('link', { name: /apply task is still running/i })).toHaveAttribute(
+		expect(zone.getByRole('link', { name: /Applying task task is still running/ })).toHaveAttribute(
 			'href',
 			'/ui/records/tasks',
 		);
@@ -451,7 +455,7 @@ describe('Overview: fleet at a glance', () => {
 
 /** A journal row, as GET /audit returns it. */
 function entry(over: Record<string, unknown>) {
-	return {
+	const row = {
 		id: 1,
 		timestamp: new Date().toISOString(),
 		user_id: 'owner (hp_owner000001)',
@@ -467,6 +471,8 @@ function entry(over: Record<string, unknown>) {
 		details_json: null,
 		...over,
 	};
+	// Each row comes with the server's words (dashboard/wording.py).
+	return { ...row, words: journalWordsFor(row as { action: string; artifact_id: string | null; target_host: string | null }) };
 }
 
 /**
@@ -550,16 +556,28 @@ describe('Overview: what happened', () => {
 		expect(screen.getByRole('button', { name: 'Hide system activity' })).toHaveAttribute('aria-expanded', 'true');
 	});
 
-	it('says an action it has no words for as recorded, never a paraphrase', async () => {
+	it("says every action in the server's words, never its code (3.14)", async () => {
 		seed({});
 		listAudit.mockImplementation(async (p: { actor?: string }) =>
 			p.actor === 'people'
-				? { items: [entry({ user_id: 'operator (hp_x)', action: 'tailnet_join', target_host: 'relay' })], total: 1 }
+				? {
+						items: [
+							entry({ id: 3, user_id: 'operator (hp_x)', action: 'tailnet_join', target_host: 'relay' }),
+							entry({ id: 2, user_id: 'claude (hp_asst0000001)', action: 'apply_refused', artifact_id: '2026-11-18-shell-web01-abc123' }),
+							entry({ id: 1, user_id: 'system', action: 'composite-rollback' }),
+						],
+						total: 3,
+					}
 				: { items: [], total: 0 },
 		);
 
 		render(Overview);
-		await waitFor(() => expect(feed().textContent).toContain('operator: tailnet_join (relay)'));
+		await waitFor(() => expect(feed().querySelectorAll('[data-happened] li')).toHaveLength(3));
+		const text = feed().textContent ?? '';
+		expect(text).toContain('operator joined the tailnet: relay');
+		expect(text).toContain('claude tried to apply 2026-11-18-shell-web01-abc123 - stopped: the machine had changed');
+		expect(text).toContain('HomePilot recorded: composite rollback');
+		for (const code of ['tailnet_join', 'apply_refused', 'composite-rollback']) expect(text).not.toContain(code);
 	});
 
 	it('caps the list rather than growing an unbounded one', async () => {
@@ -714,7 +732,8 @@ describe('Overview: says how much it read', () => {
 		render(Overview);
 		const zone = within(await attentionZone());
 
-		expect(zone.getByText(/nginx-conf is still pending/i)).toBeInTheDocument();
+		expect(zone.getByText(/Applying nginx-conf is still waiting to start/)).toBeInTheDocument();
+		expect(zone.queryByText(/pending/)).toBeNull();
 	});
 
 });
@@ -934,8 +953,8 @@ describe('Overview: attention honesty', () => {
 		render(Overview);
 		const zone = within(await attentionZone());
 
-		expect(chipOf(zone, /apply pg-tune failed/)).toBe('critical');
-		expect(zone.queryByText(/apply nginx-conf failed/)).toBeNull();
+		expect(chipOf(zone, /Applying pg-tune failed/)).toBe('critical');
+		expect(zone.queryByText(/Applying nginx-conf failed/)).toBeNull();
 		expect(listTasks).not.toHaveBeenCalled();
 		expect(document.querySelector('[data-attention-footer]')?.textContent).toContain(
 			'1 failed run was superseded by later successes and 2 are more than a day old; all are in Records.',

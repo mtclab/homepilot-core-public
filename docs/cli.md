@@ -124,7 +124,8 @@ on the control-plane host and against a profile.
 ```bash
 hp status                          # Needs you (one line per thing to act on, with the
                                    #   command that acts on it), machines, agents,
-                                   #   alerts, changes waiting, version, update
+                                   #   alerts, changes waiting, version, update, and
+                                   #   What happened - the Overview's words, never codes
 hp hosts list [--gone] [--running] # the inventory; --gone: machines Proxmox no longer reports
 hp hosts show NAME
 hp hosts forget NAME...            # names every host first and asks; --yes to skip
@@ -136,12 +137,15 @@ hp agents upgrade NAME... | --all  # one host at a time, progress per host, stop
 hp agents install NAME             # install + enrol through qemu-guest-agent
 hp agents forget ID                # forget a decommissioned agent (revokes its credential)
 
-hp changes list [--inbox]          # --inbox: what waits for review or a run
-hp changes show ID
-hp changes propose FILE            # a spec in YAML or JSON (- = stdin)
-hp changes approve ID
+hp changes list [--inbox] [--tag T] # --inbox: what waits for review or a run;
+                                   #   --tag pattern: the changes marked worth imitating
+hp changes show ID                 # includes the policy rules a proposed change matches
+hp changes propose FILE            # a spec in YAML or JSON (- = stdin); add a disk:
+                                   #   docs/add-disk.md has a guest-disk example
+hp changes approve ID [--acknowledge-policy]
+                                   # a change a policy rule matches needs the flag
 hp changes apply ID [--no-wait]    # follows the run to its outcome unless --no-wait
-hp changes approve-and-apply ID [--no-wait]
+hp changes approve-and-apply ID [--no-wait] [--acknowledge-policy]
 hp changes withdraw ID [--reason ...]
 hp changes reject ID --reason ...
 hp tasks list [--change ID]

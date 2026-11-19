@@ -138,6 +138,7 @@ class ArtifactTransitionManager:
         role: str | None = None,
         authority: str | None = None,
         identity: dict[str, Any] | None = None,
+        policy_acknowledged: list[str] | None = None,
     ) -> None:
         def _locked() -> tuple[dict[str, Any], list[str]]:
             with self.file_store.file_lock(id):
@@ -172,6 +173,10 @@ class ArtifactTransitionManager:
                     fm["approved_by"]["authority"] = authority
                 if reason:
                     fm["approved_by"]["reason"] = reason
+                # The policies the approver acknowledged matching (#506): the
+                # warning was seen and approved over, on the record.
+                if policy_acknowledged:
+                    fm["approved_by"]["policy_acknowledged"] = policy_acknowledged
 
                 fm_yml = self.file_store.serialize_frontmatter(fm)
                 self.file_store.write(id, fm_yml, body, "approve")
@@ -185,6 +190,9 @@ class ArtifactTransitionManager:
         if cascade:
             details = dict(details or {})
             details["cascaded_to"] = cascade
+        if policy_acknowledged:
+            details = dict(details or {})
+            details["policy_acknowledged"] = policy_acknowledged
         await self._audit("approve", id, user, details)
         await self._sync_to_db(id, fm)
         for sub_id in cascade:

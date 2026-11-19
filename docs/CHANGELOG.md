@@ -1,5 +1,457 @@
 # Changelog
 
+<!--
+Convention, read by the update notice (src/homepilot/updates/releases.py,
+operator_actions): each release has a `### Operator actions` section. Each
+top-level `- ` bullet there is ONE action an operator is told about (keep each
+under 500 characters; at most 5 are shown, the last saying how many more);
+plain prose is one action; "None." means nothing to do. Only instruction
+headings count: "Operator actions", "Upgrade notes", "Upgrade instructions",
+"Upgrading", "Before you upgrade", or any heading saying "before upgrading".
+A feature heading that merely starts with "Upgrade" ("Upgrade agent keeps...")
+is not one. A paragraph led by a bold `**Upgrade...:**` label is an action too.
+-->
+
+## 3.14.0 - 2026-11-18
+
+### Operator actions
+
+- **Upgrade every agent** (`hp agents upgrade --all`, or Upgrade agent per host).
+  Until then an agent still runs `ps aux`, `systemctl status` and
+  `journalctl -o json` for any caller that reaches it (#817), reports no
+  percentage metrics (#661) and cannot describe how its host is built (#818).
+- Compose: take the new `docker-compose.yml` (or add `stop_grace_period: 150s` to your backend service), then `docker compose up -d`.
+- n8n: re-import both flows in `n8n/`; give "Compute Signature" a Crypto credential holding HomePilot's webhook secret and "Fetch KB Summary" a Header Auth credential with a read token, and fill each "Notification Targets" node (docs/notifications.md). Without the secret the event flow refuses every event.
+- Optional, per host: an unprivileged agent cannot read the Docker socket, so its
+  description says "docker: not readable". Adding `hp-agent` to the `docker`
+  group lets it report containers, but that group is root-equivalent on the host.
+
+### Phone alerts from the product (#822)
+
+An install reaches a phone without a hand-built side project. **Monitoring >
+Channels > Get alerts on your phone** offers three choices: HomePilot's own ntfy
+server, an ntfy server you already run, or ntfy.sh. Nothing extra runs until
+you choose. Existing installs need no step; to use HomePilot's own server,
+take the new compose file (it adds the opt-in `ntfy` service).
+
+- **HomePilot's own ntfy server**: an opt-in compose service (profile `ntfy`,
+  ntfy 2.37.2 pinned by tag and digest, data in `<data dir>/ntfy/`, published on
+  one address only). HomePilot generates its publisher and admin tokens, keeps
+  them in the vault, writes ntfy's config (anonymous access `deny-all`, no
+  signup, no web app, no attachments) and creates its own channel. The tokens
+  are never shown, logged or put in an environment. One
+  `docker compose --profile ntfy up -d` starts it; after that the service picks
+  up every config change by itself.
+- **Add a phone**: a read-only ntfy login made through ntfy's admin API, its
+  password shown once and kept nowhere; a subscribe link and QR code for the
+  ntfy app. Logins that existed before HomePilot adopted a server can be given
+  access too (docs/notifications.md, "Adopting").
+- **The address a phone uses** is asked for and checked - an ntfy that refuses
+  anonymous readers must answer there - before the setup calls itself done. A
+  reference vhost ships at `deploy/ntfy/nginx-ntfy.conf`.
+- **Honest limit, said on the channel:** ntfy on the control plane's host cannot
+  push "this host is down"; the page offers a second channel.
+- **ntfy.sh**: HomePilot picks a long random topic and says plainly that alert
+  text leaves your network.
+- The first-run checklist gains the optional step "Get alerts on your phone".
+- Removing a phone HomePilot does not list answers 404 "No phone named ..."
+  (it was a 503 "ntfy refused to remove the login (HTTP 400)"); a 503 is kept
+  for ntfy really failing.
+
+### How a host is built, for the knowledge base (#818)
+
+The read tier could not see most of what defines a machine - nginx vhosts,
+compose projects, unit files, firewall, pending updates - so the reverse proxy
+that fronts the estate could not be described, let alone rebuilt, from
+HomePilot. Now each agent describes its host:
+
+- **What it reports:** listening sockets with the owning process NAME and unit;
+  systemd services and timers that are active or enabled, with state and the
+  ExecStart PROGRAM path; Docker containers and compose projects (image tag and
+  digest, ports, mounts, restart policy and count, compose project/service);
+  nginx server blocks (server_name, listen, root/proxy targets, TLS files and
+  client-certificate mode), upstreams and the include graph; certificate names
+  and expiry, certbot renewal domains and authenticator; ufw state and rules,
+  nftables tables/chains with rule counts; pending and security updates, reboot
+  required; NTP state. Each part says when the agent's user could not see it
+  ("not visible to the agent") instead of failing.
+- **What it never reports:** command lines or arguments, environments,
+  container commands or labels other than compose's, header values outside a
+  known-safe list, anything under a key/secret/token/password directive, private
+  keys or file contents. A deny filter runs over the finished description IN THE
+  AGENT (private-key blocks, bearer/basic credentials, URL userinfo,
+  `password=`-style values, well-known token formats), so secrets never leave
+  the host. Every field and the whole description are size-capped.
+- **Where:** the host page's new **How it is built** tab (grouped: what runs,
+  how it is exposed, what it depends on, what changed, what the agent could not
+  see; "Collect now" and, for writers, "Export to knowledge base"),
+  `GET /inventory/{id}/description` (and `POST` to collect now, both
+  read scope), the read-tier MCP tool `describe_host` (`refresh` to collect
+  now), and `hp hosts describe NAME [--refresh] [--export] [--json]`. The latest
+  and the previous description are kept, so the answer includes what changed.
+  Hosts are re-described daily (`HP_HOST_DESCRIPTION_INTERVAL_SECONDS`, 0 = off).
+- **As-built note:** `POST /inventory/{id}/description/export`, the MCP tool
+  `export_host_asbuilt` or `hp hosts describe NAME --export` records the
+  description in the knowledge base as the host's "as-built" note - what runs,
+  how it is exposed, where its configuration lives, what it depends on, and a
+  rebuild checklist - superseding the host's previous as-built note.
+- **Read tier, reviewed:** `read_file_on_guest` and `cat` now also serve
+  `/etc/nginx`, `/etc/letsencrypt/renewal`, `/etc/ufw`,
+  `/var/lib/update-notifier/updates-available` and `/run/reboot-required`;
+  any file whose name says secret/token/passw/credential, and every `*.env` /
+  `.env.*` file, is refused wherever it sits. Compose files are deliberately NOT
+  readable: they routinely carry passwords inline; the description reports what
+  compose runs from the Docker daemon instead.
+- The tab and the as-built note no longer say a part's name twice ("Docker:
+  docker: not readable"): a reason that starts with the part's own name is shown
+  after the label without it.
+
+### Percentage alert rules, and a readable week of metrics (#661)
+
+"Alert when a disk is over 90% full" could not be written: every metric was an
+absolute, so a fleet-wide `disk.free_gb < N` meant the same gigabytes on a 20 GB
+VM and a 4 TB array. And the 7-day chart showed the newest 33 hours of the week.
+
+- **The agent reports three ratios**, computed when it measures: `disk.used_pct`
+  (as `df` counts it), `memory.used_pct` (of MemAvailable) and
+  `load.1m_per_core`. "Disk over 90%" is `disk.used_pct` above 90, in the rule
+  form, `create_alert_rule` or `hp api monitoring create-rule`. The seeded
+  defaults stay the absolute floors (under 1 GB free, under 200 MB memory): a
+  floor is late on a big host but never wrong, and a percentage is wrong on one
+  end or the other.
+- **A rule names the hosts it cannot see yet.** A host whose agent predates the
+  ratios reports other metrics but not these; `GET /monitoring/rules` (and the
+  console, and `list_alert_rules`) now carries `hosts_without_metric`, their
+  names and a sentence: "1 host does not report disk.used_pct yet - upgrade its
+  agent (...)".
+- **`cpu.count` is no longer sampled.** It was a constant stored every minute
+  (12.5% of a real metrics table); it stays in the agent's system info, where the
+  Agents view reads it. The hub still accepts it from older agents.
+- **`resolution=auto`** on `GET /monitoring/hosts/{h}/series` (and
+  `get_host_metrics_series`, and `hp api`): a window holding more than the
+  2000-point cap comes back whole, as min/avg/max buckets, and says so
+  (`resolution: bucketed`, `bucket_seconds`, `aggregation`). Raw stays the
+  default and still says `truncated`. The host page uses it for the 7d range and
+  says it is showing per-bucket min/avg/max, with the true sample range.
+- **A window past the metric retention is refused** with a sentence instead of
+  answered with nothing; the host page offers only ranges inside it.
+- A window over the 720-hour ceiling, or one of 0 hours or less, gets the same
+  kind of sentence over the route and MCP - it was pydantic's validation list
+  ("Input should be less than or equal to 720").
+- Each agent now stores ten series instead of eight: ~13.6 MB per host per week
+  measured with realistic identities (the old 77.7 B/row figure came from a
+  five-character hostname and was ~66% optimistic).
+
+### Add a disk to a VM, as one reviewed change (#824)
+
+Taking a new disk into use needed two root shells: one on the Proxmox host to
+attach it, one in the guest to format and mount it. Now it is one change you
+approve (owner decision 2026-11-18): **Hosts > a VM > Add a disk**, the
+assistant tool `add_guest_disk`, or `hp changes propose` with a `guest-disk`
+spec (example in docs/add-disk.md).
+
+- **Attach:** a new disk from a Proxmox storage (the form lists the node's
+  storages that hold VM disks, with free space), hot-plugged on the first free
+  slot read from the VM's current config, with a serial HomePilot sets.
+- **In the guest,** as root through the QEMU guest agent (the path the agent
+  install uses; the hp-agent stays unprivileged): find the disk by that serial,
+  never by a /dev/sdX letter; refuse unless it has no partitions and no
+  signature (`wipefs -n`, `blkid -p`) - nothing is formatted otherwise; mkfs
+  (ext4 or xfs) with a label; an empty, immutable mount point; back up
+  /etc/fstab, add one `LABEL=... nofail` line, mount that one mount point (no
+  `mount -a`), check it with `findmnt`.
+- **Refused before anything changes:** a guest without disk hotplug, a stopped
+  guest, a guest agent that does not answer, a storage that is missing or too
+  small, a mount point that is not empty, a label or mount point fstab already
+  uses, a container. A physical `/dev/disk/by-id` disk is refused with the
+  exact `qm set` command to run as root on the node; HomePilot never runs it.
+- **Partly applied** (#796) when the attach works and the guest part fails: the
+  steps done, the one that failed and why, the steps not run, and what to do
+  next. The disk stays attached - HomePilot never detaches a disk. Approving
+  and applying again continues without a second attach or a second mkfs.
+- The review shows the slot, serial, fstab line and anything that would refuse
+  it now (`plan_artifact` answers for `guest-disk` too); drift checks the disk
+  is attached, mounted from its label and in fstab.
+- **A confined guest agent is named, not mistaken for a missing tool.** On
+  Fedora/RHEL-family guests qemu-ga runs confined by SELinux (`virt_qemu_ga_t`)
+  and the commands it starts may not see or run `mount`, `mkfs` and friends;
+  the check said "the guest has no mount". It now tells "really missing" from
+  "installed but out of the agent's reach" and names what the guest's owner
+  can do (`virt_qemu_ga_run_unconfined`, `semanage permissive`), saying both
+  widen what the guest agent may do. HomePilot changes neither.
+
+### The read tier no longer shows command lines (#817)
+
+A read-scope token (and any assistant holding one) could read every process's
+full command line through `exec_on_guest_readonly`, and command lines carry
+other services' secrets: a workspace manager passes session tokens as
+`--token=...` arguments.
+
+- **`ps`** at the read tier prints process names, never arguments or
+  environments: every form names its columns with one `-o` from a fixed
+  name-only set, e.g. `ps -eo pid,user,comm,etime,pcpu,pmem` (narrow with
+  `-p`, `-u`, `-C`; `--sort`, `--forest`, `--no-headers`). `ps aux`, `-f`,
+  `-ef`, `-o args|cmd|command`, `ww` and the BSD forms are refused.
+- **`systemctl status`** (which prints the unit's processes with their command
+  lines, and with no unit every process on the host) is refused; use
+  `systemctl is-active|is-enabled|is-failed UNIT` or the new
+  `systemctl show UNIT -p ActiveState,SubState,MainPID,NRestarts,...` (a fixed
+  property set: no Exec*, Environment or Description).
+- **`journalctl`** output is the short family or `cat`: `json`, `verbose` and
+  `export` print each entry's `_CMDLINE`. `-F`/`--field` stays refused.
+- Reads of `/proc/<pid>/task/<tid>/cmdline|environ` are denied like
+  `/proc/<pid>/cmdline` already was, even under an operator-widened read prefix.
+- A refusal names the safe form to use instead, on the control plane and in
+  the agent alike.
+- The full forms (`ps aux`, `systemctl status`) remain for an admin on a
+  **privileged** agent.
+
+### Unit files no longer show other services' secrets (#853)
+
+Unit files and drop-ins are readable at the read tier, and they carry secrets:
+`Environment=TOKEN=...` in a drop-in, a credential set inline, and the files a
+unit loads its environment from, which were readable whenever their name did
+not say "env".
+
+- **Redacted in the agent:** `read_file_on_guest` and `cat` return every unit
+  file, drop-in and systemd config with each `Environment=`,
+  `DefaultEnvironment=` and `ManagerEnvironment=` value replaced
+  (`Environment=TOKEN=<redacted>`; quoted words, continued lines and
+  commented-out lines included), `SetCredential=` keeping only its id, and a
+  WireGuard `.netdev`'s `PrivateKey=`/`PresharedKey=` removed. Variable names
+  stay, so the unit still explains the service. The same on privileged agents.
+  `ExecStart=` and the other `Exec*=` lines keep their program and prefix
+  characters and lose every argument (`ExecStart=/usr/bin/app <arguments
+  redacted>`), as `ps` did in #817; an artifact's revoke still puts the exact
+  bytes back, because the pre-apply capture now reads through the privileged
+  write path (`snapshot_file`) instead of the read tier.
+- **Secret sources refused:** any file a unit on the host names in
+  `EnvironmentFile=`, `LoadCredential=`, `PrivateKeyFile=` or
+  `PresharedKeyFile=` is refused at the read tier wherever it sits, whatever
+  its name (a `%i`-style specifier matches any instance). Units kept outside
+  the systemd directories can be declared with `HP_AGENT_UNIT_DIRS`.
+- **Artifacts:** drift compares a unit's desired content redacted the same way
+  (those values are not compared; every other byte is). A rollback no longer
+  "restores" a unit whose captured content was redacted - it reports that the
+  prior bytes cannot be put back instead of writing placeholders over the
+  service's environment.
+
+### Upgrade agent keeps the agent's id, and a failed upgrade puts everything back (#823)
+
+An agent installed before `agent.id` existed has no id on disk. Upgrade agent
+let the installer mint a new one, refused the result as a second agent, and
+rolled back only the binary: the old agent came back under the new id and
+config, and the hub held two records for one host.
+
+- The upgrade hands the installer the live agent's id (`HP_AGENT_ID` in the
+  staged environment; `install-agent.sh --agent-id ID` by hand). The installer
+  uses it where no id is stored, and refuses - before changing anything - when
+  the host stores a different one.
+- Before it changes anything over an existing agent, the installer saves the
+  binary, the previous binary, `agent.env`, `agent.id`, `agent.token`,
+  `agent.token.prev` and the unit to `/var/lib/hp-agent/upgrade-snapshot`
+  (root-only, denied to the read tier). A failed upgrade restores every one of
+  them byte for byte, or removes it if it did not exist, except two things kept
+  so the old agent returns as the SAME agent: a credential the hub had already
+  issued to the new agent (the task says so), and, on a host that stored no
+  id, the live id as `agent.id`. A successful upgrade deletes the snapshot.
+
+### Upgrade agent keeps the host's grant (#841)
+
+Upgrade agent carried no grant, so the installer fell back to its defaults and a
+privileged agent (or one with custom write prefixes) came back unprivileged:
+`agent.env` and the unit rewritten, provisioning on that host refused. An
+upgrade now passes `KEEP_GRANT=true` (`install-agent.sh --keep-grant` by hand)
+and the installer reads privileged, package install and write prefixes from the
+host's own `agent.env` - the file the running agent and its unit were made
+from - and refuses if there is none to read. A grant stated explicitly
+(`--privileged`, `--allow-package-install`, `--write-prefix`, or the matching
+variables) still wins.
+
+### The installer checks the whole TLS pin (#842)
+
+`--tls-pin` was checked line by line, so 64 hex characters followed by a
+newline and `VAR=...` passed and wrote a second variable line into `agent.env`.
+The whole value is matched now, as `--agent-id` is.
+
+### A real agent with an identity clash is no longer banned (#789)
+
+An agent that lost its credential and came back on the shared token was
+refused with `host_holds_credential` on every restart, and each refusal counted
+toward the 5-failure peer ban, so it was locked out for good and its refusal
+turned into a silent hang-up. Identity clashes - the shared token for a
+hostname that holds its own credential, or a host's genuine credential
+presented under another hostname - no longer count toward the ban (owner
+decision 2026-11-18); a wrong, forged, expired or revoked token still does. The
+refusal now names the remedy: `hp agents install HOST` on a QEMU guest, or
+`hp agent bootstrap` and its install command on any other host.
+### What happened, in words (#844)
+
+- The Overview's **What happened** says every entry in plain words. It used to
+  print journal codes it had no phrase for - `apply_refused`,
+  `rollback_refused`, `recheck_refused`, `provision_failed`,
+  `notification_channel_*`, `instance_claimed` and more: 24 of the 64 codes
+  HomePilot writes. **Needs you** says "Installing the agent on web-01 failed"
+  and "Applying nginx-conf is still waiting to start", not
+  `install_agent web-01 failed` / `is still pending`.
+- One wording table, on the server (`dashboard/wording.py`): the journal API
+  and MCP `get_audit_log` carry `words` on every row, the Overview's run lines
+  carry `words`, and the console, `hp status` and MCP all show those and
+  nothing else. `hp status` gains a **What happened** section (the last 8
+  entries by people and assistants; `what_happened` in `--json`).
+- A gate test derives every code the producers can write from the source -
+  every call that reaches the journal, through wrappers, callbacks, f-strings,
+  loops, constants and callers; migration SQL; the `tasks` table's CHECK
+  constraints - and fails on a code with no words, on words for a code nothing
+  writes, and on a journal write whose code cannot be derived.
+- The words name who did it too (`actor`): a token's label, never an internal
+  id. Agent installs and upgrades, guest creation and tailnet joins recorded
+  the caller's user id, so `hp status` read "<uuid> upgraded the agent on ...";
+  they now record the token's name, and rows already recorded that way read as
+  the token's label, or "A token that no longer exists".
+
+### Proxmox endpoint paths live in the adapters (#717)
+
+- Owner decision 2026-11-18 amends the 2026-08-26 mandate: HomePilot may call
+  Proxmox endpoints directly, but an endpoint path is written only in the
+  adapter modules (`adapters/proxmox.py`, `adapters/pve_reads.py`,
+  `adapters/pve_sdn.py`, `adapters/pve_access.py`,
+  `adapters/pve_firewall_guard.py`). The provisioning-default probes read SDN
+  vnets and zones through `pve_sdn`; inventory, addresses, power, IP
+  allocation, the run guard, the executor, the Proxmox settings test and the
+  MCP server use the named reads in the new `adapters/pve_reads.py`. A gate
+  test fails on any PVE path literal anywhere else, with file and line.
+
+### Re-enrol a refused host in one click (#789)
+
+- Hosts > Agents, **Waiting to join**: a refused host that is a QEMU guest
+  keeps **Install again**; any other refused host now has **Re-enrol**, which
+  makes a single-use bootstrap token and shows the install one-liner for it on
+  that host's line - the same server-built command Enroll agent shows. Run it on
+  the host; no enrolment window is opened.
+
+### The artifact library and policy warnings (#506)
+
+- **Tags as the library.** `tags: ["pattern"]` marks a change worth imitating.
+  `GET /artifacts?tag=`, MCP `query_artifacts` `{"tag": "pattern"}` and
+  `hp changes list --tag pattern` filter on an exact tag. Tags are short slugs
+  (lowercase letters, digits, `-`; 1-32 characters; at most 10), refused at
+  propose otherwise.
+- **Policy warnings at approve.** A policy note may carry a machine-readable
+  `policy-rule` block: forbidden `kind` / `verb` / `path` pattern. A change it
+  matches is never refused at propose. While it is proposed, the review screen,
+  `hp changes show`, `GET /artifacts/{id}`, MCP `get_artifact` and the plan show
+  what matched; approving it needs `acknowledge_policy` (API and MCP) or
+  `--acknowledge-policy` (`hp changes approve`, `approve-and-apply`), and the
+  acknowledgement is recorded on the approval and in the journal. Free-text
+  policies stay free text.
+- Not yet in the console: the acknowledgement checkbox and a tag filter on the
+  Changes list. The review screen shows the warning and the command that
+  acknowledges it; approving a matching change from the console is answered
+  with the same message until the checkbox lands.
+
+### Fixes
+
+- **A change that deletes a disk volume is no longer defeated by its own
+  snapshot.** A proxmox-api-sequence that freed a VM's unused disk took the
+  automatic pre-apply snapshot first; the snapshot held the volume, Proxmox
+  refused the delete "volume is still in use (snapshot?)" and the change was
+  left partly applied. Such a change (config `delete` of an `unusedN` key, or a
+  disk key with `force`; a forced `unlink`; destroying the guest; deleting one
+  of its volumes from a storage) is now refused at propose unless it says
+  `requires_snapshot: false`, refused before the snapshot at apply if it was
+  proposed earlier, and a refusal Proxmox still gives says which snapshot holds
+  the volume and what to do.
+- **Hints name the commands `hp --help` lists.** "Review with: hp artifacts
+  show" and 40-odd other messages named the pre-3.13 group names (`hp
+  artifacts`, `hp inventory`, `hp agent`), now hidden aliases; they say `hp
+  changes`, `hp hosts` and `hp agents`. A gate resolves every `hp ...` the
+  product names against the real command tree.
+- **A clean shutdown is no longer killed by Docker (#812).** Each step of the
+  shutdown is bounded, and the bounds add up to ~126 s (hub stop, reconcilers,
+  seven drains, blocking pools, WAL checkpoint, close). The compose files set no
+  `stop_grace_period`, so Docker's 10 s default could SIGKILL a shutdown that
+  legitimately needed longer - mid-drain. Both shipped compose files now give
+  the backend 150 s; normally a shutdown still takes about a second. A gate holds
+  the compose value to the computed worst case, and every bound in the shutdown
+  to the table it is computed from.
+- **A deep link keeps its `#fragment` through the login (#807).** Both redirects
+  to the login page (the shell's and the API client's on a 401) dropped it, so
+  `/ui/settings#alerts` opened logged out landed without its anchor and the
+  legacy-anchor redirects never fired. The return address stays same-origin.
+- **Records > Tasks no longer scrolls the whole page sideways on a phone
+  (#829).** Not the table - its card already scrolls - but the Row-actions
+  header's screen-reader label: absolutely positioned under a static scroller,
+  it was never clipped by it and sat at the wide table's far edge. Every console
+  route is now in the phone-width check, on a fleet with a long task in it.
+- **The MCP self-check no longer says the loop watchdog is off while it runs
+  (#814).** HTTP and MCP read two different state objects; every self-check
+  surface now reads the one the process was built from. That also fixes the
+  HTTP self-check losing the agent hub's refusal reason. A gate boots the app
+  and compares both transports subsystem by subsystem.
+- **A busy build box no longer fails the gate at random (#810).** The
+  loop-block detector now reads the loop thread's run-queue wait: a window where
+  the code's own time fits the budget and the rest was waiting for a CPU is
+  reported as `INCONCLUSIVE: starved (...)` with the numbers, not as a block. A
+  real block still fails; the budget is unchanged. `make gate` starts with a
+  warning when the box is loaded.
+- **`query_inventory` applies a hostname filter (#818).** Asking for one machine
+  by name returned the whole inventory; it now returns that host and its
+  services.
+- **The shipped n8n flow's signature check works (#787).** It ran in an IF
+  expression that cannot `require('crypto')` or see the raw body, and its IF was
+  wired backwards. A Crypto node now computes the HMAC over the raw body with the
+  secret from an n8n Crypto credential, and a Code node compares it in constant
+  time. The flow reads nothing from the environment: env access from nodes stays
+  blocked (n8n 2.x default), so no Code node can read the n8n container's tokens,
+  and the Matrix room and Telegram chat are set once in the flow (the Telegram
+  chat id was never passed to n8n at all). Proven offline against HomePilot's
+  real signer; not yet run in a live n8n. The morning briefing
+  (`n8n/morning-briefing.json`) reads its HomePilot URL, room and chat the same
+  way, and two bugs there are fixed: it printed a `snippet` field the KB search
+  never returns (every line said `undefined`), and its Telegram post sent the
+  Matrix node's API response instead of the briefing. The event flow's Telegram
+  nodes had the same defect - every Telegram event message was empty - and now
+  read their formatter's message; "Respond OK" read the event name from the
+  Telegram response too, so every delivery ended in an error after both chats
+  were notified. The artifact messages printed `Timestamp: undefined` (artifact
+  events carry no timestamp; the time received is shown) and `undefined` parts
+  for a service or missing target. A gate now runs both flows offline for every
+  event HomePilot emits and fails on any expression reading a field its input
+  does not carry.
+
+### The installer is checked before it runs (#843)
+
+- The enrol one-liner (Enroll agent, Re-enrol, `hp agents bootstrap`) carries
+  the sha256 of the installer this HomePilot serves and refuses a download that
+  does not match before running it, with a sentence saying so. The zero-touch
+  install and Upgrade agent check it the same way. The agent binary was already
+  checked; the installer, fetched over plain http when the hub runs without TLS
+  and run as root, was not.
+
+### The console: acknowledge a policy, filter by tag (#506, #789)
+
+- A change a `policy-rule` matches shows a checkbox on its page; Approve and
+  Approve and apply stay disabled until it is ticked, and the approval records
+  the acknowledgement. The Inbox says when an approval is held for a policy.
+- The Changes list filters by tag (`pattern`, the library, is always offered).
+- Re-enrol records which host its bootstrap token was made for; the pending
+  list shows it. (A label: the hub accepts a bootstrap token from any host.)
+
+### Update notices list every operator action
+
+- The update notice took a release's whole "Operator actions" section as one
+  item cut at 500 characters, and lifted feature headings that merely start
+  with "Upgrade". Each bullet is now its own action, and only instruction
+  headings count (the convention is at the top of this file).
+
+### Housekeeping
+
+- Every Proxmox endpoint path now lives in the adapters, with no exceptions
+  left in the gate (#717).
+- The stale copies under `agent/n8n/workflows/` are gone; the shipped flows are
+  `n8n/` (docs/notifications.md).
+
 ## 3.13.0 - 2026-11-14
 
 `hp` works from any machine. Install it on a workstation, log in to a server

@@ -97,6 +97,28 @@ def _no_cli_client_profile(tmp_path_factory: pytest.TempPathFactory, monkeypatch
         monkeypatch.delenv(name, raising=False)
     from homepilot.cli import remote
 
+    # The environment alone is not enough (#840 review): a test that runs the CLI
+    # under `patch.dict(os.environ, ..., clear=True)` drops XDG_CONFIG_HOME, and
+    # `config_dir()` then falls back to Path.home() - which, with HOME cleared
+    # too, is the account's REAL home from the password database. Thirty-six
+    # tests read a developer's real client.toml that way and ran in remote mode
+    # against the server it named. So the path functions themselves are patched,
+    # which no environment change can undo: an XDG dir a test chose inside this
+    # run's temp tree is honoured, anything else resolves to this test's own
+    # empty dir. tests/test_cli_client_isolation.py holds it.
+    base = tmp_path_factory.getbasetemp().resolve()
+
+    def _test_dir(variable: str, fallback: Path):
+        def resolve() -> Path:
+            chosen = os.environ.get(variable)
+            if chosen and Path(chosen).resolve().is_relative_to(base):
+                return Path(chosen) / "homepilot"
+            return fallback / "homepilot"
+
+        return resolve
+
+    monkeypatch.setattr(remote, "config_dir", _test_dir("XDG_CONFIG_HOME", xdg / "config"))
+    monkeypatch.setattr(remote, "cache_dir", _test_dir("XDG_CACHE_HOME", xdg / "cache"))
     remote.set_active_target(None)
 
 
@@ -434,6 +456,14 @@ def pytest_configure(config: pytest.Config) -> None:
 
     loop_block_detector.install()
     config.pluginmanager.register(loop_block_detector, "hp-loop-block-detector")
+
+    # And no test talks to anything but this machine (#840 review): a CLI test
+    # that read a developer's real client profile ran in remote mode against a
+    # real server. tests/network_guard.py fails any test that connects off-box.
+    from . import network_guard
+
+    network_guard.install()
+    config.pluginmanager.register(network_guard, "hp-network-guard")
 
 
 @pytest.fixture

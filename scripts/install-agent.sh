@@ -28,6 +28,17 @@
 #   --write-prefix P  Grant writes under P (repeatable). Replaces the default
 #                     prefix set; /etc/homepilot is always included.
 #   --no-start        Install the unit but do not start it.
+#   --keep-grant      Over an existing agent, keep the grant it has now
+#                     (privileged, package install, write prefixes), read from
+#                     its agent.env. HomePilot's Upgrade agent passes this
+#                     (KEEP_GRANT=true). An explicit grant flag or variable
+#                     (--privileged, --allow-package-install, --write-prefix,
+#                     PRIVILEGED=, ALLOW_PACKAGE_INSTALL=, WRITE_PREFIXES=) wins.
+#   --agent-id ID     The id of the agent already running on this host (also
+#                     read from HP_AGENT_ID in the environment). HomePilot's
+#                     Upgrade agent passes it, so an old agent that never stored
+#                     its id keeps it instead of being given a new one; an id
+#                     stored on the host that differs is refused (#823).
 #   --allow-unverified
 #                     Install the GitHub-fallback binary even when the release
 #                     carries no SHA256SUMS manifest to verify it against. This
@@ -60,6 +71,13 @@ HUB="${HUB:-}"
 TOKEN="${TOKEN:-}"
 USE_TLS="${USE_TLS:-false}"
 TLS_PIN="${TLS_PIN:-}"
+# Whether the caller stated a grant itself (environment here, flags below): a
+# stated grant always wins over --keep-grant.
+GRANT_EXPLICIT=""
+if [ -n "${PRIVILEGED+x}${ALLOW_PACKAGE_INSTALL+x}${WRITE_PREFIXES+x}" ]; then
+    GRANT_EXPLICIT=1
+fi
+KEEP_GRANT="${KEEP_GRANT:-false}"
 PRIVILEGED="${PRIVILEGED:-false}"
 ALLOW_PACKAGE_INSTALL="${ALLOW_PACKAGE_INSTALL:-false}"
 WRITE_PREFIXES="${WRITE_PREFIXES:-}"
@@ -86,15 +104,58 @@ while [ $# -gt 0 ]; do
         --version)    VERSION="$2"; shift 2 ;;
         --tls)        USE_TLS="true"; shift ;;
         --tls-pin)    TLS_PIN="$2"; USE_TLS="true"; shift 2 ;;
-        --privileged) PRIVILEGED="true"; shift ;;
+        --privileged) PRIVILEGED="true"; GRANT_EXPLICIT=1; shift ;;
         --allow-package-install)
-                      PRIVILEGED="true"; ALLOW_PACKAGE_INSTALL="true"; shift ;;
-        --write-prefix) WRITE_PREFIXES="$WRITE_PREFIXES $2"; shift 2 ;;
+                      PRIVILEGED="true"; ALLOW_PACKAGE_INSTALL="true"; GRANT_EXPLICIT=1; shift ;;
+        --write-prefix) WRITE_PREFIXES="$WRITE_PREFIXES $2"; GRANT_EXPLICIT=1; shift 2 ;;
+        --keep-grant) KEEP_GRANT="true"; shift ;;
         --no-start)   START=0; shift ;;
+        --agent-id)   HP_AGENT_ID="$2"; shift 2 ;;
         --allow-unverified) ALLOW_UNVERIFIED="true"; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+
+# >>> keep-grant block (executed verbatim by tests/test_agent_upgrade.py)
+# An upgrade must not change what the host granted the agent (#841). The
+# defaults below are UNPRIVILEGED with the default prefixes, so an upgrade that
+# carried no grant silently turned a privileged agent into an unprivileged one -
+# agent.env and the unit both rewritten - and provisioning on that host stopped.
+# The grant is read HERE, from the agent.env the running agent was started
+# with, rather than sent by the server: that file is what the agent and its
+# unit were generated from, while the server would have to know every field
+# for every agent ever installed (an old agent reports none of it), and any
+# field it lacked would fall back to the default - the same silent drop. A
+# line missing from agent.env means the agent ran with that line's default,
+# which is what the defaults below then reproduce. No agent.env to read is a
+# refusal, never a default.
+if [ "$KEEP_GRANT" = "true" ] && [ -z "$GRANT_EXPLICIT" ]; then
+    GRANT_ENV="${CONF_DIR:-/etc/homepilot}/agent.env"
+    if ! $SUDO test -f "$GRANT_ENV"; then
+        echo "--keep-grant: there is no $GRANT_ENV to keep the grant from." >&2
+        echo "Install with an explicit grant (--privileged, --write-prefix P) instead." >&2
+        exit 1
+    fi
+    grant_value() {
+        $SUDO sed -n "s/^$1=//p" "$GRANT_ENV" | tail -1 | tr -d '[:space:]' || true
+    }
+    # The agent's own reading of these values (envBool in agent/go/config.go).
+    case "$(grant_value HP_AGENT_PRIVILEGED | tr 'A-Z' 'a-z')" in
+        1|true|yes) PRIVILEGED="true" ;;
+        *)          PRIVILEGED="false" ;;
+    esac
+    case "$(grant_value HP_AGENT_ALLOW_PACKAGE_INSTALL | tr 'A-Z' 'a-z')" in
+        1|true|yes) ALLOW_PACKAGE_INSTALL="true" ;;
+        *)          ALLOW_PACKAGE_INSTALL="false" ;;
+    esac
+    WRITE_PREFIXES=$(grant_value HP_AGENT_WRITE_PREFIXES | tr ':' ' ')
+    echo "Keeping this host's grant: privileged=$PRIVILEGED," \
+        "package install=$ALLOW_PACKAGE_INSTALL, write prefixes=${WRITE_PREFIXES:-default}"
+fi
+# <<< end keep-grant block
 
 # >>> grant block (executed verbatim by agent/go/unit_matrix_test.go)
 # Default write-prefix sets. The privileged set MUST stay in lockstep with
@@ -142,7 +203,8 @@ print_grant_summary() {
         echo "=== Grant: UNPRIVILEGED (default) ==="
         echo "  runs as        : hp-agent (non-root systemd unit)"
         echo "  commands       : read-only allowlist only (cat, ls, ps, df, free, ip,"
-        echo "                   ss, systemctl status/is-active, journalctl, dpkg -l, docker ps)"
+        echo "                   ss, systemctl is-active/show, journalctl, dpkg -l, docker ps;"
+        echo "                   ps prints process names, never command lines)"
         echo "  writable paths : $WRITE_PREFIXES"
         echo "  provisioning   : install_package / manage_service / write_config are REFUSED"
         return
@@ -185,7 +247,10 @@ if [ -n "$TLS_PIN" ]; then
         *)        PIN_HEX="$TLS_PIN" ;;
     esac
     PIN_HEX=$(printf '%s' "$PIN_HEX" | tr -d ':')
-    if ! printf '%s' "$PIN_HEX" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    # The WHOLE value, not line by line as grep would match it: a pin of 64 hex
+    # characters, a newline and VAR=... passed grep and put a second variable
+    # line into agent.env (#842).
+    if ! [[ "$PIN_HEX" =~ ^[0-9a-fA-F]{64}$ ]]; then
         echo "--tls-pin must be a sha256 fingerprint (64 hex chars): $TLS_PIN" >&2
         exit 1
     fi
@@ -204,8 +269,54 @@ HUB_HOST="${HUB%%:*}"
 HUB_PORT="${HUB##*:}"
 [ "$HUB_PORT" = "$HUB" ] && HUB_PORT="8443"  # no port given → default
 
-SUDO=""
-[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+# >>> agent-id resolve block (run with the agent-identity block by its tests)
+# WHICH agent this install is, settled before anything on the host is touched.
+# An upgrade passes the LIVE agent's id (--agent-id, or HP_AGENT_ID in the
+# environment, which is how HomePilot's Upgrade agent hands it over): an agent
+# installed before agent.id existed has no id on disk, and minting a new one
+# there turned the upgrade into a SECOND agent that the upgrade then refused,
+# leaving the host on the old binary under the new id (#823). A stored id that
+# differs from the passed one is refused here, before the binary is swapped, so
+# the refusal changes nothing. CONF_DIR is overridable so tests can run this in a
+# sandbox; production always uses the default.
+CONF_DIR="${CONF_DIR:-/etc/homepilot}"
+HP_AGENT_ID="${HP_AGENT_ID:-}"
+# Matched on the WHOLE value (not line by line, as grep would): it is written
+# into agent.env, so a newline must not smuggle a second variable in.
+if [ -n "$HP_AGENT_ID" ] && ! [[ "$HP_AGENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "--agent-id must be an agent id (letters, digits, '.', '_', '-'): $HP_AGENT_ID" >&2
+    exit 1
+fi
+# The id the host already has, in the agent's own precedence: HP_AGENT_ID in
+# agent.env, else the agent.id file.
+stored_agent_id() {
+    local id=""
+    if [ -f "$CONF_DIR/agent.env" ]; then
+        id=$($SUDO sed -n 's/^HP_AGENT_ID=//p' "$CONF_DIR/agent.env" | head -1 || true)
+    fi
+    if [ -z "$id" ] && [ -f "$CONF_DIR/agent.id" ]; then
+        id=$($SUDO cat "$CONF_DIR/agent.id" 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    printf '%s' "$id"
+}
+# Sets AGENT_ID to the passed id, else the stored one, else empty (a new host).
+resolve_agent_id() {
+    local stored
+    stored=$(stored_agent_id)
+    AGENT_ID="$stored"
+    if [ -n "$HP_AGENT_ID" ]; then
+        if [ -n "$stored" ] && [ "$stored" != "$HP_AGENT_ID" ]; then
+            echo "Refusing to install: this host's stored agent id is $stored" >&2
+            echo "($CONF_DIR/agent.env or agent.id), but this install is for agent $HP_AGENT_ID." >&2
+            echo "Nothing on the host was changed. Check which agent runs here (Hosts > Agents)" >&2
+            echo "before installing over it." >&2
+            return 1
+        fi
+        AGENT_ID="$HP_AGENT_ID"
+    fi
+}
+resolve_agent_id || exit 1
+# <<< end agent-id resolve block
 
 # ─── Detect arch ───
 ARCH=$(uname -m)
@@ -216,6 +327,48 @@ case "$ARCH" in
 esac
 
 echo "=== Installing hp-agent (linux-$GOARCH) ==="
+
+# >>> upgrade-snapshot block (executed verbatim by tests/test_agent_upgrade.py)
+# Over an existing agent, everything this installer may change is copied aside
+# BEFORE anything changes: the binary, the previous binary, agent.env, agent.id,
+# agent.token, agent.token.prev and the unit. If the upgraded agent never comes
+# back, HomePilot's rollback (_rollback_script in agent_hub/enroll.py) puts each
+# one back from here byte for byte - or removes it, if it did not exist - so a
+# failed upgrade leaves the host as it found it. It used to put back only the
+# binary, and the old binary came up under the new agent.id/agent.env (#823).
+# The manifest maps each saved name to its live path, so the rollback restores
+# exactly what this block saved and needs no copy of the list. The directory is
+# root-only and outside every read prefix (the read policy denies it too): it
+# holds credentials. SNAPSHOT_DIR and UNIT_PATH are overridable for tests.
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-/var/lib/hp-agent/upgrade-snapshot}"
+UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/hp-agent.service}"
+$SUDO rm -rf "$SNAPSHOT_DIR" "$SNAPSHOT_DIR.new"
+if [ -f "$INSTALL_DIR/hp-agent" ]; then
+    $SUDO mkdir -p "$SNAPSHOT_DIR.new"
+    $SUDO chmod 700 "$(dirname "$SNAPSHOT_DIR")" "$SNAPSHOT_DIR.new"
+    snapshot_one() {
+        if [ -e "$2" ]; then
+            $SUDO cp -p "$2" "$SNAPSHOT_DIR.new/$1"
+        fi
+        printf '%s %s\n' "$1" "$2" | $SUDO tee -a "$SNAPSHOT_DIR.new/manifest" >/dev/null
+    }
+    snapshot_one hp-agent "$INSTALL_DIR/hp-agent"
+    snapshot_one hp-agent.prev "$INSTALL_DIR/hp-agent.prev"
+    snapshot_one agent.env "$CONF_DIR/agent.env"
+    snapshot_one agent.id "$CONF_DIR/agent.id"
+    snapshot_one agent.token "$CONF_DIR/agent.token"
+    snapshot_one agent.token.prev "$CONF_DIR/agent.token.prev"
+    snapshot_one unit "$UNIT_PATH"
+    # The id of the agent running here, when the upgrade named it: an agent with
+    # no agent.id on disk gets it back as its agent.id on rollback, or the old
+    # binary would mint a new id at restart - the second agent of #823 again.
+    if [ -n "$HP_AGENT_ID" ]; then
+        printf '%s' "$HP_AGENT_ID" | $SUDO tee "$SNAPSHOT_DIR.new/live-agent-id" >/dev/null
+    fi
+    $SUDO mv "$SNAPSHOT_DIR.new" "$SNAPSHOT_DIR"
+    echo "Saved the current agent's binary, configuration and unit to $SNAPSHOT_DIR"
+fi
+# <<< end upgrade-snapshot block
 
 # >>> download block (executed verbatim by tests/test_install_agent_download.py)
 # ─── Download ───
@@ -342,10 +495,8 @@ fi
 
 # ─── Write the agent environment file ───
 echo "=== Configuring agent → hub $HUB_HOST:$HUB_PORT ==="
-# CONF_DIR is overridable so the identity+env block below can be exercised in a
-# sandbox by tests/test_install_agent_identity.py; production always uses the
-# default and the systemd unit points at that path.
-CONF_DIR="${CONF_DIR:-/etc/homepilot}"
+# CONF_DIR is set by the agent-id resolve block above (overridable for tests;
+# production always uses the default and the systemd unit points at that path).
 $SUDO mkdir -p "$CONF_DIR"
 
 # >>> agent-identity block (executed verbatim by tests/test_install_agent_identity.py)
@@ -363,16 +514,14 @@ new_uuid() {
         od -xN20 /dev/urandom | head -1 | awk '{print $2$3"-"$4"-"$5"-"$6"-"$7$8$9}'
     fi
 }
-AGENT_ID=""
-if [ -f "$CONF_DIR/agent.env" ]; then
-    AGENT_ID=$($SUDO sed -n 's/^HP_AGENT_ID=//p' "$CONF_DIR/agent.env" | head -1 || true)
-fi
-if [ -z "$AGENT_ID" ] && [ -f "$CONF_DIR/agent.id" ]; then
-    AGENT_ID=$($SUDO cat "$CONF_DIR/agent.id" 2>/dev/null | tr -d '[:space:]' || true)
-fi
+# resolve_agent_id (agent-id resolve block): the id an upgrade passed, else the
+# stored one; a mismatch between the two was refused before anything changed.
+resolve_agent_id || exit 1
 if [ -z "$AGENT_ID" ]; then
     AGENT_ID=$(new_uuid)
     echo "Assigned agent id $AGENT_ID"
+elif [ -n "$HP_AGENT_ID" ]; then
+    echo "Keeping the live agent id $AGENT_ID"
 else
     echo "Keeping existing agent id $AGENT_ID"
 fi
@@ -445,9 +594,9 @@ done
 $SUDO chown -R "$OWNER" "$CONF_DIR" 2>/dev/null || true
 
 # ─── Install the systemd unit ───
-# UNIT_PATH is overridable so the unit block below can be rendered into a sandbox
-# by agent/go/unit_matrix_test.go; production always uses the default.
-UNIT_PATH="${UNIT_PATH:-/etc/systemd/system/hp-agent.service}"
+# UNIT_PATH (set by the upgrade-snapshot block) is overridable so the unit block
+# below can be rendered into a sandbox by agent/go/unit_matrix_test.go;
+# production always uses the default.
 
 # >>> systemd-unit block (rendered verbatim by agent/go/unit_matrix_test.go)
 # The unit is DERIVED from the same grant decision written into agent.env, so the

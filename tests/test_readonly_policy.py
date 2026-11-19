@@ -119,6 +119,40 @@ def test_the_read_tier_command_set_is_a_conscious_list() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("refused", "safe_form"),
+    [
+        ("ps aux", "ps -eo pid,user,comm,etime,pcpu,pmem"),
+        ("ps -ef", "ps -eo pid,user,comm,etime,pcpu,pmem"),
+        ("ps -eo pid,args", "ps -eo pid,user,comm,etime,pcpu,pmem"),
+        ("systemctl status nginx", "systemctl is-active UNIT"),
+        ("journalctl -o json", "-o short"),
+    ],
+)
+async def test_a_refused_argv_form_names_the_safe_form(refused: str, safe_form: str) -> None:
+    """#817: the read tier never shows a command line, and the refusal an
+    assistant gets through exec_on_guest_readonly says what to ask for instead,
+    and what it names is itself accepted. Nothing reaches the host: the
+    adapter's exec is never called.
+
+    Teeth: drop the policy's ``hint`` (or its read-out in readonly_policy.py)
+    and the refusal stops naming the safe form."""
+    from unittest.mock import AsyncMock
+
+    from homepilot.adapters.agent import ReadOnlyCommandError
+
+    adapter = AgentAdapter.__new__(AgentAdapter)
+    adapter.exec = AsyncMock()  # type: ignore[method-assign]
+    with pytest.raises(ReadOnlyCommandError) as exc:
+        await adapter.exec_readonly("web-01", refused)
+    assert safe_form in str(exc.value), str(exc.value)
+    adapter.exec.assert_not_called()
+    named = safe_form.replace("UNIT", "nginx")
+    if named.startswith("-o"):
+        named = "journalctl " + named
+    assert AgentAdapter._validate_readonly_command(named), named
+
+
 def test_the_readonly_exec_description_names_every_read_tier_command() -> None:
     """The tool description is what an assistant reads to decide what to ask
     for; it once omitted `cat`, so a permitted read looked forbidden (#690).
@@ -134,3 +168,33 @@ def test_the_readonly_exec_description_names_every_read_tier_command() -> None:
         c for c in readonly_policy.read_tier_commands() if not re.search(rf"\b{c}\b", description)
     )
     assert not missing, f"exec_on_guest_readonly description omits: {missing}"
+
+
+# --- #853: systemd unit files ------------------------------------------------
+
+_UNIT_CORPUS = _CORPUS["unit_redaction"]
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "want", "count"),
+    [tuple(case) for case in _UNIT_CORPUS["cases"]],
+    ids=[case[0] for case in _UNIT_CORPUS["cases"]],
+)
+def test_the_unit_rewrite_mirrors_the_agent(name: str, text: str, want: str, count: int) -> None:
+    """The control plane's mirror of the agent's rewrite produces the corpus's
+    bytes - the same bytes agent/go/unitfiles_test.go holds the agent to - and
+    is a fixed point, which is what ``unit_read_is_redacted`` relies on."""
+    got, n = readonly_policy.redact_unit_text(text)
+    assert (got, n) == (want, count), name
+    assert readonly_policy.redact_unit_text(got)[0] == got, f"{name}: not a fixed point"
+
+
+def test_a_redacted_read_is_told_from_the_real_bytes() -> None:
+    """What the agent sent (placeholders) is recognised; the real bytes - what
+    an agent older than #853 still sends - are not, so they stay restorable.
+    A file with nothing to redact is never "redacted"."""
+    raw = "[Service]\nEnvironment=TOKEN=value1\nExecStart=/usr/bin/app\n"
+    sent, _ = readonly_policy.redact_unit_text(raw)
+    assert readonly_policy.unit_read_is_redacted(sent)
+    assert not readonly_policy.unit_read_is_redacted(raw)
+    assert not readonly_policy.unit_read_is_redacted("[Unit]\nDescription=x\n")

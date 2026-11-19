@@ -17,6 +17,7 @@
 		navCounts,
 		guestsGateOpen,
 		isCurrentNav,
+		returnAddress,
 		shellCounts,
 		type NavCount,
 		type NavCountKey,
@@ -57,7 +58,8 @@
 	let paletteOpen = false;
 
 	function toLogin() {
-		const returnTo = encodeURIComponent($page.url.pathname + $page.url.search);
+		// The fragment too (#807): see returnAddress.
+		const returnTo = encodeURIComponent(returnAddress(window.location));
 		goto(`${base}/login?returnTo=${returnTo}`, { replaceState: true });
 	}
 

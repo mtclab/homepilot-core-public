@@ -205,3 +205,16 @@ export function liveConfirm(t: ArtifactTarget | null): LiveConfirm {
 	}
 	return { blocked: null, name: t.confirm.name, vmid: t.confirm.vmid, state: liveStateLine(t.confirm) };
 }
+
+/**
+ * Was this approval held for a policy acknowledgement (#506)? The server answers
+ * 409 `policy_acknowledgement_required`; the Inbox cannot tick the box for the
+ * operator, so it says so and points at the change, where the matches are read.
+ */
+export function heldForPolicy(e: unknown): boolean {
+	const info = (e as { info?: Record<string, unknown> | null } | null)?.info;
+	return info?.code === 'policy_acknowledgement_required';
+}
+
+export const POLICY_HELD =
+	'matches a policy - open the change to read it and approve with the acknowledgement';

@@ -61,7 +61,7 @@ GATEWAY = "198.51.100.1:53"  # the control: the fence ACCEPTs tcp/53 to the gate
 
 GUEST_NETWORK = DesiredGuestNetwork(
     zone="guest",
-    vnet="innkeep",
+    vnet="guestnet",
     subnet_cidr="198.51.100.0/24",
     gateway="198.51.100.1",
     snat=True,
@@ -161,19 +161,21 @@ def proxmox() -> AsyncMock:
     px.api_host = PVE_HOST
     px.api_port = 8006
     px.next_vmid = AsyncMock(return_value=104)
-    px.clone_vm = AsyncMock(return_value="UPID:elizabeth:clone:")
+    px.clone_vm = AsyncMock(return_value="UPID:pve-gw:clone:")
     px.wait_for_task = AsyncMock(return_value={"status": "stopped", "exitstatus": "OK"})
     px.set_vm_config = AsyncMock(return_value={"data": None})
     px.resize_disk = AsyncMock(return_value={"data": None})
-    px.start_vm = AsyncMock(return_value="UPID:elizabeth:start:")
-    px.stop_vm = AsyncMock(return_value="UPID:elizabeth:stop:")
-    px.delete_vm = AsyncMock(return_value="UPID:elizabeth:destroy:")
+    px.start_vm = AsyncMock(return_value="UPID:pve-gw:start:")
+    px.stop_vm = AsyncMock(return_value="UPID:pve-gw:stop:")
+    px.delete_vm = AsyncMock(return_value="UPID:pve-gw:destroy:")
     px.get_vm_current = AsyncMock(return_value={"data": {"status": "running"}})
     px.get_vm_agent_network = AsyncMock(return_value=AGENT_OK)
     return px
 
 
-def _service(db, proxmox, bridge: str = "innkeep", guest_network=GUEST_NETWORK) -> ProvisionService:
+def _service(
+    db, proxmox, bridge: str = "guestnet", guest_network=GUEST_NETWORK
+) -> ProvisionService:
     service = ProvisionService(
         proxmox=proxmox,
         task_repo=TaskRepository(db),
@@ -192,7 +194,7 @@ def _service(db, proxmox, bridge: str = "innkeep", guest_network=GUEST_NETWORK) 
     service.sdn_gateway = FakeFirewall()
 
     async def _defaults(_source: Any = None) -> ProvisioningDefaults:
-        return ProvisioningDefaults(node="elizabeth", template_vmid=9000, bridge=bridge)
+        return ProvisioningDefaults(node="pve-gw", template_vmid=9000, bridge=bridge)
 
     async def _guest_network(_source: Any = None) -> DesiredGuestNetwork | None:
         return guest_network
@@ -218,7 +220,7 @@ def _restore_module():
 def _request(**overrides: Any) -> ProvisionRequest:
     payload: dict[str, Any] = {
         "name": "friends-box",
-        "node": "elizabeth",
+        "node": "pve-gw",
         "template_vmid": 9000,
         "ssh_authorized_key": PUBKEY,
         "owner": "a-friend",
@@ -290,8 +292,8 @@ class TestTheFenceIsAskedNotAssumed:
         }
         # A BOOTED guest: stopped first (PVE refuses to destroy a running one),
         # then destroyed, both WAITED for.
-        proxmox.stop_vm.assert_awaited_once_with("elizabeth", 104)
-        proxmox.delete_vm.assert_awaited_once_with("elizabeth", 104)
+        proxmox.stop_vm.assert_awaited_once_with("pve-gw", 104)
+        proxmox.delete_vm.assert_awaited_once_with("pve-gw", 104)
         assert proxmox.wait_for_task.await_count >= 4  # clone, start, stop, destroy
         assert _hosts(str(tmp_path / "test.db")) == [], (
             "a breaching guest must never be recorded as a host anyone can hand over"

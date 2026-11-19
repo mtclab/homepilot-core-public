@@ -33,8 +33,10 @@
 	import {
 		approvalAge,
 		cannotRun,
+		heldForPolicy,
 		inboxState,
 		liveConfirm,
+		POLICY_HELD,
 		recentlyFinished,
 		type LiveConfirm,
 	} from '$lib/changes';
@@ -290,10 +292,10 @@
 				else await api.rejectArtifact(id, (rejectReasons[id] ?? '').trim() || undefined);
 				done += 1;
 				items = items.filter((a) => a.id !== id);
-			} catch {
+			} catch (e) {
 				// One refusal must not abandon the rest of the batch, and the
 				// operator has to be told WHICH ones did not go through.
-				failed.push(id.slice(-8));
+				failed.push(id.slice(-8) + (heldForPolicy(e) ? ' (matches a policy)' : ''));
 			}
 		}
 		selected = new Set();
@@ -318,7 +320,7 @@
 			await load(false);
 			await refreshDetail(id);
 		} catch (e) {
-			notify(String(e), 'err');
+			notify(heldForPolicy(e) ? `${id} ${POLICY_HELD}` : String(e), 'err');
 		} finally {
 			working = { ...working, [id]: false };
 		}
@@ -333,7 +335,7 @@
 		} catch (e) {
 			// Approved but not started still lands in "Ready to run": the reload
 			// below shows it there, never lost.
-			notify(String(e), 'err');
+			notify(heldForPolicy(e) ? `${id} ${POLICY_HELD}` : String(e), 'err');
 		} finally {
 			await load(false);
 			await refreshDetail(id);

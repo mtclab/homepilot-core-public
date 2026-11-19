@@ -67,8 +67,13 @@ from .test_install_agent_identity import _identity_block
 _needs_go = pytest.mark.skipif(not _GO, reason=GO_SKIP_REASON)
 
 
-def _install(conf: Path, token: str, *, hub_port: int = 8443, pin: str = "") -> str:
-    """Run the SHIPPED installer's identity block against ``conf``; return its output."""
+def _install(
+    conf: Path, token: str, *, hub_port: int = 8443, pin: str = "", agent_id: str = ""
+) -> str:
+    """Run the SHIPPED installer's identity block against ``conf``; return its output.
+
+    ``agent_id`` is the live agent's id an upgrade hands over (HP_AGENT_ID in the
+    environment, as the zero-touch wrapper's sourced env file sets it)."""
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -88,12 +93,11 @@ def _install(conf: Path, token: str, *, hub_port: int = 8443, pin: str = "") -> 
             _identity_block(),
         ]
     )
+    env = {"PATH": "/usr/bin:/bin", "HP_TEST_TOKEN": token}
+    if agent_id:
+        env["HP_AGENT_ID"] = agent_id
     proc = subprocess.run(
-        ["bash", "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={"PATH": "/usr/bin:/bin", "HP_TEST_TOKEN": token},
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
     )
     assert proc.returncode == 0, f"identity block failed: {proc.stderr}"
     output = proc.stdout + proc.stderr
@@ -211,12 +215,13 @@ class _Rig:
     async def bootstrap(self) -> str:
         return str(await self.hub._token_store.create(minted_by="reinstall journey"))
 
-    def install(self, token: str) -> str:
+    def install(self, token: str, agent_id: str = "") -> str:
         return _install(
             self.conf,
             token,
             hub_port=self.state.settings.agent_hub_port,
             pin="sha256:" + self.hub.cert_fingerprint,
+            agent_id=agent_id,
         )
 
     async def start(self) -> None:

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from ..auth.deps import SCOPE_ENFORCER_ATTR, require_scope
+from ..auth.principal import audit_actor
 from ..common import OPENAPI_DESTRUCTIVE
 from .audit import ActionType, set_audit_caller
 from .enroll import AgentEnrollService, EnrollConflictError, EnrollPreconditionError
@@ -570,15 +571,31 @@ async def migrate_fleet_tls(request: Request, body: MigrateTLSRequest) -> dict[s
 # is a state change a cookie-authenticated browser can be tricked into making
 # from any origin. Minting is a mutation; it gets a mutating method and the CSRF
 # gate that comes with it.
+class BootstrapRequest(BaseModel):
+    # The host the token is for (Re-enrol, #789). Recorded with the token so the
+    # pending list says whose it is. A LABEL: the hub does not bind a bootstrap
+    # token to a hostname, so any host presenting it enrols.
+    # As the knocking peer CLAIMED it (shown on the Waiting-to-join line), so
+    # not validated as a hostname - only bounded and stripped of control bytes.
+    hostname: str | None = Field(default=None, max_length=253)
+
+
 @router.post("/bootstrap", dependencies=[_admin_only])
 async def create_bootstrap_token(
-    request: Request, caller: dict[str, Any] = _admin_token
+    request: Request,
+    caller: dict[str, Any] = _admin_token,
+    body: BootstrapRequest | None = None,
 ) -> dict[str, Any]:
     registry = _get_registry()
     hub = registry.hub_server
     if hub is None:
         raise HTTPException(status_code=503, detail="Agent hub server not available")
-    token = await hub._token_store.create(minted_by=_caller_label(caller))
+    label = _caller_label(caller)
+    raw = (body.hostname if body is not None else None) or ""
+    claimed = "".join(ch for ch in raw if ch.isprintable()).strip()
+    if claimed:
+        label = f"re-enrol of {claimed}, by {label}"
+    token = await hub._token_store.create(minted_by=label)
     host, port = _advertised_hub(request, hub.host, hub.port)
     return {
         "bootstrap_token": token,
@@ -779,7 +796,8 @@ async def install_agent_on_host(
             host,
             hub_host,
             hub_port,
-            actor=token.get("user_id") or "system",
+            # The credential's name, never the internal user id (3.14 walk).
+            actor=audit_actor(token),
             upgrade=body.upgrade,
         )
     except EnrollPreconditionError as exc:

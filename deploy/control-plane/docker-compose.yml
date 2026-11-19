@@ -18,7 +18,7 @@
 services:
   backend:
     container_name: homepilot
-    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.13.0}
+    image: ghcr.io/mtclab/homepilot-core-public:${HP_IMAGE_TAG:-3.14.0}
     build:
       context: ./repo
       dockerfile: Dockerfile
@@ -30,15 +30,73 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # Where the opt-in ntfy service answers on the compose network (#822).
+      HP_NTFY_INTERNAL_URL: ${HP_NTFY_INTERNAL_URL:-http://ntfy}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    # Covers the shutdown's bounded worst case (~126 s, main.shutdown_worst_case_s);
+    # Docker's default 10 s SIGKILLs a clean shutdown mid-drain (#812).
+    stop_grace_period: 150s
     healthcheck:
       test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 15s
+    networks:
+      - homepilot
+
+  # ── Phone alerts: the bundled ntfy server (#822) - OPT-IN ────────────────
+  # Runs only after `docker compose --profile ntfy up -d` (or with
+  # COMPOSE_PROFILES=ntfy in .env). Enable it in Monitoring > Channels FIRST:
+  # that creates the `ntfy/` directory inside hp-data, which this service mounts
+  # as a volume subpath (Docker Engine >= 26) and which must exist when the
+  # container is created. HomePilot then writes ntfy/server.yml and manages
+  # phone logins over ntfy's admin API; the service waits for that file and
+  # restarts or stops ntfy by itself when it changes. Same block as the root
+  # docker-compose.yml - see the comments there.
+  ntfy:
+    image: binwiederhier/ntfy:v2.37.2@sha256:1875ddcf815c8a3c981d6d78c67a93452d0abba79b1ab9520b1f5f5238902bd7
+    profiles: ["ntfy"]
+    container_name: homepilot-ntfy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cfg="$${NTFY_HP_CONFIG:-/var/lib/ntfy/server.yml}"
+        pid=""
+        trap 'if [ -n "$$pid" ]; then kill -TERM "$$pid" 2>/dev/null; wait "$$pid"; fi; exit 0' TERM INT
+        while :; do
+          if [ ! -f "$$cfg" ]; then sleep 5; continue; fi
+          sum="$$(sha256sum "$$cfg")"
+          ntfy serve --config "$$cfg" &
+          pid=$$!
+          while kill -0 "$$pid" 2>/dev/null && [ "$$(sha256sum "$$cfg" 2>/dev/null)" = "$$sum" ]; do sleep 5; done
+          kill -TERM "$$pid" 2>/dev/null
+          wait "$$pid"
+          pid=""
+          sleep 1
+        done
+    ports:
+      - "${HP_NTFY_BIND:-127.0.0.1}:${HP_NTFY_PORT:-2586}:80"
+    volumes:
+      - type: volume
+        source: hp-data
+        target: /var/lib/ntfy
+        volume:
+          subpath: ntfy
+    depends_on:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/v1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     networks:
       - homepilot
 

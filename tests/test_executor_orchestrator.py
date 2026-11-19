@@ -221,6 +221,7 @@ class TestFullLifecycleHostProvision:
         # (#426); a bare AsyncMock returns a MagicMock, which does not unpack.
         mock_agent.exec_readonly = AsyncMock(return_value=(1, "", ""))
         mock_agent.read_file = AsyncMock(side_effect=FileNotFoundError("absent"))
+        mock_agent.snapshot_file = AsyncMock(side_effect=FileNotFoundError("absent"))
         mock_proxmox = AsyncMock()
         mock_proxmox.snapshot = AsyncMock(return_value={"data": "snap1"})
         mock_repo = AsyncMock()
@@ -985,7 +986,7 @@ Set the description on the VM
 steps:
   - id: describe
     method: POST
-    path: /nodes/elizabeth/qemu/9001/config
+    path: /nodes/pve-gw/qemu/9001/config
     body:
       description: hp
     on_error: halt
@@ -1002,7 +1003,7 @@ Set the description on the container
 steps:
   - id: describe
     method: POST
-    path: /nodes/elizabeth/lxc/9002/config
+    path: /nodes/pve-gw/lxc/9002/config
     body:
       description: hp
     on_error: halt
@@ -1047,9 +1048,7 @@ class _RecordingPVE:
             # named "snap" and never finish.
             return httpx.Response(
                 200,
-                json={
-                    "data": "UPID:elizabeth:0000FFFF:0000AAAA:66000000:qmsnapshot:9001:root@pam:"
-                },
+                json={"data": "UPID:pve-gw:0000FFFF:0000AAAA:66000000:qmsnapshot:9001:root@pam:"},
             )
         if "/tasks/" in path and path.endswith("/status"):
             return httpx.Response(200, json={"data": {"status": "stopped", "exitstatus": "OK"}})
@@ -1058,8 +1057,8 @@ class _RecordingPVE:
                 200,
                 json={
                     "data": [
-                        {"vmid": 9001, "type": "qemu", "node": "elizabeth"},
-                        {"vmid": 9002, "type": "lxc", "node": "elizabeth"},
+                        {"vmid": 9001, "type": "qemu", "node": "pve-gw"},
+                        {"vmid": 9002, "type": "lxc", "node": "pve-gw"},
                     ]
                 },
             )
@@ -1104,7 +1103,7 @@ class TestSnapshotHitsTheGuestsOwnCollection:
             proxmox=_client_over(pve),
             agent=AsyncMock(),
             vault=AsyncMock(),
-            pve_nodes=["elizabeth"],
+            pve_nodes=["pve-gw"],
         )
         spec = _make_spec(kind="proxmox-api-sequence", body=body, target=target)
         aid = await lifecycle.propose(spec)
@@ -1116,12 +1115,12 @@ class TestSnapshotHitsTheGuestsOwnCollection:
         result = await self._apply(
             tmp_artifacts_dir,
             pve,
-            {"kind": "vm", "vmid": 9001, "node": "elizabeth", "host": "web1"},
+            {"kind": "vm", "vmid": 9001, "node": "pve-gw", "host": "web1"},
             QEMU_GUEST_SPEC_BODY,
         )
 
         assert result.success
-        assert pve.snapshot_paths == ["/api2/json/nodes/elizabeth/qemu/9001/snapshot"]
+        assert pve.snapshot_paths == ["/api2/json/nodes/pve-gw/qemu/9001/snapshot"]
         assert not any("/lxc/" in p for p in pve.snapshot_paths)
 
     async def test_lxc_target_snapshots_the_lxc_collection(self, tmp_artifacts_dir):
@@ -1129,12 +1128,12 @@ class TestSnapshotHitsTheGuestsOwnCollection:
         result = await self._apply(
             tmp_artifacts_dir,
             pve,
-            {"kind": "lxc", "vmid": 9002, "node": "elizabeth", "host": "ct1"},
+            {"kind": "lxc", "vmid": 9002, "node": "pve-gw", "host": "ct1"},
             LXC_GUEST_SPEC_BODY,
         )
 
         assert result.success
-        assert pve.snapshot_paths == ["/api2/json/nodes/elizabeth/lxc/9002/snapshot"]
+        assert pve.snapshot_paths == ["/api2/json/nodes/pve-gw/lxc/9002/snapshot"]
         assert not any("/qemu/" in p for p in pve.snapshot_paths)
 
     async def test_snapshot_401_names_the_path_the_status_and_the_token(self, tmp_artifacts_dir):
@@ -1144,13 +1143,13 @@ class TestSnapshotHitsTheGuestsOwnCollection:
         result = await self._apply(
             tmp_artifacts_dir,
             pve,
-            {"kind": "vm", "vmid": 9001, "node": "elizabeth", "host": "web1"},
+            {"kind": "vm", "vmid": 9001, "node": "pve-gw", "host": "web1"},
             QEMU_GUEST_SPEC_BODY,
         )
 
         assert not result.success
         reason = result.failure_reason or ""
-        assert "nodes/elizabeth/qemu/9001/snapshot" in reason
+        assert "nodes/pve-gw/qemu/9001/snapshot" in reason
         assert "401" in reason
         assert "write token" in reason
         # And the apply stopped: no config write reached the guest.

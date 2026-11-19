@@ -17,6 +17,7 @@ import MonitoringIndex from './monitoring/+page.svelte';
 import MonitoringLayout from './monitoring/+layout.svelte';
 import MonitoringAlertsPage from './monitoring/alerts/+page.svelte';
 import MonitoringRulesPage from './monitoring/rules/+page.svelte';
+import MonitoringChannelsPage from './monitoring/channels/+page.svelte';
 import GuestsPage from './guests/+page.svelte';
 import ChangesPage from './changes/+page.svelte';
 import AssistantsPage from './assistants/+page.svelte';
@@ -107,13 +108,23 @@ describe('every nav entry reaches a rendered page', () => {
 describe('the moved panels render on their new pages', () => {
 	beforeEach(() => vi.clearAllMocks());
 
-	it('Monitoring > Rules has the rules, the channels and the webhooks', async () => {
+	it('Monitoring > Rules has the rules and points at Channels', async () => {
 		setPage('/ui/monitoring/rules');
 		render(MonitoringRulesPage);
-		for (const name of ['Alert rules', 'Notification channels', 'Webhooks']) {
+		expect(screen.getByRole('heading', { name: 'Alert rules' })).toBeInTheDocument();
+		expect(screen.getByRole('link', { name: 'Channels' })).toHaveAttribute(
+			'href',
+			'/ui/monitoring/channels',
+		);
+		await waitFor(() => expect(api.listAlertRules).toHaveBeenCalled());
+	});
+
+	it('Monitoring > Channels has the phone setup, the channels and the webhooks (#822)', async () => {
+		setPage('/ui/monitoring/channels');
+		render(MonitoringChannelsPage);
+		for (const name of ['Get alerts on your phone', 'Notification channels', 'Webhooks']) {
 			expect(screen.getByRole('heading', { name })).toBeInTheDocument();
 		}
-		await waitFor(() => expect(api.listAlertRules).toHaveBeenCalled());
 		await waitFor(() => expect(api.listNotificationChannels).toHaveBeenCalled());
 		await waitFor(() => expect(api.listWebhooks).toHaveBeenCalled());
 	});

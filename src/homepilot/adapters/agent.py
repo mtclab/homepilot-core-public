@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any
+from typing import Any, Final
 
 from homepilot.adapters.readonly_policy import readonly_command_refusal
 
@@ -37,6 +37,17 @@ def is_pve_node(host: str, pve_nodes: list[str]) -> bool:
 
 class ReadOnlyCommandError(AgentAdapterError):
     pass
+
+
+class AgentTooOldError(AgentAdapterError):
+    """The connected agent predates an action it was asked for."""
+
+
+#: The agent action (and system-info capability) of the host description (#818).
+DESCRIBE_CAPABILITY: Final = "describe_host"
+#: The agent action (and capability) that returns the exact bytes write_config is
+#: about to replace, for a rollback snapshot (#853).
+SNAPSHOT_CAPABILITY: Final = "snapshot_file"
 
 
 class AgentAdapter:
@@ -161,6 +172,79 @@ class AgentAdapter:
         return await self._provision(
             host, "write_config", {"path": path, "content": content, "mode": mode}
         )
+
+    async def snapshot_file(self, host: str, path: str) -> str:
+        """The exact bytes at ``path`` on ``host``, for a rollback snapshot (#853).
+
+        The read tier (``read_file``) redacts a unit file's ``Environment=``
+        values and ``Exec*=`` arguments, so its answer is not something a revoke
+        can write back. This is the write path's own read: a privileged agent
+        answers it for a path ``write_config`` could replace (never a denied
+        credential path, never through a symlink). Only the pre-apply capture
+        calls it; no read-tier tool or route does.
+
+        Raises :class:`AgentTooOldError` when the agent does not advertise the
+        action (an older agent would drop the frame and leave this waiting), and
+        the agent's own refusal (unprivileged, "file not found", denied path)
+        as :class:`~homepilot.agent_hub.server.AgentCommandError`.
+        """
+        self._check_guest_only(host)
+        if not self._hub:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        agent = self._hub.registry.get_by_hostname(host)
+        if agent is None:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        capabilities = (agent.system_info or {}).get("capabilities") or []
+        if SNAPSHOT_CAPABILITY not in capabilities:
+            version = (agent.system_info or {}).get("agent_version") or "unknown"
+            raise AgentTooOldError(
+                f"the agent on {host} (version {version}) cannot snapshot a file "
+                "for rollback: upgrade it"
+            )
+        try:
+            result = await self._hub.send_action(
+                agent.agent_id, SNAPSHOT_CAPABILITY, {"path": path}
+            )
+        except (TimeoutError, ConnectionError) as exc:
+            raise AgentAdapterError(f"agent snapshot_file failed for {host}: {exc}") from exc
+        content = result.get("content")
+        if not isinstance(content, str):
+            raise AgentAdapterError(f"the agent on {host} answered without the file's content")
+        return content
+
+    async def describe_host(self, host: str, timeout: int = 60) -> dict[str, Any]:
+        """The agent's host description (#818): how the machine is built.
+
+        Read-only on the host: the agent runs only its fixed collectors and
+        takes no parameters from this frame. An agent that does not advertise
+        ``describe_host`` in its system info is refused here with the reason -
+        an older agent would silently drop the frame and leave the caller
+        waiting out the timeout.
+        """
+        self._check_guest_only(host)
+        if not self._hub:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        agent = self._hub.registry.get_by_hostname(host)
+        if agent is None:
+            raise AgentAdapterError(f"no agent connected for {host}")
+        capabilities = (agent.system_info or {}).get("capabilities") or []
+        if DESCRIBE_CAPABILITY not in capabilities:
+            version = (agent.system_info or {}).get("agent_version") or "unknown"
+            raise AgentTooOldError(
+                f"the agent on {host} (version {version}) cannot describe its host: "
+                "upgrade it to report how the host is built"
+            )
+        # A TimeoutError propagates as itself: "did not answer" is its own answer.
+        try:
+            result = await self._hub.send_action(
+                agent.agent_id, DESCRIBE_CAPABILITY, {}, timeout=timeout
+            )
+        except ConnectionError as exc:
+            raise AgentAdapterError(f"agent describe_host failed for {host}: {exc}") from exc
+        description = result.get("description")
+        if not isinstance(description, dict):
+            raise AgentAdapterError(f"the agent on {host} answered without a description")
+        return description
 
     async def exec_readonly(self, host: str, command: str) -> tuple[int, str, str]:
         refusal = readonly_command_refusal(command)

@@ -65,6 +65,9 @@
 			{#if partial.steps_not_run.length}
 				<li>Not run: {partial.steps_not_run.join(', ')}</li>
 			{/if}
+			{#if partial.remedy}
+				<li data-testid="partial-remedy">What you can do: {partial.remedy}</li>
+			{/if}
 		</ul>
 	{/if}
 

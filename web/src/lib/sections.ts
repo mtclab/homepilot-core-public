@@ -8,6 +8,8 @@ import type { RouteTabDef } from './tabs';
 export const MONITORING_TABS: RouteTabDef[] = [
 	{ id: 'alerts', label: 'Alerts', href: '/monitoring/alerts' },
 	{ id: 'rules', label: 'Rules', href: '/monitoring/rules' },
+	// Who hears an alert: phone alerts, channels and webhooks (#822).
+	{ id: 'channels', label: 'Channels', href: '/monitoring/channels' },
 ];
 
 /**

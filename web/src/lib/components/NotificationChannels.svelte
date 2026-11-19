@@ -101,7 +101,7 @@
 	<p class="prose-note prose-measure text-xs">
 		Firing and resolved alerts are pushed to every enabled channel. For ntfy, paste
 		the topic URL you subscribed to in the ntfy app, e.g.
-		<span class="font-mono">https://ntfy.example.com/CHANGE_ME_matrix_room_alias</span>, and
+		<span class="font-mono">https://ntfy.example.com/hp-alerts</span>, and
 		an access token if the topic is protected. The URL is stored in the vault and
 		listed by host only - anyone holding it can read the topic. Messages carry host
 		and rule names, so a public ntfy server sees them; a server on your own network

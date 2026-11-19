@@ -45,7 +45,7 @@ function card(): HTMLElement {
 
 const DESIRED = {
 	zone: 'guest',
-	vnet: 'innkeep',
+	vnet: 'guestnet',
 	subnet_cidr: '198.51.100.0/24',
 	gateway: '198.51.100.1',
 	snat: true,
@@ -59,14 +59,14 @@ const SURVEY = {
 	zones: [],
 	vnets: [],
 	subnets: [],
-	node: 'elizabeth',
+	node: 'pve-gw',
 	firewall_stack: 'legacy',
 	pending: [],
 	errors: [],
 };
 
 const LEGACY_NOTE =
-	'Node elizabeth runs the LEGACY iptables firewall, which stores vnet firewall rules ' +
+	'Node pve-gw runs the LEGACY iptables firewall, which stores vnet firewall rules ' +
 	'but does not enforce them on vnet forward traffic. The fence that holds today is the ' +
 	'per-VM rule set HomePilot writes at provision time.';
 
@@ -142,7 +142,7 @@ describe('the Guest network card', () => {
 				blockers: [],
 				steps: [
 					{ id: 'create-zone', description: 'create SDN zone guest', op: 'create_zone', params: {} },
-					{ id: 'create-vnet', description: 'create vnet innkeep in zone guest', op: 'create_vnet', params: {} },
+					{ id: 'create-vnet', description: 'create vnet guestnet in zone guest', op: 'create_vnet', params: {} },
 					{ id: 'apply-sdn', description: 'apply the pending SDN configuration', op: 'apply_sdn', params: {} },
 				],
 			},
@@ -171,7 +171,7 @@ describe('the Guest network card', () => {
 			survey: { ...SURVEY, firewall_stack: 'nftables' },
 			plan: { converged: true, blockers: [], steps: [] },
 			detail: 'The cluster matches the desired guest network.',
-			enforcement: 'Node elizabeth runs the nftables proxmox-firewall, so the vnet forward rules are enforced.',
+			enforcement: 'Node pve-gw runs the nftables proxmox-firewall, so the vnet forward rules are enforced.',
 		});
 		render(SettingsPage);
 		const state = await waitFor(() => {

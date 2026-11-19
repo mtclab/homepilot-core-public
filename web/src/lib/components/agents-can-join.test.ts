@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/svelte';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -201,6 +201,66 @@ describe('JoinRequests: a refused agent is seen and can be let in', () => {
 		await waitFor(() => expect(installAgent).toHaveBeenCalledWith('host-42'));
 		await waitFor(() => expect(getTask).toHaveBeenCalledWith('t-1'));
 		expect(openEnrolmentWindow).not.toHaveBeenCalled();
+	});
+
+	// #789: a refused host HomePilot cannot reinstall into - bare metal, a
+	// container, a guest with no qemu-guest-agent - is re-enrolled from its own
+	// line: a single-use token and the server's one-liner for it, no window.
+	// Teeth: drop the Re-enrol branch from JoinRequests.svelte and this fails;
+	// render a command of its own instead of InstallOneLiner and the verbatim
+	// assertion fails.
+	it('offers Re-enrol on a refused host it cannot reinstall into, with the server one-liner', async () => {
+		const lost = {
+			...KNOCKING,
+			hostname: 'nas-01',
+			peer: '192.0.2.31',
+			reason_code: 'host_holds_credential',
+			wants_to_join: false,
+			reason: 'shared-token enrolment refused: host nas-01 already holds a live per-agent credential',
+			install_host_id: null,
+		};
+		const guest = { ...lost, hostname: 'old-guest', peer: '192.0.2.32', install_host_id: 'host-42' };
+		getEnrolmentRequests.mockResolvedValue({
+			attempts: [lost, guest],
+			pending_tokens: [],
+			window: CLOSED,
+			summary: { ...EMPTY_SUMMARY, refused: 2 },
+		});
+		getBootstrapToken.mockResolvedValue(BOOTSTRAP);
+		render(JoinRequests, { props: { canWrite: true } });
+
+		const rows = await screen.findAllByTestId('refused-host');
+		const nas = rows.find((r) => r.textContent?.includes('nas-01')) as HTMLElement;
+		const qemu = rows.find((r) => r.textContent?.includes('old-guest')) as HTMLElement;
+		// The QEMU guest keeps its Install again; only the other line offers Re-enrol.
+		expect(within(qemu).queryByRole('button', { name: 'Re-enrol' })).toBeNull();
+		expect(within(qemu).getByRole('button', { name: 'Install again' })).toBeTruthy();
+
+		await fireEvent.click(within(nas).getByRole('button', { name: 'Re-enrol' }));
+		await waitFor(() => expect(getBootstrapToken).toHaveBeenCalledTimes(1));
+		// Minted FOR this host: the pending list says whose it is.
+		expect(getBootstrapToken).toHaveBeenCalledWith('nas-01');
+		const cmd = await within(nas).findByTestId('install-command');
+		expect(cmd.textContent?.trim()).toBe(FROM_HERE);
+		expect(within(nas).getByTestId('re-enrol').textContent).toMatch(/Run this on nas-01 as root/);
+		expect(within(nas).queryByRole('button', { name: 'Re-enrol' })).toBeNull();
+		// Nothing else was done on the operator's behalf: no window, no install.
+		expect(openEnrolmentWindow).not.toHaveBeenCalled();
+		expect(installAgent).not.toHaveBeenCalled();
+		// The panel re-read, so the new token is listed as pending.
+		expect(getEnrolmentRequests.mock.calls.length).toBeGreaterThanOrEqual(2);
+	});
+
+	it('offers a reader no Re-enrol', async () => {
+		getEnrolmentRequests.mockResolvedValue({
+			attempts: [{ ...KNOCKING, hostname: 'nas-01', wants_to_join: false, reason_code: 'host_holds_credential' }],
+			pending_tokens: [],
+			window: CLOSED,
+			summary: { ...EMPTY_SUMMARY, refused: 1 },
+		});
+		render(JoinRequests, { props: { canWrite: false } });
+		await screen.findByTestId('refused-host');
+		expect(screen.queryByRole('button', { name: 'Re-enrol' })).toBeNull();
 	});
 
 	it('offers a reader no Install again', async () => {

@@ -19,6 +19,12 @@
 #   * the admin secret is random per run, and the update check is off (no
 #     call to the release API from a gate run).
 #
+# Nothing else is set that the workflow does not set. 3.14.0's gate also set
+# HP_NTFY_INTERNAL_URL, the workflow does not, and a phone-alert test that
+# needed it passed here and failed only in the mirror. A test that needs a
+# setting the workflow's server lacks starts its own server (the e2e fleet
+# server in tests/test_e2e.py); tests/test_gate_runs_the_e2e.py holds the list.
+#
 # Usage: scripts/gate-e2e.sh <venv-bin-dir>      (make gate-e2e passes $(VENV))
 set -euo pipefail
 

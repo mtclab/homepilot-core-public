@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Any
 
+from homepilot.artifacts.policy_rules import policy_warnings
 from homepilot.runtime.blocking import run_blocking
 
 _APPROVE_RATELIMIT_MAX = 10
@@ -21,9 +22,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "query_artifacts",
         "description": (
-            "Find prior artifacts by status, kind, host, or date. "
+            "Find prior artifacts by status, kind, host, or tag. "
             'Pass a JSON filter object (e.g. {"status": "applied", "kind": "ansible-playbook"}) '
-            "or None for all."
+            "or None for all. "
+            '{"tag": "pattern"} lists the changes marked as worth imitating: the library '
+            "is the store plus the `tags` convention - read one with get_artifact (its "
+            "body and its execution log) and propose your own with the same shape and "
+            '`"tags": ["pattern"]` when it is a good one.'
         ),
         "inputSchema": {
             "type": "object",
@@ -69,7 +74,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "subnet, vnet firewall) from a ```yaml guest-network-spec``` block "
                         "whose omitted fields come from this instance's guest_network_* "
                         "settings; it is the ONLY way to change the guest network, and "
-                        "query_guest_network shows the plan it would run."
+                        "query_guest_network shows the plan it would run. "
+                        "guest-disk adds a disk to a running VM and takes it into use; "
+                        "propose it with add_guest_disk, which fills the spec and refuses "
+                        "at once what the apply would refuse."
                     ),
                 },
             },
@@ -124,7 +132,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Approve a proposed artifact so the executor can apply it. Requires a "
             "human decision: the operator reads the artifact's approval_code from "
-            "the web review screen, `hp artifacts show`, or a proposal "
+            "the web review screen, `hp changes show`, or a proposal "
             "notification, and relays it to you. You cannot approve without it - "
             "the code is never shown over this transport, so a valid code proves a "
             "human approved. Five wrong codes lock approval until an operator "
@@ -143,6 +151,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": (
                         "The per-artifact approval code a human relayed to you. "
                         "Grouping and case do not matter."
+                    ),
+                },
+                "acknowledge_policy": {
+                    "type": "boolean",
+                    "description": (
+                        "Approve over the structured policy rules the change matches "
+                        "(get_artifact's policy_warnings). Only when the human who "
+                        "relayed the code has seen the warnings and said to go ahead; "
+                        "without it a matching change is refused with the matches."
                     ),
                 },
             },
@@ -313,12 +330,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "plan_artifact",
         "description": (
-            "What applying this host-provision artifact would actually change on the "
-            "host: the per-item before/after, a change count, whether the host already "
-            "matches, and the policies you recorded for it. A READ-ONLY probe over the "
-            "agent - it changes nothing on the host and is read-scoped, so a read-only "
-            "MCP token may call it. Only host-provision artifacts have a plan engine; "
-            "other kinds are refused rather than answered with an empty plan."
+            "What applying this host-provision or guest-disk artifact would actually "
+            "change: the per-item before/after, a change count, whether the target already "
+            "matches, and the policies you recorded for it. For a guest-disk change it "
+            "also gives `disk`: the slot it would take (from the guest's current config), "
+            "the serial, the fstab line, the in-guest steps and anything that would refuse "
+            "it now. A READ-ONLY probe - it changes nothing and is read-scoped, so a "
+            "read-only MCP token may call it. Other kinds are refused rather than answered "
+            "with an empty plan."
         ),
         "inputSchema": {
             "type": "object",
@@ -335,6 +354,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "items": {"type": "array", "items": {"type": "object"}},
                 "change_count": {"type": "integer"},
                 "in_spec": {"type": "boolean"},
+                "disk": {"type": "object"},
             },
         },
     },
@@ -537,7 +557,8 @@ async def handle_query_artifacts(arguments: dict[str, Any], ctx: dict[str, Any])
     status = filter_obj.get("status") if filter_obj else None
     kind = filter_obj.get("kind") if filter_obj else None
     target_filter = filter_obj.get("target") if filter_obj else None
-    results = await run_blocking("io", ctx["store"].list, status=status, kind=kind)
+    tag = filter_obj.get("tag") if filter_obj else None
+    results = await run_blocking("io", ctx["store"].list, status=status, kind=kind, tag=tag)
     if target_filter:
         filtered = []
         for r in results:
@@ -557,6 +578,7 @@ async def handle_query_artifacts(arguments: dict[str, Any], ctx: dict[str, Any])
             "status": r.get("status", ""),
             "intent": r.get("intent", ""),
             "created_at": r.get("created_at", ""),
+            "tags": r.get("tags") or [],
         }
         for r in results
     ]
@@ -592,7 +614,7 @@ async def handle_propose_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     msg = (
         f"Artifact {artifact_id} created with status: "
         f"{fm.get('status', 'unknown')}. "
-        f"Review with: hp artifacts show {artifact_id}"
+        f"Review with: hp changes show {artifact_id}"
     )
     return {
         "id": artifact_id,
@@ -652,6 +674,7 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
     weak code cannot be brute-forced over MCP. The refusal never reveals the
     code."""
     from homepilot.artifacts.models import ApprovalRefusedError
+    from homepilot.artifacts.policy_rules import PolicyAcknowledgementRequiredError
     from homepilot.auth.principal import Principal
 
     caller_id = ctx.get("_mcp_caller_id", "mcp-stdio")
@@ -666,7 +689,7 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
         raise ValueError(
             "approve_artifact requires an approval_code a human relays to you — "
             "the assistant cannot approve its own proposal. Ask the operator to "
-            "read the code from the review screen or `hp artifacts show`."
+            "read the code from the review screen or `hp changes show`."
         )
 
     if ctx.get("repo") is None:
@@ -683,8 +706,9 @@ async def handle_approve_artifact(arguments: dict[str, Any], ctx: dict[str, Any]
             Principal.assistant(str(caller_id)),
             "Approved via MCP approval code",
             approval_code=str(approval_code),
+            acknowledge_policy=arguments.get("acknowledge_policy") is True,
         )
-    except ApprovalRefusedError as exc:
+    except (ApprovalRefusedError, PolicyAcknowledgementRequiredError) as exc:
         raise ValueError(str(exc)) from None
     fm, _ = await run_blocking("io", ctx["store"].read, artifact_id)
     logger.info("MCP approve_artifact: %s approved via operator code", artifact_id)
@@ -747,6 +771,13 @@ async def handle_get_artifact(arguments: dict[str, Any], ctx: dict[str, Any]) ->
         "summary": summarize(fm, full_body),
         "body": body,
         "truncated": truncated,
+        # The structured policy rules a proposed change matches (#506) - what
+        # approving it needs acknowledged. The same answer GET /artifacts/{id} gives.
+        "policy_warnings": (
+            await policy_warnings(artifact_id, ctx["store"], ctx.get("kb_service"))
+            if fm.get("status") == "proposed"
+            else []
+        ),
     }
 
 
@@ -864,6 +895,7 @@ async def handle_plan_artifact(arguments: dict[str, Any], ctx: dict[str, Any]) -
             store=ctx["store"],
             agent=agent,
             kb_service=ctx.get("kb_service"),
+            proxmox=getattr(executor, "proxmox", None) or ctx.get("proxmox"),
         )
     except ArtifactActionError as exc:
         raise ValueError(exc.detail) from exc

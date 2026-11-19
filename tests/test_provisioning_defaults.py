@@ -882,13 +882,28 @@ class TestTheBridgeProbeSeesSdnVnets:
         class Px:
             async def read(self, path, query=None):
                 seen.append((path, query))
-                return {"data": [{"iface": "innkeep", "type": "any_bridge"}]}
+                return {"data": [{"iface": "guestnet", "type": "any_bridge"}]}
 
-        ctx = ProbeContext(proxmox=Px(), node="elizabeth")
+        ctx = ProbeContext(proxmox=Px(), node="pve-gw")
         entries, failure = await _network_entries(ctx)
         assert failure is None
         assert seen and seen[0][1] == {"type": "any_bridge"}
-        assert entries and entries[0]["iface"] == "innkeep"
+        assert entries and entries[0]["iface"] == "guestnet"
+
+
+class _NodeOnly:
+    """A cluster that answers the node network listing and refuses any SDN path."""
+
+    async def read(self, path, query=None):
+        assert path.startswith("/nodes/"), f"SDN read hand-rolled past pve_sdn: {path}"
+        return {"data": [{"iface": "vmbr0", "type": "bridge"}]}
+
+
+class _Sdn:
+    """pve_sdn's gateway, faked at its boundary (it hands back rows, unwrapped)."""
+
+    async def list_vnets(self):
+        return [{"vnet": "guestnet", "zone": "guest"}]
 
 
 class TestTheBridgeProbeAcceptsSdnVnets:
@@ -898,29 +913,39 @@ class TestTheBridgeProbeAcceptsSdnVnets:
         default points at. The probe asks the SDN too (live catch #5)."""
         from homepilot.provision.probes import ProbeContext, probe_bridge
 
-        class Px:
-            async def read(self, path, query=None):
-                if path.startswith("/nodes/"):
-                    return {"data": [{"iface": "vmbr0", "type": "bridge"}]}
-                assert path == "/cluster/sdn/vnets"
-                return {"data": [{"vnet": "innkeep", "zone": "guest"}]}
-
-        result = await probe_bridge("innkeep", ProbeContext(proxmox=Px(), node="elizabeth"))
+        result = await probe_bridge(
+            "guestnet", ProbeContext(proxmox=_NodeOnly(), node="pve1", sdn=_Sdn())
+        )
         assert result.ok, result.detail
         assert "SDN vnet" in result.detail
+
+    async def test_the_vnets_come_through_pve_sdn_not_a_hand_rolled_path(self, monkeypatch) -> None:
+        """#717: pve_sdn is the one place naming an SDN endpoint. With no gateway
+        handed in, the probe builds pve_sdn's own for its ProxmoxClient - and the
+        client is never asked for an SDN path (``_NodeOnly`` refuses one)."""
+        from homepilot.adapters import pve_sdn
+        from homepilot.provision.probes import ProbeContext, probe_bridge
+
+        built: list[object] = []
+
+        def gateway_from(proxmox: object) -> _Sdn:
+            built.append(proxmox)
+            return _Sdn()
+
+        monkeypatch.setattr(pve_sdn, "gateway_from", gateway_from)
+        px = _NodeOnly()
+        result = await probe_bridge("guestnet", ProbeContext(proxmox=px, node="pve1"))
+        assert result.ok, result.detail
+        assert built == [px]
 
     async def test_a_missing_bridge_names_the_vnets_too(self) -> None:
         from homepilot.provision.probes import ProbeContext, probe_bridge
 
-        class Px:
-            async def read(self, path, query=None):
-                if path.startswith("/nodes/"):
-                    return {"data": [{"iface": "vmbr0", "type": "bridge"}]}
-                return {"data": [{"vnet": "innkeep", "zone": "guest"}]}
-
-        result = await probe_bridge("vmbr9", ProbeContext(proxmox=Px(), node="elizabeth"))
+        result = await probe_bridge(
+            "vmbr9", ProbeContext(proxmox=_NodeOnly(), node="pve1", sdn=_Sdn())
+        )
         assert result.ok is False
-        assert "SDN vnets: innkeep" in result.detail
+        assert "SDN vnets: guestnet" in result.detail
 
 
 # ── Target storage for the clone (#618) ──────────────────────────────────────

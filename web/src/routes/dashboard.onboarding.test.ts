@@ -97,3 +97,44 @@ describe('Dashboard: getting started', () => {
 		expect(screen.queryByText(/getting started/i)).not.toBeInTheDocument();
 	});
 });
+
+describe('Dashboard: an optional step (#822)', () => {
+	beforeEach(() => vi.clearAllMocks());
+
+	function withPhone(done: string[], complete = false) {
+		const s = summary(done, complete);
+		s.onboarding.steps.splice(3, 0, {
+			key: 'phone',
+			title: 'Get alerts on your phone',
+			detail: 'Optional…',
+			href: '/monitoring/channels',
+			done: done.includes('phone'),
+			optional: true,
+		} as never);
+		return s;
+	}
+
+	it('offers it, marked optional, without making it the next thing to do', async () => {
+		getDashboard.mockResolvedValue(withPhone(['inventory', 'adopt', 'agent']));
+
+		render(Overview);
+
+		expect(await screen.findByText(/get alerts on your phone/i)).toBeInTheDocument();
+		expect(screen.getByText('(optional)')).toBeInTheDocument();
+		const next = screen.getAllByRole('link', { name: /do this next/i });
+		expect(next).toHaveLength(1);
+		expect(next[0]).toHaveAttribute('href', expect.stringContaining('/artifacts'));
+		expect(screen.getByRole('link', { name: /set it up/i })).toHaveAttribute(
+			'href',
+			expect.stringContaining('/monitoring/channels'),
+		);
+	});
+
+	it('does not count it in "N of M done"', async () => {
+		getDashboard.mockResolvedValue(withPhone(['inventory', 'adopt']));
+
+		render(Overview);
+
+		expect(await screen.findByText(/2 of 4 done/i)).toBeInTheDocument();
+	});
+});

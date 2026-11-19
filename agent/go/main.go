@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"errors"
@@ -643,6 +644,10 @@ var workerActions = map[string]func(a *Agent, m msg, reqID string, gen uint64){
 	"install_package": (*Agent).handleInstallPackage,
 	"manage_service":  (*Agent).handleManageService,
 	"write_config":    (*Agent).handleWriteConfig,
+	// #818: the read-only host description. Takes no parameters from the hub.
+	"describe_host": (*Agent).handleDescribeHost,
+	// #853: the bytes write_config is about to replace, for a rollback.
+	"snapshot_file": (*Agent).handleSnapshotFile,
 }
 
 // dispatch runs work in the pool, or refuses it at once when every worker is
@@ -686,6 +691,28 @@ func (a *Agent) handleReadFile(m msg, reqID string, gen uint64) {
 	}
 	a.sendResult(gen, msg{"action": "command_result", "for_action": "read_file",
 		"content": content, "request_id": reqID}, "read_file", reqID)
+}
+
+// handleSnapshotFile answers with the exact bytes of a file write_config may
+// replace, on a privileged agent only (snapshot.go).
+func (a *Agent) handleSnapshotFile(m msg, reqID string, gen uint64) {
+	content, err := snapshotFile(a.exec.allow.privileged, str(m, "path"))
+	if err != nil {
+		_ = a.sendOn(gen, msg{"action": "command_result", "for_action": "snapshot_file",
+			"error": err.Error(), "request_id": reqID})
+		return
+	}
+	a.sendResult(gen, msg{"action": "command_result", "for_action": "snapshot_file",
+		"content": content, "request_id": reqID}, "snapshot_file", reqID)
+}
+
+// handleDescribeHost answers with the host description (describe.go). It runs
+// only fixed, read-only collectors and takes nothing from the frame but its
+// request id, so the hub cannot steer what it reads.
+func (a *Agent) handleDescribeHost(m msg, reqID string, gen uint64) {
+	doc := describeHost(context.Background(), defaultDescribeEnv(a.cfg.Privileged))
+	a.sendResult(gen, msg{"action": "command_result", "for_action": "describe_host",
+		"description": doc, "request_id": reqID}, "describe_host", reqID)
 }
 
 func (a *Agent) handleWriteFile(m msg, reqID string, gen uint64) {

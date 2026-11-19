@@ -540,12 +540,123 @@ async def test_operator_actions_follow_the_changelog_conventions() -> None:
     actions = releases.operator_actions(body)
     assert actions == [
         "Operator action, `agents` profile only: before upgrading, set both values.",
-        "Back up first. - and keep the key",
+        # A list item in an instruction section is its own action (3.14).
+        "Back up first.",
+        "and keep the key",
         "Operator action - check every install whose `.env` came from an older "
         "template. Run the grep.",
     ]
     assert releases.operator_actions(None) == []
     assert releases.operator_actions("Just notes.\n\n## Docker\n") == []
+
+
+# ── The real CHANGELOG (3.14 release check) ──────────────────────────────────
+# The notice is built from the release notes, which are docs/CHANGELOG.md's
+# section for the release. Asserted on the real file, not a fixture: the 3.14
+# section had five bullets and the notice carried ONE item cut at 500
+# characters (the compose and n8n steps lost), plus two feature headings that
+# contain "Upgrade" ("Upgrade agent keeps the host's grant (#841)") lifted as
+# "operator actions".
+
+_CHANGELOG = Path(__file__).resolve().parents[1] / "docs" / "CHANGELOG.md"
+
+
+def _changelog_section(version: str) -> str:
+    """The body of `## <version>...` in docs/CHANGELOG.md."""
+    text = _CHANGELOG.read_text(encoding="utf-8")
+    parts = text.split("\n## ")
+    for part in parts[1:]:
+        title, _, body = part.partition("\n")
+        if title.startswith(version):
+            return body
+    raise AssertionError(f"no section {version} in docs/CHANGELOG.md")
+
+
+def _bullets(body: str) -> list[str]:
+    """The `### Operator actions` bullets, whitespace-joined, emphasis off."""
+    section = body.split("### Operator actions", 1)[1].split("\n### ", 1)[0]
+    items = section.strip().removeprefix("- ").split("\n- ")
+    return [" ".join(i.split()).replace("**", "") for i in items]
+
+
+async def test_the_314_notes_yield_each_of_their_operator_actions_whole() -> None:
+    body = (
+        _changelog_section("3.14.0")
+        if "## 3.14.0" in _CHANGELOG.read_text(encoding="utf-8")
+        else _changelog_section("Unreleased")
+    )
+    actions = releases.operator_actions(body)
+    expected = _bullets(body)
+    # Every operator action fits the notice: no more bullets than it shows.
+    assert 1 <= len(expected) <= releases.MAX_ACTIONS, expected
+    assert actions == expected
+    assert all(len(a) <= releases.MAX_ACTION_CHARS and not a.endswith("...") for a in actions)
+    assert any(a.startswith("Compose:") for a in actions)
+    assert any(a.startswith("n8n:") for a in actions)
+    # The feature headings that merely contain "Upgrade" are not instructions.
+    assert not any("keeps the" in a for a in actions)
+
+
+@pytest.mark.parametrize(
+    "version, first_words",
+    [
+        ("3.13.0", []),  # "None."
+        ("3.12.0", ["Migration 42 adds"]),
+        ("3.11.0", ["Changes approved before", "Hosts > Agents: press", "No migration."]),
+        ("3.10.0", ["Migrations 40 and 41", "Copy `proxy_read_timeout", "MCP clients with"]),
+    ],
+)
+async def test_earlier_notes_yield_one_action_per_bullet(version, first_words) -> None:
+    """3.10-3.12 used to come out as ONE item (all bullets joined, 3.10's cut at
+    500 characters); each bullet is its own action now."""
+    actions = releases.operator_actions(_changelog_section(version))
+    assert [a[: len(w)] for a, w in zip(actions, first_words, strict=True)] == first_words
+    assert all(not a.endswith("...") for a in actions)
+
+
+@pytest.mark.parametrize(
+    "heading, counts",
+    [
+        ("Operator actions", True),
+        ("Operator actions (agents profile)", True),
+        ("Upgrade notes", True),
+        ("\u26a0\ufe0f Upgrade notes (read before updating an existing deployment)", True),
+        ("Upgrading", True),
+        ("Before you upgrade", True),
+        ("REQUIRED READING BEFORE UPGRADING", True),
+        ("Upgrade agent keeps the host's grant (#841)", False),
+        ("Upgrade agent keeps the agent's id (#823)", False),
+        ("Operator power controls: start, shut down", False),
+        ("Upgraded dependencies", False),
+    ],
+)
+async def test_only_instruction_headings_count(heading: str, counts: bool) -> None:
+    assert releases.is_action_heading(heading) is counts
+    body = f"### {heading}\n\nDo the thing.\n"
+    assert releases.operator_actions(body) == (["Do the thing."] if counts else [])
+
+
+async def test_a_section_items_are_list_items_and_prose_is_one() -> None:
+    body = (
+        "### Operator actions\n\nRead this first. It is one\nparagraph.\n\n"
+        "Still the same prose.\n\n- one, wrapped\n  onto two lines\n- two\n"
+        "1. three\n"
+    )
+    assert releases.operator_actions(body) == [
+        "Read this first. It is one paragraph. Still the same prose.",
+        "one, wrapped onto two lines",
+        "two",
+        "three",
+    ]
+
+
+async def test_more_actions_than_fit_says_how_many_more() -> None:
+    n = releases.MAX_ACTIONS + 3
+    body = "### Operator actions\n\n" + "".join(f"- step {i}\n" for i in range(n))
+    actions = releases.operator_actions(body)
+    assert len(actions) == releases.MAX_ACTIONS
+    assert actions[:-1] == [f"step {i}" for i in range(releases.MAX_ACTIONS - 1)]
+    assert actions[-1].startswith(f"{n - releases.MAX_ACTIONS + 1} more operator actions")
 
 
 async def test_an_operator_actions_section_that_says_none_is_no_action() -> None:

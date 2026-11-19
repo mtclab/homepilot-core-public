@@ -8,10 +8,16 @@
     "the WHOLE command (Go wraps them in ^(?:...)$, Python uses fullmatch).",
     "read_tier=false keeps a command out of the MCP read tier (exec_on_guest_readonly) while the agent",
     "still accepts it from an admin caller. path_checked=true routes the argument through read_paths,",
-    "exactly like read_file.",
+    "exactly like read_file. hint (optional) is the safe form a refusal of that command names, on both",
+    "layers, so a caller told no is also told what to ask for instead (#817).",
     "read_paths is DEFAULT-DENY: a path must be in allow_exact or under allow_prefixes (or a write prefix),",
     "and must not hit any deny rule. Deny rules always win, including over an operator's",
-    "HP_AGENT_READ_PREFIXES / HP_AGENT_WRITE_PREFIXES."
+    "HP_AGENT_READ_PREFIXES / HP_AGENT_WRITE_PREFIXES.",
+    "#818 widened read_paths to the build-defining config that holds no secrets by convention: the web",
+    "server (/etc/nginx), certbot renewal configs (/etc/letsencrypt/renewal: domains, authenticator, paths;",
+    "keys live in live/ and archive/, which stay unlisted), ufw (/etc/ufw), and update-notifier's pending",
+    "updates. The basename deny now also refuses any *secret*/*token*/*passw*/*credential* file and every",
+    "*.env / .env.* file, wherever it sits."
   ],
   "version": 1,
   "shell_metachars": "|;&`$<>!#(){}[]'\"\\\n\r",
@@ -23,9 +29,10 @@
     "df": {"read_tier": true, "pattern": "df(\\s+-[hHiTkP]+)*(\\s+[a-zA-Z0-9_./-]+)?"},
     "ls": {"read_tier": true, "pattern": "ls(\\s+-[aAlrStZh1d]+)*(\\s+[a-zA-Z0-9_./][a-zA-Z0-9_./-]*)*"},
     "ps": {
-      "_doc": "No BSD 'e' anywhere: 'ps e' / 'ps auxe' print every process's environment. A dashed cluster may start with -e (all processes) and otherwise holds only letters that are valid UNIX options, so procps never falls back to reading it as BSD letters (where 'e' would mean environment).",
+      "_doc": "Read tier: process NAMES only, never command lines or environments (#817). argv carries other services' secrets (tokens passed as --flags), so every form names its columns with ONE -o from a fixed set that holds comm and never args/cmd/command/e; there is no BSD form (aux, ww, e) and no -f/-F. The full forms run only on a privileged agent, for an admin (agent/go/allowlist.go).",
       "read_tier": true,
-      "pattern": "ps(\\s+(-e|-e?[AadfFHjlLNTw]+|[afjlmrSTuvwxH]+|(-e?[AadfFHjlLNTw]*)?[opuUCgG]\\s+[a-zA-Z0-9_,%.:=+][a-zA-Z0-9_,%.:=+-]*|--(forest|no-headers|headers)|--sort=[a-zA-Z0-9_,%+-]+))*"
+      "pattern": "ps(\\s+(-[AeH]+|-[pUuCgG]\\s+[a-zA-Z0-9_][a-zA-Z0-9_,.:+-]*|--(forest|no-headers|headers)|--sort=[a-zA-Z0-9_,%+-]+))*\\s+-[AeH]*o\\s+(pid|ppid|pgid|sid|tid|lwp|nlwp|user|euser|ruser|uid|euid|ruid|group|egroup|rgroup|gid|egid|rgid|comm|ucmd|ucomm|fname|etime|etimes|time|cputime|pcpu|%cpu|pmem|%mem|rss|rssize|vsz|vsize|sz|stat|state|s|ni|nice|pri|psr|lstart|start|stime|start_time|bsdstart|tty|tt|tname|wchan|class|cls|c)(,(pid|ppid|pgid|sid|tid|lwp|nlwp|user|euser|ruser|uid|euid|ruid|group|egroup|rgroup|gid|egid|rgid|comm|ucmd|ucomm|fname|etime|etimes|time|cputime|pcpu|%cpu|pmem|%mem|rss|rssize|vsz|vsize|sz|stat|state|s|ni|nice|pri|psr|lstart|start|stime|start_time|bsdstart|tty|tt|tname|wchan|class|cls|c))*(\\s+(-[AeH]+|-[pUuCgG]\\s+[a-zA-Z0-9_][a-zA-Z0-9_,.:+-]*|--(forest|no-headers|headers)|--sort=[a-zA-Z0-9_,%+-]+))*",
+      "hint": "the read tier shows process names, never command lines (they carry other services' secrets): use ps -eo pid,user,comm,etime,pcpu,pmem (narrow with -p PID, -u USER or -C NAME; order with --sort=-pcpu)"
     },
     "ip": {
       "_doc": "Read verbs only (show/list/get). No set/add/del/flush/change/replace, no -batch, no netns exec.",
@@ -38,14 +45,16 @@
       "pattern": "ss(\\s+-[tuwxlanpresmiHO460Sdob]+)*(\\s+[a-zA-Z0-9_.:/][a-zA-Z0-9_.:/-]*)*"
     },
     "systemctl": {
-      "_doc": "No daemon-reload: it is a state change and stays a privileged-only command.",
+      "_doc": "No daemon-reload: it is a state change and stays a privileged-only command. No status (#817): it prints the unit's processes with their full command lines, and with no unit every process on the host. show takes a unit and a fixed property set (no Exec*/Environment*/Description: a transient unit's description is its command line). status stays on a privileged agent, for an admin.",
       "read_tier": true,
-      "pattern": "systemctl\\s+(status|is-active|is-enabled|is-failed)(\\s+[a-zA-Z0-9_.@-]+)?"
+      "pattern": "systemctl\\s+(is-active|is-enabled|is-failed)(\\s+[a-zA-Z0-9_.@-]+)?|systemctl\\s+show\\s+[a-zA-Z0-9_.@][a-zA-Z0-9_.@-]*\\s+(-p\\s+|--property=)(Id|LoadState|ActiveState|SubState|UnitFileState|UnitFilePreset|MainPID|ExecMainPID|ExecMainStatus|ExecMainCode|ExecMainStartTimestamp|ExecMainExitTimestamp|ActiveEnterTimestamp|ActiveExitTimestamp|InactiveEnterTimestamp|StateChangeTimestamp|NRestarts|Result|MemoryCurrent|CPUUsageNSec|TasksCurrent|FragmentPath|Type|Restart)(,(Id|LoadState|ActiveState|SubState|UnitFileState|UnitFilePreset|MainPID|ExecMainPID|ExecMainStatus|ExecMainCode|ExecMainStartTimestamp|ExecMainExitTimestamp|ActiveEnterTimestamp|ActiveExitTimestamp|InactiveEnterTimestamp|StateChangeTimestamp|NRestarts|Result|MemoryCurrent|CPUUsageNSec|TasksCurrent|FragmentPath|Type|Restart))*(\\s+--value)?",
+      "hint": "systemctl status prints the unit's processes with their full command lines: use systemctl is-active UNIT, systemctl show UNIT -p ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp, or journalctl -u UNIT"
     },
     "journalctl": {
-      "_doc": "Read flags only. No --flush/--rotate/--vacuum-*/--sync/--relinquish-var/--setup-keys/--update-catalog/-D/--file, no -f (never returns). Option values never start with '--', so a value slot cannot smuggle a flag.",
+      "_doc": "Read flags only. No --flush/--rotate/--vacuum-*/--sync/--relinquish-var/--setup-keys/--update-catalog/-D/--file, no -f (never returns). Option values never start with '--', so a value slot cannot smuggle a flag. Output formats are the short family and cat only (#817): json, verbose and export print every entry's _CMDLINE (the logging process's full command line), and there is no -F/--field.",
       "read_tier": true,
-      "pattern": "journalctl(\\s+(-[xeraqkm]+|--(no-pager|utc|no-hostname|reverse|quiet|dmesg|catalog|merge|no-full|full|all|pager-end|list-boots)|-[xeraqkm]*[unpotSUg](\\s*[a-zA-Z0-9_.:@+/][a-zA-Z0-9_.:@+/-]*|\\s+-[0-9][a-zA-Z0-9]*)|--(unit|user-unit|lines|priority|output|identifier|grep|since|until|boot)=[a-zA-Z0-9_.:@+/-]+|-b(-?[0-9]+|\\s+-?[0-9]+|\\s+[a-f0-9]{32})?))*"
+      "hint": "json, verbose and export output carry each process's full command line: use -o short (or short-iso, short-precise, with-unit, cat)",
+      "pattern": "journalctl(\\s+(-[xeraqkm]+|--(no-pager|utc|no-hostname|reverse|quiet|dmesg|catalog|merge|no-full|full|all|pager-end|list-boots)|-[xeraqkm]*[unptSUg](\\s*[a-zA-Z0-9_.:@+/][a-zA-Z0-9_.:@+/-]*|\\s+-[0-9][a-zA-Z0-9]*)|-[xeraqkm]*o\\s*(short|short-full|short-iso|short-iso-precise|short-precise|short-monotonic|short-unix|short-delta|with-unit|cat)|--output=(short|short-full|short-iso|short-iso-precise|short-precise|short-monotonic|short-unix|short-delta|with-unit|cat)|--(unit|user-unit|lines|priority|identifier|grep|since|until|boot)=[a-zA-Z0-9_.:@+/-]+|-b(-?[0-9]+|\\s+-?[0-9]+|\\s+[a-f0-9]{32})?))*"
     },
     "dpkg": {
       "read_tier": true,
@@ -69,7 +78,10 @@
       "/etc/systemd/",
       "/lib/systemd/system/",
       "/usr/lib/systemd/system/",
-      "/etc/apt/sources.list.d/"
+      "/etc/apt/sources.list.d/",
+      "/etc/nginx/",
+      "/etc/letsencrypt/renewal/",
+      "/etc/ufw/"
     ],
     "allow_exact": [
       "/etc/hostname",
@@ -88,7 +100,10 @@
       "/proc/loadavg",
       "/proc/uptime",
       "/proc/version",
-      "/proc/mounts"
+      "/proc/mounts",
+      "/var/lib/update-notifier/updates-available",
+      "/run/reboot-required",
+      "/run/reboot-required.pkgs"
     ],
     "default_write_prefixes": [
       "/etc/homepilot/",
@@ -112,12 +127,13 @@
       "/etc/wireguard/",
       "/etc/credstore/",
       "/etc/credstore.encrypted/",
-      "/opt/homepilot/data/"
+      "/opt/homepilot/data/",
+      "/var/lib/hp-agent/"
     ],
     "deny_path_regex": [
       "/etc/[^/]*shadow[^/]*",
       "/etc/ssh/[^/]*_key",
-      "/proc/[^/]+/(environ|mem|cmdline|auxv|maps)",
+      "/proc/(.+/)?(environ|mem|cmdline|auxv|maps)",
       ".*/\\.(ssh|gnupg|aws|kube|docker|hp|password-store)(/.*)?"
     ],
     "deny_basename_regex": [
@@ -127,7 +143,50 @@
       "\\.env",
       "key\\.json",
       "\\.?(netrc|pgpass|git-credentials)",
-      ".*htpasswd.*"
+      ".*htpasswd.*",
+      "(?i:.*(secret|token|passw|credential).*)",
+      ".*\\.env",
+      "\\.env\\..*"
     ]
+  },
+  "unit_files": {
+    "_doc": [
+      "#853: systemd unit files and drop-ins are readable (read_paths), and they carry other services'",
+      "secrets: Environment=TOKEN=..., SetCredential=, a WireGuard .netdev's PrivateKey=. The AGENT redacts",
+      "them before the content leaves the host, on every read_file and cat, privileged agent or not.",
+      "A file is unit-shaped when its path (as given or resolved) is under dirs, its name matches",
+      "unit_basename_regex, or its directory matches dropin_dir_regex. Its logical lines (a trailing",
+      "backslash continues a line) are rewritten: env_keys keep each variable NAME and lose its value",
+      "(Environment=TOKEN=<redacted>, quoted words keep their quote); credential_keys keep the credential",
+      "ID; secret_keys lose the whole value. Keys match case-insensitively. The control plane mirrors the",
+      "rewrite (adapters/readonly_policy.py) so drift and rollback can tell a redacted read from the bytes;",
+      "the shared corpus pins both to the same output.",
+      "exec_keys keep the program (and its systemd prefix characters -@:+!|) and lose every argument:",
+      "ExecStart=/usr/bin/app <arguments redacted> (args_mark). Arguments carry other services' secrets",
+      "(--token=...), the same class as #817. Rollback does not depend on this read: a privileged agent's",
+      "snapshot_file action returns the bytes write_config is about to replace (agent/go/snapshot.go).",
+      "file_keys and credential_file_keys name files a unit loads secrets FROM (EnvironmentFile=,",
+      "LoadCredential=ID:PATH, PrivateKeyFile=). The agent scans every unit-shaped file under dirs (plus",
+      "HP_AGENT_UNIT_DIRS) and refuses to read any file one of them names, wherever it sits, so an",
+      "environment file is unreadable even when nothing in its name says so. A % specifier in a named",
+      "path matches anything. Agent-only: the control plane cannot see the host's units."
+    ],
+    "dirs": [
+      "/etc/systemd/",
+      "/run/systemd/",
+      "/usr/lib/systemd/",
+      "/lib/systemd/",
+      "/usr/local/lib/systemd/"
+    ],
+    "unit_basename_regex": ".+\\.(service|socket|timer|path|mount|automount|swap|target|slice|scope|netdev|network|link)",
+    "dropin_dir_regex": ".+\\.(service|socket|timer|path|mount|automount|swap|target|slice|scope|netdev|network|link)\\.d",
+    "env_keys": ["Environment", "DefaultEnvironment", "ManagerEnvironment"],
+    "credential_keys": ["SetCredential", "SetCredentialEncrypted"],
+    "secret_keys": ["PrivateKey", "PresharedKey", "Key"],
+    "exec_keys": ["ExecStart", "ExecStartPre", "ExecStartPost", "ExecCondition", "ExecReload", "ExecStop", "ExecStopPre", "ExecStopPost"],
+    "file_keys": ["EnvironmentFile", "PrivateKeyFile", "PresharedKeyFile", "KeyFile"],
+    "credential_file_keys": ["LoadCredential", "LoadCredentialEncrypted"],
+    "mark": "<redacted>",
+    "args_mark": "<arguments redacted>"
   }
 }

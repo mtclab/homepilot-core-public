@@ -60,7 +60,7 @@ AGENT_OK = {
 
 GUEST_NETWORK = DesiredGuestNetwork(
     zone="guest",
-    vnet="innkeep",
+    vnet="guestnet",
     subnet_cidr="198.51.100.0/24",
     gateway="198.51.100.1",
     snat=True,
@@ -117,12 +117,12 @@ async def db(tmp_path):
 def proxmox() -> AsyncMock:
     px = AsyncMock(spec=ProxmoxClient)
     px.next_vmid = AsyncMock(return_value=104)
-    px.clone_vm = AsyncMock(return_value="UPID:elizabeth:clone:")
+    px.clone_vm = AsyncMock(return_value="UPID:pve-gw:clone:")
     px.wait_for_task = AsyncMock(return_value={"status": "stopped", "exitstatus": "OK"})
     px.set_vm_config = AsyncMock(return_value={"data": None})
     px.resize_disk = AsyncMock(return_value={"data": None})
-    px.start_vm = AsyncMock(return_value="UPID:elizabeth:start:")
-    px.delete_vm = AsyncMock(return_value="UPID:elizabeth:destroy:")
+    px.start_vm = AsyncMock(return_value="UPID:pve-gw:start:")
+    px.delete_vm = AsyncMock(return_value="UPID:pve-gw:destroy:")
     px.get_vm_agent_network = AsyncMock(return_value=AGENT_OK)
     return px
 
@@ -140,7 +140,7 @@ def _service(db, proxmox, firewall, bridge: str, guest_network) -> ProvisionServ
     service.sdn_gateway = firewall
 
     async def _defaults(_source: Any = None) -> ProvisioningDefaults:
-        return ProvisioningDefaults(node="elizabeth", template_vmid=9000, bridge=bridge)
+        return ProvisioningDefaults(node="pve-gw", template_vmid=9000, bridge=bridge)
 
     async def _guest_network(_source: Any = None) -> DesiredGuestNetwork | None:
         return guest_network
@@ -169,7 +169,7 @@ def _restore_module():
 def _request(**overrides: Any) -> ProvisionRequest:
     payload: dict[str, Any] = {
         "name": "friends-box",
-        "node": "elizabeth",
+        "node": "pve-gw",
         "template_vmid": 9000,
         "ssh_authorized_key": PUBKEY,
         "owner": "a-friend",
@@ -193,11 +193,11 @@ async def _run(service: ProvisionService) -> dict[str, Any]:
 class TestAGuestOnTheGuestVnetIsFenced:
     async def test_the_nic_carries_firewall_1(self, db, proxmox) -> None:
         firewall = FakeFirewall()
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         row = await _run(service)
         assert row["status"] == "succeeded", row["error"]
         config = proxmox.set_vm_config.await_args.args[2]
-        assert config["net0"] == "virtio,bridge=innkeep,firewall=1", (
+        assert config["net0"] == "virtio,bridge=guestnet,firewall=1", (
             "without firewall=1 on the NIC, PVE stores the rules and applies none of them"
         )
 
@@ -205,15 +205,15 @@ class TestAGuestOnTheGuestVnetIsFenced:
         self, db, proxmox
     ) -> None:
         firewall = FakeFirewall()
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         await _run(service)
         assert firewall.options == [
-            {"node": "elizabeth", "vmid": 104, "enable": 1, "policy_out": "ACCEPT"}
+            {"node": "pve-gw", "vmid": 104, "enable": 1, "policy_out": "ACCEPT"}
         ], "the guest must still reach the internet; the DROPs are what fence it"
 
     async def test_the_rules_are_exact_and_in_order(self, db, proxmox) -> None:
         firewall = FakeFirewall()
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         await _run(service)
         # The property is the COMPILED chain, as PVE stores it after prepending
         # every create - NOT the order of the list HomePilot POSTed. Asserting
@@ -246,10 +246,10 @@ class TestAGuestOnTheGuestVnetIsFenced:
 
         async def record_start(node: str, vmid: int) -> str:
             order.append("start")
-            return "UPID:elizabeth:start:"
+            return "UPID:pve-gw:start:"
 
         proxmox.start_vm = AsyncMock(side_effect=record_start)
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         await _run(service)
         assert order.index("rule") < order.index("start")
 
@@ -257,11 +257,11 @@ class TestAGuestOnTheGuestVnetIsFenced:
         """An operator asking 'is my friend's box walled off' gets the ruleset,
         not a boolean they have to trust."""
         firewall = FakeFirewall()
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         row = await _run(service)
         result = json.loads(row["result_json"])
         fence = result["guest_network_fence"]
-        assert fence["vnet"] == "innkeep"
+        assert fence["vnet"] == "guestnet"
         assert len(fence["rules"]) == 5
         assert fence["rules"][-1]["dest"] == "198.51.100.1/32"
 
@@ -279,7 +279,7 @@ class TestAGuestElsewhereIsNotFenced:
 
     async def test_no_guest_network_configured_means_no_fence(self, db, proxmox) -> None:
         firewall = FakeFirewall()
-        service = _service(db, proxmox, firewall, "innkeep", None)
+        service = _service(db, proxmox, firewall, "guestnet", None)
         row = await _run(service)
         assert row["status"] == "succeeded"
         assert firewall.rules == []
@@ -292,13 +292,13 @@ class TestAGuestElsewhereIsNotFenced:
         firewall = FakeFirewall()
         open_network = DesiredGuestNetwork(
             zone="guest",
-            vnet="innkeep",
+            vnet="guestnet",
             subnet_cidr="198.51.100.0/24",
             gateway="198.51.100.1",
             dhcp_range="198.51.100.100-198.51.100.199",
             isolate_cidrs=(),
         )
-        service = _service(db, proxmox, firewall, "innkeep", open_network)
+        service = _service(db, proxmox, firewall, "guestnet", open_network)
         row = await _run(service)
         assert row["status"] == "failed"
         assert "guest_network_isolate_cidrs" in row["error"]
@@ -309,7 +309,7 @@ class TestAGuestElsewhereIsNotFenced:
 class TestAFenceThatCannotBeWritten:
     async def test_a_fence_that_cannot_be_written_fails_the_provision(self, db, proxmox) -> None:
         firewall = FakeFirewall(fail=True)
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         row = await _run(service)
         assert row["status"] == "failed"
         assert "fence" in row["error"]
@@ -317,9 +317,9 @@ class TestAFenceThatCannotBeWritten:
 
     async def test_a_failed_fence_destroys_the_half_made_guest(self, db, proxmox) -> None:
         firewall = FakeFirewall(fail=True)
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         row = await _run(service)
-        proxmox.delete_vm.assert_awaited_once_with("elizabeth", 104)
+        proxmox.delete_vm.assert_awaited_once_with("pve-gw", 104)
         assert "destroyed" in row["error"]
         # And it never booted: an unfenced guest must not have been on the wire
         # at all, not even briefly.
@@ -328,8 +328,8 @@ class TestAFenceThatCannotBeWritten:
     async def test_a_destroy_that_also_fails_says_the_guest_may_remain(self, db, proxmox) -> None:
         firewall = FakeFirewall(fail=True)
         proxmox.delete_vm = AsyncMock(side_effect=RuntimeError("VM is locked"))
-        service = _service(db, proxmox, firewall, "innkeep", GUEST_NETWORK)
+        service = _service(db, proxmox, firewall, "guestnet", GUEST_NETWORK)
         row = await _run(service)
         assert row["status"] == "failed"
-        assert "may still be on elizabeth" in row["error"]
+        assert "may still be on pve-gw" in row["error"]
         assert "unfenced" in row["error"]

@@ -559,7 +559,7 @@ When prompted, enter JSON:
 Add to `.env`:
 
 ```env
-HP_PROXMOX_HOST=pve.example.local          # or IP address
+HP_PROXMOX_HOST=pve.example.com          # or IP address
 PVE_API_TOKEN=admin@pam!tokenid=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
 
@@ -781,6 +781,8 @@ pin. Run it as root on the host:
 ```bash
 ( f="$(mktemp)" && trap 'rm -f "$f"' EXIT && \
   curl -fsSL -H 'x-hp-agent-token: <token>' http://<homepilot-host>:8000/agents/dist/install-agent.sh -o "$f" && \
+  { printf '%s  %s\n' <installer-sha256> "$f" | sha256sum -c - >/dev/null 2>&1 \
+      || { echo 'the downloaded install-agent.sh does not match ...' >&2; false; }; } && \
   bash "$f" --hp-api http://<homepilot-host>:8000 --hub <homepilot-host>:8443 \
       --token <token> --tls-pin sha256:<fingerprint> ) \
   || { echo 'HomePilot agent install FAILED - see the error above' >&2; false; }
@@ -789,6 +791,13 @@ pin. Run it as root on the host:
 It downloads the installer to a file and runs it, rather than piping `curl` into
 `bash`: in a pipe a refused download ran bash on nothing and reported success.
 Any failed step ends the command non-zero with that last line.
+
+The command carries the sha256 of the installer this control plane serves and
+checks the download against it before running anything (#843): the installer
+comes over plain http when the hub runs without TLS, and it runs as root. A
+file that does not match is refused with a sentence saying so, and nothing
+runs. The zero-touch install and Upgrade agent check it the same way. (The
+agent binary the installer fetches was already checked against SHA256SUMS.)
 
 Both the installer and the agent binary come from this control plane, so the
 host needs no internet access and the agent it installs is the control plane's
@@ -1221,7 +1230,7 @@ forward.
 
 | Variable | Default | Description |
 |---|---|---|
-| `HP_IMAGE_TAG` | `3.13.0` | Docker image tag for the backend container |
+| `HP_IMAGE_TAG` | `3.14.0` | Docker image tag for the backend container |
 | `HP_ENV` | — | Set to `production` to refuse an auto-generated vault passphrase (the vault stays disabled unless one is supplied) |
 | `HP_DATA_DIR` | `~/.hp` | Data directory (DB, vault, artifacts) inside the container |
 | `HP_DAEMON_PORT` | `8000` | Docker host port mapped to the container's fixed `:8000` |
@@ -1279,12 +1288,16 @@ forward.
 | `HP_RETENTION_DAYS` | `90` | How long operational history is kept: audit log, agent audit, finished tasks, webhook deliveries. Artifacts are never pruned |
 | `HP_RETENTION_INTERVAL_SECONDS` | `21600` | How often the retention sweep runs |
 | `HP_DB_INTEGRITY_INTERVAL_SECONDS` | `21600` | How often `PRAGMA quick_check` runs against the database file, on its own read-only connection. `0` turns it off. `/health` reports the verdict as `database: corrupt`; `hp db check` runs it on demand |
+| `HP_HOST_DESCRIPTION_INTERVAL_SECONDS` | `86400` | How often every connected agent that can describe its host is asked to (#818): a host is re-described when its stored description is older than this. `0` turns the schedule off; `Collect now`, `POST /inventory/{id}/description` and `hp hosts describe --refresh` still work |
 | `HP_LOOP_STALL_MS` | `500` | Loop-stall watchdog: when one callback holds the event loop longer than this, the loop thread's Python stack is logged while it is still blocked, and the stall shows in `/admin/selfcheck` as `loop_watchdog` (a stall in the last 15 minutes reads as a fault). Every request, the agent hub and every reconciler share that loop. `0` turns it off |
 | `HP_ARTIFACTS_PUSH_INTERVAL_SECONDS` | `3600` | How often the artifact store is pushed to `HP_ARTIFACTS_REMOTE` (only when a remote is set) |
 | `HP_METRICS_PRUNE_INTERVAL_SECONDS` | `3600` | How often the retention pruner runs |
 | `HP_METRICS_ALERT_INTERVAL_SECONDS` | `60` | How often alert rules are evaluated against the stored window |
 | `HP_UPDATE_CHECK_ENABLED` | `1` | Look for a newer HomePilot release on the public mirror (one unauthenticated GitHub API request per check). A newer release raises an Overview line and one `update_available` event; nothing is ever upgraded automatically. `0` switches it off, e.g. on an install with no internet access |
 | `HP_UPDATE_CHECK_INTERVAL_SECONDS` | `86400` | How often the release check runs (minimum `3600`); the first check runs about two minutes after boot, and a failed one is retried after an hour |
+| `HP_NTFY_INTERNAL_URL` | — (compose: `http://ntfy`) | Where HomePilot reaches the bundled ntfy service (phone alerts, #822) to publish and to manage phone logins. The shipped compose files set it to the service's name; phones never use it. See [Phone alerts](notifications.md#phone-alerts-the-bundled-ntfy-server) |
+| `HP_NTFY_BIND` | `127.0.0.1` | Compose only: the host address the opt-in `ntfy` service is published on. Set the control plane's LAN address when the reverse proxy in front of it runs on another box; never `0.0.0.0` |
+| `HP_NTFY_PORT` | `2586` | Compose only: the host port the `ntfy` service is published on |
 | `HP_PORTAL_CN_HEADER` | `ssl-client-subject-dn` | Header the mTLS proxy sets with the client-certificate subject DN (see [portal.md](portal.md)) |
 | `HP_PORTAL_VERIFY_HEADER` | `ssl-client-verify` | Header that must equal `SUCCESS` for the certificate to be trusted |
 | `HP_PORTAL_TRUSTED_PROXY` | — | Address/CIDR(s) `/invite/*` requests must arrive from; unset = portal 503s |

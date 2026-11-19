@@ -86,10 +86,10 @@ is a network and a fence, and HomePilot builds both.
 ### The network
 
 One SDN zone (`simple`, dnsmasq DHCP, PVE IPAM), one vnet, one subnet with a
-gateway, SNAT and a DHCP range. The estate's shape: vnet `innkeep` in zone
+gateway, SNAT and a DHCP range. The estate's shape: vnet `guestnet` in zone
 `guest`, subnet `198.51.100.0/24`, gateway `198.51.100.1`, DHCP `.100-.199`,
 isolated from `192.0.2.0/24` - which is the operator LAN, on the same node,
-because `elizabeth` is both hypervisor and gateway.
+because `pve-gw` is both hypervisor and gateway.
 
 The desired state lives in the `guest_network_*` settings (Settings ->
 Subsystems -> **Guest network**, or `HP_GUEST_NETWORK_*`). Each field is checked
@@ -155,7 +155,7 @@ PVE 9 can carry firewall rules on a vnet
 (`/cluster/sdn/vnets/{vnet}/firewall/*`), and that is the right place for
 "guests may not reach the operator LAN". **Those rules are enforced only under
 the nftables `proxmox-firewall` stack.** A node on the LEGACY iptables firewall
-- which is what `elizabeth` runs - accepts them, stores them, shows them, and
+- which is what `pve-gw` runs - accepts them, stores them, shows them, and
 does not apply them to vnet forward traffic.
 
 So HomePilot writes both:
@@ -243,8 +243,12 @@ absent - silence towards a dead host would look like a fence.
 
 ### Where the PVE calls live
 
-HomePilot does not re-implement Proxmox endpoints. The SDN and firewall calls go
-through the estate's own library, `homepilot-proxmox-mcp` (repo
+A Proxmox endpoint path lives only in the adapter modules (owner decision
+2026-11-18, #717): `adapters/proxmox.py`, `adapters/pve_reads.py`,
+`adapters/pve_sdn.py`, `adapters/pve_access.py` and
+`adapters/pve_firewall_guard.py`. Anything else asks an adapter by name, and
+`tests/test_pve_paths_only_in_adapters.py` fails the build on a path literal
+outside them. The SDN and firewall calls go through the estate's own library, `homepilot-proxmox-mcp` (repo
 `mtclab/proxmox-mcp`, public mirror `mtclab/proxmox-mcp-public`), via the single
 adapter `src/homepilot/adapters/pve_sdn.py`. That adapter is the only place in
 this codebase that names a PVE SDN or firewall endpoint, and it records the two

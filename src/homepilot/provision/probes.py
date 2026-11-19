@@ -20,10 +20,12 @@ Three outcomes, and the difference between the last two matters:
   value here and calling it validated would be the lie this module exists to
   prevent.
 
-This module deliberately imports nothing from ``homepilot`` except the Proxmox
-error type: the settings registry imports IT, so a dependency in the other
-direction would be a cycle. Consumption of the resolved defaults lives in
-``provision.defaults`` instead, which is free to use the registry.
+This module deliberately imports nothing from ``homepilot`` except the PVE
+adapters it reads through (``pve_reads``, and ``pve_sdn`` for the SDN - the
+only modules allowed to name a PVE path, #717): the settings registry imports
+IT, so a dependency in the other direction would be a cycle. Consumption of the
+resolved defaults lives in ``provision.defaults`` instead, which is free to use
+the registry.
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ import ipaddress
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+
+from homepilot.adapters import pve_reads
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,9 @@ class ProbeContext:
     # are handed the one this instance already carries - exactly as the bridge
     # probe is handed the node.
     guest_subnet: str = ""
+    # The SDN reads (vnets, zones) go through ``adapters.pve_sdn`` (#717). None:
+    # built from ``proxmox`` on demand; a test hands in a gateway double here.
+    sdn: Any | None = None
 
 
 ProbeFn = Callable[[Any, ProbeContext], Awaitable[ProbeResult]]
@@ -104,11 +111,29 @@ class _NotConfiguredError(Exception):
     """No Proxmox client to ask - distinct from a cluster that answered badly."""
 
 
-async def _read(ctx: ProbeContext, path: str, query: dict[str, Any] | None = None) -> Any:
+async def _read(ctx: ProbeContext, read: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+    """One named PVE read (``adapters.pve_reads``) against the context's cluster."""
     proxmox = ctx.proxmox
     if proxmox is None:
         raise _NotConfiguredError
-    return await proxmox.read(path, query) if query else await proxmox.read(path)
+    return await read(proxmox, *args)
+
+
+def _sdn(ctx: ProbeContext) -> Any:
+    """The SDN reads, through ``adapters.pve_sdn`` - the one place naming them (#717).
+
+    ``ctx.sdn`` when the caller handed one in (a test's gateway double);
+    otherwise the gateway for the context's own ProxmoxClient. No cluster, or a
+    client that cannot hand over credentials, is "not configured".
+    """
+    if ctx.sdn is not None:
+        return ctx.sdn
+    from homepilot.adapters.pve_sdn import gateway_from
+
+    gateway = gateway_from(ctx.proxmox)
+    if gateway is None:
+        raise _NotConfiguredError
+    return gateway
 
 
 def _truthy(raw: Any) -> bool:
@@ -129,7 +154,7 @@ async def probe_node(value: Any, ctx: ProbeContext) -> ProbeResult:
     if not node:
         return ProbeResult(True, "No default node: every provision must name its own node.")
     try:
-        rows = _rows(await _read(ctx, "/nodes"))
+        rows = _rows(await _read(ctx, pve_reads.nodes))
     except _NotConfiguredError:
         return _NO_CLUSTER
     except Exception as exc:
@@ -148,7 +173,7 @@ async def probe_template_vmid(value: Any, ctx: ProbeContext) -> ProbeResult:
     if vmid == 0:
         return ProbeResult(True, "No default template: every provision must name its own.")
     try:
-        rows = _rows(await _read(ctx, "/cluster/resources", {"type": "vm"}))
+        rows = _rows(await _read(ctx, pve_reads.cluster_guests))
     except _NotConfiguredError:
         return _NO_CLUSTER
     except Exception as exc:
@@ -189,7 +214,7 @@ async def probe_pool(value: Any, ctx: ProbeContext) -> ProbeResult:
     if not pool:
         return ProbeResult(True, "No default pool: provisioned guests join no pool.")
     try:
-        rows = _rows(await _read(ctx, "/pools"))
+        rows = _rows(await _read(ctx, pve_reads.pools))
     except _NotConfiguredError:
         return _NO_CLUSTER
     except Exception as exc:
@@ -227,7 +252,7 @@ async def probe_storage(value: Any, ctx: ProbeContext) -> ProbeResult:
             "provision_default_node names one",
         )
     try:
-        rows = _rows(await _read(ctx, f"/nodes/{ctx.node}/storage"))
+        rows = _rows(await _read(ctx, pve_reads.node_storage, ctx.node))
     except _NotConfiguredError:
         return _NO_CLUSTER
     except Exception as exc:
@@ -285,7 +310,7 @@ async def probe_bridge(value: Any, ctx: ProbeContext) -> ProbeResult:
     # probe refused the guest vnet the moment the guest network was applied
     # (found live, 2026-08-27). Vnets are cluster-scoped, so ask the SDN.
     try:
-        vnet_rows = _rows(await _read(ctx, "/cluster/sdn/vnets"))
+        vnet_rows = await _sdn(ctx).list_vnets()
     except _NotConfiguredError:
         vnet_rows = []
     except Exception as exc:  # pragma: no cover - same shape as _network_entries
@@ -390,7 +415,7 @@ async def probe_ip_mode(value: Any, ctx: ProbeContext) -> ProbeResult:
             "subnet itself, so nothing on the wire has to answer. No cluster call.",
         )
     try:
-        rows = _rows(await _read(ctx, "/cluster/sdn/zones"))
+        rows = await _sdn(ctx).list_zones()
     except _NotConfiguredError:
         return _NO_CLUSTER
     except Exception as exc:
@@ -440,10 +465,10 @@ async def _network_entries(ctx: ProbeContext) -> tuple[list[dict[str, Any]], Pro
     try:
         # type=any_bridge, because a plain /network listing omits SDN vnet
         # bridges - the guest vnet IS a bridge a guest NIC can sit on, and the
-        # probe refused it with "no bridge innkeep on node elizabeth" the
+        # probe refused it with "no bridge guestnet on node pve-gw" the
         # moment the guest network went live (found on prod, 2026-08-27).
         return (
-            _rows(await _read(ctx, f"/nodes/{ctx.node}/network", {"type": "any_bridge"})),
+            _rows(await _read(ctx, pve_reads.node_network, ctx.node, {"type": "any_bridge"})),
             None,
         )
     except _NotConfiguredError:

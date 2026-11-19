@@ -34,6 +34,7 @@ from . import __version__
 # library (proxmox_mcp -> proxmoxer -> requests) was first imported inside a
 # request - the claim's write-token probe, a guest-network read - ON the loop
 # (3.10.0: 265 ms on a fresh venv). tests/test_no_blocking_on_loop.py holds it.
+from .adapters import pve_reads
 from .adapters import pve_sdn as _pve_sdn  # noqa: F401
 from .app_state import create_app_state, get_agent_registry
 from .auth.deps import _SAFE_METHODS, SCOPE_ENFORCER_ATTR, require_token
@@ -194,6 +195,59 @@ def _stop_log_listener() -> None:
         _log_listener.stop()
 
 
+# The shutdown's per-step bounds (#812). Each step of the lifespan's `finally`
+# is bounded on its own, so the longest a clean shutdown can legitimately take
+# is their SUM - and the shipped compose files' `stop_grace_period` must cover
+# it, or Docker SIGKILLs a shutdown that is still draining (Docker's default
+# grace is 10 s). tests/test_compose_stop_grace.py holds the compose files to
+# `shutdown_worst_case_s()` and every bound in the `finally` to this table.
+SHUTDOWN_HUB_STOP_S = 20.0
+SHUTDOWN_RECONCILER_STOP_S = 10.0
+SHUTDOWN_DRAIN_S = 10.0
+SHUTDOWN_POOLS_S = 10.0
+SHUTDOWN_DB_CLOSE_S = 10.0
+# Services drained before the database closes, as (label, app.state attribute).
+SHUTDOWN_DRAINABLE: tuple[tuple[str, str], ...] = (
+    ("task runner", "task_runner"),
+    ("provision service", "provision_service"),
+    ("guest template service", "guest_template_service"),
+    ("agent enrolment service", "agent_enroll_service"),
+    # Also drained inside agent_hub.stop(), but the registry outlives a
+    # DISABLED hub: create_app_state leaves agent_hub None when the
+    # transport check fails (#468's upgrade case) while the registry
+    # stays live and still writes. Draining twice is a no-op.
+    ("agent registry", "agent_registry"),
+    # The KB rebuild started by a lifecycle transition or by startup's
+    # reindex_if_needed writes to the database from a task nobody
+    # awaits (#622).
+    ("kb service", "kb_service"),
+    # Alert pushes in flight record their outcome on the channel and on
+    # the alert event (#660).
+    ("notifier", "notifier"),
+)
+
+
+def shutdown_worst_case_s() -> float:
+    """The longest the lifespan's shutdown can take with every step at its bound.
+
+    Normally the whole shutdown takes about a second; this is the case a git
+    push in flight or a slow disk can produce, which the shutdown is bounded to
+    finish rather than be killed in. The loop watchdog's thread join is bounded
+    by its own tick (at most 1 s): ``2 * tick + 1``.
+    """
+    from .db.connection import Database
+
+    return (
+        SHUTDOWN_HUB_STOP_S
+        + SHUTDOWN_RECONCILER_STOP_S
+        + SHUTDOWN_DRAIN_S * len(SHUTDOWN_DRAINABLE)
+        + SHUTDOWN_POOLS_S
+        + Database._CHECKPOINT_SECONDS
+        + SHUTDOWN_DB_CLOSE_S
+        + LoopStallWatchdog.MAX_STOP_JOIN_S
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
@@ -212,6 +266,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if loop_watchdog is not None:
             await loop_watchdog.stop()
         raise
+    # On the AppState too: that is the object every self-check surface reads (#814).
+    state.loop_watchdog = loop_watchdog
 
     for cidr in (settings.trusted_proxies or _HP_TRUSTED_PROXIES_ENV).split(","):
         cidr = cidr.strip()
@@ -433,6 +489,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         app.state.db_integrity = db_integrity
 
+    # How each host is built (#818): one service behind the routes, the MCP
+    # tools and the slow schedule, so they share the per-host collection lock.
+    from .adapters.agent import AgentAdapter as _DescribeAdapter
+    from .inventory.description import HostDescriptionReconciler, HostDescriptionService
+
+    describe_adapter = (
+        _DescribeAdapter(
+            hub_server=state.agent_hub,
+            pve_nodes=getattr(state.artifact_lifecycle, "_pve_nodes_list", None) or [],
+        )
+        if state.agent_hub is not None
+        else None
+    )
+    host_descriptions = HostDescriptionService(state.repo, describe_adapter)
+    app.state.host_descriptions = host_descriptions
+    if settings.host_description_interval_seconds > 0 and describe_adapter is not None:
+        reconciler_scheduler.register(
+            HostDescriptionReconciler(
+                host_descriptions, float(settings.host_description_interval_seconds)
+            ),
+            interval=float(settings.host_description_interval_seconds) / 4,
+            startup_delay=300.0,
+        )
+
     alert_evaluator = AlertEvaluator(state.metrics_repo, repo=state.repo, notifier=state.notifier)
     reconciler_scheduler.register(
         alert_evaluator,
@@ -610,7 +690,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Best-effort PVE node list for host-targeted tools.
     if state.proxmox is not None:
         try:
-            pve_data = await state.proxmox.read("/nodes")
+            pve_data = await pve_reads.nodes(state.proxmox)
             pve_nodes = [
                 n.get("node") or n.get("name", "")
                 for n in (
@@ -689,6 +769,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "task_runner": task_runner,
             "provision_service": app.state.provision_service,
             "guest_template_service": app.state.guest_template_service,
+            # How each host is built (#818): the SAME service the routes and the
+            # schedule use, so a collection over MCP shares their per-host lock.
+            "host_descriptions": app.state.host_descriptions,
         }
     )
 
@@ -725,7 +808,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # off and what is broken, and diagnostics must not add a single millisecond to
     # the time the app takes to start serving. It runs last so the MCP transport
     # it reports on is already up.
-    selfcheck_task = schedule_boot_selfcheck(app.state, settings)
+    # The AppState: the one object every self-check surface reads (#814).
+    selfcheck_task = schedule_boot_selfcheck(state, settings)
 
     try:
         yield
@@ -748,10 +832,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 # fires first it cancels stop() midway and its registry.drain()
                 # never runs - leaving exactly the un-drained writes that close
                 # the database under themselves (#496).
-                await asyncio.wait_for(agent_hub.stop(), timeout=20.0)
+                await asyncio.wait_for(agent_hub.stop(), timeout=SHUTDOWN_HUB_STOP_S)
                 logger.info("Agent hub stopped")
             except TimeoutError:
-                logger.warning("Agent hub stop timed out after 20s — proceeding")
+                logger.warning(
+                    "Agent hub stop timed out after %.0fs — proceeding", SHUTDOWN_HUB_STOP_S
+                )
             except Exception as exc:
                 # Never out of the shutdown `finally`: an exception here would
                 # skip the reconciler stop, every drain, the database close and
@@ -759,41 +845,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.warning("Agent hub stop error: %s", exc)
 
         try:
-            await asyncio.wait_for(reconciler_scheduler.stop(), timeout=10.0)
+            await asyncio.wait_for(reconciler_scheduler.stop(), timeout=SHUTDOWN_RECONCILER_STOP_S)
         except TimeoutError:
-            logger.warning("Reconciler scheduler stop timed out after 10s — proceeding")
+            logger.warning(
+                "Reconciler scheduler stop timed out after %.0fs — proceeding",
+                SHUTDOWN_RECONCILER_STOP_S,
+            )
 
         # Background jobs run behind an already-accepted request, so nothing else
         # awaits them. Drain them BEFORE the database closes (#496): a write that
         # outlives its loop kills aiosqlite's worker thread, and the close then
         # queues onto a thread that will never pick it up. It also stops a
         # provision from being remembered as "running" forever.
-        drainable = (
-            ("task runner", getattr(app.state, "task_runner", None)),
-            ("provision service", getattr(app.state, "provision_service", None)),
-            ("guest template service", getattr(app.state, "guest_template_service", None)),
-            ("agent enrolment service", getattr(app.state, "agent_enroll_service", None)),
-            # Also drained inside agent_hub.stop(), but the registry outlives a
-            # DISABLED hub: create_app_state leaves agent_hub None when the
-            # transport check fails (#468's upgrade case) while the registry
-            # stays live and still writes. Draining twice is a no-op.
-            ("agent registry", getattr(app.state, "agent_registry", None)),
-            # The KB rebuild started by a lifecycle transition or by startup's
-            # reindex_if_needed writes to the database from a task nobody
-            # awaits (#622).
-            ("kb service", getattr(app.state, "kb_service", None)),
-            # Alert pushes in flight record their outcome on the channel and on
-            # the alert event (#660).
-            ("notifier", getattr(app.state, "notifier", None)),
-        )
-        for label, service in drainable:
-            drain = getattr(service, "drain", None)
+        # The list (and why each one is on it) is SHUTDOWN_DRAINABLE, above.
+        for label, attr in SHUTDOWN_DRAINABLE:
+            drain = getattr(getattr(app.state, attr, None), "drain", None)
             if drain is None:
                 continue
             try:
-                await asyncio.wait_for(drain(), timeout=10.0)
+                await asyncio.wait_for(drain(), timeout=SHUTDOWN_DRAIN_S)
             except TimeoutError:
-                logger.warning("%s drain timed out after 10s — proceeding", label)
+                logger.warning(
+                    "%s drain timed out after %.0fs — proceeding", label, SHUTDOWN_DRAIN_S
+                )
             except Exception as exc:
                 logger.warning("%s drain error: %s", label, exc)
 
@@ -802,7 +876,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # read - a read transaction still open would leave the checkpoint below
         # busy. Bounded; queued work is finished, never cancelled.
         try:
-            await shutdown_pools(timeout=10.0)
+            await shutdown_pools(timeout=SHUTDOWN_POOLS_S)
         except Exception as exc:
             logger.warning("Blocking pool shutdown error: %s", exc)
 
@@ -817,9 +891,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.warning("WAL checkpoint before close failed: %s", exc)
 
         try:
-            await asyncio.wait_for(state.database.close(), timeout=10.0)
+            await asyncio.wait_for(state.database.close(), timeout=SHUTDOWN_DB_CLOSE_S)
         except TimeoutError:
-            logger.warning("Database close timed out after 10s — proceeding")
+            logger.warning("Database close timed out after %.0fs — proceeding", SHUTDOWN_DB_CLOSE_S)
         except Exception as exc:
             logger.warning("Database close error (ok on restart): %s", exc)
         from .mcp.server import _server_context

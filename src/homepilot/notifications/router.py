@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..auth.deps import require_scope, require_token
 from ..auth.principal import audit_actor
+from ..config import get_settings
+from .bundled import PhoneAlerts, PhoneAlertsConflictError, PhoneAlertsError, create_ntfy_sh_channel
 from .ntfy import MAX_TOKEN_LENGTH, MAX_URL_LENGTH
 from .service import MAX_NAME_LENGTH, ChannelStoreError, Notifier
 
@@ -129,5 +131,173 @@ async def test_channel(
         token,
         "notification_channel_tested",
         {"id": channel_id, "endpoint": result["endpoint"], "delivered": result["delivered"]},
+    )
+    return result
+
+
+# ── Phone alerts (#822) ──────────────────────────────────────────────────────
+# The guided "Get alerts on your phone" flow: the bundled ntfy server, its phone
+# logins, and the ntfy.sh choice. Admin scope like every channel route. Two
+# answers carry a credential ONCE - a new phone's password and the ntfy.sh
+# topic URL - because the phone has to be given it; both are sent with
+# `Cache-Control: no-store` and never audited, logged or stored in the clear.
+# HomePilot's own ntfy tokens are in NO answer.
+
+
+class PublicUrlIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=512)
+
+
+class PhoneIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=32)
+
+
+def _phone_alerts(request: Request) -> PhoneAlerts:
+    """One PhoneAlerts per app, so its lock serialises enable/disable."""
+    existing = getattr(request.app.state, "phone_alerts", None)
+    if isinstance(existing, PhoneAlerts):
+        return existing
+    repo = getattr(request.app.state, "repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="Phone alerts are not available")
+    settings = get_settings()
+    # An unset HP_NTFY_INTERNAL_URL refuses only what needs the bundled service
+    # (PhoneAlerts says why); the status still answers, so the page keeps
+    # offering ntfy.sh and an existing server instead of one error.
+    made = PhoneAlerts(
+        notifier=_notifier(request),
+        repo=repo,
+        data_dir=settings.data_dir,
+        internal_url=settings.ntfy_internal_url,
+    )
+    request.app.state.phone_alerts = made
+    return made
+
+
+def _http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, PhoneAlertsConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, LookupError):
+        return HTTPException(status_code=404, detail=f"No phone named {exc.args[0]!r}")
+    return HTTPException(status_code=503, detail=str(exc))
+
+
+def _no_store(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+
+
+@router.get("/phone", dependencies=[_admin])
+async def phone_alerts_status(request: Request) -> dict[str, Any]:
+    return await _phone_alerts(request).status()
+
+
+@router.post("/phone/bundled", dependencies=[_admin])
+async def enable_bundled_ntfy(
+    request: Request, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    try:
+        result = await _phone_alerts(request).enable()
+    except PhoneAlertsError as exc:
+        raise _http_error(exc) from None
+    await _audit(request, token, "phone_alerts_bundled_enabled", {})
+    return result
+
+
+@router.delete("/phone/bundled", dependencies=[_admin])
+async def disable_bundled_ntfy(
+    request: Request, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    try:
+        result = await _phone_alerts(request).disable()
+    except PhoneAlertsError as exc:
+        raise _http_error(exc) from None
+    await _audit(request, token, "phone_alerts_bundled_disabled", {})
+    return result
+
+
+@router.put("/phone/bundled/public-url", dependencies=[_admin])
+async def set_bundled_public_url(
+    request: Request, body: PublicUrlIn, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    try:
+        result = await _phone_alerts(request).set_public_url(body.url)
+    except (PhoneAlertsError, ValueError) as exc:
+        raise _http_error(exc) from None
+    await _audit(
+        request,
+        token,
+        "phone_alerts_public_url_set",
+        {"public_url": result["public_url"], "ok": result["ok"]},
+    )
+    return result
+
+
+@router.get("/phone/phones", dependencies=[_admin])
+async def list_phones(request: Request) -> dict[str, Any]:
+    try:
+        items = await _phone_alerts(request).list_phones()
+    except PhoneAlertsError as exc:
+        raise _http_error(exc) from None
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/phone/phones", dependencies=[_admin], status_code=201)
+async def add_phone(
+    request: Request, body: PhoneIn, response: Response, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    _no_store(response)
+    try:
+        result = await _phone_alerts(request).add_phone(body.name)
+    except (PhoneAlertsError, ValueError) as exc:
+        raise _http_error(exc) from None
+    await _audit(request, token, "phone_alerts_phone_added", {"name": result["name"]})
+    return result
+
+
+@router.post("/phone/phones/{name}/allow", dependencies=[_admin])
+async def allow_phone(
+    request: Request, name: str, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    try:
+        result = await _phone_alerts(request).allow_phone(name)
+    except (PhoneAlertsError, ValueError, LookupError) as exc:
+        raise _http_error(exc) from None
+    await _audit(request, token, "phone_alerts_phone_allowed", {"name": result["name"]})
+    return result
+
+
+@router.delete("/phone/phones/{name}", dependencies=[_admin])
+async def remove_phone(
+    request: Request, name: str, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    try:
+        result = await _phone_alerts(request).remove_phone(name)
+    except (PhoneAlertsError, ValueError, LookupError) as exc:
+        raise _http_error(exc) from None
+    await _audit(request, token, "phone_alerts_phone_removed", {"name": result["name"]})
+    return result
+
+
+@router.post("/phone/ntfy-sh", dependencies=[_admin], status_code=201)
+async def use_ntfy_sh(
+    request: Request, response: Response, token: dict[str, Any] = _principal
+) -> dict[str, Any]:
+    _no_store(response)
+    try:
+        result = await create_ntfy_sh_channel(_notifier(request))
+    except ChannelStoreError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    view = result["channel"]
+    await _audit(
+        request,
+        token,
+        "notification_channel_created",
+        {"id": view["id"], "kind": view["kind"], "endpoint": view["endpoint"]},
     )
     return result

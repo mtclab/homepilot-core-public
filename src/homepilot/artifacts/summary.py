@@ -204,6 +204,24 @@ def destroyed_vmids(fm: dict[str, Any], body: str) -> list[int]:
     return out
 
 
+def _disk_steps(body: str, label: str, target: dict[str, Any]) -> list[str]:
+    """A guest-disk change in the order it runs (#824)."""
+    from .guest_disk import parse_guest_disk_spec
+
+    try:
+        spec = parse_guest_disk_spec(body, target)
+    except ValueError as exc:
+        return [f"Add a disk to {label} - refused: {exc}"]
+    return [
+        f"Attach a new {spec.size_gib} GiB disk from {spec.storage} to {label} "
+        f"(first free {spec.bus} slot, hot-plugged)",
+        "In the guest, as root: refuse unless that disk is blank, then make "
+        f"{spec.filesystem} with label {spec.label}",
+        f"Back up /etc/fstab, add LABEL={spec.label} at {spec.mount_point} "
+        f"({spec.mount_options}) and mount it",
+    ]
+
+
 def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
     """The plain-words summary of one artifact.
 
@@ -241,6 +259,8 @@ def summarize(fm: dict[str, Any], body: str) -> dict[str, Any]:
             steps.append(words.format(guest=label))
         if action == "stop":
             danger = "stop"
+    elif kind == ArtifactKind.GUEST_DISK.value:
+        steps.extend(_disk_steps(body, label, target))
     elif kind == ArtifactKind.COMPOSITE.value:
         steps.append("Run several changes in order (each is its own change, listed in the spec)")
     elif kind in _KIND_SENTENCE:

@@ -152,3 +152,72 @@ class TestTheFirstRunPath:
         assert body["onboarding"]["complete"] is False, (
             "the checklist called itself complete with no agent ever connected"
         )
+
+
+class TestGetAlertsOnYourPhone:
+    """#822: the checklist OFFERS phone alerts and never requires them (owner
+    decision 2026-11-18, opt-in). Done means a channel has DELIVERED, read from
+    its own record - not that one exists.
+
+    Teeth: count the step towards `complete` and the walked-path test fails;
+    tick it for any channel row and the never-delivered test fails."""
+
+    async def test_it_is_offered_and_optional(self, api):
+        client, _repo = api
+        body = (await client.get("/dashboard/summary")).json()
+        step = next(s for s in body["onboarding"]["steps"] if s["key"] == "phone")
+        assert step["optional"] is True
+        assert step["href"] == "/monitoring/channels"
+        assert step["done"] is False
+
+    async def test_a_channel_that_never_delivered_does_not_tick_it(self, api):
+        client, repo = api
+        await repo.db.execute(
+            "INSERT INTO notification_channels (kind, name, endpoint, secret_ref, has_token, "
+            "enabled, created_at) VALUES ('ntfy', 'p', 'https://ntfy.example.com', 'x', 0, 1, "
+            "'2026-11-18T00:00:00Z')"
+        )
+        await repo.db.conn.commit()
+        assert (await _steps(client))["phone"] is False
+
+        await repo.db.execute(
+            "UPDATE notification_channels SET last_ok_at = '2026-11-18T00:01:00Z', "
+            "last_result = 'ok'"
+        )
+        await repo.db.conn.commit()
+        assert (await _steps(client))["phone"] is True
+
+    async def test_the_path_completes_without_it(self, api, monkeypatch):
+        """Every required step walked, no phone: the checklist is complete."""
+        from types import SimpleNamespace
+
+        import homepilot.app_state as app_state
+
+        client, repo = api
+        live = SimpleNamespace(list_connected=lambda: [{"agent_id": "a1"}], started_at=None)
+        monkeypatch.setattr(app_state, "get_agent_registry", lambda: live)
+        await repo.create_host(hostname="web01", host_type="qemu", role="guest", managed=True)
+        await repo.create_artifact(
+            id="2026-11-18-first-change",
+            kind="shell-command",
+            intent="the first managed change",
+            status="applied",
+            mutating=True,
+            hash="deadbeef",
+            target_json=None,
+            idempotence=None,
+            produced_by_json="{}",
+            file_path="2026/11/2026-11-18-first-change.md",
+        )
+
+        body = (await client.get("/dashboard/summary")).json()
+
+        steps = {s["key"]: s["done"] for s in body["onboarding"]["steps"]}
+        assert steps == {
+            "inventory": True,
+            "adopt": True,
+            "agent": True,
+            "phone": False,
+            "artifact": True,
+        }
+        assert body["onboarding"]["complete"] is True, "an optional step held the checklist open"

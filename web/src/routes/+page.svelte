@@ -19,7 +19,6 @@
 	} from '$lib/api';
 	import { onArtifactEvent } from '$lib/events';
 	import { debounce } from '$lib/debounce';
-	import { shortTaskId } from '$lib/taskStatus';
 	import { canWrite as capCanWrite, isAdmin as capIsAdmin } from '$lib/capabilities';
 	import { notify } from '$lib/stores';
 	import { destination, resolvedEpisodes } from '$lib/alertHistory';
@@ -34,7 +33,7 @@
 		upgradeInTurn,
 		type UpgradeState,
 	} from '$lib/attention';
-	import { describeJournal, sentence } from '$lib/journalWords';
+	import { describeJournal, runWords, sentence } from '$lib/journalWords';
 	import Readout from '$lib/components/Readout.svelte';
 	import Lamp from '$lib/components/Lamp.svelte';
 	import Icon from '$lib/components/Icon.svelte';
@@ -366,10 +365,6 @@
 
 	// --- The server's lines (summary.attention), in words ------------------
 
-	function runTarget(r: AttentionRun): string {
-		return r.artifact_id ?? r.hostname ?? shortTaskId(r.task_id);
-	}
-
 	/** Where a run is fixed: its change, or the task list when it has none. */
 	function runHref(r: AttentionRun): string {
 		return r.artifact_id ? `${base}/changes/${r.artifact_id}` : `${base}/records/tasks`;
@@ -380,7 +375,8 @@
 		return {
 			key: r.key,
 			severity: r.severity,
-			text: `${r.action} ${runTarget(r)} failed${r.error ? `: ${r.error}` : ''}`,
+			// The server's words (dashboard/wording.py), never the task's codes.
+			text: `${runWords(r).what} failed${r.error ? `: ${r.error}` : ''}`,
 			href: runHref(r),
 			meta: ago(at),
 			since: at,
@@ -388,11 +384,11 @@
 	}
 
 	function stuckLine(r: AttentionRun): Attention {
-		const what = `${r.action} ${runTarget(r)}`;
+		const { what, status } = runWords(r);
 		return {
 			key: r.key,
 			severity: r.severity,
-			text: `${what} is still ${r.status}`,
+			text: `${what} is still ${status}`,
 			href: runHref(r),
 			meta: ago(r.created_at),
 			since: r.created_at,
@@ -965,8 +961,11 @@
 	const FEED_LIMIT = 8;
 	let showLeftOut = false;
 
-	$: doneCount = d ? d.onboarding.steps.filter((s) => s.done).length : 0;
-	$: nextStep = d ? d.onboarding.steps.find((s) => !s.done) : undefined;
+	// Optional steps (#822: "Get alerts on your phone") are offered, never
+	// counted as the next thing to do or towards "N of M done".
+	$: requiredSteps = d ? d.onboarding.steps.filter((s) => !s.optional) : [];
+	$: doneCount = requiredSteps.filter((s) => s.done).length;
+	$: nextStep = requiredSteps.find((s) => !s.done);
 	$: allLines = buildAttention(d, fleet, firing, unread, selfcheck, joining);
 	$: snoozes = new Map<string, AttentionSnooze>((d?.attention?.snoozes ?? []).map((s) => [s.key, s]));
 	// A line a snooze holds leaves the list for the footer; a line that became
@@ -1048,7 +1047,7 @@
 					<div>
 						<h2 class="section-title" id="getting-started">Getting started</h2>
 						<p class="prose-note text-xs">
-							{doneCount} of {d.onboarding.steps.length} done. This disappears on its own once
+							{doneCount} of {requiredSteps.length} done. This disappears on its own once
 							a change has been applied to a managed host.
 						</p>
 					</div>
@@ -1063,7 +1062,7 @@
 							>
 							<span class="space-y-0.5">
 								<span class="block text-sm {step.done ? 'text-muted line-through' : 'text-ink'}">
-									{step.title}
+									{step.title}{#if step.optional}<span class="text-muted text-xs"> (optional)</span>{/if}
 									<span class="sr-only">{step.done ? '(done)' : '(not done yet)'}</span>
 								</span>
 								{#if !step.done}
@@ -1071,6 +1070,10 @@
 									{#if step.key === nextStep?.key}
 										<a class="btn btn-primary text-xs mt-1 inline-block" href="{base}{step.href}"
 											>Do this next <Icon name="arrow-right" /></a
+										>
+									{:else if step.optional}
+										<a class="btn btn-ghost text-xs mt-1 inline-block" href="{base}{step.href}"
+											>Set it up <Icon name="arrow-right" /></a
 										>
 									{/if}
 								{/if}

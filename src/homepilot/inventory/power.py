@@ -55,6 +55,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ..adapters import pve_reads
 from ..adapters.proxmox import (
     GUEST_POWER_ACTIONS,
     ProxmoxTaskStillRunningError,
@@ -67,6 +68,10 @@ POWER_ACTIONS: tuple[str, ...] = GUEST_POWER_ACTIONS
 # The actions that take a machine down (for a while or for good). On the self
 # guest or a protected one they need the guest's name typed back.
 OFF_ACTIONS: tuple[str, ...] = ("shutdown", "reboot", "stop")
+# The journal's code for each power action that was sent ("guest_start"...).
+# A lookup rather than an f-string so the set of codes can be read off the
+# source: the Overview words every code it can show (dashboard/wording.py).
+POWER_AUDIT_ACTIONS: dict[str, str] = {action: f"guest_{action}" for action in POWER_ACTIONS}
 
 OUTCOME_OK = "ok"
 OUTCOME_FAILED = "failed"
@@ -356,7 +361,7 @@ class PowerService:
         await self._audit(
             actor,
             source,
-            f"guest_{action}",
+            POWER_AUDIT_ACTIONS[action],
             host,
             artifact_id,
             {
@@ -595,7 +600,7 @@ class PowerService:
             return
         name = host.get("hostname")
         try:
-            listing = await self.proxmox.read("/cluster/resources", {"type": "vm"})
+            listing = await pve_reads.cluster_guests(self.proxmox)
         except Exception as exc:  # the scan cannot complete: refuse
             raise PowerRefusedError(
                 "disk_unknown",

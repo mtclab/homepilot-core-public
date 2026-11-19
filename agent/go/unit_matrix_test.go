@@ -101,6 +101,7 @@ func renderInstall(t *testing.T, args ...string) renderedInstall {
 		blockBetween(t, text, "grant"),
 		"CONF_DIR='" + confDir + "'",
 		"mkdir -p \"$CONF_DIR\"",
+		blockBetween(t, text, "agent-id resolve"),
 		"HUB_HOST=hub.example", "HUB_PORT=8443", "TOKEN=enrollment-token", "USE_TLS=false",
 		"INSTALL_DIR=/usr/local/bin",
 		"UNIT_PATH='" + unitPath + "'",
@@ -243,7 +244,10 @@ var privilegedCommandNeeds = map[string]commandNeed{
 	// regex requires it. That is a pre-existing allowlist quirk (it makes the
 	// single-spaced form unusable), left alone here — #422 is about the runtime,
 	// not about widening or reshaping the allowlist.
-	"systemctl":         {sample: "systemctl restart nginx.service", needsRoot: true},
+	"systemctl": {sample: "systemctl restart nginx.service", needsRoot: true},
+	// The full process listing (#817) reads /proc and writes nothing; it is
+	// privileged because of what it shows (command lines), not what it needs.
+	"ps":                {sample: "ps aux"},
 	"docker-run":        {sample: "docker run nginx", needsRoot: true},
 	"docker-pull":       {sample: "docker pull nginx:latest", needsRoot: true},
 	"docker-compose-up": {sample: "docker compose -f /opt/homepilot/docker-compose.yml up -d", needsRoot: true},

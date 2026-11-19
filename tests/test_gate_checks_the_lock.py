@@ -62,7 +62,8 @@ def _run(tmp_path: Path, out: str, code: int) -> tuple[subprocess.CompletedProce
 def test_gate_runs_the_lock_check_first() -> None:
     match = re.search(r"^gate:(.*)$", MAKEFILE, re.MULTILINE)
     assert match, "no `gate:` target in the Makefile"
-    assert match.group(1).split()[0] == "gate-lock"
+    # Only the advisory box-load warning (#810), which tests nothing, runs before it.
+    assert match.group(1).split()[:2] == ["gate-box", "gate-lock"]
     recipe = MAKEFILE.split("\ngate-lock:\n", 1)[1].split("\n\n", 1)[0]
     assert 'scripts/check_venv_lock.py "$(VENV)"' in recipe
 

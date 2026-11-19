@@ -55,8 +55,8 @@ from homepilot.tasks.repository import TaskRepository
 pytestmark = pytest.mark.asyncio
 
 PUBKEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGwqABCm8wgfVU6mDkhzQAaGT1kEJmpTB/J0UODkf1Xq me@lab"
-NODE = "elizabeth"
-VNET = "innkeep"
+NODE = "pve-gw"
+VNET = "guestnet"
 SUBNET = "198.51.100.0/24"
 GATEWAY = "198.51.100.1"
 
@@ -489,10 +489,15 @@ class TestTheSettingsRefuseWhatTheyCannotHonour:
 
         class Cluster:
             async def read(self, path: str, query: Any = None) -> dict[str, Any]:
-                assert path == "/cluster/sdn/zones"
-                return {"data": [{"zone": "guest", "type": "simple"}]}
+                raise AssertionError(f"SDN read hand-rolled past pve_sdn (#717): {path}")
 
-        result = await PROBES["provision_ip_mode"]("dhcp", ProbeContext(proxmox=Cluster()))
+        class Sdn:  # pve_sdn's gateway, faked at its boundary
+            async def list_zones(self) -> list[dict[str, Any]]:
+                return [{"zone": "guest", "type": "simple"}]
+
+        result = await PROBES["provision_ip_mode"](
+            "dhcp", ProbeContext(proxmox=Cluster(), sdn=Sdn())
+        )
         assert result.ok is False
         assert result.reachable is True
         assert "no SDN zone" in result.detail

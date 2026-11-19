@@ -21,8 +21,19 @@ var privilegedCommands = map[string]*regexp.Regexp{
 	"docker-compose-up": regexp.MustCompile(
 		`^docker\s+compose\s+(-f\s+[a-zA-Z0-9_./-]+\s+)?(up|down)\s+(-d\s+)?(--build\s+)?[a-zA-Z0-9_.-]*$`),
 	"docker-stop": regexp.MustCompile(`^docker\s+(stop|rm|restart)\s+[a-zA-Z0-9_.:-]+$`),
+	// `status` lives here, not in the shared read policy: it prints the unit's
+	// processes with their full command lines, which carry other services'
+	// secrets (#817). An admin on a privileged agent may still read them.
 	"systemctl": regexp.MustCompile(
-		`^systemctl\s+(daemon-reload|start|stop|restart|enable|disable)(\s+[a-zA-Z0-9_.-]+(\.service)?)?$`),
+		`^systemctl\s+((daemon-reload|start|stop|restart|enable|disable)(\s+[a-zA-Z0-9_.-]+(\.service)?)?|status(\s+[a-zA-Z0-9_.@-]+)?)$`),
+	// Full process listings (`ps aux`, `ps -ef`, `-o args`) print every
+	// process's command line, so they left the shared read policy (#817), whose
+	// ps prints names only. A privileged agent keeps them for an admin: this is
+	// the pre-#817 read pattern, still without BSD 'e' (environments) anywhere -
+	// a dashed cluster holds only valid UNIX letters, so procps never re-reads it
+	// as BSD letters where 'e' would mean environment.
+	"ps": regexp.MustCompile(
+		`^ps(\s+(-e|-e?[AadfFHjlLNTw]+|[afjlmrSTuvwxH]+|(-e?[AadfFHjlLNTw]*)?[opuUCgG]\s+[a-zA-Z0-9_,%.:=+][a-zA-Z0-9_,%.:=+-]*|--(forest|no-headers|headers)|--sort=[a-zA-Z0-9_,%+-]+))*$`),
 	"mkdir": regexp.MustCompile(`^mkdir\s+-p\s+[a-zA-Z0-9_./-]+$`),
 	"chmod": regexp.MustCompile(`^chmod\s+[0-7]{3,4}\s+[a-zA-Z0-9_./-]+$`),
 	"cp":    regexp.MustCompile(`^cp\s+[a-zA-Z0-9_./-]+\s+[a-zA-Z0-9_./-]+$`),
@@ -185,6 +196,9 @@ func (a Allowlist) IsAllowed(command string) (bool, string) {
 				}
 			}
 			return true, ""
+		}
+		if hint := commandHints[base]; hint != "" {
+			return false, "command pattern not allowed: " + actual + " (" + hint + ")"
 		}
 		return false, "command pattern not allowed: " + actual
 	}

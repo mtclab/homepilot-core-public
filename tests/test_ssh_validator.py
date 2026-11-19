@@ -29,11 +29,13 @@ class TestValidateReadonlyCommand:
     def test_cat_path_traversal_rejected(self):
         assert AgentAdapter._validate_readonly_command("cat /var/log/../../etc/shadow") is False
 
-    def test_ps_no_flags(self):
-        assert AgentAdapter._validate_readonly_command("ps") is True
+    def test_ps_name_only_columns(self):
+        assert AgentAdapter._validate_readonly_command("ps -eo pid,user,comm,etime") is True
 
-    def test_ps_with_flags(self):
-        assert AgentAdapter._validate_readonly_command("ps aux") is True
+    def test_ps_full_listing_rejected(self):
+        """#817: command lines carry other services' secrets."""
+        assert AgentAdapter._validate_readonly_command("ps aux") is False
+        assert AgentAdapter._validate_readonly_command("ps") is False
 
     def test_ip_addr(self):
         assert AgentAdapter._validate_readonly_command("ip addr") is True
@@ -41,17 +43,21 @@ class TestValidateReadonlyCommand:
     def test_ip_route(self):
         assert AgentAdapter._validate_readonly_command("ip route") is True
 
-    def test_systemctl_status(self):
-        assert AgentAdapter._validate_readonly_command("systemctl status nginx.service") is True
+    def test_systemctl_is_active(self):
+        assert AgentAdapter._validate_readonly_command("systemctl is-active nginx.service") is True
 
-    def test_systemctl_status_without_suffix(self):
-        assert AgentAdapter._validate_readonly_command("systemctl status nginx") is True
+    def test_systemctl_is_active_without_suffix(self):
+        assert AgentAdapter._validate_readonly_command("systemctl is-active nginx") is True
 
-    def test_systemctl_status_path_traversal_rejected(self):
-        assert AgentAdapter._validate_readonly_command("systemctl status ../../evil") is False
+    def test_systemctl_status_rejected(self):
+        """#817: status prints the unit's processes with their command lines."""
+        assert AgentAdapter._validate_readonly_command("systemctl status nginx") is False
 
-    def test_systemctl_status_absolute_path_rejected(self):
-        assert AgentAdapter._validate_readonly_command("systemctl status /usr/bin/foo") is False
+    def test_systemctl_path_traversal_rejected(self):
+        assert AgentAdapter._validate_readonly_command("systemctl is-active ../../evil") is False
+
+    def test_systemctl_absolute_path_rejected(self):
+        assert AgentAdapter._validate_readonly_command("systemctl is-active /usr/bin/foo") is False
 
     def test_uname_a(self):
         assert AgentAdapter._validate_readonly_command("uname -a") is True

@@ -11,6 +11,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from ..adapters import pve_reads
 from ..app_settings import (
     EnvOverrideError,
     ProbeRefusedError,
@@ -22,7 +23,7 @@ from ..app_settings import (
 from ..auth.deps import require_scope
 from ..config import get_settings
 from ..proxmox_config import ProxmoxTokens, resolve_proxmox_tokens
-from ..selfcheck import selfcheck_report
+from ..selfcheck import report_state, selfcheck_report
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,8 @@ async def selfcheck(
     describes now, not boot - the boot copy goes to the log.
     """
     settings = getattr(request.app.state, "settings", None) or get_settings()
-    return await selfcheck_report(request.app.state, settings)
+    # The same object the get_selfcheck MCP tool reads (#814).
+    return await selfcheck_report(report_state(request.app.state), settings)
 
 
 async def proxmox_settings_report(state: Any) -> dict[str, Any]:
@@ -266,7 +268,7 @@ async def probe_proxmox_connection(state: Any, config: ProxmoxConfigIn) -> dict[
         base_url=base_url, token=token, verify_ssl=verify_ssl, write_token=write_token
     )
     try:
-        version_info = await client.read("/version")
+        version_info = await pve_reads.version(client)
     except Exception as exc:
         with contextlib.suppress(Exception):
             await client.close()
@@ -502,7 +504,7 @@ async def _do_reload(request: Request) -> dict[str, Any]:
                     write_token=effective_write_token,
                 )
                 try:
-                    await new_proxmox.read("/version")
+                    await pve_reads.version(new_proxmox)
                 except Exception as exc:
                     logger.error("New ProxmoxClient validation failed: %s", exc, exc_info=True)
                     await new_proxmox.close()

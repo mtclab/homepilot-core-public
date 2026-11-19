@@ -10,6 +10,7 @@ import httpx
 from ..auth.principal import Principal
 from ..events import emit_event
 from ..runtime.blocking import run_blocking
+from . import policy_rules
 from .file_store import ArtifactFileStore
 from .models import ApprovalRefusedError, ArtifactStatus
 from .models import ConflictError as ConflictError
@@ -165,7 +166,7 @@ class ArtifactLifecycle:
             # Mint the approval code AFTER the artifacts row exists. Never logged
             # (it is a human-relay secret); it reaches operators only via the
             # outbound webhook POST below, the review screen for an operator
-            # credential, and `hp artifacts show`. No MCP read, no SSE event and
+            # credential, and `hp changes show`. No MCP read, no SSE event and
             # no non-operator REST read returns it (#681).
             try:
                 from .approval_code import ensure_approval_code
@@ -259,7 +260,7 @@ class ArtifactLifecycle:
             raise ApprovalRefusedError(
                 "Approving needs an approval code a human relays to you, or an "
                 "operator credential. Ask the operator to read the code from the "
-                "review screen or `hp artifacts show`."
+                "review screen or `hp changes show`."
             )
         if self.repo is None:
             raise ApprovalRefusedError("approval-code store unavailable")
@@ -278,7 +279,7 @@ class ArtifactLifecycle:
             raise ApprovalRefusedError(
                 f"Approval for '{id}' is locked after too many wrong codes. "
                 "An operator must reset it from the web UI or "
-                "`hp artifacts reset-approval` before it can be approved with a code."
+                "`hp changes reset-approval` before it can be approved with a code."
             )
         if not verify_code(str(approval_code), str(row["code"])):
             state = await self.repo.record_failed_approval(id, LOCK_THRESHOLD)
@@ -297,6 +298,7 @@ class ArtifactLifecycle:
         reason: str | None = None,
         *,
         approval_code: str | None = None,
+        acknowledge_policy: bool = False,
     ) -> None:
         # A bare name is not authority: every caller must say WHO is approving as
         # an authenticated Principal, so a transport that forgets the check
@@ -307,9 +309,29 @@ class ArtifactLifecycle:
                 f"not {type(principal).__name__}"
             )
         authority = await self._approval_authority(id, principal, approval_code)
+        # A structured policy rule this change matches is a warning the approver
+        # must acknowledge (#506) - here, the one gate every transport shares.
+        # Never a refusal of the change: the same approval, acknowledged, goes on.
+        # No KB, no policies. Only a proposed change is approved; anything else
+        # is refused below with its own reason, which a policy warning must not
+        # stand in for.
+        matched: list[dict[str, Any]] = []
+        if self._kb_service is not None:
+            fm_now, _ = await run_blocking("io", self.store.read, id)
+            if fm_now.get("status") == ArtifactStatus.PROPOSED.value:
+                matched = policy_rules.blocking(
+                    await policy_rules.policy_warnings(id, self.store, self._kb_service)
+                )
+        if matched and not acknowledge_policy:
+            raise policy_rules.PolicyAcknowledgementRequiredError(matched)
         identity = await self._confirm_identity_for_approval(id)
         await self._ensure_transitions().approve(
-            id, principal.name, reason, authority=authority, identity=identity
+            id,
+            principal.name,
+            reason,
+            authority=authority,
+            identity=identity,
+            policy_acknowledged=sorted({str(w["policy_id"]) for w in matched}) or None,
         )
         # The artifact has left PROPOSED, so its approval code is spent: clear it
         # so a replay of the same code cannot re-approve anything (#385 gate 2).

@@ -10,7 +10,7 @@ self-check and the Settings page read it. "Configured" and "working" stop
 being the same claim.
 
 The push itself is the store's own (`ArtifactStore.push`): same lock, same
-ssh-key handling as the CLI's `hp artifacts push`. Subprocess git is
+ssh-key handling as the CLI's `hp changes push`. Subprocess git is
 synchronous, so it runs in a worker thread rather than blocking the loop.
 """
 

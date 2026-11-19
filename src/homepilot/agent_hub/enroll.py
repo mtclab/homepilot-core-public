@@ -26,6 +26,7 @@ import contextlib
 import json
 import logging
 import re
+import shlex
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,7 @@ from ..adapters.proxmox import ProxmoxClient
 from ..background import DEFAULT_DRAIN_TIMEOUT, drain_tasks
 from ..db.repository import Repository
 from ..tasks.repository import TaskRepository
+from .dist import INSTALLER_MISMATCH_MESSAGE
 
 if TYPE_CHECKING:
     from .registry import AgentRegistry
@@ -52,6 +54,16 @@ INSTALLER_URL = (
 # /run is tmpfs: the staged credentials never reach the guest's disk.
 _ENV_PATH = "/run/hp-agent-enroll.env"
 _INSTALLER_PATH = "/run/hp-agent-install.sh"
+
+# Where install-agent.sh's upgrade-snapshot block saves everything it may change
+# over an existing agent (binary, agent.env, agent.id, credentials, unit), and
+# what the rollback restores from (#823). Root-only, outside every read prefix.
+SNAPSHOT_DIR = "/var/lib/hp-agent/upgrade-snapshot"
+
+# The rollback says so when it kept the credential the hub had already issued to
+# the new agent (restoring the old one would lock the host out). A line the
+# wrapper echoes, not a secret.
+_KEPT_CREDENTIAL_MARKER = "hp-agent-rollback: kept agent.token"
 
 # install-agent.sh always writes the agent id it resolved to /etc/homepilot/agent.id
 # (it reuses an existing id rather than minting one, so the id is not ours to
@@ -315,18 +327,40 @@ class AgentEnrollService:
             # hub on - that address is already resolved for this guest's network -
             # so the binary comes from the control plane rather than the internet
             # (#464). A guest on an egress-limited VLAN can then still enrol.
-            from .dist import api_base_for
+            from .dist import api_base_for, installer_sha256
 
             api_base = api_base_for(hub_host)
-            env_body = _env_file(hub_host, hub_port, token, tls, pin, api_base)
+            if upgrade:
+                # The LIVE agent's id goes to the installer (#823): an agent from
+                # before agent.id existed has no id on disk, and an installer left
+                # to guess minted a new one - a second agent the upgrade then had
+                # to refuse.
+                prior = registry.get_by_hostname(hostname)
+                if prior is None:
+                    raise RuntimeError(
+                        f"the agent on {hostname} disconnected before the upgrade started; "
+                        "nothing was changed"
+                    )
+            env_body = _env_file(
+                hub_host,
+                hub_port,
+                token,
+                tls,
+                pin,
+                api_base,
+                agent_id=str(prior.agent_id) if prior is not None else "",
+                # The host's grant stays as it is (#841): the installer reads
+                # it from the live agent.env rather than defaulting to
+                # unprivileged.
+                keep_grant=upgrade,
+                installer_sha256=installer_sha256() or "",
+            )
             await proxmox.agent_write_file(node, vmid, _ENV_PATH, env_body)
 
             step = "install"
             from .join_requests import install_started_at
 
             started_at = install_started_at()
-            if upgrade and registry is not None:
-                prior = registry.get_by_hostname(hostname)
             exit_code, stdout, stderr = await self._install(node, vmid)
             # The binary-swap block announces the swap; only then is there a
             # previous binary of THIS run to put back.
@@ -367,6 +401,9 @@ class AgentEnrollService:
                 task_id, "succeeded", result_json=json.dumps(result)
             )
             await self._audit(actor, hostname, "install_agent", result)
+            # The new agent is in: the snapshot of the one it replaced (old
+            # credentials among it) has nothing left to restore.
+            await self._drop_snapshot(node, vmid)
         except Exception as exc:
             # Never log or store the exception body raw: a PVE error echoes the
             # command back, and captured guest output could carry the token.
@@ -519,7 +556,7 @@ class AgentEnrollService:
         if not swapped:
             return "The binary was not replaced, so there was nothing to roll back."
         try:
-            exit_code, _out, _err = await self.proxmox.agent_run(
+            exit_code, out, _err = await self.proxmox.agent_run(
                 node,
                 vmid,
                 _rollback_script(),
@@ -528,19 +565,31 @@ class AgentEnrollService:
             )
         except Exception:
             logger.warning("Agent upgrade rollback on vmid %s failed", vmid, exc_info=True)
-            return "Putting the previous agent back failed; see the host's journal."
+            return (
+                "Putting the previous agent back failed; see the host's journal. "
+                f"The saved copy is in {SNAPSHOT_DIR}."
+            )
         if exit_code != 0:
-            return f"Putting the previous agent back exited {exit_code}."
+            return (
+                f"Putting the previous agent back exited {exit_code}. "
+                f"The saved copy is in {SNAPSHOT_DIR}."
+            )
+        kept = (
+            " It kept the credential the hub had already issued to the new agent; "
+            "every other file is as it was."
+            if _KEPT_CREDENTIAL_MARKER in (out or "")
+            else ""
+        )
         deadline = time.monotonic() + self.connect_wait_s
         while time.monotonic() < deadline:
             agent = registry.get(prior.agent_id)
             if agent is not None and agent is not prior:
                 return (
                     f"HomePilot put the previous agent back and it is connected again "
-                    f"({_agent_version(agent)})."
+                    f"({_agent_version(agent)}).{kept}"
                 )
             await asyncio.sleep(self.connect_interval)
-        return "HomePilot put the previous agent back, but it has not reconnected yet."
+        return f"HomePilot put the previous agent back, but it has not reconnected yet.{kept}"
 
     async def _refusal_since(self, hostname: str, since: str | None) -> dict[str, Any] | None:
         """The hub's latest refusal of this host since the install began, if any.
@@ -564,6 +613,15 @@ class AgentEnrollService:
         with contextlib.suppress(Exception):
             await proxmox.agent_exec(node, vmid, ["rm", "-f", _ENV_PATH, _INSTALLER_PATH])
 
+    async def _drop_snapshot(self, node: str, vmid: int) -> None:
+        """Best effort: remove the installer's upgrade snapshot once the new
+        agent is verified, so stale copies of old credentials do not linger."""
+        proxmox = self.proxmox
+        if proxmox is None:
+            return
+        with contextlib.suppress(Exception):
+            await proxmox.agent_exec(node, vmid, ["rm", "-rf", SNAPSHOT_DIR])
+
     async def _audit(self, actor: str, hostname: str, action: str, details: dict[str, Any]) -> None:
         try:
             await self.repo.log_audit(
@@ -585,14 +643,40 @@ def _assert_shell_safe(name: str, value: str) -> str:
 
 
 def _env_file(
-    hub_host: str, hub_port: int, token: str, tls: bool, pin: str, api_base: str = ""
+    hub_host: str,
+    hub_port: int,
+    token: str,
+    tls: bool,
+    pin: str,
+    api_base: str = "",
+    agent_id: str = "",
+    keep_grant: bool = False,
+    installer_sha256: str = "",
 ) -> str:
     """The env file the guest sources. Every value is shell-safe by validation,
-    because `.` EXECUTES this file rather than parsing it."""
+    because `.` EXECUTES this file rather than parsing it.
+
+    ``agent_id`` is the LIVE agent an upgrade replaces: install-agent.sh keeps
+    it (HP_AGENT_ID) instead of minting an id where the old agent stored none,
+    and refuses before changing anything if the host stores a different one.
+
+    ``keep_grant`` (an upgrade) has the installer keep the grant the host's
+    agent.env holds - privileged, package install, write prefixes - instead of
+    its unprivileged defaults (#841). The grant is deliberately NOT sent from
+    here: the server does not reliably know it, and a field it lacked would
+    default, the very drop this prevents."""
     lines = [
         f"HUB={_assert_shell_safe('hub host', f'{hub_host}:{hub_port}')}",
         f"TOKEN={_assert_shell_safe('enrollment token', token)}",
     ]
+    if agent_id:
+        lines.append(f"HP_AGENT_ID={_assert_shell_safe('agent id', agent_id)}")
+    if keep_grant:
+        lines.append("KEEP_GRANT=true")
+    if installer_sha256:
+        # What the installer fetched from HP_API must hash to (#843); the
+        # wrapper refuses to run anything else.
+        lines.append(f"INSTALLER_SHA256={_assert_shell_safe('installer sha256', installer_sha256)}")
     if api_base:
         # Points the installer at THIS control plane for the binary, so a guest
         # with no internet still enrols and the agent matches the hub (#464).
@@ -628,6 +712,12 @@ def _install_script() -> str:
         f'curl -fsSL -H "x-hp-agent-token: $TOKEN" "$HP_API/agents/dist/install-agent.sh" '
         f"-o {_INSTALLER_PATH}; else "
         f"curl -fsSL {INSTALLER_URL} -o {_INSTALLER_PATH}; fi; "
+        # The installer runs as root: one that is not the file the control
+        # plane vouched for is refused before it runs (#843).
+        f'if [ -n "${{INSTALLER_SHA256:-}}" ]; then '
+        f"printf '%s  %s\\n' \"$INSTALLER_SHA256\" {_INSTALLER_PATH} | sha256sum -c - "
+        f">/dev/null 2>&1 || {{ echo {shlex.quote(INSTALLER_MISMATCH_MESSAGE)} >&2; "
+        f"rm -f {_INSTALLER_PATH}; exit 1; }}; fi; "
         f"bash {_INSTALLER_PATH}; "
         f"rm -f {_INSTALLER_PATH}; "
         f"printf '{_AGENT_ID_MARKER}%s\\n' \"$(cat /etc/homepilot/agent.id)\""
@@ -635,20 +725,63 @@ def _install_script() -> str:
 
 
 def _rollback_script() -> str:
-    """Put the agent that was running before a failed upgrade back.
+    """Put the agent that was running before a failed upgrade back - all of it.
 
-    The binary the installer kept as hp-agent.prev replaces the new one; the
-    credential it kept as agent.token.prev comes back only if the new agent never
-    persisted one (if it did, that new credential is the live one on the hub and
-    works with either binary). Paths default to the installer's; INSTALL_DIR and
-    CONF_DIR exist so a test can run this very text in a sandbox.
+    install-agent.sh's upgrade-snapshot block saved every file it may change
+    (binary, hp-agent.prev, agent.env, agent.id, agent.token, agent.token.prev,
+    the unit) with a manifest of where each lives. Each is put back byte for
+    byte with its mode and owner, and one that did not exist is removed again
+    (#823: restoring only the binary brought the old agent up under the NEW id
+    and config). Two deliberate exceptions, both so the old agent comes back as
+    the SAME agent:
+
+    * a credential the new agent already received from the hub stays: the hub
+      replaced the old one with it, so restoring the old one would lock the
+      host out (the script prints a marker the task reports);
+    * a host that stored no agent.id keeps the live agent's id (which the
+      upgrade passed) as agent.id: otherwise the old binary mints a fresh id at
+      restart - the second agent of #823.
+
+    Files are swapped by rename, never written in place: the binary may be
+    running. With no snapshot (an installer that predates it), the old
+    behaviour: the previous binary and, if missing, the kept credential.
+    SNAPSHOT_DIR, INSTALL_DIR and CONF_DIR exist so a test can run this very text
+    in a sandbox.
     """
     return (
+        f'S="${{SNAPSHOT_DIR:-{SNAPSHOT_DIR}}}"; '
         'I="${INSTALL_DIR:-/usr/local/bin}"; C="${CONF_DIR:-/etc/homepilot}"; '
+        'fail=""; '
+        'if [ -f "$S/manifest" ]; then '
+        'keep_token=""; '
+        "token_path=$(sed -n 's/^agent[.]token //p' \"$S/manifest\"); "
+        'if [ -n "$token_path" ] && [ -s "$token_path" ] '
+        '&& ! cmp -s "$token_path" "$S/agent.token"; then keep_token=1; fi; '
+        "while read -r name path; do "
+        '[ -n "$name" ] || continue; '
+        'if [ "$name" = agent.token ] && [ -n "$keep_token" ]; then continue; fi; '
+        'if [ -e "$S/$name" ]; then '
+        '{ cp -p "$S/$name" "$path.hp-rollback" && mv -f "$path.hp-rollback" "$path"; } '
+        "|| fail=1; "
+        'elif [ "$name" = agent.id ] && [ -s "$S/live-agent-id" ]; then '
+        # The installer wrote it with the right owner; rewrite it only if not.
+        'cmp -s "$path" "$S/live-agent-id" || { cp "$S/live-agent-id" "$path.hp-rollback" '
+        '&& chmod 600 "$path.hp-rollback" '
+        '&& { chown --reference="$(dirname "$path")" "$path.hp-rollback" 2>/dev/null || true; } '
+        '&& mv -f "$path.hp-rollback" "$path"; } || fail=1; '
+        'else rm -f "$path" || fail=1; fi; '
+        'done < "$S/manifest"; '
+        "systemctl daemon-reload; "
+        # A partial restore keeps the snapshot for the operator and exits non-zero.
+        'if [ -z "$fail" ]; then rm -rf "$S"; fi; '
+        f'if [ -n "$keep_token" ]; then echo "{_KEPT_CREDENTIAL_MARKER}"; fi; '
+        "else "
         'if [ -f "$I/hp-agent.prev" ]; then mv -f "$I/hp-agent.prev" "$I/hp-agent"; fi; '
         'if [ ! -s "$C/agent.token" ] && [ -s "$C/agent.token.prev" ]; then '
         'cp -p "$C/agent.token.prev" "$C/agent.token"; chmod 600 "$C/agent.token"; fi; '
-        "systemctl restart hp-agent"
+        "fi; "
+        "systemctl restart hp-agent; "
+        '[ -z "$fail" ]'
     )
 
 

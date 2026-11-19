@@ -14,6 +14,8 @@ export const HOST_TABS: QueryTabDef[] = [
 	{ id: 'overview', label: 'Overview' },
 	// Every address the machine holds and who else holds one (lane B2).
 	{ id: 'network', label: 'Network' },
+	// How the machine is built (#818): the agent's host description.
+	{ id: 'built', label: 'How it is built' },
 	{ id: 'metrics', label: 'Metrics' },
 	{ id: 'changes', label: 'Changes' },
 	{ id: 'activity', label: 'Activity' },

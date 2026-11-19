@@ -80,6 +80,12 @@ class AppState:
     # Why the hub is not running despite being enabled, in the operator's words.
     # Empty when the hub is off by configuration or running normally.
     agent_hub_disabled_reason: str = ""
+    # The event-loop stall watchdog, set by the lifespan (None when
+    # HP_LOOP_STALL_MS=0). It lived only on `app.state`, so the MCP self-check -
+    # which reads THIS object - said "off" about a watchdog that was running and
+    # firing (#814). Every self-check surface now reads this object
+    # (selfcheck.report_state).
+    loop_watchdog: Any = None
 
 
 def _init_artifacts_repo(artifacts_dir: Path) -> None:

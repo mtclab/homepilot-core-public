@@ -32,6 +32,7 @@ type policyCommand struct {
 	Pattern     string `json:"pattern"`
 	ReadTier    bool   `json:"read_tier"`
 	PathChecked bool   `json:"path_checked"`
+	Hint        string `json:"hint"`
 }
 
 type policyReadPaths struct {
@@ -68,6 +69,9 @@ var (
 	safeCommands map[string]*regexp.Regexp
 	// pathCheckedCommands take one path argument that must pass checkReadPath.
 	pathCheckedCommands map[string]bool
+	// commandHints name the safe form a refused command should take instead
+	// (#817): "no" alone sends a caller guessing at the next form to try.
+	commandHints map[string]string
 	// defaultWritePrefixes is the built-in write allowlist. Overridable for
 	// tests (and constrained deployments) via HP_AGENT_WRITE_PREFIXES.
 	defaultWritePrefixes []string
@@ -88,10 +92,14 @@ func init() {
 	shellMetaRe = regexp.MustCompile("[" + regexp.QuoteMeta(p.ShellMetachars) + "]")
 	safeCommands = make(map[string]*regexp.Regexp, len(p.Commands))
 	pathCheckedCommands = map[string]bool{}
+	commandHints = map[string]string{}
 	for name, c := range p.Commands {
 		safeCommands[name] = wholeMatch(c.Pattern)
 		if c.PathChecked {
 			pathCheckedCommands[name] = true
+		}
+		if c.Hint != "" {
+			commandHints[name] = c.Hint
 		}
 	}
 	rp := p.ReadPaths
@@ -164,6 +172,12 @@ func checkReadPath(path string) (string, error) {
 	}
 	if !readAllowed(resolved) {
 		return "", fmt.Errorf("path not in the read allowlist: %s", path)
+	}
+	// A file a systemd unit loads secrets from (EnvironmentFile=,
+	// LoadCredential=...) is refused wherever it sits (#853): its name need not
+	// say "env", and the deny rules above only know names.
+	if reason := unitSecretSourceRefusal(lexical, resolved); reason != "" {
+		return "", fmt.Errorf("%s", reason)
 	}
 	return resolved, nil
 }

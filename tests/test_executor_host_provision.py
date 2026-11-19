@@ -45,6 +45,8 @@ def _apply_agent() -> AsyncMock:
     # exec_readonly, which does not unpack into (rc, stdout, stderr).
     agent.exec_readonly = AsyncMock(return_value=(1, "", ""))
     agent.read_file = AsyncMock(side_effect=FileNotFoundError("absent"))
+    # The capture reads through the write path's snapshot (#853).
+    agent.snapshot_file = AsyncMock(side_effect=FileNotFoundError("absent"))
     return agent
 
 
@@ -187,7 +189,7 @@ class TestHostProvisionApply:
     async def test_apply_captures_the_prior_state(self, make_frontmatter):
         """Nothing else records it, and after the apply the prior bytes are gone."""
         agent = _apply_agent()
-        agent.read_file = AsyncMock(return_value="original config")
+        agent.snapshot_file = AsyncMock(return_value="original config")
         agent.exec_readonly = AsyncMock(return_value=(0, "install ok installed", ""))
         fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
 
@@ -385,3 +387,175 @@ class TestHostProvisionDrift:
         assert result.drifted is True
         assert "config:/etc/nginx/conf.d/app.conf" in result.details["drifted_items"]
         _assert_no_mutation(agent)
+
+
+# #853: the agent returns unit files with their Environment= values redacted.
+# A rollback snapshot must not take those placeholders for the bytes that were
+# there (writing them back would replace a service's real environment), and
+# drift must compare like with like instead of reporting every unit with an
+# environment as drifted.
+UNIT_BODY = """\
+## Plan
+Run the app with its token.
+
+```yaml host-provision-spec
+config_files:
+  - path: /etc/systemd/system/app.service.d/override.conf
+    content: |
+      [Service]
+      Environment=TOKEN=value1 MODE=prod
+    mode: "0644"
+```
+"""
+
+
+class TestUnitFilesTheAgentRedacts:
+    @staticmethod
+    def _agent(on_host: str) -> AsyncMock:
+        """An agent from before snapshot_file: the capture falls back to the
+        read tier, which redacts."""
+        from homepilot.adapters.agent import AgentTooOldError
+
+        agent = _apply_agent()
+        agent.read_file = AsyncMock(return_value=on_host)
+        agent.snapshot_file = AsyncMock(side_effect=AgentTooOldError("no snapshot_file"))
+        agent.exec_readonly = AsyncMock(return_value=(0, "644", ""))
+        return agent
+
+    async def test_a_redacted_prior_read_is_unknown_and_never_written_back(self, make_frontmatter):
+        """Teeth: drop the unit_read_is_redacted check from capture_pre_state and
+        the snapshot holds the placeholders, which the rollback then writes."""
+        from homepilot.adapters.readonly_policy import redact_unit_text
+        from homepilot.executor.host_provision import capture_pre_state
+
+        real = "[Service]\nEnvironment=TOKEN=value0 MODE=dev\n"
+        agent = self._agent(redact_unit_text(real)[0])
+        spec = parse_host_provision_spec(UNIT_BODY)
+
+        captured = await capture_pre_state(agent, "web1", spec)
+
+        assert captured[0]["existed"] is None
+        assert captured[0]["prior_content"] is None
+        assert "redacts" in captured[0]["read_error"]
+
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+        result = await host_provision_execute(
+            fm, UNIT_BODY, fm["target"], agent, rollback=True, pre_state=captured
+        )
+        agent.write_config.assert_not_awaited()
+        assert result["success"] is False
+        assert "override.conf" in result["failure_reason"]
+        assert "redacts" in result["failure_reason"]
+
+    async def test_an_older_agents_real_bytes_stay_restorable(self):
+        from homepilot.executor.host_provision import capture_pre_state
+
+        real = "[Service]\nEnvironment=TOKEN=value0 MODE=dev\n"
+        captured = await capture_pre_state(
+            self._agent(real), "web1", parse_host_provision_spec(UNIT_BODY)
+        )
+
+        assert captured[0]["existed"] is True
+        assert captured[0]["prior_content"] == real
+
+    async def test_drift_compares_a_redacted_unit_redacted(self):
+        """Teeth: drop the redacted comparison from probe and an applied unit
+        with an environment reads "differs" for ever."""
+        from homepilot.adapters.readonly_policy import redact_unit_text
+        from homepilot.executor.host_provision import probe
+
+        spec = parse_host_provision_spec(UNIT_BODY)
+        desired = spec.config_files[0].content
+
+        [item] = await probe(self._agent(redact_unit_text(desired)[0]), "web1", spec)
+        assert item["changes"] is False and item["established"] is True
+        assert item["observed"].startswith("matches")
+        assert "not compared" in item["observed"]
+
+        # Every byte outside the redacted values is still compared.
+        other = desired.replace("[Service]", "[Service]\nUser=nobody")
+        [item] = await probe(self._agent(redact_unit_text(other)[0]), "web1", spec)
+        assert item["changes"] is True and item["observed"] == "differs"
+
+        # An older agent's real bytes compare as bytes.
+        [item] = await probe(self._agent(desired), "web1", spec)
+        assert item["observed"] == "matches"
+
+
+class TestRollbackThroughTheWritePathsSnapshot:
+    """#853: the read tier now redacts every unit file's Exec*= arguments too,
+    which would make the revoke of nearly any unit an artifact overwrote
+    "cannot put back". A current agent answers the capture through
+    snapshot_file - write_config's own read, privileged agents only - so the
+    exact bytes are kept for the revoke while the read tier never shows them."""
+
+    RAW = (
+        "[Service]\nEnvironment=TOKEN=value0\n"
+        "ExecStart=/usr/bin/app --token=value0 --port 80\n"
+        "ExecStartPre=-/usr/bin/prep --key value0\n"
+    )
+
+    def _agent(self) -> AsyncMock:
+        from homepilot.adapters.readonly_policy import redact_unit_text
+
+        agent = _apply_agent()
+        agent.snapshot_file = AsyncMock(return_value=self.RAW)
+        agent.read_file = AsyncMock(return_value=redact_unit_text(self.RAW)[0])
+        agent.exec_readonly = AsyncMock(return_value=(0, "644", ""))
+        return agent
+
+    async def test_the_revoke_puts_the_exact_bytes_back(self, make_frontmatter):
+        """Teeth: capture through read_file again and the prior content is
+        unknown, so the revoke refuses instead of restoring."""
+        from homepilot.executor.host_provision import capture_pre_state
+
+        agent = self._agent()
+        captured = await capture_pre_state(agent, "web1", parse_host_provision_spec(UNIT_BODY))
+        assert captured[0]["existed"] is True
+        assert captured[0]["prior_content"] == self.RAW
+        agent.read_file.assert_not_awaited()
+
+        fm = make_frontmatter(kind="host-provision", target=VM_TARGET)
+        result = await host_provision_execute(
+            fm, UNIT_BODY, fm["target"], agent, rollback=True, pre_state=captured
+        )
+        assert result["success"] is True, result
+        agent.write_config.assert_awaited_once_with(
+            "web1", "/etc/systemd/system/app.service.d/override.conf", self.RAW, "644"
+        )
+
+    async def test_drift_of_a_unit_with_exec_arguments_compares_redacted(self):
+        from homepilot.adapters.readonly_policy import redact_unit_text
+        from homepilot.executor.host_provision import probe
+
+        body = UNIT_BODY.replace(
+            "      Environment=TOKEN=value1 MODE=prod\n",
+            "      Environment=TOKEN=value1 MODE=prod\n      ExecStart=/usr/bin/app --token=value1\n",
+        )
+        spec = parse_host_provision_spec(body)
+        desired = spec.config_files[0].content
+        agent = self._agent()
+        agent.read_file = AsyncMock(return_value=redact_unit_text(desired)[0])
+        [item] = await probe(agent, "web1", spec)
+        assert item["changes"] is False and "Exec arguments" in item["observed"]
+        # Drift is read-tier only: it never asks for the raw bytes.
+        agent.snapshot_file.assert_not_awaited()
+
+
+def test_only_the_pre_apply_capture_asks_for_a_snapshot() -> None:
+    """snapshot_file returns unredacted bytes, so nothing a read-scope caller
+    reaches may call it: no MCP tool, no route, no drift or plan probe. Teeth:
+    call it from anywhere else in src/ and this fails."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "src" / "homepilot"
+    callers = sorted(
+        str(p.relative_to(src))
+        for p in src.rglob("*.py")
+        if re.search(r"\.snapshot_file\(", p.read_text("utf-8"))
+    )
+    assert callers == ["executor/host_provision.py"], callers
+    text = (src / "executor" / "host_provision.py").read_text("utf-8")
+    assert text.count(".snapshot_file(") == 1
+    assert "async def _read_prior" in text

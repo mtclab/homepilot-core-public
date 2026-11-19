@@ -395,7 +395,7 @@ class TestUnreadableIsNotAbsent:
         from homepilot.executor.host_provision import capture_pre_state
 
         agent = MagicMock()
-        agent.read_file = AsyncMock(
+        agent.snapshot_file = AsyncMock(
             side_effect=Exception("permission denied: /etc/nginx/nginx.conf")
         )
         agent.exec_readonly = AsyncMock(return_value=(0, "", ""))
@@ -409,7 +409,9 @@ class TestUnreadableIsNotAbsent:
         from homepilot.executor.host_provision import capture_pre_state
 
         agent = MagicMock()
-        agent.read_file = AsyncMock(side_effect=Exception("file not found: /etc/nginx/nginx.conf"))
+        agent.snapshot_file = AsyncMock(
+            side_effect=Exception("file not found: /etc/nginx/nginx.conf")
+        )
         agent.exec_readonly = AsyncMock(return_value=(0, "", ""))
 
         captured = await capture_pre_state(agent, "web1", self._spec_with_config())

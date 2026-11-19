@@ -38,6 +38,7 @@ go vet ./... && go test ./...
 | `HP_AGENT_METRICS_ENABLED` | `true` | Report system metrics to the hub; only an explicit false turns it off |
 | `HP_AGENT_METRICS_INTERVAL` | `60` | Seconds between samples |
 | `HP_AGENT_METRICS_BUFFER` | `1440` | Samples held while the hub is unreachable. Past the bound the OLDEST are dropped and the drop is logged |
+| `HP_AGENT_DESCRIBE_ROOT` | `/` | The filesystem the host description reads (#818). Only for tests, or a host whose root is mounted elsewhere |
 
 ## Run / systemd
 
@@ -78,3 +79,25 @@ prefix + JSON. Register handshake (`auth_token`), then the hub sends
 by `request_id`); the agent sends periodic `heartbeat` and `metrics` frames, and
 drops a metric batch from its buffer only once the hub's `metrics_ack` arrives. Connect uses capped exponential backoff (no crash on an
 unreachable hub).
+
+### Host description (`describe_host`, #818)
+
+The hub asks with `{"action": "describe_host"}` (no parameters) and the agent
+answers `command_result` with a `description`: a versioned JSON document
+(`schema: hp.host-description/1`) of how the host is built - listening sockets
+with the owning process NAME and unit, systemd services/timers that are active
+or enabled with the ExecStart PROGRAM path, Docker containers and compose
+projects (when the agent's user can open the docker socket), nginx server
+blocks/upstreams/include graph, certificate names and expiry, certbot renewal
+domains and authenticator, a firewall summary (ufw, nftables), pending updates
+and time sync. It never contains command lines or arguments, environments,
+container commands or non-compose labels, header values outside a known-safe
+list, anything under a key/secret/token/password-looking directive, private
+keys or file contents. A deny filter (`describe_scrub.go`) runs over the
+finished document in the agent and redacts private-key blocks, bearer/basic
+credentials, URL userinfo, `password=`-style assignments and well-known token
+formats. Each part reports `status` (`ok`, `partial`, `not_visible`,
+`not_installed`, `error`): an unprivileged agent says what its user cannot see
+instead of failing. Every string is capped (512 bytes) and so is the document
+(256 KiB, trimmed list by list with a `truncated` note). The agent advertises
+`capabilities: ["describe_host"]` in its system info.

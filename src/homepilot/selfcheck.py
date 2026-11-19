@@ -291,7 +291,7 @@ def _notifications_subsystem(state: Any) -> Subsystem:
                 STATE_OFF,
                 "No notification channel is configured, so a firing alert reaches this "
                 "console and the alert history and no phone. Add an ntfy topic in "
-                "Settings -> Monitoring.",
+                "Monitoring -> Channels.",
             )
         channels = [c for c in every if c["enabled"]]
         if not channels:
@@ -309,14 +309,14 @@ def _notifications_subsystem(state: Any) -> Subsystem:
                 STATE_UNREACHABLE,
                 f"{len(failing)} of {len(channels)} channel(s) failed their LAST delivery: "
                 f"{names}. Alerts sent there are not arriving. The error is on the channel "
-                "in Settings -> Monitoring; press Send test once it is fixed.",
+                "in Monitoring -> Channels; press Send test once it is fixed.",
             )
         if not ok:
             names = ", ".join(c["name"] for c in untested)
             return ProbeVerdict(
                 STATE_UNKNOWN,
                 f"Channel(s) {names} have never delivered anything, so nothing proves an "
-                "alert would arrive. Press Send test in Settings -> Monitoring.",
+                "alert would arrive. Press Send test in Monitoring -> Channels.",
             )
         newest = max(str(c["last_ok_at"]) for c in ok)
         age = _age_seconds(newest)
@@ -1051,6 +1051,23 @@ async def run_selfcheck(
         },
         "subsystems": subsystem_list,
     }
+
+
+def report_state(app_state: Any) -> Any:
+    """The ONE object every self-check surface reads (#814).
+
+    A running app has two state objects: the ``AppState`` it was built from
+    (which the MCP tools hold) and Starlette's ``app.state`` (which the HTTP
+    routes hold), mirrored by hand one field at a time. The report used to read
+    whichever its caller held, so every field mirrored onto only one of them
+    split the answer: the loop watchdog lived only on ``app.state`` (MCP said
+    "off" while it ran and fired), the hub's refusal reason only on the
+    ``AppState`` (HTTP lost the sentence naming the setting to change). The
+    HTTP route and the boot log now pass ``app.state`` through here and read
+    the same ``AppState`` the MCP tool reads. An app built without one (a test
+    app wired by hand) has only ``app.state``, which is then the one object.
+    """
+    return getattr(app_state, "hp_state", None) or app_state
 
 
 async def selfcheck_report(

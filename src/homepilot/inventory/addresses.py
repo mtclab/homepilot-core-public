@@ -54,6 +54,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
+from homepilot.adapters import pve_reads
+
 logger = logging.getLogger(__name__)
 
 SOURCE_QEMU_IPCONFIG = "qemu-ipconfig"
@@ -725,7 +727,7 @@ class AddressGuard:
                 "no Proxmox is configured, so the guest's config cannot be read"
             )
         try:
-            pending = await self.proxmox.read(f"/nodes/{node}/{guest_type}/{vmid}/pending")
+            pending = await pve_reads.guest_pending(self.proxmox, node, guest_type, vmid)
         except Exception as exc:  # any failure means "not known": the caller must refuse
             raise AddressCheckError(
                 f"could not read the config of {guest_type} {vmid} on {node} ({exc}), so "
@@ -757,7 +759,7 @@ class AddressGuard:
                 "no Proxmox is configured, so which guests hold an address cannot be asked"
             )
         try:
-            listing = await self.proxmox.read("/cluster/resources", {"type": "vm"})
+            listing = await pve_reads.cluster_guests(self.proxmox)
         except Exception as exc:  # any failure means "not known": the caller must refuse
             raise AddressCheckError(
                 f"could not list the cluster's guests to see who holds the address ({exc})"
@@ -794,7 +796,7 @@ class AddressGuard:
             # boot with, which is exactly the plain GET (#781).
             query = {"current": 1} if status == "running" else None
             try:
-                config = await self.proxmox.read(f"/nodes/{node}/{guest_type}/{vmid}/config", query)
+                config = await pve_reads.guest_config(self.proxmox, node, guest_type, vmid, query)
             except Exception as exc:  # any failure leaves the scan partial: refuse
                 raise AddressCheckError(
                     f"could not read the config of {guest_type} {vmid} on {node} ({exc}), "

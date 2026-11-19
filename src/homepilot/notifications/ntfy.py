@@ -2,7 +2,7 @@
 
 ntfy (https://ntfy.sh, self-hostable) takes a message on a TOPIC. An operator
 gives HomePilot the topic URL they would subscribe to in the app, e.g.
-``https://ntfy.example.com/CHANGE_ME_matrix_room_alias``. That URL is a capability -
+``https://ntfy.example.com/hp-alerts``. That URL is a capability -
 anyone holding it can read and post the topic - so it is stored in the vault,
 never in the database, and is never logged or returned whole (see service.py).
 
@@ -57,7 +57,7 @@ def split_topic_url(raw: str) -> tuple[str, str]:
     if not _TOPIC_RE.match(topic):
         raise ValueError(
             "the topic URL must end in a topic name (letters, digits, '-' or '_', "
-            "at most 64), e.g. https://ntfy.example.com/CHANGE_ME_matrix_room_alias"
+            "at most 64), e.g. https://ntfy.example.com/hp-alerts"
         )
     publish = urlunsplit((parts.scheme, parts.netloc, prefix + "/", "", ""))
     return publish, topic

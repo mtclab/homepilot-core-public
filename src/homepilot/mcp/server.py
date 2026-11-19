@@ -14,6 +14,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 
+from homepilot.adapters import pve_reads
 from homepilot.app_state import create_app_state
 from homepilot.config import get_settings
 
@@ -55,6 +56,20 @@ from .tools.artifact_tools import (
     handle_replay_artifact,
     handle_revoke_artifact,
     handle_withdraw_artifact,
+)
+from .tools.describe_tools import (
+    TOOL_DEFINITIONS as DESCRIBE_TOOL_DEFS,
+)
+from .tools.describe_tools import (
+    handle_describe_host,
+    handle_export_host_asbuilt,
+)
+from .tools.disk_tools import (
+    TOOL_DEFINITIONS as DISK_TOOL_DEFS,
+)
+from .tools.disk_tools import (
+    handle_add_guest_disk,
+    handle_get_guest_disks,
 )
 from .tools.guest_network_tools import (
     TOOL_DEFINITIONS as GUEST_NETWORK_TOOL_DEFS,
@@ -191,6 +206,8 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = (
     + GUEST_TOOL_DEFS
     + GUEST_NETWORK_TOOL_DEFS
     + POWER_TOOL_DEFS
+    + DISK_TOOL_DEFS
+    + DESCRIBE_TOOL_DEFS
     + AGENT_TOOL_DEFS
     + MONITORING_TOOL_DEFS
     + OPS_TOOL_DEFS
@@ -241,6 +258,12 @@ _MUTATING_TOOLS = frozenset(
         # to Proxmox, so it is a propose, at the propose tier. The direct power
         # route is operator-only and has no MCP twin.
         "power_guest",
+        # Adding a disk (#824): PROPOSES a guest-disk change and attaches nothing,
+        # like power_guest - POST /inventory/{host_id}/disks is API `write`.
+        "add_guest_disk",
+        # How a host is built (#818): writes the host's as-built KB note, like
+        # record_fact - POST /inventory/{host_id}/description/export is `write`.
+        "export_host_asbuilt",
     }
 )
 
@@ -384,6 +407,11 @@ _READ_ONLY_TOOLS = frozenset(
         "preview_artifact",
         # GET /inventory/{host_id}/power (#781): reads Proxmox, sends nothing.
         "get_guest_power",
+        # GET /inventory/{host_id}/disks (#824): reads Proxmox, sends nothing.
+        "get_guest_disks",
+        # How a host is built (#818): GET/POST /inventory/{host_id}/description,
+        # both API `read` - the agent runs only read-only collectors.
+        "describe_host",
     }
 )
 
@@ -408,7 +436,7 @@ async def _bootstrap() -> dict[str, Any]:
     lifecycle._vault_mgr = vault
     if proxmox:
         try:
-            pve_nodes_data = await proxmox.read("/nodes")
+            pve_nodes_data = await pve_reads.nodes(proxmox)
             pve_node_list = [
                 n.get("node") or n.get("name", "")
                 for n in (
@@ -441,6 +469,7 @@ async def _bootstrap() -> dict[str, Any]:
         lifecycle._executor_ref = executor
 
     from homepilot.app_state import get_agent_registry
+    from homepilot.inventory.description import HostDescriptionService
     from homepilot.inventory.service import InventoryService
     from homepilot.reconciler import DriftReconciler
     from homepilot.tasks.repository import TaskRepository
@@ -538,6 +567,10 @@ async def _bootstrap() -> dict[str, Any]:
         # transport and errors on the other is the exact trap
         # TestBothTransportsCarryTheSameToolContext guards.
         "guest_template_service": guest_template_service,
+        # How each host is built (#818). Over stdio there is no hub in this
+        # process, so a collection is refused with the reason; the stored
+        # descriptions and the export work the same as over HTTP.
+        "host_descriptions": HostDescriptionService(state.repo, agent_adapter),
         # The hub's live registry, for the reachability check. None when the hub
         # is not running in this process, which the handler reports as "unknown"
         # rather than as "reachable".
@@ -601,6 +634,10 @@ _TOOL_HANDLERS: dict[str, _Handler] = {
     "get_host": handle_get_host,
     "get_guest_power": handle_get_guest_power,
     "power_guest": handle_power_guest,
+    "get_guest_disks": handle_get_guest_disks,
+    "add_guest_disk": handle_add_guest_disk,
+    "describe_host": handle_describe_host,
+    "export_host_asbuilt": handle_export_host_asbuilt,
     "list_tasks": handle_list_tasks,
     "get_dashboard_summary": handle_get_dashboard_summary,
     "get_update_status": handle_get_update_status,

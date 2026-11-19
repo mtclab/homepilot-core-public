@@ -73,6 +73,8 @@ _DEPLOYMENT_ONLY: frozenset[str] = frozenset(
     {
         "HP_IMAGE_TAG",  # compose image tag
         "HP_DAEMON_PORT",  # host port mapped to container's fixed :8000
+        "HP_NTFY_BIND",  # host address the opt-in ntfy service publishes on (#822)
+        "HP_NTFY_PORT",  # host port mapped to the ntfy service's fixed :80 (#822)
     }
 )
 

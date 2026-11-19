@@ -1,0 +1,702 @@
+{
+	"phrases": {
+		"address_conflict": {
+			"verb": "found two machines on one address",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"address_conflict_resolved": {
+			"verb": "saw an address clash clear",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"apply": {
+			"verb": "applied",
+			"on": "change",
+			"tail": "",
+			"many": "applied {n} changes"
+		},
+		"apply_failed": {
+			"verb": "could not apply",
+			"on": "change",
+			"tail": "",
+			"many": "could not apply {n} changes"
+		},
+		"apply_refused": {
+			"verb": "tried to apply",
+			"on": "change",
+			"tail": " - stopped: the machine had changed",
+			"many": null
+		},
+		"apply_unsettled": {
+			"verb": "started applying",
+			"on": "change",
+			"tail": " - the outcome is not known: Proxmox had not finished",
+			"many": null
+		},
+		"approve": {
+			"verb": "approved",
+			"on": "change",
+			"tail": "",
+			"many": "approved {n} changes"
+		},
+		"attention_snoozed": {
+			"verb": "put off a line on the Overview",
+			"on": "none",
+			"tail": "",
+			"many": "put off {n} lines on the Overview"
+		},
+		"attention_unsnoozed": {
+			"verb": "brought back a line on the Overview",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"check_cycle": {
+			"verb": "checked every applied change for drift",
+			"on": "none",
+			"tail": "",
+			"many": "checked for drift {n} times"
+		},
+		"check_drift": {
+			"verb": "checked for drift:",
+			"on": "change",
+			"tail": "",
+			"many": "checked {n} changes for drift"
+		},
+		"duplicate_host_retired": {
+			"verb": "retired a duplicate record of",
+			"on": "host",
+			"tail": "",
+			"many": "retired a duplicate record of {n} duplicate records"
+		},
+		"edit": {
+			"verb": "edited",
+			"on": "change",
+			"tail": "",
+			"many": "edited {n} changes"
+		},
+		"fail": {
+			"verb": "recorded as failed:",
+			"on": "change",
+			"tail": "",
+			"many": "recorded {n} changes as failed"
+		},
+		"guest_invite_minted": {
+			"verb": "made an invite for",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_invite_revoked": {
+			"verb": "revoked an invite for",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_power_refused": {
+			"verb": "tried a power action on",
+			"on": "host",
+			"tail": " - refused",
+			"many": null
+		},
+		"guest_quota_removed": {
+			"verb": "removed the budget for",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_quota_set": {
+			"verb": "set the budget for",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_reboot": {
+			"verb": "rebooted",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_shutdown": {
+			"verb": "shut down",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_start": {
+			"verb": "started",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_stop": {
+			"verb": "stopped",
+			"on": "host",
+			"tail": " (forced)",
+			"many": null
+		},
+		"guest_template_cancelled": {
+			"verb": "cancelled building the guest template",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_template_create_failed": {
+			"verb": "could not build the guest template",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"guest_template_created": {
+			"verb": "built the guest template",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"host_added": {
+			"verb": "added the host",
+			"on": "host",
+			"tail": "",
+			"many": "added the host {n} hosts"
+		},
+		"host_forgotten": {
+			"verb": "forgot",
+			"on": "host",
+			"tail": "",
+			"many": "forgot {n} machines"
+		},
+		"install_agent": {
+			"verb": "installed the agent on",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"install_agent_failed": {
+			"verb": "could not install the agent on",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"instance_claimed": {
+			"verb": "claimed this HomePilot",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"invalidate": {
+			"verb": "sent back to review",
+			"on": "change",
+			"tail": ": one of its steps was edited",
+			"many": null
+		},
+		"login": {
+			"verb": "signed in",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"notification_channel_created": {
+			"verb": "added a notification channel",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"notification_channel_deleted": {
+			"verb": "removed a notification channel",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"notification_channel_disabled": {
+			"verb": "turned off a notification channel",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"notification_channel_enabled": {
+			"verb": "turned on a notification channel",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"notification_channel_tested": {
+			"verb": "tested a notification channel",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_bundled_disabled": {
+			"verb": "stopped HomePilot's ntfy server for phone alerts",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_bundled_enabled": {
+			"verb": "set up HomePilot's ntfy server for phone alerts",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_phone_added": {
+			"verb": "added a phone for alerts",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_phone_allowed": {
+			"verb": "let a phone read the alerts",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_phone_removed": {
+			"verb": "removed a phone from alerts",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"phone_alerts_public_url_set": {
+			"verb": "set the address phones reach ntfy at",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"propose": {
+			"verb": "proposed",
+			"on": "change",
+			"tail": "",
+			"many": "proposed {n} changes"
+		},
+		"provision": {
+			"verb": "created the guest",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"provision_cancelled": {
+			"verb": "cancelled creating the guest",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"provision_failed": {
+			"verb": "could not create the guest",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"recheck_refused": {
+			"verb": "rechecked",
+			"on": "change",
+			"tail": " and sent it back to review: the machine had changed",
+			"many": null
+		},
+		"refresh": {
+			"verb": "read the inventory from Proxmox",
+			"on": "none",
+			"tail": "",
+			"many": "read the inventory from Proxmox {n} times"
+		},
+		"refresh_incomplete": {
+			"verb": "could not finish reading the inventory",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"reject": {
+			"verb": "rejected",
+			"on": "change",
+			"tail": "",
+			"many": "rejected {n} changes"
+		},
+		"replay": {
+			"verb": "ran again",
+			"on": "change",
+			"tail": "",
+			"many": "ran again {n} changes"
+		},
+		"replay_failed": {
+			"verb": "could not run again",
+			"on": "change",
+			"tail": "",
+			"many": "could not run again {n} changes"
+		},
+		"replay_refused": {
+			"verb": "tried to run again",
+			"on": "change",
+			"tail": " - stopped: the machine had changed",
+			"many": null
+		},
+		"replay_unsettled": {
+			"verb": "started running again",
+			"on": "change",
+			"tail": " - the outcome is not known: Proxmox had not finished",
+			"many": null
+		},
+		"returned_for_review": {
+			"verb": "sent back to review",
+			"on": "change",
+			"tail": "",
+			"many": "sent back to review {n} changes"
+		},
+		"revoke": {
+			"verb": "revoked",
+			"on": "change",
+			"tail": "",
+			"many": "revoked {n} changes"
+		},
+		"rollback_refused": {
+			"verb": "tried to roll back",
+			"on": "change",
+			"tail": " - stopped: the machine had changed",
+			"many": null
+		},
+		"self_guest_cleared": {
+			"verb": "cleared HomePilot's own host",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"self_guest_confirmed": {
+			"verb": "marked",
+			"on": "host",
+			"tail": " as HomePilot's own host",
+			"many": null
+		},
+		"supersede": {
+			"verb": "replaced",
+			"on": "change",
+			"tail": "",
+			"many": "replaced {n} changes"
+		},
+		"tailnet_join": {
+			"verb": "joined the tailnet:",
+			"on": "host",
+			"tail": "",
+			"many": null
+		},
+		"token_minted": {
+			"verb": "made a token",
+			"on": "none",
+			"tail": "",
+			"many": "made {n} tokens"
+		},
+		"token_revoked": {
+			"verb": "revoked a token",
+			"on": "none",
+			"tail": "",
+			"many": "revoked {n} tokens"
+		},
+		"unsettled": {
+			"verb": "left",
+			"on": "change",
+			"tail": " waiting on Proxmox - the outcome is not known yet",
+			"many": null
+		},
+		"webhook_created": {
+			"verb": "added a webhook",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"webhook_deleted": {
+			"verb": "removed a webhook",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"webhook_tested": {
+			"verb": "tested a webhook",
+			"on": "none",
+			"tail": "",
+			"many": null
+		},
+		"withdraw": {
+			"verb": "withdrew",
+			"on": "change",
+			"tail": "",
+			"many": "withdrew {n} approved changes"
+		}
+	},
+	"run_actions": {
+		"apply": "Applying",
+		"create_guest_template": "Building the guest template",
+		"install_agent": "Installing the agent on",
+		"provision": "Creating the guest",
+		"replay": "Running again",
+		"revoke": "Revoking",
+		"tailnet_join": "Joining the tailnet:",
+		"withdraw": "Withdrawing"
+	},
+	"run_statuses": {
+		"cancelled": "cancelled",
+		"failed": "failed",
+		"pending": "waiting to start",
+		"running": "running",
+		"succeeded": "done",
+		"unknown": "of unknown outcome - Proxmox had not finished when the run stopped"
+	},
+	"_comment": "Generated from src/homepilot/dashboard/wording.py by `python tests/test_what_happened_wording.py --fixture`; tests/test_what_happened_wording.py holds it equal to the server's words.",
+	"journal": [
+		{
+			"row": {
+				"action": "install_agent",
+				"artifact_id": null,
+				"target_host": "infra-docker",
+				"details_json": "{\"upgrade\":true,\"agent_version\":\"v3.11.0\"}"
+			},
+			"words": {
+				"verb": "upgraded the agent on",
+				"object": "infra-docker",
+				"tail": " to v3.11.0",
+				"many": null,
+				"text": "upgraded the agent on infra-docker to v3.11.0"
+			}
+		},
+		{
+			"row": {
+				"action": "host_forgotten",
+				"artifact_id": null,
+				"target_host": "probe-1",
+				"details_json": "{\"reason\":\"destroyed by an applied change\"}"
+			},
+			"words": {
+				"verb": "forgot",
+				"object": "probe-1",
+				"tail": ", which an applied change destroyed",
+				"many": "forgot {n} machines",
+				"text": "forgot probe-1, which an applied change destroyed"
+			}
+		},
+		{
+			"row": {
+				"action": "approve",
+				"artifact_id": "2026-11-08-retire-104",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "approved",
+				"object": "2026-11-08-retire-104",
+				"tail": "",
+				"many": "approved {n} changes",
+				"text": "approved 2026-11-08-retire-104"
+			}
+		},
+		{
+			"row": {
+				"action": "withdraw",
+				"artifact_id": "a-1",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "withdrew",
+				"object": "a-1",
+				"tail": "",
+				"many": "withdrew {n} approved changes",
+				"text": "withdrew a-1"
+			}
+		},
+		{
+			"row": {
+				"action": "withdraw",
+				"artifact_id": "a-2",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "withdrew",
+				"object": "a-2",
+				"tail": "",
+				"many": "withdrew {n} approved changes",
+				"text": "withdrew a-2"
+			}
+		},
+		{
+			"row": {
+				"action": "withdraw",
+				"artifact_id": "a-3",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "withdrew",
+				"object": "a-3",
+				"tail": "",
+				"many": "withdrew {n} approved changes",
+				"text": "withdrew a-3"
+			}
+		},
+		{
+			"row": {
+				"action": "withdraw",
+				"artifact_id": "a-4",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "withdrew",
+				"object": "a-4",
+				"tail": "",
+				"many": "withdrew {n} approved changes",
+				"text": "withdrew a-4"
+			}
+		},
+		{
+			"row": {
+				"action": "withdraw",
+				"artifact_id": "mine",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "withdrew",
+				"object": "mine",
+				"tail": "",
+				"many": "withdrew {n} approved changes",
+				"text": "withdrew mine"
+			}
+		},
+		{
+			"row": {
+				"action": "apply_refused",
+				"artifact_id": "2026-11-18-shell-web01-abc123",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "tried to apply",
+				"object": "2026-11-18-shell-web01-abc123",
+				"tail": " - stopped: the machine had changed",
+				"many": null,
+				"text": "tried to apply 2026-11-18-shell-web01-abc123 - stopped: the machine had changed"
+			}
+		},
+		{
+			"row": {
+				"action": "tailnet_join",
+				"artifact_id": null,
+				"target_host": "relay",
+				"details_json": null
+			},
+			"words": {
+				"verb": "joined the tailnet:",
+				"object": "relay",
+				"tail": "",
+				"many": null,
+				"text": "joined the tailnet: relay"
+			}
+		},
+		{
+			"row": {
+				"action": "check_drift",
+				"artifact_id": "nginx-conf",
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "checked for drift:",
+				"object": "nginx-conf",
+				"tail": "",
+				"many": "checked {n} changes for drift",
+				"text": "checked for drift: nginx-conf"
+			}
+		},
+		{
+			"row": {
+				"action": "refresh",
+				"artifact_id": null,
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "read the inventory from Proxmox",
+				"object": null,
+				"tail": "",
+				"many": "read the inventory from Proxmox {n} times",
+				"text": "read the inventory from Proxmox"
+			}
+		},
+		{
+			"row": {
+				"action": "host_added",
+				"artifact_id": null,
+				"target_host": "nas",
+				"details_json": null
+			},
+			"words": {
+				"verb": "added the host",
+				"object": "nas",
+				"tail": "",
+				"many": "added the host {n} hosts",
+				"text": "added the host nas"
+			}
+		},
+		{
+			"row": {
+				"action": "composite-rollback",
+				"artifact_id": null,
+				"target_host": null,
+				"details_json": null
+			},
+			"words": {
+				"verb": "recorded: composite rollback",
+				"object": null,
+				"tail": "",
+				"many": null,
+				"text": "recorded: composite rollback"
+			}
+		}
+	],
+	"runs": [
+		{
+			"action": "apply",
+			"status": "failed",
+			"target": "nginx-conf",
+			"words": {
+				"what": "Applying nginx-conf",
+				"status": "failed"
+			}
+		},
+		{
+			"action": "apply",
+			"status": "failed",
+			"target": "pg-tune",
+			"words": {
+				"what": "Applying pg-tune",
+				"status": "failed"
+			}
+		},
+		{
+			"action": "apply",
+			"status": "running",
+			"target": "task task",
+			"words": {
+				"what": "Applying task task",
+				"status": "running"
+			}
+		},
+		{
+			"action": "apply",
+			"status": "pending",
+			"target": "nginx-conf",
+			"words": {
+				"what": "Applying nginx-conf",
+				"status": "waiting to start"
+			}
+		},
+		{
+			"action": "install_agent",
+			"status": "failed",
+			"target": "relay",
+			"words": {
+				"what": "Installing the agent on relay",
+				"status": "failed"
+			}
+		}
+	]
+}
