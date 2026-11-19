@@ -12,6 +12,22 @@ A feature heading that merely starts with "Upgrade" ("Upgrade agent keeps...")
 is not one. A paragraph led by a bold `**Upgrade...:**` label is an action too.
 -->
 
+## 3.14.1 - 2026-11-19
+
+### Operator actions
+
+None.
+
+### Fixes
+
+- **How it is built works for a web server with `root` locations.** The agent
+  leaves out empty fields, so an nginx location that serves files from a `root`
+  carries no `alias` at all; the as-built recipe looked the alias up directly and
+  failed (`KeyError: 'alias'`) on the host page, in `hp hosts describe` and in the
+  knowledge-base export. Found on the first live reverse proxy described after
+  3.14.0. A test now renders a location carrying each optional field alone, with
+  the field list read from the agent's own struct.
+
 ## 3.14.0 - 2026-11-18
 
 ### Operator actions

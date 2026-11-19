@@ -533,3 +533,33 @@ class TestTheRecipe:
         # A reason that merely contains a colon is left whole.
         doc["docker"]["reason"] = "not visible to the agent: its user cannot read this"
         assert "Docker: not visible to the agent: its user" in render_asbuilt("p", doc)
+
+
+# 3.14.1: the agent drops every empty field (`omitempty`), so a location may carry
+# a root and no alias at all. The renderer indexed loc['alias'] and the whole
+# as-built recipe failed with KeyError on the estate's reverse proxy (found on
+# prod right after the 3.14.0 upgrade). Every optional location field, alone,
+# must render - the field list is read from the agent's own struct, so a field
+# added there later is covered without touching this test.
+_NGINX_GO = Path(__file__).resolve().parents[1] / "agent" / "go" / "describe_nginx.go"
+
+
+def _optional_location_fields() -> list[str]:
+    src = _NGINX_GO.read_text(encoding="utf-8")
+    body = src[src.index("type nginxLocation struct {") :]
+    body = body[: body.index("\n}")]
+    fields = re.findall(r'json:"([a-z_]+),omitempty"', body)
+    assert fields, "no omitempty fields found in nginxLocation - the parser no longer matches"
+    return fields
+
+
+@pytest.mark.parametrize("field", _optional_location_fields())
+def test_a_location_with_only_one_optional_field_renders(field: str) -> None:
+    doc = description()
+    server = doc["nginx"]["servers"][0]
+    value: Any = [{"name": "X-Probe", "value": "v"}] if field == "headers" else f"/probe/{field}"
+    server["locations"] = [{"match": f"/only-{field}", field: value}]
+    md = render_asbuilt("proxy-1", doc)
+    assert f"location /only-{field}" in md
+    if field in ("root", "alias", "proxy_pass", "pass", "return"):
+        assert f"/probe/{field}" in md
