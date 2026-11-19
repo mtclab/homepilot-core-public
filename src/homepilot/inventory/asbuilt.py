@@ -178,7 +178,7 @@ def _how_exposed(doc: dict[str, Any]) -> list[str]:
                 (f"proxy to `{loc['proxy_pass']}`" if loc.get("proxy_pass") else "")
                 or (f"`{loc['pass']}`" if loc.get("pass") else "")
                 or (
-                    f"files from `{loc['alias'] or loc['root']}`"
+                    f"files from `{loc.get('alias') or loc.get('root')}`"
                     if loc.get("alias") or loc.get("root")
                     else ""
                 )
